@@ -1,0 +1,51 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+.venv/
+venv/
+env/
+
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+.env
+.env.local
+*.local.yaml
+
+# Runtime artifacts produced by demo runs
+runs/
+*.db
+*.sqlite3
+mock/data/dq_flags.runtime.csv
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local agent/CLI tooling config — machine-specific, not part of the demo
+.github/copilot/settings.json
+.foundry/
+.azure
+
+# azd environment values - can contain secrets
+.azure/
+
+# Generated handoff bundle - reproducible, not source
+handoff/
+
+# Browser automation state - holds a signed-in session
+.browser-profile/
+.browser-debug/
+
+# Raw transcripts from scripts/compare_models.py. Live model output, kept so a
+# failed comparison can be diagnosed without paying for every run again -- but
+# it is unreviewed model text about a real tenant, so it never gets committed.
+.compare-runs/

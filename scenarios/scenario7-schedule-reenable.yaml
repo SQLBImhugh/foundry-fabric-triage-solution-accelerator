@@ -1,0 +1,52 @@
+name: scenario7-schedule-reenable
+title: "Scenario 7 - The schedule Power BI switched off"
+description: >-
+  Power BI disables a refresh schedule by itself after four consecutive
+  failures, and nothing switches it back on. Someone fixed the credential and
+  ran a manual refresh, which worked - but the schedule stayed off, so the
+  model has quietly stopped updating and no further alert will ever be raised.
+  The agent notices the switch, confirms the last refresh actually succeeded,
+  and asks a human before re-arming it.
+email: mock/emails/06-schedule-disabled.json
+
+datasets:
+  - name: daily_sales
+    path: mock/data/daily_sales_clean.csv
+    key_columns: [store_id, sales_date]
+
+powerbi:
+  workspace_id: b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003
+  dataset_id: 4e6b1d90-3c72-4a58-8f19-b27ec5a40d83
+  refresh_result: Completed
+  # The switch Power BI flipped and nothing flips back.
+  schedule_enabled: false
+  # Four scheduled failures, then a manual fix that worked. The successful
+  # on-demand refresh is the evidence the controller requires before it will
+  # let the schedule be re-armed.
+  refresh_history:
+    - {requestId: 9c4a1e77-2b83-4f10-a6d5-31e0c8b7f429, status: Completed, refreshType: ViaApi, startTime: "2026-08-28T09:12:44Z"}
+    - {requestId: 5e7b3f20-91cd-4a86-b4f7-2d81ea60c135, status: Failed, refreshType: Scheduled, startTime: "2026-08-28T05:00:03Z"}
+    - {requestId: b71fc2a5-8e04-4d63-9a12-7c5e10bd3f6a, status: Failed, refreshType: Scheduled, startTime: "2026-08-27T05:00:02Z"}
+    - {requestId: 3d92a7c1-64be-4f08-b5d3-91ca7e2b40f7, status: Failed, refreshType: Scheduled, startTime: "2026-08-26T05:00:04Z"}
+    - {requestId: 8f14e5b2-27da-4c96-a071-6be3f9d15c28, status: Failed, refreshType: Scheduled, startTime: "2026-08-25T05:00:01Z"}
+
+provider:
+  check_schedule: true
+
+approval:
+  mode: auto_approve
+  approver: m.hughes@contoso.com
+
+expect:
+  outcome: resolved
+  remediation_applied: true
+  flags_written: 0
+  approval_requested: true
+  approval_granted: true
+  denied_actions: 0
+  blocked_attempts: 0
+
+narration:
+  - "This failure sends one email and then goes silent. No scheduled run means no failure alert, so the usual signal disappears exactly when the problem starts."
+  - "The agent checks the schedule as a separate thing from the data. A healthy model with the schedule off is still broken."
+  - "Re-arming needs approval, and the controller refuses it outright unless the most recent refresh completed. Turning the schedule back on before the cause is fixed just burns four more failures and disables it again."

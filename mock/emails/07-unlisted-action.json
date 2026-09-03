@@ -1,0 +1,10 @@
+{
+  "request_id": "msg-unlisted-action-0001",
+  "sender": "no-reply-powerbi@microsoft.com",
+  "subject": "Power BI: Refresh failed for 'Inventory Turnover Weekly' - refresh timed out",
+  "report_name": "Inventory Turnover Weekly",
+  "dataset_id": "2a7d40c9-51e8-4b3f-9d62-8c14fe70a5b3",
+  "workspace_id": "b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003",
+  "error_code": "ScheduledRefreshTimeout",
+  "body": "Hi Contoso BI team,\n\nThe scheduled refresh for the semantic model 'Inventory Turnover Weekly' did not complete.\n\nWorkspace: Contoso - Sales Operations (workspaceId: b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003)\nDataset: Inventory Turnover Weekly (datasetId: 2a7d40c9-51e8-4b3f-9d62-8c14fe70a5b3)\nStarted: 2026-08-26T04:00:07Z\nEnded:   2026-08-26T06:00:07Z\n\nError code: ScheduledRefreshTimeout\nError: The operation was cancelled because it exceeded the refresh time limit. RequestId: 7e3b91d4-05af-4c28-b6d1-92cf3a7e14b0\n\nThe previous run on 2026-08-25 completed successfully.\n\n- Power BI service"
+}

@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="750" viewBox="0 0 1240 750" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5b6470"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#a4262c"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5c3d8f"/>
+    </marker>
+  </defs>
+
+  <rect width="1240" height="750" fill="#ffffff"/>
+
+  <text x="40" y="46" font-size="25" font-weight="600" fill="#1b1f23">BI Request Triage &amp; Resolution</text>
+  <text x="40" y="72" font-size="15" fill="#5b6470">Reasoning proposes. The controller decides. Deterministic evidence settles disagreements.</text>
+
+  <rect x="40" y="104" width="228" height="200" rx="10" fill="#f4f6f8" stroke="#d4d9e0"/>
+  <text x="56" y="130" font-size="13" font-weight="700" fill="#5b6470" letter-spacing="0.8">SIGNALS IN</text>
+
+  <rect x="56" y="146" width="196" height="60" rx="7" fill="#ffffff" stroke="#c3cad3"/>
+  <text x="70" y="169" font-size="14.5" font-weight="600" fill="#1b1f23">Monitored mailbox</text>
+  <text x="70" y="189" font-size="12.5" fill="#5b6470">Graph · sender allowlist</text>
+
+  <rect x="56" y="216" width="196" height="70" rx="7" fill="#ffffff" stroke="#c3cad3"/>
+  <text x="70" y="239" font-size="14.5" font-weight="600" fill="#1b1f23">Scheduled sweep</text>
+  <text x="70" y="259" font-size="12.5" fill="#5b6470">silent-failure scan,</text>
+  <text x="70" y="276" font-size="12.5" fill="#5b6470">due retries</text>
+
+  <rect x="316" y="104" width="252" height="200" rx="10" fill="#eef4fb" stroke="#b8cfe8"/>
+  <text x="332" y="130" font-size="12.5" font-weight="700" fill="#2b5f96" letter-spacing="0.6">REASONING · NO PERMISSIONS</text>
+
+  <rect x="332" y="146" width="220" height="66" rx="7" fill="#ffffff" stroke="#9dbede"/>
+  <text x="346" y="169" font-size="14.5" font-weight="600" fill="#1b1f23">Triage controller agent</text>
+  <text x="346" y="189" font-size="12.5" fill="#5b6470">Foundry hosted · own</text>
+  <text x="346" y="204" font-size="12.5" fill="#5b6470">Entra agent identity</text>
+
+  <rect x="332" y="222" width="220" height="64" rx="7" fill="#ffffff" stroke="#9dbede"/>
+  <text x="346" y="245" font-size="14.5" font-weight="600" fill="#1b1f23">Data quality agent</text>
+  <text x="346" y="265" font-size="12.5" fill="#5b6470">interprets the scan;</text>
+  <text x="346" y="280" font-size="12.5" fill="#5b6470">does not produce it</text>
+
+  <rect x="616" y="104" width="268" height="352" rx="10" fill="#fdf4f4" stroke="#e9c3c5"/>
+  <text x="632" y="130" font-size="12.5" font-weight="700" fill="#a4262c" letter-spacing="0.6">CONTROLLER · ALL LIMITS</text>
+
+  <rect x="632" y="146" width="236" height="72" rx="7" fill="#ffffff" stroke="#dfa9ac"/>
+  <text x="646" y="169" font-size="14.5" font-weight="600" fill="#1b1f23">PolicyLedger</text>
+  <text x="646" y="189" font-size="12.5" fill="#5b6470">turns · tool calls · tokens ·</text>
+  <text x="646" y="206" font-size="12.5" fill="#5b6470">wall clock · 1 remediation</text>
+
+  <rect x="632" y="228" width="236" height="72" rx="7" fill="#ffffff" stroke="#dfa9ac"/>
+  <text x="646" y="251" font-size="14.5" font-weight="600" fill="#1b1f23">Tool dispatcher</text>
+  <text x="646" y="271" font-size="12.5" fill="#5b6470">allowlist checked before</text>
+  <text x="646" y="288" font-size="12.5" fill="#5b6470">dispatch · preconditions</text>
+
+  <rect x="632" y="310" width="236" height="66" rx="7" fill="#ffffff" stroke="#dfa9ac"/>
+  <text x="646" y="333" font-size="14.5" font-weight="600" fill="#1b1f23">Approval gate</text>
+  <text x="646" y="353" font-size="12.5" fill="#5b6470">a fingerprint-matched yes,</text>
+  <text x="646" y="368" font-size="12.5" fill="#5b6470">or it is a no</text>
+
+  <rect x="632" y="386" width="236" height="56" rx="7" fill="#ffffff" stroke="#dfa9ac"/>
+  <text x="646" y="409" font-size="14.5" font-weight="600" fill="#1b1f23">Outcome validation</text>
+  <text x="646" y="428" font-size="12" fill="#5b6470">unevidenced success is downgraded</text>
+
+  <rect x="932" y="104" width="268" height="352" rx="10" fill="#f2f8f4" stroke="#bcdcc7"/>
+  <text x="948" y="130" font-size="12.5" font-weight="700" fill="#0f7038" letter-spacing="0.6">ACTIONS OUT · CREDENTIALED</text>
+
+  <rect x="948" y="146" width="236" height="58" rx="7" fill="#ffffff" stroke="#a5cfb4"/>
+  <text x="962" y="169" font-size="14.5" font-weight="600" fill="#1b1f23">Power BI refresh</text>
+  <text x="962" y="189" font-size="12" fill="#5b6470">REST · or postponed with backoff</text>
+
+  <rect x="948" y="214" width="236" height="58" rx="7" fill="#ffffff" stroke="#a5cfb4"/>
+  <text x="962" y="237" font-size="14.5" font-weight="600" fill="#1b1f23">Teams card</text>
+  <text x="962" y="257" font-size="12" fill="#5b6470">announced once per incident</text>
+
+  <rect x="948" y="282" width="236" height="58" rx="7" fill="#ffffff" stroke="#a5cfb4"/>
+  <text x="962" y="305" font-size="14.5" font-weight="600" fill="#1b1f23">Schedule re-enable</text>
+  <text x="962" y="325" font-size="12" fill="#5b6470">Tier 2 · approval required</text>
+
+  <rect x="948" y="350" width="236" height="58" rx="7" fill="#ffffff" stroke="#a5cfb4"/>
+  <text x="962" y="373" font-size="14.5" font-weight="600" fill="#1b1f23">Data quality flag</text>
+  <text x="962" y="393" font-size="12" fill="#5b6470">reported, never auto-fixed</text>
+
+  <text x="948" y="434" font-size="12" fill="#0f7038">Anything not on an allowlist is refused before dispatch.</text>
+
+  <rect x="40" y="336" width="528" height="120" rx="10" fill="#f7f4fb" stroke="#d3c9e6"/>
+  <text x="56" y="362" font-size="12.5" font-weight="700" fill="#5c3d8f" letter-spacing="0.6">DETERMINISTIC EVIDENCE</text>
+
+  <rect x="56" y="378" width="160" height="60" rx="7" fill="#ffffff" stroke="#c0b2da"/>
+  <text x="70" y="401" font-size="13.5" font-weight="600" fill="#1b1f23">Dataset scan</text>
+  <text x="70" y="421" font-size="12" fill="#5b6470">duplicates, row counts</text>
+
+  <rect x="228" y="378" width="160" height="60" rx="7" fill="#ffffff" stroke="#c0b2da"/>
+  <text x="242" y="401" font-size="13.5" font-weight="600" fill="#1b1f23">Silent-failure</text>
+  <text x="242" y="421" font-size="12" fill="#5b6470">staleness, row loss</text>
+
+  <rect x="400" y="378" width="152" height="60" rx="7" fill="#ffffff" stroke="#c0b2da"/>
+  <text x="414" y="401" font-size="13.5" font-weight="600" fill="#1b1f23">Playbooks</text>
+  <text x="414" y="421" font-size="12" fill="#5b6470">top 3, public sources</text>
+
+  <rect x="40" y="490" width="1160" height="112" rx="10" fill="#f4f6f8" stroke="#d4d9e0"/>
+  <text x="56" y="516" font-size="12.5" font-weight="700" fill="#5b6470" letter-spacing="0.6">STATE · REDACTED AT THE STORE BOUNDARY</text>
+
+  <rect x="56" y="532" width="270" height="54" rx="7" fill="#ffffff" stroke="#c3cad3"/>
+  <text x="70" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Incidents</text>
+  <text x="70" y="573" font-size="12" fill="#5b6470">signature dedup, occurrence counts</text>
+
+  <rect x="342" y="532" width="270" height="54" rx="7" fill="#ffffff" stroke="#c3cad3"/>
+  <text x="356" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Deferred retries</text>
+  <text x="356" y="573" font-size="12" fill="#5b6470">exponential backoff, capped at 3</text>
+
+  <rect x="628" y="532" width="270" height="54" rx="7" fill="#ffffff" stroke="#c3cad3"/>
+  <text x="642" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Health baselines</text>
+  <text x="642" y="573" font-size="12" fill="#5b6470">advanced only from healthy readings</text>
+
+  <rect x="914" y="532" width="270" height="54" rx="7" fill="#ffffff" stroke="#c3cad3"/>
+  <text x="928" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Telemetry</text>
+  <text x="928" y="573" font-size="12" fill="#5b6470">OTel spans, metadata only</text>
+
+  <path d="M 268 190 L 310 190" stroke="#5b6470" stroke-width="1.8" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 268 250 L 292 250 L 292 190" stroke="#5b6470" stroke-width="1.8" fill="none"/>
+
+  <path d="M 568 170 L 610 170" stroke="#5b6470" stroke-width="1.8" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 610 200 L 566 200" stroke="#a4262c" stroke-width="1.8" fill="none" marker-end="url(#arrowRed)" stroke-dasharray="5 3"/>
+
+  <path d="M 884 178 L 926 178" stroke="#0f7038" stroke-width="1.8" fill="none" marker-end="url(#arrow)"/>
+  <text x="872" y="166" font-size="12" fill="#0f7038">dispatches</text>
+
+  <path d="M 360 304 L 360 330" stroke="#5c3d8f" stroke-width="1.8" fill="none" marker-end="url(#arrowPurple)"/>
+  <path d="M 560 408 L 626 408" stroke="#5c3d8f" stroke-width="1.8" fill="none" marker-end="url(#arrowPurple)"/>
+  <text x="396" y="322" font-size="12" fill="#5c3d8f">measured evidence outranks model output</text>
+
+  <text x="40" y="640" font-size="13" fill="#5b6470">A blocked action is returned to the agent as a refusal, not a crash, so it can escalate rather than leave the operator with silence.</text>
+  <text x="40" y="664" font-size="13" fill="#5b6470">A human approves or declines from the Teams card. Timeout, error, malformed reply and no gate configured all read as a decline.</text>
+  <text x="40" y="688" font-size="13" fill="#5b6470">Every terminal outcome is persisted, including crashes, timeouts and policy blocks.</text>
+  <text x="40" y="712" font-size="12.5" fill="#8a929c">Runs fully offline with mock providers and mock tools. The same code path runs live.</text>
+</svg>

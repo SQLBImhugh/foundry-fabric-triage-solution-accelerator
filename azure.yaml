@@ -1,0 +1,213 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+
+name: foundry-fabric-triage-solution-accelerator
+metadata:
+    template: foundry-fabric-triage-solution-accelerator@1.0
+
+services:
+    bi-request-triage:
+        host: azure.ai.project
+        endpoint: ${AZURE_AI_PROJECT_ENDPOINT}
+
+    bi-triage-controller:
+        project: ./src
+        host: azure.ai.agent
+        language: python
+        uses:
+            - bi-request-triage
+        codeConfiguration:
+            dependencyResolution: remote_build
+            entryPoint: app.py
+            runtime: python_3_13
+        container:
+            resources:
+                cpu: "1"
+                memory: 2Gi
+        kind: hosted
+        name: bi-triage-controller
+        environmentVariables:
+            # INFO so the container explains its own decisions in the log:
+            # which identity it presented, what it ignored and why. A hosted
+            # agent you cannot interrogate is a hosted agent you cannot trust.
+            - name: TRIAGE_LOG_LEVEL
+              value: INFO
+            # The controller reasons through the Foundry prompt agents and acts
+            # through real tools. Mock stays available for offline evaluation by
+            # overriding these, but the deployed default is the real thing.
+            - name: TRIAGE_PROVIDER_MODE
+              value: foundry
+            - name: TRIAGE_TOOL_MODE
+              value: live
+            - name: FOUNDRY_PROJECT_ENDPOINT
+              value: ${AZURE_AI_PROJECT_ENDPOINT}
+            - name: FOUNDRY_TRIAGE_AGENT_NAME
+              value: bi-triage
+            - name: FOUNDRY_DQ_AGENT_NAME
+              value: bi-data-quality
+            - name: FOUNDRY_AGENT_MODEL
+              value: ${FOUNDRY_AGENT_MODEL}
+            - name: FOUNDRY_HANDOFF_MODE
+              value: responses
+            # Mailbox ingestion is the one thing the agent identity cannot do.
+            # Verified from inside this container: with the same token, Graph's
+            # directory endpoint returns 200 while the Exchange-backed mail
+            # endpoint returns 401. Graph accepts an Entra agent identity;
+            # Exchange does not yet accept one for app-only mailbox access.
+            #
+            # So ingestion falls back to a conventional app registration,
+            # scoped by an Exchange ApplicationAccessPolicy to a single mailbox.
+            # It is the only credential in this deployment, it expires, and it
+            # is precisely what the agent identity removes everywhere else.
+            # Injected from the azd environment, never committed.
+            - name: GRAPH_TENANT_ID
+              value: ${AZURE_TENANT_ID}
+            - name: GRAPH_CLIENT_ID
+              value: ${GRAPH_CLIENT_ID}
+            - name: GRAPH_CLIENT_SECRET
+              value: ${GRAPH_CLIENT_SECRET}
+            - name: GRAPH_MAILBOX
+              value: ${GRAPH_MAILBOX}
+            # A mailbox the agent must NOT be able to read. Startup refuses to
+            # ingest if this read succeeds, because app-only Mail.Read is
+            # tenant-wide until Exchange scopes it.
+            - name: GRAPH_CANARY_MAILBOX
+              value: ${GRAPH_CANARY_MAILBOX}
+            # Senders the agent will act on, as an allowlist. This is a security
+            # control: an agent that acts on every message it receives is
+            # steerable by anyone who can email it. Adding a known address is a
+            # different thing from removing the check.
+            - name: GRAPH_SENDER_ALLOWLIST
+              value: ${GRAPH_SENDER_ALLOWLIST}
+            - name: INCIDENT_TABLE_ENDPOINT
+              value: ${INCIDENT_TABLE_ENDPOINT}
+            - name: INCIDENT_TABLE_NAME
+              value: incidents
+            # Approval requests wait here and human decisions land here. It has
+            # to be shared, durable state: the agent writes the request in one
+            # invocation and a person answers from somewhere else entirely, a
+            # Teams card or `bi-triage approve`.
+            - name: APPROVAL_TABLE_NAME
+              value: approvals
+            # The URL behind the card's Approve/Decline buttons. A card posted
+            # through an incoming webhook has no bot behind it, so Action.Submit
+            # does nothing; the buttons have to be links to something that
+            # writes the decision. Left unset, the card shows the request id and
+            # the CLI is the channel.
+            - name: APPROVAL_CALLBACK_URL
+              value: ${APPROVAL_CALLBACK_URL}
+            # The silent-failure detector. The off switch lives here rather than
+            # in routine state, because routine state is not reliably managed
+            # from this file. See docs/OperationsGuide.md.
+            - name: SILENT_SWEEP_ENABLED
+              value: "true"
+            # Empty by default. A detector told nothing watches nothing, which
+            # is correct: "fresh" is a business question per model, and guessing
+            # it produces the false positives that get it muted.
+            - name: SILENT_HEALTH_PROBES
+              value: ${SILENT_HEALTH_PROBES}
+            # Live Power BI. No client id or secret: Power BI accepts this agent
+            # identity as a workspace principal, so the controller triggers
+            # refreshes and reads refresh history as itself. Exchange does not
+            # accept it, per the GRAPH_* note above. The two services differ,
+            # and this file says so rather than glossing it.
+            - name: POWERBI_TENANT_ID
+              value: ${AZURE_TENANT_ID}
+            - name: POWERBI_WORKSPACE_ID
+              value: ${POWERBI_WORKSPACE_ID}
+            - name: POWERBI_DATASET_ID
+              value: ${POWERBI_DATASET_ID}
+            # Teams delivery. Empty means the notifier stays mocked, which is a
+            # fallback rather than a failure. The URL is a bearer credential:
+            # anyone holding it can post to that channel, so it lives in the azd
+            # environment, which is gitignored, and never in this file.
+            - name: TEAMS_WEBHOOK_URL
+              value: ${TEAMS_WEBHOOK_URL}
+            - name: TEAMS_MODE
+              value: webhook
+        protocols:
+            - protocol: responses
+              version: 2.0.0
+
+    # The two routines below are the native scheduled trigger. They DO NOT FIRE,
+    # so they ship disabled.
+    #
+    # Verified 2026-09-02, six days after registering one: `azd ai routine show`
+    # reported it enabled with its cron, `azd ai routine list` returned
+    # {"value": null}, `azd ai routine run list` reported no runs, and a manual
+    # dispatch returned three ids while the container did nothing. Application
+    # Insights showed agent activity in two of twenty-four hours, and both were
+    # hours when a person invoked the agent by hand.
+    #
+    # `azd deploy` does not manage routines at all: it applies neither
+    # `enabled:` in either direction, nor a newly declared routine. Register and
+    # change them with `azd ai routine create --file`.
+    #
+    # They are declared rather than deleted because the shape is right and costs
+    # nothing while disabled: when the preview defect is fixed this becomes a
+    # one-line change instead of a rediscovery. They are disabled rather than
+    # enabled because an accelerator whose whole subject is failures that never
+    # announce themselves must not ship a scheduler that silently does nothing.
+    # An adopter would deploy, read `enabled: true`, and never learn that their
+    # triage agent had not run since the day they installed it.
+    #
+    # Until routines work, use infra/scheduled-sweep.json, which is a Logic App
+    # that does the same job and is verified end to end. See
+    # docs/OperationsGuide.md. Nothing needs rewriting either way, because the
+    # scheduled path and the interactive path are the same code.
+    #
+    # `input:` is load-bearing. The controller routes on the message text, and
+    # anything it does not recognise is triaged as though it were alert text.
+    # `azd ai routine create` without `--file` cannot set `input`, and a routine
+    # with no input sends an EMPTY message, which the controller treats as a
+    # mailbox sweep. A health-sweep routine registered that way would silently
+    # run the wrong job.
+    bi-triage-schedule:
+        host: azure.ai.routine
+        uses:
+            - bi-triage-controller
+        description: Drain the BI alerts mailbox and triage anything new
+        enabled: false
+        triggers:
+            default:
+                type: schedule
+                cron_expression: "*/5 * * * *"
+                time_zone: Etc/UTC
+        action:
+            type: invoke_agent_responses_api
+            agent_name: bi-triage-controller
+            input: "scheduled sweep"
+
+    # The other trigger, and the one the mailbox sweep cannot cover. "scheduled
+    # sweep" above drains the inbox and performs due retries; it never runs the
+    # silent-failure scan, because that is a different question. Not "what
+    # arrived" but "what is quietly wrong and sent nothing".
+    #
+    # Without this declaration the detector has no scheduled trigger at all,
+    # even on a platform where routines work. It would run only when a person
+    # remembered to ask, which is the opposite of the point: these are the
+    # failures nobody is told about.
+    #
+    # Hourly rather than every five minutes. A freshness probe on a daily model
+    # answers a question that changes once a day, and executeQueries is capped
+    # at 120/minute per user across every dataset, so a detector that polls hard
+    # becomes load on the capacity it is watching. Hourly costs 24 queries a day
+    # per probe instead of 96, and still catches a missed 06:00 load well inside
+    # the working morning.
+    bi-triage-health-sweep:
+        host: azure.ai.routine
+        uses:
+            - bi-triage-controller
+        description: Look for models that failed without sending an alert
+        enabled: false
+        triggers:
+            default:
+                type: schedule
+                cron_expression: "0 * * * *"
+                time_zone: Etc/UTC
+        action:
+            type: invoke_agent_responses_api
+            agent_name: bi-triage-controller
+            input: "silent sweep"
+
+infra:
+    provider: microsoft.foundry

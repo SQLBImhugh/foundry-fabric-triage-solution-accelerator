@@ -1,0 +1,30 @@
+name: scenario2b-known-issue
+title: "Scenario 2b - Known related issue: suppress instead of repeating"
+description: >-
+  The same data quality alert arrives twice. The first run flags and notifies.
+  The second run matches the open incident by signature and stops - it does not
+  re-flag, does not re-notify the same finding as new, and does not remediate.
+  This is the 'Is There a Known Related Issue? -> Wait for Resolution' branch.
+email: mock/emails/02-data-quality-failure.json
+repeat: 2
+
+datasets:
+  - name: daily_sales
+    path: mock/data/daily_sales.csv
+    key_columns: [store_id, sales_date]
+
+powerbi:
+  workspace_id: b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003
+  dataset_id: 6f1c9b52-8a4d-4e7f-9c31-2b5a7d0e4411
+  refresh_result: Completed
+
+expect:
+  outcome: duplicate_suppressed
+  remediation_applied: false
+  flags_written: 0
+  blocked_attempts: 0
+
+narration:
+  - "The second email is a different message id but the same failure - the signature is what matches."
+  - "Ask the audience what would happen during a two-hour outage without this."
+  - "Run `bi-triage incidents` afterwards: one incident, occurrence count 2."

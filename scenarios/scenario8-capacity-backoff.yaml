@@ -1,0 +1,36 @@
+name: scenario8-capacity-backoff
+title: "Scenario 8 - The retry that would make it worse"
+description: >-
+  The capacity is saturated and rejected the refresh. Retrying is the obvious
+  move and the wrong one: it adds load to the thing that is already over its
+  limits, and across several datasets at once that turns contention into an
+  outage caused by the system meant to be helping. The agent schedules the
+  retry instead of performing it, and the controller refuses an immediate
+  refresh while that window is open.
+email: mock/emails/04-capacity-throttled.json
+
+datasets:
+  - name: daily_sales
+    path: mock/data/daily_sales_clean.csv
+    key_columns: [store_id, sales_date]
+
+powerbi:
+  workspace_id: b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003
+  dataset_id: 9c05f731-6ad2-48be-b4e7-0f21ca8d3366
+  # If a refresh were attempted, this is what the capacity would say. The point
+  # of the run is that one is never attempted.
+  refresh_result: Throttled
+  retry_after_seconds: 900
+
+expect:
+  outcome: deferred_retry
+  remediation_applied: false
+  flags_written: 0
+  approval_requested: false
+  denied_actions: 0
+  blocked_attempts: 0
+
+narration:
+  - "Nothing was fixed and nothing was broken. The agent recognised a failure it should not act on yet."
+  - "No refresh was attempted at all, so no load was added to a capacity that is already over its limits."
+  - "The retry is a durable row with a due time, not a note in a summary. A later sweep performs it - and after three deferrals it stops and asks for a human, because repeated throttling is a scheduling problem, not a retry problem."

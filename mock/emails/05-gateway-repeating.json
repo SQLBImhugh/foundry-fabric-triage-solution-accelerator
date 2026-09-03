@@ -1,0 +1,10 @@
+{
+  "request_id": "msg-gateway-repeat-0001",
+  "sender": "no-reply-powerbi@microsoft.com",
+  "subject": "Power BI: Refresh failed for 'Orders Daily Rollup' - gateway unavailable (3rd consecutive failure)",
+  "report_name": "Orders Daily Rollup",
+  "dataset_id": "4e6b1d90-3c72-4a58-8f19-b27ec5a40d83",
+  "workspace_id": "b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003",
+  "error_code": "GatewayUnavailable",
+  "body": "Hi Contoso BI team,\n\nThe scheduled refresh for the semantic model 'Orders Daily Rollup' failed again. This is the third consecutive failure.\n\nWorkspace: Contoso - Sales Operations (workspaceId: b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003)\nDataset: Orders Daily Rollup (datasetId: 4e6b1d90-3c72-4a58-8f19-b27ec5a40d83)\nGateway: gw-onprem-01\nStarted: 2026-08-27T05:00:02Z\nEnded:   2026-08-27T05:11:47Z\n\nError code: GatewayUnavailable\nGatewayError: The on-premises data gateway 'gw-onprem-01' did not respond. The gateway may be offline or unable to reach the source. RequestId: b71fc2a5-8e04-4d63-9a12-7c5e10bd3f6a\n\nPrevious attempts on 2026-08-26 and 2026-08-25 failed with the same error.\n\n- Power BI service"
+}

@@ -1,0 +1,286 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "comment": [
+      "The thing that actually makes the agent run on a timer.",
+      "",
+      "Foundry routines look like the native answer and are declared in",
+      "azure.yaml, but they do not fire: registered routines produced no runs",
+      "over six days, and Application Insights showed agent activity only in the",
+      "hours containing a manual invocation. Both routines therefore ship",
+      "disabled, and this is the trigger the accelerator actually supports.",
+      "docs/hosted-architecture.md records the evidence and the commands to",
+      "reproduce it.",
+      "",
+      "Deploy it twice with different parameters - once for the mailbox drain",
+      "and once for the silent-failure scan - because they are different jobs on",
+      "different cadences:",
+      "",
+      "  command='sweep'         every 5 minutes   drains the mailbox and runs",
+      "                                            deferred retries",
+      "  command='silent sweep'  hourly            runs the freshness, volume",
+      "                                            and schema probes, which no",
+      "                                            alert will ever tell you about",
+      "",
+      "Why a Logic App and not a Function or a VM cron: it authenticates with a",
+      "system-assigned managed identity, so there is no key anywhere, which the",
+      "tenant requires. It also keeps its own run history, so a failed sweep is",
+      "visible after the fact rather than being a thing that quietly stopped.",
+      "",
+      "The identity needs permission to invoke the agent. That grant is not in",
+      "this template because it is a role assignment on the Foundry project,",
+      "which is a different scope - see docs/provisioning.md."
+    ]
+  },
+  "parameters": {
+    "name": {
+      "type": "string",
+      "defaultValue": "bi-triage-scheduled-sweep",
+      "metadata": {
+        "description": "Deploy this template once per cadence, with a distinct name each time."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "projectEndpoint": {
+      "type": "string",
+      "metadata": {
+        "description": "e.g. https://<account>.services.ai.azure.com/api/projects/<project>"
+      }
+    },
+    "agentName": {
+      "type": "string",
+      "defaultValue": "bi-triage-controller"
+    },
+    "command": {
+      "type": "string",
+      "defaultValue": "sweep",
+      "allowedValues": [
+        "sweep",
+        "silent sweep"
+      ],
+      "metadata": {
+        "description": "Constrained on purpose. The controller routes anything it does not recognise to 'triage this text as an alert', so a typo here would not fail - it would quietly triage the word as if it were a Power BI alert."
+      }
+    },
+    "frequency": {
+      "type": "string",
+      "defaultValue": "Minute",
+      "allowedValues": [
+        "Minute",
+        "Hour",
+        "Day"
+      ]
+    },
+    "interval": {
+      "type": "int",
+      "defaultValue": 5
+    },
+    "alertWebhookUrl": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional Teams incoming webhook. If set, a failed sweep posts here. Leave empty and failures are still visible in run history, but nothing announces them - which is how an outage went unnoticed until someone invoked the agent by hand."
+      }
+    },
+    "owner": {
+      "type": "string",
+      "defaultValue": "unassigned",
+      "metadata": {
+        "description": "Tag value only. Set it to whoever should be asked before this is deleted."
+      }
+    }
+  },
+  "variables": {
+    "agentUri": "[concat(parameters('projectEndpoint'), '/agents/', parameters('agentName'), '/endpoint/protocols/openai/responses?api-version=v1')]",
+    "foundryAudience": "https://ai.azure.com"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2019-05-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "tags": {
+        "CostCenter": "demo",
+        "Owner": "[parameters('owner')]",
+        "Environment": "demo",
+        "DataClassification": "synthetic"
+      },
+      "properties": {
+        "state": "Enabled",
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "agentUri": {
+              "type": "String",
+              "defaultValue": "[variables('agentUri')]"
+            },
+            "foundryAudience": {
+              "type": "String",
+              "defaultValue": "[variables('foundryAudience')]"
+            },
+            "command": {
+              "type": "String",
+              "defaultValue": "[parameters('command')]"
+            },
+            "alertWebhookUrl": {
+              "type": "SecureString",
+              "defaultValue": "[parameters('alertWebhookUrl')]"
+            }
+          },
+          "triggers": {
+            "Every_interval": {
+              "type": "Recurrence",
+              "recurrence": {
+                "frequency": "[parameters('frequency')]",
+                "interval": "[parameters('interval')]"
+              }
+            }
+          },
+          "actions": {
+            "Invoke_the_agent": {
+              "type": "Http",
+              "runAfter": {},
+              "inputs": {
+                "method": "POST",
+                "uri": "@parameters('agentUri')",
+                "headers": {
+                  "Content-Type": "application/json"
+                },
+                "body": {
+                  "input": "@{parameters('command')}"
+                },
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "@parameters('foundryAudience')"
+                },
+                "retryPolicy": {
+                  "type": "none"
+                }
+              },
+              "limit": {
+                "timeout": "PT3M"
+              }
+            },
+            "Did_it_fail": {
+              "type": "If",
+              "runAfter": {
+                "Invoke_the_agent": [
+                  "Failed",
+                  "TimedOut"
+                ]
+              },
+              "expression": {
+                "and": [
+                  {
+                    "not": {
+                      "equals": [
+                        "@empty(parameters('alertWebhookUrl'))",
+                        true
+                      ]
+                    }
+                  }
+                ]
+              },
+              "actions": {
+                "Announce_the_failure": {
+                  "type": "Http",
+                  "runAfter": {},
+                  "inputs": {
+                    "method": "POST",
+                    "uri": "@parameters('alertWebhookUrl')",
+                    "headers": {
+                      "Content-Type": "application/json"
+                    },
+                    "body": {
+                      "type": "message",
+                      "attachments": [
+                        {
+                          "contentType": "application/vnd.microsoft.card.adaptive",
+                          "content": {
+                            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                            "type": "AdaptiveCard",
+                            "version": "1.4",
+                            "body": [
+                              {
+                                "type": "TextBlock",
+                                "size": "Medium",
+                                "weight": "Bolder",
+                                "color": "Attention",
+                                "text": "Scheduled sweep failed"
+                              },
+                              {
+                                "type": "TextBlock",
+                                "wrap": true,
+                                "text": "The agent did not answer. Nothing was triaged on this run."
+                              },
+                              {
+                                "type": "FactSet",
+                                "facts": [
+                                  {
+                                    "title": "Schedule",
+                                    "value": "@{workflow()['name']}"
+                                  },
+                                  {
+                                    "title": "Command",
+                                    "value": "@{parameters('command')}"
+                                  },
+                                  {
+                                    "title": "Status",
+                                    "value": "@{outputs('Invoke_the_agent')?['statusCode']}"
+                                  },
+                                  {
+                                    "title": "When",
+                                    "value": "@{utcNow()}"
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "else": {
+                "actions": {}
+              }
+            },
+            "Fail_the_run": {
+              "type": "Terminate",
+              "runAfter": {
+                "Did_it_fail": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "runStatus": "Failed",
+                "runError": {
+                  "code": "SweepFailed",
+                  "message": "The agent did not answer. Handling the failure must not mark the run successful, or the run history stops being evidence."
+                }
+              }
+            }
+          },
+          "outputs": {}
+        },
+        "parameters": {}
+      }
+    }
+  ],
+  "outputs": {
+    "principalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('name')), '2019-05-01', 'full').identity.principalId]"
+    }
+  }
+}

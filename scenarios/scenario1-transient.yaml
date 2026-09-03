@@ -1,0 +1,35 @@
+name: scenario1-transient
+title: "Scenario 1 - Transient failure, Tier 1 agentic resolution"
+description: >-
+  A scheduled refresh times out. The Triage agent checks for a known incident,
+  consults the Data Quality agent (which finds nothing), confirms the failure is
+  isolated, applies its single permitted remediation, and reports.
+email: mock/emails/01-transient-refresh-failure.json
+
+datasets:
+  - name: daily_sales
+    path: mock/data/daily_sales_clean.csv
+    key_columns: [store_id, sales_date]
+
+powerbi:
+  workspace_id: b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003
+  dataset_id: 6f1c9b52-8a4d-4e7f-9c31-2b5a7d0e4411
+  refresh_result: Completed
+  # Two clean runs before the failure. This is what makes "isolated, therefore
+  # safe to retry" a conclusion drawn from evidence rather than an assumption.
+  refresh_history:
+    - {requestId: 4b8f2c1e-77a3-4d90-b6e2-9c0518aa3f77, status: Failed, refreshType: Scheduled, startTime: "2026-08-26T05:00:04Z"}
+    - {requestId: 91d3e7a8-2c14-4b6f-a0e9-5d8721cc4b12, status: Completed, refreshType: Scheduled, startTime: "2026-08-25T05:00:02Z"}
+    - {requestId: 7e0a5b39-64df-4a21-9c83-1f4b6e2d8a55, status: Completed, refreshType: Scheduled, startTime: "2026-08-24T05:00:03Z"}
+
+expect:
+  outcome: resolved
+  remediation_applied: true
+  flags_written: 0
+  dq_has_issue: false
+  blocked_attempts: 0
+
+narration:
+  - "Point out that get_known_incidents runs BEFORE any remediation is proposed."
+  - "The Data Quality consultation is a separate agent, not a tool on this one."
+  - "Exactly one remediation is permitted per run - watch the ledger."

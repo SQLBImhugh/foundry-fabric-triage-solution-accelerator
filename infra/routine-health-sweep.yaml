@@ -1,0 +1,11 @@
+description: Look for models that failed without sending an alert
+enabled: false
+triggers:
+    default:
+        type: schedule
+        cron_expression: "0 * * * *"
+        time_zone: America/Chicago
+action:
+    type: invoke_agent_responses_api
+    agent_name: bi-triage-controller
+    input: "silent sweep"

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Offline tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      # The suite must pass with no credentials and no tenant. If a change makes
+      # a test reach the network, it fails here rather than in front of a
+      # customer -- there is nothing in this job for it to reach.
+      - name: Test
+        run: python -m pytest -q
+
+      # Belt and braces on the invariant above: fail if a test file has started
+      # importing a live client or a credential provider.
+      - name: No network in the test path
+        run: |
+          if grep -rnE "azure\.identity|httpx\.(get|post)\(|requests\.(get|post)\(" tests/; then
+            echo "::error::A test appears to reach the network. Tests must run offline."
+            exit 1
+          fi
+
+  secrets:
+    name: No credentials in the tree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      # The same scanner the tests exercise, run against every change. It knows
+      # the shapes that matter here: client secrets, webhook URLs and approval
+      # callback URLs, all of which are bearer credentials.
+      - name: Scan
+        run: python scripts/scan_secrets.py

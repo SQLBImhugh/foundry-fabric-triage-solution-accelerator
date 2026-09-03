@@ -1,0 +1,35 @@
+# Dependencies for the hosted controller container.
+#
+# Deliberately narrower than the repo's [azure] extra: this container reads
+# mail, calls Power BI and writes incidents. It has no need for the CLI
+# rendering stack beyond what the runner imports, and every package here is a
+# package that has to be patched later. app.py imports only core types
+# (BaseAgent, Message, AgentResponse, ResponseStream), so this depends on
+# agent-framework-core rather than the agent-framework meta-package: the latter
+# pins agent-framework-core[all]==<exact>, and that extra's transitive set
+# conflicts with the agentserver versions the hosting library requires.
+#
+# The hosting library is pinned exactly, and the pin is not housekeeping. Its
+# versions are date-stamped betas that make breaking changes without a major
+# bump: 1.0.0b260903 (published 2026-09-03) changed the default history_source
+# to 'agent_server', which refuses to construct against a custom
+# SupportsAgentRun implementation. The floor was '>=1.0.0b1', so the next
+# rebuild picked it up and the container crash-looped at startup. Nothing
+# reported it -- the agent simply answered nothing until someone invoked it by
+# hand. Bump this deliberately and redeploy, rather than discovering a new beta
+# during a demo.
+agent-framework-core>=1.17,<2
+agent-framework-foundry-hosting==1.0.0b260903
+
+pydantic>=2.7
+pydantic-settings>=2.2
+# Floor set by agent-framework-foundry-hosting (httpx<1,>=0.28).
+httpx>=0.28
+rich>=13.7
+pyyaml>=6.0
+
+# Identity, storage and telemetry. No client-secret libraries: this container
+# authenticates as its own Entra agent identity.
+azure-identity>=1.17
+azure-data-tables>=12.5
+azure-monitor-opentelemetry>=1.6

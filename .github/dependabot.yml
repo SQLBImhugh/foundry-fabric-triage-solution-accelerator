@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Paths are this repository's, not the ones copied from other accelerators:
+  # dependencies are declared in the root pyproject.toml.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

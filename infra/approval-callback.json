@@ -1,0 +1,215 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "comment": [
+      "The callback behind the approval card's buttons.",
+      "",
+      "A card posted through a Teams incoming webhook has no bot behind it, so",
+      "Action.Submit does nothing. The buttons are links, and this is what they",
+      "link to: it records the human's decision in the same approvals table the",
+      "agent polls.",
+      "",
+      "Why a Logic App and not a Power Automate flow: the Azure Table connector",
+      "authenticates with a shared account key, and allowSharedKeyAccess is false",
+      "on this storage account by tenant policy. An HTTP-triggered flow is also a",
+      "premium trigger. This uses a system-assigned managed identity against the",
+      "Table REST API instead, so there is no key anywhere.",
+      "",
+      "It refuses a request that does not exist, one already answered, one that",
+      "has expired, and one whose fingerprint does not match the link. The agent",
+      "revalidates all of that independently - this is defence in depth, not the",
+      "control itself."
+    ]
+  },
+  "parameters": {
+    "name": {
+      "type": "string",
+      "defaultValue": "bi-triage-approval-callback"
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "tableEndpoint": {
+      "type": "string",
+      "metadata": {
+        "description": "e.g. https://<storage-account>.table.core.windows.net"
+      }
+    },
+    "tableName": {
+      "type": "string",
+      "defaultValue": "approvals"
+    },
+    "owner": {
+      "type": "string",
+      "defaultValue": "unassigned",
+      "metadata": {
+        "description": "Tag value only. Set it to whoever should be asked before this is deleted."
+      }
+    }
+  },
+  "variables": {
+    "entityPrefix": "[concat(parameters('tableEndpoint'), '/', parameters('tableName'), '(PartitionKey=''approval'',RowKey=''')]",
+    "storageAudience": "https://storage.azure.com/"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2019-05-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "tags": {
+        "CostCenter": "demo",
+        "Owner": "[parameters('owner')]",
+        "Environment": "demo",
+        "DataClassification": "synthetic"
+      },
+      "properties": {
+        "state": "Enabled",
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "entityPrefix": {
+              "type": "String",
+              "defaultValue": "[variables('entityPrefix')]"
+            },
+            "storageAudience": {
+              "type": "String",
+              "defaultValue": "[variables('storageAudience')]"
+            }
+          },
+          "triggers": {
+            "manual": {
+              "type": "Request",
+              "kind": "Http",
+              "inputs": {
+                "method": "GET",
+                "schema": {}
+              }
+            }
+          },
+          "actions": {
+            "Read_the_request": {
+              "type": "Http",
+              "runAfter": {},
+              "inputs": {
+                "method": "GET",
+                "uri": "@{parameters('entityPrefix')}@{encodeUriComponent(triggerOutputs()['queries']['request_id'])}')",
+                "headers": {
+                  "x-ms-version": "2019-02-02",
+                  "Accept": "application/json;odata=nometadata"
+                },
+                "authentication": {
+                  "type": "ManagedServiceIdentity",
+                  "audience": "@parameters('storageAudience')"
+                }
+              }
+            },
+            "Is_it_answerable": {
+              "type": "If",
+              "runAfter": {
+                "Read_the_request": [
+                  "Succeeded"
+                ]
+              },
+              "expression": {
+                "and": [
+                  {
+                    "equals": [
+                      "@empty(coalesce(body('Read_the_request')?['decision'], ''))",
+                      true
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "@coalesce(body('Read_the_request')?['fingerprint'], '')",
+                      "@coalesce(triggerOutputs()['queries']?['fingerprint'], '')"
+                    ]
+                  },
+                  {
+                    "less": [
+                      "@utcNow()",
+                      "@coalesce(body('Read_the_request')?['expires_at'], '9999-01-01T00:00:00Z')"
+                    ]
+                  }
+                ]
+              },
+              "actions": {
+                "Record_the_decision": {
+                  "type": "Http",
+                  "runAfter": {},
+                  "inputs": {
+                    "method": "POST",
+                    "uri": "@{parameters('entityPrefix')}@{encodeUriComponent(triggerOutputs()['queries']['request_id'])}')",
+                    "headers": {
+                      "x-ms-version": "2019-02-02",
+                      "Content-Type": "application/json",
+                      "Accept": "application/json;odata=nometadata",
+                      "X-HTTP-Method": "MERGE",
+                      "If-Match": "*"
+                    },
+                    "body": {
+                      "decision": "@{triggerOutputs()['queries']['decision']}",
+                      "responder": "@{coalesce(triggerOutputs()['queries']?['responder'], 'teams-card')}",
+                      "reason": "@{coalesce(triggerOutputs()['queries']?['reason'], '')}",
+                      "decided_at": "@{utcNow()}"
+                    },
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "audience": "@parameters('storageAudience')"
+                    }
+                  }
+                },
+                "Confirm": {
+                  "type": "Response",
+                  "kind": "Http",
+                  "runAfter": {
+                    "Record_the_decision": [
+                      "Succeeded"
+                    ]
+                  },
+                  "inputs": {
+                    "statusCode": 200,
+                    "headers": {
+                      "Content-Type": "text/html; charset=utf-8"
+                    },
+                    "body": "<!doctype html><meta charset=\"utf-8\"><title>Decision recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Decision recorded</h1><p style=\"margin:0 0 8px\"><b>@{triggerOutputs()['queries']['decision']}</b> &mdash; @{triggerOutputs()['queries']['request_id']}</p><p style=\"color:#9fb0c3\">The agent picks this up on its next poll. You can close this tab.</p>"
+                  }
+                }
+              },
+              "else": {
+                "actions": {
+                  "Refuse": {
+                    "type": "Response",
+                    "kind": "Http",
+                    "runAfter": {},
+                    "inputs": {
+                      "statusCode": 409,
+                      "headers": {
+                        "Content-Type": "text/html; charset=utf-8"
+                      },
+                      "body": "<!doctype html><meta charset=\"utf-8\"><title>Not recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Not recorded</h1><p style=\"color:#9fb0c3\">This request was already answered, has expired, or the link does not match it. Nothing was changed.</p>"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "outputs": {}
+        },
+        "parameters": {}
+      }
+    }
+  ],
+  "outputs": {
+    "principalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('name')), '2019-05-01', 'full').identity.principalId]"
+    }
+  }
+}

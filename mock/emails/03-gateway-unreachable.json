@@ -1,0 +1,10 @@
+{
+  "request_id": "msg-gateway-0001",
+  "sender": "no-reply-powerbi@microsoft.com",
+  "subject": "Power BI: Refresh failed for 'Store Operations Overview' - data source unreachable",
+  "report_name": "Store Operations Overview",
+  "dataset_id": "2d7a4e19-5b83-4c06-91ff-8ac3e0b7d522",
+  "workspace_id": "b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003",
+  "error_code": "DataSourceUnreachable",
+  "body": "Hi Contoso BI team,\n\nThe scheduled refresh for the semantic model 'Store Operations Overview' could not reach its data source.\n\nWorkspace: Contoso - Sales Operations (workspaceId: b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003)\nDataset: Store Operations Overview (datasetId: 2d7a4e19-5b83-4c06-91ff-8ac3e0b7d522)\nStarted: 2026-08-26T06:00:02Z\nEnded:   2026-08-26T06:03:38Z\n\nError code: DataSourceUnreachable\nDataSourceError: The gateway did not respond to the connection attempt. The underlying data source may be temporarily unavailable. RequestId: 8ac41b60-2e7d-4f35-9a18-6b0d3fe27c94\n\n- Power BI service"
+}

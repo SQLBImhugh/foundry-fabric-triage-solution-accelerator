@@ -1,0 +1,10 @@
+{
+  "request_id": "msg-transient-0001",
+  "sender": "no-reply-powerbi@microsoft.com",
+  "subject": "Power BI: Refresh failed for 'Sales Daily Summary'",
+  "report_name": "Sales Daily Summary",
+  "dataset_id": "6f1c9b52-8a4d-4e7f-9c31-2b5a7d0e4411",
+  "workspace_id": "b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003",
+  "error_code": "ScheduledRefreshTimeout",
+  "body": "Hi Contoso BI team,\n\nThe scheduled refresh for the semantic model 'Sales Daily Summary' did not complete.\n\nWorkspace: Contoso - Sales Operations (workspaceId: b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003)\nDataset: Sales Daily Summary (datasetId: 6f1c9b52-8a4d-4e7f-9c31-2b5a7d0e4411)\nStarted: 2026-08-26T05:00:04Z\nEnded:   2026-08-26T05:32:11Z\n\nError code: ScheduledRefreshTimeout\nError: The operation was cancelled because it exceeded the configured timeout of 1800 seconds. The data source did not respond within the allotted window. RequestId: 4b8f2c1e-77a3-4d90-b6e2-9c0518aa3f77\n\nNo further action has been taken automatically. The next scheduled refresh is at 2026-08-26T11:00:00Z.\n\n- Power BI service"
+}

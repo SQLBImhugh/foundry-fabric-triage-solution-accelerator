@@ -1,0 +1,31 @@
+name: scenario2-data-quality
+title: "Scenario 2 - Data quality issue: detect, flag, notify"
+description: >-
+  A refresh fails with a duplicate-key relationship error that does not say
+  which rows are at fault. The Data Quality agent scans the source table
+  deterministically, returns evidence, and the Triage agent flags and notifies.
+  No automated fix is attempted - and the controller would refuse one.
+email: mock/emails/02-data-quality-failure.json
+
+datasets:
+  - name: daily_sales
+    path: mock/data/daily_sales.csv
+    key_columns: [store_id, sales_date]
+
+powerbi:
+  workspace_id: b8e42d17-3f6a-4c9b-8d21-77e4a1c9f003
+  dataset_id: 6f1c9b52-8a4d-4e7f-9c31-2b5a7d0e4411
+  refresh_result: Completed
+
+expect:
+  outcome: flagged_data_quality
+  remediation_applied: false
+  flags_written: 1
+  dq_has_issue: true
+  blocked_attempts: 0
+
+narration:
+  - "Run with --show-data so the flag table is visible before and after."
+  - "The email said 'duplicate values exist'. The agent says WHICH rows, HOW MANY, on WHICH key."
+  - "The numbers come from a deterministic scan, not from the model - re-run it and they are identical."
+  - "No remediation was attempted. This is a decision, not a limitation."
