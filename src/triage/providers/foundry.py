@@ -72,6 +72,21 @@ class FoundryAgentProvider:
     ):
         if not project_endpoint:
             raise ValueError("FOUNDRY_PROJECT_ENDPOINT is required for foundry mode")
+        if handoff_mode != "responses":
+            # Rejected rather than quietly using the Responses endpoint. There is
+            # no a2a transport in this provider, so accepting the setting would
+            # mean the handoff runs over Responses while telemetry reports it as
+            # A2A -- an operator reading a trace would draw the wrong conclusion
+            # about which protocol their agents actually spoke.
+            #
+            # a2a additionally requires the CALLEE to be a hosted agent declaring
+            # container_protocol_versions [{"protocol": "a2a"}]. A prompt agent
+            # publishes no agent card, so the call fails at card fetch anyway.
+            raise ValueError(
+                f"FOUNDRY_HANDOFF_MODE={handoff_mode!r} is not implemented. Use "
+                "'responses'. a2a needs the callee to be a hosted agent speaking "
+                "the 'a2a' protocol; a prompt agent publishes no agent card."
+            )
         self._endpoint = project_endpoint.rstrip("/")
         self.model_name = agent_name
         self._agent_name = agent_name

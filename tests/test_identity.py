@@ -1,9 +1,9 @@
 """Offline tests for agent identity inspection.
 
-These use a recorded directory rather than a live tenant. The shapes here were
-captured from real Graph responses, including the awkward ones: the collection
-projection that omits ``appId``, and role assignments that carry a role *id*
-rather than a name.
+These use a synthetic directory rather than a live tenant. The shapes are the
+ones Graph really returns, including the awkward ones: the collection projection
+that omits ``appId``, and role assignments that carry a role *id* rather than a
+name. Every identifier below is fabricated.
 """
 
 from __future__ import annotations
@@ -21,11 +21,11 @@ from triage.identity import (
     project_name_prefix,
 )
 
-TRIAGE_ID = "e65cc383-c4c2-4654-bb62-7d35b622f194"
-DQ_ID = "ff780b3a-f481-4039-9f69-7729a26a8ce0"
-OTHER_PROJECT_DQ_ID = "955084de-6ab8-47b4-874a-6feb88ba5f7b"
-BLUEPRINT_APP_ID = "d867c2f2-944e-481f-b53a-ade5efbe34e1"
-GRAPH_SP_ID = "e5de9d43-9f96-4e98-9f7b-4a2c435cd551"
+TRIAGE_ID = "aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb"
+DQ_ID = "bbbbbbbb-1111-2222-3333-cccccccccccc"
+OTHER_PROJECT_DQ_ID = "cccccccc-2222-3333-4444-dddddddddddd"
+BLUEPRINT_APP_ID = "dddddddd-3333-4444-5555-eeeeeeeeeeee"
+GRAPH_SP_ID = "eeeeeeee-4444-5555-6666-ffffffffffff"
 MAIL_READ_ROLE = "810c84a8-4a9e-49e6-bf7d-12d183f40d01"
 
 PREFIX = "contoso-foundry-bi-request-triage"
@@ -61,7 +61,7 @@ def _directory(
                 "value": [
                     {
                         "id": OTHER_PROJECT_DQ_ID,
-                        "displayName": "denverdata-foundry-cus-denver-bi-data-quality-AgentIdentity",
+                        "displayName": "othertenant-foundry-eus-other-project-bi-data-quality-AgentIdentity",
                         "accountEnabled": True,
                     },
                     {
@@ -93,7 +93,7 @@ def _directory(
             f"{GRAPH}/servicePrincipals/{OTHER_PROJECT_DQ_ID}": {
                 "id": OTHER_PROJECT_DQ_ID,
                 "appId": OTHER_PROJECT_DQ_ID,
-                "displayName": "denverdata-foundry-cus-denver-bi-data-quality-AgentIdentity",
+                "displayName": "othertenant-foundry-eus-other-project-bi-data-quality-AgentIdentity",
                 "accountEnabled": True,
             },
             f"{GRAPH}/applications(appId='{BLUEPRINT_APP_ID}')": {
@@ -106,10 +106,10 @@ def _directory(
                 "value": [{"name": n} for n in fics]
             },
             f"{GRAPH}/servicePrincipals/{TRIAGE_ID}/sponsors": {
-                "value": [{"displayName": "Mark Hughes", "id": "181ecd0b"}]
+                "value": [{"displayName": "Robin Avery", "id": "ffffffff-5555-6666-7777-aaaaaaaaaaaa"}]
             },
             f"{GRAPH}/servicePrincipals/{DQ_ID}/sponsors": {
-                "value": [{"displayName": "Mark Hughes", "id": "181ecd0b"}]
+                "value": [{"displayName": "Robin Avery", "id": "ffffffff-5555-6666-7777-aaaaaaaaaaaa"}]
             },
             f"{GRAPH}/servicePrincipals/{TRIAGE_ID}/appRoleAssignments": {
                 "value": (
@@ -158,7 +158,7 @@ def test_reads_identity_and_resolves_role_name() -> None:
     # The collection omits appId; this proves the single-object re-read happened.
     assert report.app_id == TRIAGE_ID
     assert report.identity_matches_app
-    assert report.sponsors == ["Mark Hughes"]
+    assert report.sponsors == ["Robin Avery"]
     # Role ids are meaningless to a customer -- assert we resolve the name.
     assert report.graph_app_roles == ["Mail.Read on Microsoft Graph"]
     assert report.short_name == "triage"

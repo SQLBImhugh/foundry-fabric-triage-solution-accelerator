@@ -71,7 +71,7 @@ membership.
 ## 2. App registration for Microsoft Graph (inbox trigger)
 
 **Verified working on a work tenant, 2026-08-27** — see
-[`foundry/README.md`](foundry-native-architecture.md#trigger--notification--work-tenant-spike-2026-08-27).
+[`foundry/README.md`](foundry/README.md).
 
 - Permission: **`Mail.Read`** — *Application*, not Delegated
 - **Admin consent granted** (the agent runs with no signed-in user)
@@ -153,7 +153,7 @@ backup.
 ```powershell
 az login
 python scripts\register_foundry_agents.py --dry-run
-python scripts\register_foundry_agents.py --handoff client
+python scripts\register_foundry_agents.py
 ```
 
 **Re-register after any prompt or tool change.** A Foundry-registered agent does
@@ -165,7 +165,7 @@ this on the pre-flight checklist, not in someone's memory.
 ## 5. Power BI workspace + semantic model
 
 - A workspace, with the SP as Member (item 1)
-- A semantic model over the well production table, so the report is real
+- A semantic model over the daily sales table, so the report is real
 - A report — optional for the flow, but it makes the failure concrete on screen
 
 Seed the model from `mock/data/daily_sales.csv` (with duplicates) or
@@ -213,7 +213,7 @@ They point at a Consumption Logic App that writes the decision into the same
 `approvals` table the agent polls:
 
 ```powershell
-az deployment group create -g BITriageDemo -n approval-callback `
+az deployment group create -g <resource-group> -n approval-callback `
   --template-file infra\approval-callback.json `
   --parameters tableEndpoint=https://<account>.table.core.windows.net
 
@@ -268,9 +268,9 @@ that POSTs to the agent's responses endpoint:
 ```powershell
 $ep = "https://<account>.services.ai.azure.com/api/projects/<project>"
 
-az deployment group create -g BITriageDemo -n sched-silent `
+az deployment group create -g <resource-group> -n sched-silent `
   --template-file infra\scheduled-sweep.json `
-  --parameters name=bitriage-silent-sweep projectEndpoint=$ep `
+  --parameters name=bi-triage-silent-sweep projectEndpoint=$ep `
                command="silent sweep" frequency=Hour interval=1 owner=<you>
 
 # grant its identity permission to invoke the agent
@@ -280,7 +280,7 @@ az role assignment create --assignee-object-id <principalId from the output> `
   --scope <the project resource id, not the account>
 ```
 
-Repeat with `name=bitriage-mailbox-sweep`, `command="sweep"`,
+Repeat with `name=bi-triage-mailbox-sweep`, `command="sweep"`,
 `frequency=Minute interval=5` for the mailbox drain. The two are separate jobs:
 the mailbox sweep does not run the health scan.
 
@@ -530,7 +530,7 @@ unattended in Azure rather than from a laptop.
 
 ```powershell
 azd config set auth.useAzCliAuth true          # reuse the az login; no browser flow
-azd env new bitriage
+azd env new <environment-name>
 azd env set AZURE_SUBSCRIPTION_ID       (az account show --query id -o tsv)
 azd env set AZURE_LOCATION              eastus
 azd env set AZURE_AI_PROJECT_ENDPOINT   "<project endpoint>"

@@ -1,7 +1,17 @@
 # Contributor and agent contract
 
-Read this before changing anything. It is the single contract for this
-repository; [`AGENTS.md`](../AGENTS.md) points here rather than repeating it.
+Read this before changing anything.
+
+This file exists at two paths: `AGENTS.md` for tools and people that look there,
+and `.github/copilot-instructions.md` because Copilot loads that one
+automatically. **They are byte-for-byte identical and a test enforces it.** Edit
+either and copy it over the other.
+
+The repository previously carried a pointer at one path and the contract at the
+other, which delivered nothing to a tool reading only `AGENTS.md`. Before that it
+carried two real copies, and they diverged: three safety invariants, including
+"a denial must not consume the remediation budget", went missing from one while
+the other kept them.
 
 ## What this is
 

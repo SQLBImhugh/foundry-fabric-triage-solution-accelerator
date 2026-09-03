@@ -9,8 +9,8 @@ For first-time setup see [`DeploymentGuide.md`](DeploymentGuide.md).
 
 | Trigger | What it does | Off switch |
 |---|---|---|
-| `bitriage-mailbox-sweep` Logic App, every 5 min | Filters new mail, triages, acts or escalates | Disable the Logic App, or unset `GRAPH_MAILBOX` |
-| `bitriage-silent-sweep` Logic App, hourly | Drains due retries, runs the silent-failure scan | Disable the Logic App, or `SILENT_SWEEP_ENABLED=false` |
+| `bi-triage-mailbox-sweep` Logic App, every 5 min | Filters new mail, triages, acts or escalates | Disable the Logic App, or unset `GRAPH_MAILBOX` |
+| `bi-triage-silent-sweep` Logic App, hourly | Drains due retries, runs the silent-failure scan | Disable the Logic App, or `SILENT_SWEEP_ENABLED=false` |
 | Approval reply | Applies or abandons a proposed Tier 2 action | Unset `APPROVAL_CALLBACK_URL` — with no gate configured, every gated action is refused |
 
 Neither Logic App exists until you deploy it, and nothing runs on a timer until
@@ -36,12 +36,12 @@ $ep = (azd env get-values | Select-String AZURE_AI_PROJECT_ENDPOINT) -replace '.
 
 # hourly: find models that failed without telling anyone
 az deployment group create -g <rg> --template-file infra/scheduled-sweep.json `
-  --parameters name=bitriage-silent-sweep projectEndpoint=$ep `
+  --parameters name=bi-triage-silent-sweep projectEndpoint=$ep `
                command="silent sweep" frequency=Hour interval=1 owner=<you>
 
 # every 5 min: drain the mailbox, perform due retries
 az deployment group create -g <rg> --template-file infra/scheduled-sweep.json `
-  --parameters name=bitriage-mailbox-sweep projectEndpoint=$ep `
+  --parameters name=bi-triage-mailbox-sweep projectEndpoint=$ep `
                command="sweep" frequency=Minute interval=5 owner=<you>
 ```
 

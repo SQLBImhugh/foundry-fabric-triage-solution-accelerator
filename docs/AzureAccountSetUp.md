@@ -32,9 +32,11 @@ An [Azure subscription](https://azure.microsoft.com/free/) where you hold:
 
 ## Regions and model availability
 
-The accelerator deploys an Azure AI Foundry project and one model deployment. Not
-every model is available in every region, and quota is per region and per model.
-Check availability before choosing a region:
+The accelerator deploys agents into an Azure AI Foundry project. It does not
+create the project, the storage account or Application Insights — see
+[`DeploymentGuide.md`](DeploymentGuide.md) for what must exist first. Not every
+model is available in every region, and quota is per region and per model. Check
+availability before choosing a region:
 
 ```powershell
 az cognitiveservices account list-models `

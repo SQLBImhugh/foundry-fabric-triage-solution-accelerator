@@ -9,14 +9,21 @@ Keep that split and most of this document is mechanical.
 
 ## Decide the tier before writing any code
 
-Every action belongs in one of three tiers, and the tier decides where the code
-goes:
+Every action belongs in one of three classes, and the class decides where the
+code goes. The first column is the value the model actually carries in
+`TriageResult.tier` — there is no `tier_3`, because "never automate" is not a
+tier of automation:
 
-| Tier | Meaning | Where it lands |
+| `tier` value | Meaning | Where it lands |
 |---|---|---|
-| 1 | Transient and idempotent. Safe unattended. | `REMEDIATION_ACTIONS` |
-| 2 | Deterministic fix, real blast radius. Human approves first. | `REMEDIATION_ACTIONS` + an approval gate |
-| 3 | Never automate. Report with evidence. | `REPORTING_ACTIONS` |
+| `tier_1` | Transient and idempotent. Safe unattended. | `REMEDIATION_ACTIONS` |
+| `tier_2` | Deterministic fix, real blast radius. Human approves first. | `REMEDIATION_ACTIONS` + an approval gate |
+| `needs_human` | Never automate. Report with evidence. | `REPORTING_ACTIONS` |
+
+An approval gate decides *whether a permitted action runs*. It never authorises
+an action that is off the allowlist: approval-gated actions are a subset of
+`REMEDIATION_ACTIONS`, so there is no path by which saying yes widens what the
+agent can do.
 
 Getting this wrong is the expensive mistake. The test: if this action ran at
 03:00 with nobody watching and the diagnosis was wrong, what is the damage? If

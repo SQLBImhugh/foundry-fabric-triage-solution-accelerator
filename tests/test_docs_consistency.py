@@ -98,9 +98,14 @@ def test_scenario_count_claims_match_reality(doc: Path) -> None:
 
 @pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.name)
 def test_internal_doc_links_resolve(doc: Path) -> None:
-    """Relative links between docs point at files that exist."""
+    """Relative links between docs point at files that exist.
+
+    The pattern deliberately allows a ``#fragment``. An earlier version excluded
+    ``#`` from the whole match, so ``](foo.md#section)`` matched nothing at all
+    and a link to a deleted document survived a rename with the suite green.
+    """
     broken: list[str] = []
-    for target in re.findall(r"\]\(([^)#]+\.md)\)", _read(doc)):
+    for target in re.findall(r"\]\(([^)\s#]+\.md)(?:#[^)]*)?\)", _read(doc)):
         if target.startswith("http"):
             continue
         resolved = (doc.parent / target).resolve()
@@ -252,7 +257,7 @@ def test_the_broken_routines_ship_disabled() -> None:
     assert not enabled, (
         f"routines enabled: {enabled}. Foundry routines were last verified not to "
         "fire. Re-verify with `azd ai routine run list <name>` and update the "
-        "evidence in azure.yaml and docs/hosted-architecture.md before enabling."
+        "evidence in azure.yaml and docs/foundry/README.md before enabling."
     )
 
 
@@ -420,25 +425,86 @@ def test_env_example_and_settings_agree_exactly() -> None:
     )
 
 
-def test_the_contributor_contract_is_not_duplicated() -> None:
-    """`AGENTS.md` stays a pointer, so it cannot drift from the real contract.
+def test_the_contributor_contract_is_delivered_identically_to_both_paths() -> None:
+    """`AGENTS.md` and `.github/copilot-instructions.md` must be byte-identical.
 
-    This repository previously carried the contract twice, in `AGENTS.md` and
-    `.github/copilot-instructions.md`. They diverged: three safety invariants,
-    including "a denial must not consume the remediation budget", went missing
-    from one copy while the other kept them. Whichever file an agent happened to
-    read became the whole contract as far as that agent was concerned.
+    Two paths are needed: Copilot loads the `.github` one automatically, and
+    other tools and people look for `AGENTS.md`. Two copies is the only way to
+    serve both, so the copies are pinned equal rather than trusted to stay equal.
 
-    Keeping both conventions without keeping both copies removes the failure
-    mode rather than testing for it.
+    This has failed twice in different ways. First as two real copies that
+    diverged -- three safety invariants, including "a denial must not consume the
+    remediation budget", went missing from one while the other kept them, so
+    whichever file an agent happened to read became the whole contract. Then as a
+    pointer at one path, which stopped the drift by delivering no contract at all
+    to anything reading only `AGENTS.md`.
     """
-    agents = _read(REPO_ROOT / "AGENTS.md")
-    body = [line for line in agents.splitlines() if line.strip()]
+    agents = (REPO_ROOT / "AGENTS.md").read_bytes()
+    copilot = (REPO_ROOT / ".github" / "copilot-instructions.md").read_bytes()
 
-    assert "copilot-instructions.md" in agents, (
-        "AGENTS.md must point at .github/copilot-instructions.md"
+    assert agents == copilot, (
+        "AGENTS.md and .github/copilot-instructions.md have diverged. They must be "
+        "byte-for-byte identical: edit one and copy it over the other. A reader "
+        "gets exactly one of these files, and it has to be the whole contract."
     )
-    assert len(body) <= 6, (
-        f"AGENTS.md has grown to {len(body)} non-blank lines. It is a pointer, "
-        "not a second copy of the contract -- the two copies diverged last time."
+
+
+#: Names that belonged to the repository this accelerator was extracted from.
+#: Each maps to what it should be now, so the failure message tells you the fix.
+#:
+#: This exists because a rename was run, and then more files were copied in
+#: afterwards. `.github/` never went through the transform, so the issue template
+#: still asked for the output of a command that no longer exists, and pointed at
+#: a document that had been renamed. Every individual test passed.
+FORBIDDEN_TOKENS = {
+    "triage_demo": "the package is `triage`",
+    "triage-demo": "the CLI is `bi-triage`",
+    "docs/provisioning.md": "renamed to docs/DeploymentGuide.md",
+    "docs/operations.md": "renamed to docs/OperationsGuide.md",
+    "docs/architecture.md": "renamed to docs/TechnicalArchitecture.md",
+    "docs/customization.md": "renamed to docs/CustomizationGuide.md",
+    "docs/hosted-architecture.md": "renamed to docs/foundry/README.md",
+    "foundry-native-architecture": "that document is not part of the accelerator",
+    "docs/history": "project history is not part of the accelerator",
+    "demo/scripts": "presenter scripts are not part of the accelerator",
+    "demo/walkthrough": "the walkthrough is not part of the accelerator",
+    "BITriageDemo": "use a <resource-group> placeholder",
+}
+
+
+def _tracked_files() -> list[Path]:
+    """Every file git would publish, so the check covers what a reader receives."""
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, check=True,
+    )
+    return [REPO_ROOT / rel for rel in result.stdout.split("\0") if rel]
+
+
+def test_no_file_refers_to_the_repository_this_was_extracted_from() -> None:
+    """Nothing published may name a path, package or command that no longer exists.
+
+    Scoped to tracked files of a text kind, and skips this file, which has to
+    contain the tokens in order to look for them.
+    """
+    text_suffixes = {".py", ".md", ".yaml", ".yml", ".json", ".toml", ".txt", ".cfg", ""}
+    offenders: list[str] = []
+
+    for path in _tracked_files():
+        if path.name == Path(__file__).name or path.suffix.lower() not in text_suffixes:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for number, line in enumerate(content.splitlines(), start=1):
+            for token, remedy in FORBIDDEN_TOKENS.items():
+                if token in line:
+                    rel = path.relative_to(REPO_ROOT)
+                    offenders.append(f"{rel}:{number} has {token!r} -- {remedy}")
+
+    assert not offenders, "stale references to the source repository:\n" + "\n".join(
+        f"  {item}" for item in offenders
     )

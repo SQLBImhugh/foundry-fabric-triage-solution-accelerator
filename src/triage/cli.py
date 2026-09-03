@@ -981,7 +981,7 @@ def cmd_health(args: argparse.Namespace) -> int:
         if not probes:
             console.print(
                 "[dim]No probes configured.[/dim] "
-                "[dim]Set SILENT_HEALTH_PROBES; see docs/provisioning.md.[/dim]"
+                "[dim]Set SILENT_HEALTH_PROBES; see docs/DeploymentGuide.md.[/dim]"
             )
             return 0
         table = Table(title="Configured probes")

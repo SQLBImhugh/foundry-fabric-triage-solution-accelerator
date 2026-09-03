@@ -22,7 +22,7 @@ labels: bug
 
 ## Environment
 
-Output of `triage-demo preflight`. It reports what is configured and what is
+Output of `bi-triage preflight`. It reports what is configured and what is
 missing without printing any secret value.
 
 ## Logs
@@ -38,4 +38,4 @@ answer an approval, or authenticate as the app.
 ```
 
 If it passes offline and fails live, the difference is tenant configuration.
-`docs/provisioning.md` lists what must exist.
+`docs/DeploymentGuide.md` lists what must exist.

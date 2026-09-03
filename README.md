@@ -28,14 +28,22 @@ problem no inbox will ever tell you about.
 
 <h2 id="solution-overview">Solution overview</h2>
 
-This is a ready-to-deploy solution accelerator built on Azure AI Foundry, Power
-BI and Microsoft Graph. A controller agent orchestrates the loop, a data quality
-agent investigates data-shaped failures, and every action the system can take is
-on an allowlist enforced in code.
+This solution accelerator is built on Azure AI Foundry, Power BI and Microsoft
+Graph. A controller agent orchestrates the loop, a data quality agent
+investigates data-shaped failures, and every action the system can take is on an
+allowlist enforced in code.
 
 It runs **fully offline** with mock providers and mock tools, so you can read it,
 run it and evaluate its behaviour before it touches a tenant. That is also how
 the test suite runs: no credentials, no network.
+
+**Bring your own Foundry project.** This repository deploys the agents and the
+supporting Logic Apps *into* an Azure AI Foundry project you already have; it
+does not provision the project, the storage account or Application Insights for
+you. [`docs/DeploymentGuide.md`](./docs/DeploymentGuide.md) lists every
+prerequisite in the order its lead time demands, and
+[`docs/AzureAccountSetUp.md`](./docs/AzureAccountSetUp.md) covers the
+subscription and tenant permissions you need first.
 
 ### Solution architecture
 
@@ -81,9 +89,10 @@ ships around it rather than pretending otherwise — see
   evidence, calls the specialist agent, decides an action, and persists a
   terminal outcome for every incident including crashes and refusals.
 
-- **Data quality agent** <br/>Investigates data-shaped failures — duplicate keys,
-  row-count collapse, schema drift — and reports typed findings. It reports; the
-  controller decides.
+- **Data quality agent** <br/>Investigates data-shaped failures — currently
+  duplicate keys on a declared grain — and reports typed findings. It reports;
+  the controller decides. Row-collapse and schema drift are found by the
+  silent-failure detector below, which is deterministic rather than model-driven.
 
 - **Policy ledger** <br/>Turn, tool-call, token, write-action and wall-clock
   budgets, shared across all agents in a run rather than per agent. Enforced in
@@ -96,7 +105,9 @@ ships around it rather than pretending otherwise — see
 - **Human approval gate** <br/>Tier 2 actions require an explicit,
   fingerprint-matched, unexpired, unused approval. Timeouts, errors, malformed
   replies and "no gate configured" are all treated as a refusal. Silence is never
-  consent, and a denial does not consume the remediation budget.
+  consent, and a denial does not consume the remediation budget. An approval
+  decides whether a *permitted* action runs; it never authorises one that is off
+  the allowlist.
 
 - **Silent-failure detector** <br/>Finds models that failed without telling
   anyone: a refresh that reports success while the source never landed, or a
@@ -250,11 +261,20 @@ named human for permission with the evidence already gathered.
 ### Security guidelines
 
 This accelerator authenticates with [Managed Identity](https://learn.microsoft.com/entra/identity/managed-identities-azure-resources/overview)
-and Entra agent identity wherever the platform allows it. There is exactly one
-credential in the deployment — an app registration for mailbox access, because
-Exchange does not yet accept an agent identity for app-only mailbox reads — and
-it is scoped to a single mailbox by an Exchange ApplicationAccessPolicy. That
-exception is documented rather than hidden.
+and Entra agent identity wherever the platform allows it. The controller reaches
+Power BI and Azure Storage as itself, with no key and no secret.
+
+Three bearer credentials remain, and each is a deliberate exception:
+
+| Credential | Why it exists | Scope |
+|---|---|---|
+| App registration client secret | Exchange does not yet accept an Entra agent identity for app-only mailbox reads. | One mailbox, enforced by an Exchange `ApplicationAccessPolicy`. |
+| Teams Workflows webhook URL | The URL *is* the credential; there is no identity on an incoming webhook. | One channel. |
+| Approval callback URL | Anyone holding the link can answer an approval, so the link is fingerprint-bound to a single action. | One approval request. |
+
+All three live in the azd environment, which is gitignored, and never in the
+repository. Only the first expires, and its expiry will stop mail ingestion
+silently, so track it.
 
 Design rules worth keeping if you adapt this:
 

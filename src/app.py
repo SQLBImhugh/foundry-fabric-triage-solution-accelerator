@@ -45,6 +45,7 @@ from agent_framework import (
 from agent_framework._agents import ResponseStream
 from agent_framework_foundry_hosting import ResponsesHostServer
 
+from triage.observability import configure_telemetry
 from triage.runner import TriageRunner
 from triage.settings import settings
 from triage.tools.inbox import BIRequest, parse_hints
@@ -315,6 +316,14 @@ def _summarise(artifacts: Any) -> str:
 
 
 def main() -> None:
+    # Telemetry has to be configured here, not only in the CLI. The hosted
+    # container is the deployment that most needs a trace -- nobody is watching
+    # a terminal -- and it was the one path that never called this, so
+    # APPLICATIONINSIGHTS_CONNECTION_STRING was set and produced nothing.
+    #
+    # Spans carry metadata only. Prompt and completion content is never attached.
+    configure_telemetry(settings.applicationinsights_connection_string)
+
     agent = TriageControllerAgent()
     logger.info(
         "Starting hosted triage controller (provider=%s, tools=%s, mailbox=%s)",

@@ -47,6 +47,20 @@
       "metadata": {
         "description": "Tag value only. Set it to whoever should be asked before this is deleted."
       }
+    },
+    "costCenter": {
+      "type": "string",
+      "defaultValue": "unassigned",
+      "metadata": {
+        "description": "Tag value only. Your chargeback code."
+      }
+    },
+    "environment": {
+      "type": "string",
+      "defaultValue": "evaluation",
+      "metadata": {
+        "description": "Tag value only, e.g. evaluation, test, production."
+      }
     }
   },
   "variables": {
@@ -63,9 +77,9 @@
         "type": "SystemAssigned"
       },
       "tags": {
-        "CostCenter": "demo",
+        "CostCenter": "[parameters('costCenter')]",
         "Owner": "[parameters('owner')]",
-        "Environment": "demo",
+        "Environment": "[parameters('environment')]",
         "DataClassification": "synthetic"
       },
       "properties": {
