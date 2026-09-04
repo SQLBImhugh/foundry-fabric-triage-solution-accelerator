@@ -55,6 +55,32 @@ from triage.tools.teams import (
 logger = logging.getLogger("triage.runner")
 
 
+def _require_live_config(component: str, **values: str) -> None:
+    """Refuse to build a live component whose configuration is missing.
+
+    Every builder below used to read ``if live and <one setting>: live else:
+    mock``, so a deployment that asked for live tools and lacked a setting got
+    a mock and no warning.
+
+    That is not a harmless default. ``MockPowerBIClient`` reports a refresh as
+    ``Completed`` and ``MockTeamsNotifier`` reports ``delivered: True``, so the
+    run records "resolved, refresh succeeded, Teams notified" having triggered
+    no refresh and posted nothing. The incident store then carries a terminal
+    outcome that is a fabrication, and the notification dedup counter suppresses
+    the first real notification once the configuration is fixed.
+
+    Fail at construction instead. A deployment that cannot do its job should say
+    so on the way up, not report success on the way down.
+    """
+    missing = sorted(name.upper() for name, value in values.items() if not value)
+    if missing:
+        raise ValueError(
+            f"TRIAGE_TOOL_MODE=live needs {', '.join(missing)} to build the "
+            f"{component}. Set them, or set TRIAGE_TOOL_MODE=mock. Falling back "
+            "to a mock here would report success for work that never happened."
+        )
+
+
 def _fault_summary(detail: str) -> str:
     """Show the operator what to do, not what the platform said.
 
@@ -184,18 +210,44 @@ class TriageRunner:
     # --- inbox -------------------------------------------------------------
 
     @staticmethod
-    def _resolve_id(*candidates: str) -> str:
-        """First non-empty id wins: scenario, then the alert, then configuration.
+    @staticmethod
+    def _resolve_id(
+        *candidates: str,
+        untrusted: str = "",
+        label: str = "id",
+    ) -> str:
+        """First non-empty id wins: scenario, then configuration, then the alert.
 
-        Without the configured fallback the live path called Power BI with
-        empty ids and got a 404, and the agent reached a plausible-looking
-        conclusion from a tool failure rather than from evidence. A wrong
-        answer that reads correctly is the worst kind.
+        Without a fallback the live path called Power BI with empty ids and got a
+        404, and the agent reached a plausible-looking conclusion from a tool
+        failure rather than from evidence. A wrong answer that reads correctly is
+        the worst kind.
+
+        Configuration deliberately outranks the alert. The alert is an email, and
+        the sender of an email is trivially forged, so an attacker who gets one
+        message past the inbox filter could otherwise name any workspace or
+        dataset and have the agent act on it -- bounded only by what the
+        controller's identity happens to reach.
+
+        A deployment that watches many models leaves the configured ids empty and
+        the alert is used, which is the same behaviour as before. That case is
+        steerable by construction, so the disagreement is logged rather than
+        hidden.
         """
+        resolved = ""
         for candidate in candidates:
             if candidate and candidate.strip():
-                return candidate.strip()
-        return ""
+                resolved = candidate.strip()
+                break
+
+        if untrusted and untrusted.strip() and untrusted.strip() != resolved:
+            logger.warning(
+                "Ignoring %s id %r supplied by the alert; using configured %r",
+                label,
+                untrusted.strip(),
+                resolved,
+            )
+        return resolved
 
     def _build_store(self) -> IncidentStore:
         """Choose where incidents live.
@@ -245,7 +297,14 @@ class TriageRunner:
         return log
 
     def build_inbox(self):
-        if self.settings.triage_tool_mode == "live" and self.settings.graph_tenant_id:
+        if self.settings.triage_tool_mode == "live":
+            _require_live_config(
+                "Graph inbox",
+                graph_tenant_id=self.settings.graph_tenant_id,
+                graph_client_id=self.settings.graph_client_id,
+                graph_client_secret=self.settings.graph_client_secret,
+                graph_mailbox=self.settings.graph_mailbox,
+            )
             from triage.tools.mail_filter import MailFilter
 
             return GraphInbox(
@@ -266,7 +325,11 @@ class TriageRunner:
     # --- clients -----------------------------------------------------------
 
     def build_powerbi(self, scenario: Scenario | None = None):
-        if self.settings.triage_tool_mode == "live" and self.settings.powerbi_tenant_id:
+        if self.settings.triage_tool_mode == "live":
+            _require_live_config(
+                "Power BI client",
+                powerbi_tenant_id=self.settings.powerbi_tenant_id,
+            )
             return LivePowerBIClient(
                 tenant_id=self.settings.powerbi_tenant_id,
                 client_id=self.settings.powerbi_client_id,
@@ -538,7 +601,11 @@ class TriageRunner:
         return store
 
     def build_health_client(self):
-        if self.settings.triage_tool_mode == "live" and self.settings.powerbi_tenant_id:
+        if self.settings.triage_tool_mode == "live":
+            _require_live_config(
+                "semantic health client",
+                powerbi_tenant_id=self.settings.powerbi_tenant_id,
+            )
             return LiveSemanticHealthClient(
                 tenant_id=self.settings.powerbi_tenant_id,
                 client_id=self.settings.powerbi_client_id,
@@ -658,8 +725,15 @@ class TriageRunner:
                     "app-only channel posting is restricted by Microsoft to migration "
                     "scenarios; use 'webhook' with a Power Automate Workflows URL."
                 )
-            if self.settings.triage_tool_mode == "live" and self.settings.teams_webhook_url:
-                self._teams = WorkflowsWebhookTeamsNotifier(self.settings.teams_webhook_url)
+            if self.settings.triage_tool_mode == "live":
+                if self.settings.teams_webhook_url:
+                    self._teams = WorkflowsWebhookTeamsNotifier(self.settings.teams_webhook_url)
+                else:
+                    # Not a mock. A mock would report delivered=True and consume
+                    # the incident's single announcement.
+                    from triage.tools.teams import UnconfiguredTeamsNotifier
+
+                    self._teams = UnconfiguredTeamsNotifier()
             else:
                 self._teams = MockTeamsNotifier()
         return self._teams
@@ -764,13 +838,17 @@ class TriageRunner:
             datasets=datasets or {},
             workspace_id=self._resolve_id(
                 scenario.workspace_id if scenario else "",
-                request.workspace_id,
                 self.settings.powerbi_workspace_id,
+                request.workspace_id,
+                untrusted=request.workspace_id,
+                label="workspace",
             ),
             dataset_id=self._resolve_id(
                 scenario.dataset_id if scenario else "",
-                request.dataset_id,
                 self.settings.powerbi_dataset_id,
+                request.dataset_id,
+                untrusted=request.dataset_id,
+                label="dataset",
             ),
             signature=signature,
             known_incident=known,

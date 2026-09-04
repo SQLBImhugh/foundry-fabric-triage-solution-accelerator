@@ -84,6 +84,49 @@ class ResolutionSummary:
         }
 
 
+@dataclass
+class UnconfiguredTeamsNotifier:
+    """Live mode with no webhook: report honestly that nothing was delivered.
+
+    This slot used to hold ``MockTeamsNotifier``, which returns
+    ``delivered: True``. That is right in a test, where the in-memory list really
+    did receive the message, and wrong in a live deployment, where it means the
+    run records a notification that no human will ever see.
+
+    It also corrupts deduplication. The controller announces an incident once,
+    counted against ``notified_count``, so a fabricated delivery consumes the
+    single announcement and suppresses the *first real* notification after
+    someone fixes the webhook.
+
+    Not delivering is survivable; notification is not the agent's primary job.
+    Claiming to have delivered is not.
+    """
+
+    attempts: list[ResolutionSummary] = field(default_factory=list)
+
+    async def post(self, summary: ResolutionSummary) -> dict[str, Any]:
+        self.attempts.append(summary)
+        logger.warning(
+            "Teams notification NOT delivered (%s): TEAMS_WEBHOOK_URL is not set",
+            summary.title,
+        )
+        return {
+            "status": "skipped",
+            "delivered": False,
+            "transport": "unconfigured",
+            "reason": "TEAMS_WEBHOOK_URL is not set",
+        }
+
+    async def post_card(self, card: dict[str, Any]) -> dict[str, Any]:
+        logger.warning("Teams card NOT delivered: TEAMS_WEBHOOK_URL is not set")
+        return {
+            "status": "skipped",
+            "delivered": False,
+            "transport": "unconfigured",
+            "reason": "TEAMS_WEBHOOK_URL is not set",
+        }
+
+
 class TeamsNotifier(Protocol):
     async def post(self, summary: ResolutionSummary) -> dict[str, Any]: ...
 

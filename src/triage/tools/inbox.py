@@ -428,3 +428,42 @@ class GraphInbox:
             "status": resp.status_code,
             "reason": f"inconclusive (HTTP {resp.status_code})",
         }
+
+
+def mailbox_scope_refusal(
+    *,
+    scope: dict[str, object] | None,
+    canary_mailbox: str,
+    mailbox: str,
+) -> str | None:
+    """Return why mail must not be read, or ``None`` when it is proven safe.
+
+    App-only ``Mail.Read`` is tenant-wide unless Exchange scopes it to a mailbox
+    with an ``ApplicationAccessPolicy``, so an unscoped app registration can read
+    every mailbox in the tenant.
+
+    All three unproven cases refuse:
+
+    * no canary configured, so nothing was ever tested -- and unset is the
+      shipped default, which is why this mattered
+    * the check did not complete, because inconclusive is not proof
+    * the check completed and the agent could read the canary
+
+    This lives here rather than in the hosted entry point so it can be tested
+    without the hosting library. The previous version returned early on the
+    first two cases and read the mailbox anyway, while the surrounding comment
+    and the documentation both said it failed closed.
+    """
+    if not canary_mailbox:
+        return (
+            "Refusing to read mail: GRAPH_CANARY_MAILBOX is not set, so there is "
+            f"no evidence this agent is confined to {mailbox}. Set it to a "
+            "mailbox this agent must NOT be able to read."
+        )
+    scope = scope or {}
+    reason = str(scope.get("reason", "")).strip()
+    if not scope.get("checked"):
+        return f"Refusing to read mail: the mailbox scope check did not complete. {reason}".strip()
+    if not scope.get("scoped"):
+        return f"Refusing to read mail: this agent is not confined to {mailbox}. {reason}".strip()
+    return None

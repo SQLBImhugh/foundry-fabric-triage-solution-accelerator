@@ -48,7 +48,7 @@ from agent_framework_foundry_hosting import ResponsesHostServer
 from triage.observability import configure_telemetry
 from triage.runner import TriageRunner
 from triage.settings import settings
-from triage.tools.inbox import BIRequest, parse_hints
+from triage.tools.inbox import BIRequest, mailbox_scope_refusal, parse_hints
 
 logging.basicConfig(
     level=os.getenv("TRIAGE_LOG_LEVEL", "INFO"),
@@ -266,18 +266,27 @@ class TriageControllerAgent(BaseAgent):
                     "the agent's own identity."
                 )
 
-        # Fail closed. App-only Mail.Read is tenant-wide unless Exchange scopes
-        # it to a mailbox, so an unscoped agent could read the whole tenant.
-        # Refusing here is the difference between a bounded demo and an
-        # incident report.
+        # Fail closed, and that means all three ways this can be unproven: no
+        # canary configured (the shipped default), a check that did not
+        # complete, and a check that proved the agent can read it.
+        #
+        # The decision lives in triage.tools.inbox so it can be tested without
+        # the hosting library. This used to refuse only the third case, while
+        # the comment here and the documentation both said it failed closed.
         verify_scope = getattr(inbox, "verify_scope", None)
-        if verify_scope is not None and settings.graph_canary_mailbox:
-            scope = await verify_scope(settings.graph_canary_mailbox)
-            if scope.get("checked") and not scope.get("scoped"):
-                return (
-                    "Refusing to read mail: this agent is not confined to "
-                    f"{settings.graph_mailbox}. {scope.get('reason', '')}"
-                )
+        if verify_scope is not None:
+            scope = (
+                await verify_scope(settings.graph_canary_mailbox)
+                if settings.graph_canary_mailbox
+                else {}
+            )
+            refusal = mailbox_scope_refusal(
+                scope=scope,
+                canary_mailbox=settings.graph_canary_mailbox,
+                mailbox=settings.graph_mailbox,
+            )
+            if refusal:
+                return refusal
 
         requests = await inbox.fetch(limit=10)
         if not requests:
