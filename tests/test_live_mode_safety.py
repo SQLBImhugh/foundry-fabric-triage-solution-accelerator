@@ -22,10 +22,35 @@ from triage.tools.teams import MockTeamsNotifier, UnconfiguredTeamsNotifier
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+#: Every setting these tests care about, blanked. `Settings` reads `.env`, so a
+#: developer with a configured tenant would otherwise see different results from
+#: CI -- this suite passed in a repository with no `.env` and failed in one with
+#: a real GRAPH_CLIENT_ID, having asserted on which variables were reported
+#: missing. A test whose result depends on the machine it runs on is not a test.
+_BLANK: dict[str, object] = {
+    "graph_tenant_id": "",
+    "graph_client_id": "",
+    "graph_client_secret": "",
+    "graph_mailbox": "",
+    "graph_canary_mailbox": "",
+    "powerbi_tenant_id": "",
+    "powerbi_client_id": "",
+    "powerbi_client_secret": "",
+    "powerbi_workspace_id": "",
+    "powerbi_dataset_id": "",
+    "teams_webhook_url": "",
+    "incident_table_endpoint": "",
+    "approval_callback_url": "",
+}
+
 
 def _live(**overrides: object) -> Settings:
     """Settings that ask for live tools, with nothing configured by default."""
-    return Settings(triage_tool_mode="live", triage_provider_mode="mock", **overrides)
+    return Settings(
+        triage_tool_mode="live",
+        triage_provider_mode="mock",
+        **{**_BLANK, **overrides},
+    )
 
 
 def _runner(settings: Settings) -> TriageRunner:
@@ -77,7 +102,7 @@ def test_live_health_client_without_a_tenant_refuses_to_build() -> None:
 
 def test_mock_mode_still_builds_everything_without_configuration() -> None:
     """The offline path must stay configuration-free. It is the evaluation path."""
-    runner = _runner(Settings(triage_tool_mode="mock"))
+    runner = _runner(Settings(triage_tool_mode="mock", **_BLANK))
 
     assert runner.build_powerbi() is not None
     assert runner.build_inbox() is not None
