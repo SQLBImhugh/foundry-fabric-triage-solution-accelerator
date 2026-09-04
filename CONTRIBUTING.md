@@ -1,14 +1,39 @@
 # Contributing
 
-This project welcomes contributions and suggestions. Most contributions require you to
-agree to a Contributor License Agreement (CLA) declaring that you have the right to,
-and actually do, grant us the rights to use your contribution. For details, visit
-https://cla.microsoft.com.
+Contributions are welcome. There is no Contributor License Agreement: by opening
+a pull request you agree that your contribution is licensed under the repository
+[MIT licence](LICENSE).
 
-When you submit a pull request, a CLA-bot will automatically determine whether you need
-to provide a CLA and decorate the PR appropriately (e.g., label, comment). Simply follow the
-instructions provided by the bot. You will only need to do this once across all repositories using our CLA.
+## Before you open a pull request
 
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/)
-or contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe scripts\scan_secrets.py
+```
+
+All three must pass. The test suite runs entirely offline, and a change that
+makes a test need credentials or a tenant will fail CI.
+
+## What the review will look for
+
+[`AGENTS.md`](AGENTS.md) is the contract. The parts that most often come back
+with comments:
+
+- **A new limit belongs in `PolicyLedger` with a test proving it fires.** A limit
+  that exists only as prompt wording is not a limit.
+- **A new tool belongs on an action allowlist.** Anything not on one is refused
+  before dispatch, and that is the property the whole design rests on.
+- **A new test needs a negative control.** Break the thing it guards and watch it
+  fail, then restore. A check that has never failed is not a check.
+- **Comment the why, not the what**, especially where a design choice traces to a
+  real failure. Those comments are the most valuable content in this repository.
+
+## Reporting bugs
+
+Use GitHub Issues, and search first. If it fails against a tenant but passes
+offline, say so — the difference is almost always tenant configuration, and
+[`docs/DeploymentGuide.md`](docs/DeploymentGuide.md) lists what must exist.
+
+For anything security-sensitive, follow [`SECURITY.md`](SECURITY.md) instead of
+opening an issue.
