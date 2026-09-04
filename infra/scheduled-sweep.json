@@ -28,6 +28,13 @@
       "tenant requires. It also keeps its own run history, so a failed sweep is",
       "visible after the fact rather than being a thing that quietly stopped.",
       "",
+      "The HTTP timeout is PT10M and that number is not arbitrary: it must exceed",
+      "APPROVAL_TIMEOUT_SECONDS (default 300s), because a sweep that triages an",
+      "alert requiring approval blocks while it waits for a human. At the previous",
+      "PT3M the scheduler killed the run BEFORE the approval window closed, so a",
+      "person could approve inside the documented five minutes and find the work",
+      "had already been abandoned. Raise both together.",
+      "",
       "The identity needs permission to invoke the agent. That grant is not in",
       "this template because it is a role assignment on the Foundry project,",
       "which is a different scope - see docs/DeploymentGuide.md."
@@ -181,7 +188,7 @@
                 }
               },
               "limit": {
-                "timeout": "PT3M"
+                "timeout": "PT10M"
               }
             },
             "Did_it_fail": {

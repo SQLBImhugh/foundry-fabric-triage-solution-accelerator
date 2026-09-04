@@ -48,6 +48,7 @@ from agent_framework_foundry_hosting import ResponsesHostServer
 from triage.observability import configure_telemetry
 from triage.runner import TriageRunner
 from triage.settings import settings
+from triage.store.claims import build_claim_store
 from triage.tools.inbox import BIRequest, mailbox_scope_refusal, parse_hints
 
 logging.basicConfig(
@@ -131,7 +132,22 @@ class TriageControllerAgent(BaseAgent):
             ),
         )
         self._runner = TriageRunner(settings, base_dir=REPO_ROOT)
+        # Process-local, so it serialises work inside one container and
+        # nothing more. A hosted agent is constructed fresh per request, so
+        # this does not even span two requests to the same replica.
         self._lock = asyncio.Lock()
+        # The one that actually prevents duplicate remediation. Durable when
+        # storage is configured; in-process, and therefore honest about what
+        # it can guarantee, when it is not.
+        self._claims = build_claim_store(
+            endpoint=settings.incident_table_endpoint,
+            table_name=settings.claim_table_name,
+        )
+        if not getattr(self._claims, "is_durable", False):
+            logger.warning(
+                "Claim store is not durable: INCIDENT_TABLE_ENDPOINT is unset. "
+                "Two concurrent invocations could triage the same alert twice."
+            )
 
     def run(  # type: ignore[override]
         self,
@@ -295,14 +311,50 @@ class TriageControllerAgent(BaseAgent):
             return "No new alerts."
 
         lines: list[str] = []
+        contended = 0
         for request in requests:
-            artifacts = await self._runner.run_request(request)
-            # Only after the outcome is persisted. A crash before this point
-            # means the alert is triaged again next sweep, which is safe; a
-            # crash after marking would lose it silently.
-            inbox.mark_processed(request.request_id, received_at=request.received_at)
-            lines.append(f"- {request.subject or '(no subject)'}: {_summarise(artifacts)}")
-        summary = f"Triaged {len(requests)} alert(s).\n" + "\n".join(lines)
+            # Take a distributed claim before doing anything with real effect.
+            #
+            # `seen()` was checked when the message was read and `mark_processed`
+            # happens after the outcome is persisted, so between those two points
+            # a second invocation sees the same message as untriaged. A manual
+            # invoke overlapping a scheduled sweep, or two hosted replicas, would
+            # both trigger the same refresh. The write-action budget does not
+            # help: it is per run, and these are two runs.
+            claim_key = f"message:{request.request_id}"
+            if not self._claims.claim(claim_key):
+                # Someone else has it. Skipping is right: they will mark it
+                # processed, and if they die their lease expires and the next
+                # sweep picks it up.
+                contended += 1
+                logger.info("Skipping %s: claimed by another invocation", request.request_id)
+                continue
+
+            try:
+                artifacts = await self._runner.run_request(request)
+                # Only after the outcome is persisted. A crash before this point
+                # means the alert is triaged again next sweep, which is safe; a
+                # crash after marking would lose it silently.
+                inbox.mark_processed(request.request_id, received_at=request.received_at)
+                lines.append(f"- {request.subject or '(no subject)'}: {_summarise(artifacts)}")
+            finally:
+                # Released whatever happened. The message is marked processed on
+                # success, so releasing cannot cause a re-run; on failure it lets
+                # the next sweep retry immediately instead of waiting out the
+                # lease.
+                self._claims.release(claim_key)
+
+        if not lines:
+            base = "No new alerts."
+            if contended:
+                base = f"No alerts triaged; {contended} claimed by another invocation."
+            if retried:
+                return base + " Deferred retries performed:\n" + "\n".join(retried)
+            return base
+
+        summary = f"Triaged {len(lines)} alert(s).\n" + "\n".join(lines)
+        if contended:
+            summary += f"\nSkipped {contended} claimed by another invocation."
         if retried:
             summary += "\nDeferred retries performed:\n" + "\n".join(retried)
         return summary

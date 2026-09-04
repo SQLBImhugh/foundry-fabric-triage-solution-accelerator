@@ -258,75 +258,136 @@ class GraphInbox:
             self._token_expires_at = 0.0
         return self._token
 
+    #: How many Graph pages one sweep will walk before giving up. Bounds the
+    #: work per sweep on a busy mailbox while still being deep enough that a run
+    #: of irrelevant mail cannot hide an alert underneath it.
+    _MAX_PAGES = 10
+
+    #: Graph page size. Larger than the caller's limit on purpose: most messages
+    #: in a shared mailbox are not Power BI alerts, so a page buys several
+    #: candidates rather than one.
+    _PAGE_SIZE = 50
+
     async def fetch(self, limit: int = 10) -> list[BIRequest]:
+        """Return up to ``limit`` alerts that have not been triaged yet.
+
+        Paginates, and that is the whole point of this method's shape. It used
+        to request a single page of ``limit`` messages ordered newest-first and
+        stop. Once ``limit`` messages that the filter rejects -- or that were
+        already triaged -- occupied the top of the inbox, every later sweep
+        retrieved exactly those, skipped them all, and returned nothing. Older
+        mail beneath them was never reached again.
+
+        That is a denial of service available to anyone who can email the
+        mailbox, and it needs no privilege: ten newsletters disable triage
+        permanently while the logs report "No new alerts."
+
+        Messages the filter rejects are deliberately **not** marked processed.
+        Marking them would make later sweeps cheaper, but the filter fails
+        closed -- including when its own subject pattern is invalid -- so one bad
+        pattern would mark an entire mailbox as handled and fixing the pattern
+        would not bring any of it back. Re-reading is the recoverable choice.
+        """
         import httpx
 
         token = await self._get_token()
         url = (
             f"{self._BASE}/users/{self._mailbox}/mailFolders/inbox/messages"
-            f"?$top={limit}&$orderby=receivedDateTime desc"
+            f"?$top={self._PAGE_SIZE}&$orderby=receivedDateTime desc"
             f"&$select=id,subject,body,from,receivedDateTime"
         )
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
-            if resp.status_code >= 400:
-                # Surface Graph's own explanation. Without it a 401 here is
-                # indistinguishable between a bad token, a missing app role
-                # and an Exchange policy denial -- three very different fixes.
-                try:
-                    detail = str(resp.json().get("error", {}).get("message", ""))[:400]
-                except Exception:
-                    detail = resp.text[:400]
-                logger.error("Graph mail read failed: HTTP %s %s", resp.status_code, detail)
-            resp.raise_for_status()
-            messages = resp.json().get("value", [])
 
         out: list[BIRequest] = []
         skipped = 0
         already = 0
-        for msg in messages:
-            mid = msg.get("id", "")
-            if self._processed.seen(mid):
-                # Already triaged on an earlier sweep. Counted so an operator
-                # can tell "nothing new" apart from "not looking".
-                already += 1
-                continue
+        pages = 0
 
-            subject = msg.get("subject", "") or ""
-            sender = ((msg.get("from") or {}).get("emailAddress") or {}).get("address", "")
+        async with httpx.AsyncClient(timeout=30) as client:
+            while url and pages < self._MAX_PAGES and len(out) < limit:
+                resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+                if resp.status_code >= 400:
+                    # Surface Graph's own explanation. Without it a 401 here is
+                    # indistinguishable between a bad token, a missing app role
+                    # and an Exchange policy denial -- three very different fixes.
+                    try:
+                        detail = str(resp.json().get("error", {}).get("message", ""))[:400]
+                    except Exception:
+                        detail = resp.text[:400]
+                    logger.error("Graph mail read failed: HTTP %s %s", resp.status_code, detail)
+                resp.raise_for_status()
 
-            if self._filter is not None:
-                accepted, reason = self._filter.accepts(sender=sender, subject=subject)
-                if not accepted:
-                    # Counted, not silently dropped: an operator needs to know
-                    # the agent saw this and chose not to act.
-                    skipped += 1
-                    logger.info("Skipped message (%s)", reason)
-                    continue
+                payload = resp.json()
+                url = payload.get("@odata.nextLink", "")
+                pages += 1
 
-            body = ((msg.get("body") or {}).get("content") or "")[:20000]
-            hints = parse_hints(subject, body)
-            out.append(
-                BIRequest(
-                    request_id=mid,
-                    received_at=msg.get("receivedDateTime", ""),
-                    sender=sender,
-                    subject=subject,
-                    body=body,
-                    report_name=hints["report_name"],
-                    dataset_id=hints["dataset_id"],
-                    workspace_id=hints["workspace_id"],
-                    error_code=hints["error_code"],
-                    source="graph",
-                )
-            )
+                for msg in payload.get("value", []):
+                    if len(out) >= limit:
+                        break
+                    outcome = self._classify(msg)
+                    if outcome == "processed":
+                        already += 1
+                    elif outcome == "filtered":
+                        skipped += 1
+                    elif outcome is not None:
+                        out.append(outcome)
+
         if skipped:
             logger.info(
                 "Ignored %d message(s) that were not Power BI refresh alerts", skipped
             )
         if already:
             logger.info("Skipped %d message(s) already triaged on an earlier sweep", already)
+        if pages > 1:
+            logger.info("Walked %d page(s) of mail to find %d alert(s)", pages, len(out))
+        if url and len(out) < limit:
+            # Ran out of page budget with mail still unexamined. Said out loud,
+            # because quietly returning fewer alerts than exist is the failure
+            # this pagination was added to remove.
+            logger.warning(
+                "Stopped after %d page(s) with mail still unread and only %d alert(s) "
+                "found. Older alerts may be waiting: tighten GRAPH_SUBJECT_PATTERN "
+                "or raise _MAX_PAGES if this persists.",
+                pages,
+                len(out),
+            )
         return out
+
+    def _classify(self, msg: dict[str, Any]) -> BIRequest | str | None:
+        """One message: a request, ``"processed"``, ``"filtered"``, or ``None``.
+
+        Split out of ``fetch`` so the pagination loop stays readable. The string
+        sentinels keep the counters that let an operator tell "nothing new"
+        apart from "not looking", which the logs have to preserve.
+        """
+        mid = msg.get("id", "")
+        if self._processed.seen(mid):
+            return "processed"
+
+        subject = msg.get("subject", "") or ""
+        sender = ((msg.get("from") or {}).get("emailAddress") or {}).get("address", "")
+
+        if self._filter is not None:
+            accepted, reason = self._filter.accepts(sender=sender, subject=subject)
+            if not accepted:
+                # Counted, not silently dropped: an operator needs to know the
+                # agent saw this and chose not to act.
+                logger.info("Skipped message (%s)", reason)
+                return "filtered"
+
+        body = ((msg.get("body") or {}).get("content") or "")[:20000]
+        hints = parse_hints(subject, body)
+        return BIRequest(
+            request_id=mid,
+            received_at=msg.get("receivedDateTime", ""),
+            sender=sender,
+            subject=subject,
+            body=body,
+            report_name=hints["report_name"],
+            dataset_id=hints["dataset_id"],
+            workspace_id=hints["workspace_id"],
+            error_code=hints["error_code"],
+            source="graph",
+        )
 
     @staticmethod
     def _decode_jwt_payload(token: str) -> dict[str, Any]:

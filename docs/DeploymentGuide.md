@@ -234,6 +234,23 @@ An HTTP-triggered flow is also a premium trigger the tenant may not be
 licensed for. The Logic App uses a system-assigned managed identity against the
 Table REST API, so there is no key anywhere.
 
+**Approving takes two steps, on purpose.** The link in the card opens a
+confirmation page; the page's button POSTs the decision. GET never changes
+anything. A link in a Teams message is fetched by preview generators, scanners
+and prefetchers, and an approval a link preview can grant is not an approval.
+
+**The responder is not an authenticated identity.** Anyone holding the link can
+answer, and the name recorded is whatever the query string claimed, which is why
+the table stores it as `responder_claimed` rather than as an audit fact. Put the
+workflow behind Entra authentication if you need to know who actually clicked.
+
+**An approval that arrives after the run has ended is not applied.** The run
+waits `APPROVAL_TIMEOUT_SECONDS` (default 300) and then abandons the action. A
+decision recorded later sits unused and expires, which is fail-closed and safe,
+but it is not resumed. If you schedule sweeps, the Logic App's HTTP timeout must
+exceed the approval window -- `infra/scheduled-sweep.json` uses `PT10M`, and a
+test fails if the two ever cross.
+
 **The callback URL is a bearer credential.** Anyone holding the link can answer
 an approval. It lives in the azd environment, never in the repo, and
 `scripts/scan_secrets.py` treats it as a secret. The fingerprint in the link binds it

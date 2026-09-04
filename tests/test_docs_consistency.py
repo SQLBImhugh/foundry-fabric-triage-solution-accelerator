@@ -508,3 +508,89 @@ def test_no_file_refers_to_the_repository_this_was_extracted_from() -> None:
     assert not offenders, "stale references to the source repository:\n" + "\n".join(
         f"  {item}" for item in offenders
     )
+
+
+def test_the_approval_callback_never_changes_state_on_a_get() -> None:
+    """A link in a Teams message is fetched by things that are not people.
+
+    Preview generators, link scanners and prefetchers all issue GET. The first
+    version of this workflow recorded the decision directly on GET, so an
+    approval could be granted by a mail client rendering a card. An approval
+    that a link preview can grant is not an approval, it is a URL.
+
+    GET must now return a confirmation page, and only POST may write.
+    """
+    workflow = json.loads(
+        (REPO_ROOT / "infra" / "approval-callback.json").read_text(encoding="utf-8")
+    )
+    definition = workflow["resources"][0]["properties"]["definition"]
+
+    trigger = definition["triggers"]["manual"]["inputs"]
+    assert trigger.get("method") != "GET", (
+        "the trigger accepts only GET, so the confirmation POST cannot reach it"
+    )
+
+    body = json.dumps(definition["actions"])
+    assert "toupper(triggerOutputs()['method'])" in body, (
+        "nothing branches on the HTTP method, so GET and POST do the same thing"
+    )
+
+    # The write must sit inside the POST branch, not at the top level.
+    post_branch = definition["actions"]["Is_it_a_confirmation"]["actions"]
+    assert "Read_the_request" in post_branch
+    assert "Ask_for_confirmation" in definition["actions"]["Is_it_a_confirmation"]["else"]["actions"]
+
+
+def test_the_approval_write_is_conditional_on_the_etag_it_read() -> None:
+    """`If-Match: *` let two decisions overwrite each other silently.
+
+    An Approve and a Decline arriving together could both pass the "already
+    answered?" check and both write, and the last one to land would win with no
+    record that the other happened.
+    """
+    workflow = json.loads(
+        (REPO_ROOT / "infra" / "approval-callback.json").read_text(encoding="utf-8")
+    )
+    definition = workflow["resources"][0]["properties"]["definition"]
+    record = (
+        definition["actions"]["Is_it_a_confirmation"]["actions"]["Is_it_answerable"]
+        ["actions"]["Record_the_decision"]
+    )
+
+    if_match = record["inputs"]["headers"]["If-Match"]
+    assert if_match != "*", "unconditional write: concurrent decisions can overwrite"
+    assert "Read_the_request" in if_match, "the write does not use the ETag it read"
+
+
+def test_the_scheduler_waits_longer_than_the_approval_window() -> None:
+    """A sweep blocks while a human decides, so the caller must outlast them.
+
+    The Logic App timeout was PT3M while APPROVAL_TIMEOUT_SECONDS defaults to
+    300s, so the scheduler abandoned the run ninety seconds before the approval
+    window the card advertises actually closed. Someone could approve well
+    inside the documented five minutes and find the work already gone.
+    """
+    import re
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from triage.settings import Settings
+
+    template = json.loads(
+        (REPO_ROOT / "infra" / "scheduled-sweep.json").read_text(encoding="utf-8")
+    )
+    timeout = (
+        template["resources"][0]["properties"]["definition"]["actions"]
+        ["Invoke_the_agent"]["limit"]["timeout"]
+    )
+    match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", timeout)
+    assert match, f"unparsable timeout {timeout!r}"
+    hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    budget = hours * 3600 + minutes * 60 + seconds
+
+    approval = Settings().approval_timeout_seconds
+    assert budget > approval, (
+        f"the scheduler gives up after {budget}s but an approval may take "
+        f"{approval}s. Raise the Logic App timeout, or lower "
+        "APPROVAL_TIMEOUT_SECONDS -- they have to move together."
+    )

@@ -82,20 +82,44 @@ class DataQualityAgent:
             )
 
         # --- deterministic evidence, before any model call ------------------
-        evidence: DuplicateEvidence | None = None
-        scan_error: str = ""
-        source = next(iter(datasets.values()))
-        with tool_span("check_duplicates", table=source.name):
-            if not source.exists():
-                scan_error = f"No file at {source.path}"
-            else:
-                evidence = detect_duplicates(
-                    path=source.path,
-                    key_columns=source.key_columns,
-                    table_name=source.name,
-                )
-        if ledger is not None:
-            ledger.charge_tool_call("check_duplicates")
+        #
+        # Every registered table is scanned, not just the first. This used to
+        # read `next(iter(datasets.values()))` while reporting `list(datasets)`
+        # as checked, so a two-table consultation opened one file and claimed
+        # both were clean. A finding that names a table it never read is worse
+        # than no finding: it is evidence the reader will trust.
+        #
+        # Collect everything, then let reporting priority decide what is
+        # announced. Stopping at the first clean table is the same defect in a
+        # different costume -- a model that looked healthy hiding one that is not.
+        evidences: list[DuplicateEvidence] = []
+        scan_errors: list[str] = []
+        scanned: list[str] = []
+
+        for source in datasets.values():
+            with tool_span("check_duplicates", table=source.name):
+                if not source.exists():
+                    scan_errors.append(f"{source.name}: no file at {source.path}")
+                else:
+                    evidences.append(
+                        detect_duplicates(
+                            path=source.path,
+                            key_columns=source.key_columns,
+                            table_name=source.name,
+                        )
+                    )
+                    scanned.append(source.name)
+            # Charged per table, because that is how many scans really ran. A
+            # budget that under-counts is a budget that does not bind.
+            if ledger is not None:
+                ledger.charge_tool_call("check_duplicates")
+
+        # A defect anywhere outranks cleanliness everywhere else.
+        evidence: DuplicateEvidence | None = next(
+            (item for item in evidences if item.duplicate_row_count > 0),
+            evidences[0] if evidences else None,
+        )
+        scan_error = "; ".join(scan_errors)
 
         if evidence is None:
             return DataQualityFinding(
@@ -103,7 +127,7 @@ class DataQualityAgent:
                 issue_type="unknown",
                 confidence=0.0,
                 detail=f"Deterministic scan could not run: {scan_error}",
-                checked_tables=list(datasets),
+                checked_tables=scanned,
                 recommended_action="escalate",
                 agent_name=self.AGENT_NAME,
             )
@@ -132,7 +156,7 @@ class DataQualityAgent:
             ledger.charge_tokens(resp.total_tokens)
 
         model_payload = _parse_json_object(resp.content)
-        return self._reconcile(model_payload, evidence, list(datasets))
+        return self._reconcile(model_payload, evidence, scanned)
 
     # --- reconciliation ----------------------------------------------------
 

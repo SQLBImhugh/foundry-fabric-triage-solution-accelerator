@@ -10,11 +10,28 @@
       "link to: it records the human's decision in the same approvals table the",
       "agent polls.",
       "",
+      "GET NEVER CHANGES ANYTHING. The link opens a confirmation page and the",
+      "page's button POSTs. This is not ceremony: a link in a Teams message is",
+      "fetched by preview generators, scanners and prefetchers, and the first",
+      "version of this recorded a decision on GET. An approval that can be",
+      "granted by a link preview is not a human approval, it is a URL.",
+      "",
+      "The write is conditional on the ETag read moments earlier, not 'If-Match:",
+      "*'. With '*', an Approve and a Decline arriving together could both pass",
+      "the 'already answered?' check and then overwrite each other, and the last",
+      "writer would win silently. Now the loser gets 412 and is told so.",
+      "",
       "Why a Logic App and not a Power Automate flow: the Azure Table connector",
       "authenticates with a shared account key, and allowSharedKeyAccess is false",
       "on this storage account by tenant policy. An HTTP-triggered flow is also a",
       "premium trigger. This uses a system-assigned managed identity against the",
       "Table REST API instead, so there is no key anywhere.",
+      "",
+      "KNOWN LIMITATION: the responder is not an authenticated identity. Anyone",
+      "holding the link can answer, and the recorded name is whatever the query",
+      "string claimed, so it is stored as 'responder_claimed' rather than as an",
+      "audit fact. Put the workflow behind Entra authentication if you need to",
+      "know who actually clicked.",
       "",
       "It refuses a request that does not exist, one already answered, one that",
       "has expired, and one whose fingerprint does not match the link. The agent",
@@ -102,76 +119,34 @@
               "type": "Request",
               "kind": "Http",
               "inputs": {
-                "method": "GET",
                 "schema": {}
               }
             }
           },
           "actions": {
-            "Read_the_request": {
-              "type": "Http",
-              "runAfter": {},
-              "inputs": {
-                "method": "GET",
-                "uri": "@{parameters('entityPrefix')}@{encodeUriComponent(triggerOutputs()['queries']['request_id'])}')",
-                "headers": {
-                  "x-ms-version": "2019-02-02",
-                  "Accept": "application/json;odata=nometadata"
-                },
-                "authentication": {
-                  "type": "ManagedServiceIdentity",
-                  "audience": "@parameters('storageAudience')"
-                }
-              }
-            },
-            "Is_it_answerable": {
+            "Is_it_a_confirmation": {
               "type": "If",
-              "runAfter": {
-                "Read_the_request": [
-                  "Succeeded"
-                ]
-              },
+              "runAfter": {},
               "expression": {
                 "and": [
                   {
                     "equals": [
-                      "@empty(coalesce(body('Read_the_request')?['decision'], ''))",
-                      true
-                    ]
-                  },
-                  {
-                    "equals": [
-                      "@coalesce(body('Read_the_request')?['fingerprint'], '')",
-                      "@coalesce(triggerOutputs()['queries']?['fingerprint'], '')"
-                    ]
-                  },
-                  {
-                    "less": [
-                      "@utcNow()",
-                      "@coalesce(body('Read_the_request')?['expires_at'], '9999-01-01T00:00:00Z')"
+                      "@toupper(triggerOutputs()['method'])",
+                      "POST"
                     ]
                   }
                 ]
               },
               "actions": {
-                "Record_the_decision": {
+                "Read_the_request": {
                   "type": "Http",
                   "runAfter": {},
                   "inputs": {
-                    "method": "POST",
+                    "method": "GET",
                     "uri": "@{parameters('entityPrefix')}@{encodeUriComponent(triggerOutputs()['queries']['request_id'])}')",
                     "headers": {
                       "x-ms-version": "2019-02-02",
-                      "Content-Type": "application/json",
-                      "Accept": "application/json;odata=nometadata",
-                      "X-HTTP-Method": "MERGE",
-                      "If-Match": "*"
-                    },
-                    "body": {
-                      "decision": "@{triggerOutputs()['queries']['decision']}",
-                      "responder": "@{coalesce(triggerOutputs()['queries']?['responder'], 'teams-card')}",
-                      "reason": "@{coalesce(triggerOutputs()['queries']?['reason'], '')}",
-                      "decided_at": "@{utcNow()}"
+                      "Accept": "application/json;odata=minimalmetadata"
                     },
                     "authentication": {
                       "type": "ManagedServiceIdentity",
@@ -179,35 +154,125 @@
                     }
                   }
                 },
-                "Confirm": {
-                  "type": "Response",
-                  "kind": "Http",
+                "Is_it_answerable": {
+                  "type": "If",
                   "runAfter": {
-                    "Record_the_decision": [
+                    "Read_the_request": [
                       "Succeeded"
                     ]
                   },
-                  "inputs": {
-                    "statusCode": 200,
-                    "headers": {
-                      "Content-Type": "text/html; charset=utf-8"
+                  "expression": {
+                    "and": [
+                      {
+                        "equals": [
+                          "@empty(coalesce(body('Read_the_request')?['decision'], ''))",
+                          true
+                        ]
+                      },
+                      {
+                        "equals": [
+                          "@coalesce(body('Read_the_request')?['fingerprint'], '')",
+                          "@coalesce(triggerOutputs()['queries']?['fingerprint'], '')"
+                        ]
+                      },
+                      {
+                        "less": [
+                          "@utcNow()",
+                          "@coalesce(body('Read_the_request')?['expires_at'], '9999-01-01T00:00:00Z')"
+                        ]
+                      }
+                    ]
+                  },
+                  "actions": {
+                    "Record_the_decision": {
+                      "type": "Http",
+                      "runAfter": {},
+                      "inputs": {
+                        "method": "POST",
+                        "uri": "@{parameters('entityPrefix')}@{encodeUriComponent(triggerOutputs()['queries']['request_id'])}')",
+                        "headers": {
+                          "x-ms-version": "2019-02-02",
+                          "Content-Type": "application/json",
+                          "Accept": "application/json;odata=nometadata",
+                          "X-HTTP-Method": "MERGE",
+                          "If-Match": "@{coalesce(outputs('Read_the_request')?['headers']?['ETag'], '*')}"
+                        },
+                        "body": {
+                          "decision": "@{triggerOutputs()['queries']['decision']}",
+                          "responder_claimed": "@{coalesce(triggerOutputs()['queries']?['responder'], 'teams-card')}",
+                          "reason": "@{coalesce(triggerOutputs()['queries']?['reason'], '')}",
+                          "decided_at": "@{utcNow()}"
+                        },
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "@parameters('storageAudience')"
+                        }
+                      }
                     },
-                    "body": "<!doctype html><meta charset=\"utf-8\"><title>Decision recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Decision recorded</h1><p style=\"margin:0 0 8px\"><b>@{triggerOutputs()['queries']['decision']}</b> &mdash; @{triggerOutputs()['queries']['request_id']}</p><p style=\"color:#9fb0c3\">The agent picks this up on its next poll. You can close this tab.</p>"
+                    "Confirm": {
+                      "type": "Response",
+                      "kind": "Http",
+                      "runAfter": {
+                        "Record_the_decision": [
+                          "Succeeded"
+                        ]
+                      },
+                      "inputs": {
+                        "statusCode": 200,
+                        "headers": {
+                          "Content-Type": "text/html; charset=utf-8"
+                        },
+                        "body": "<!doctype html><meta charset=\"utf-8\"><title>Decision recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Decision recorded</h1><p style=\"margin:0 0 8px\"><b>@{triggerOutputs()['queries']['decision']}</b> &mdash; @{triggerOutputs()['queries']['request_id']}</p><p style=\"color:#9fb0c3\">The agent picks this up on its next poll. You can close this tab.</p>"
+                      }
+                    },
+                    "Lost_the_race": {
+                      "type": "Response",
+                      "kind": "Http",
+                      "runAfter": {
+                        "Record_the_decision": [
+                          "Failed",
+                          "TimedOut"
+                        ]
+                      },
+                      "inputs": {
+                        "statusCode": 409,
+                        "headers": {
+                          "Content-Type": "text/html; charset=utf-8"
+                        },
+                        "body": "<!doctype html><meta charset=\"utf-8\"><title>Not recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Not recorded</h1><p style=\"color:#9fb0c3\">Someone answered this request at the same moment. Their decision stands and nothing here was changed.</p>"
+                      }
+                    }
+                  },
+                  "else": {
+                    "actions": {
+                      "Refuse": {
+                        "type": "Response",
+                        "kind": "Http",
+                        "runAfter": {},
+                        "inputs": {
+                          "statusCode": 409,
+                          "headers": {
+                            "Content-Type": "text/html; charset=utf-8"
+                          },
+                          "body": "<!doctype html><meta charset=\"utf-8\"><title>Not recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Not recorded</h1><p style=\"color:#9fb0c3\">This request was already answered, has expired, or the link does not match it. Nothing was changed.</p>"
+                        }
+                      }
+                    }
                   }
                 }
               },
               "else": {
                 "actions": {
-                  "Refuse": {
+                  "Ask_for_confirmation": {
                     "type": "Response",
                     "kind": "Http",
                     "runAfter": {},
                     "inputs": {
-                      "statusCode": 409,
+                      "statusCode": 200,
                       "headers": {
                         "Content-Type": "text/html; charset=utf-8"
                       },
-                      "body": "<!doctype html><meta charset=\"utf-8\"><title>Not recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Not recorded</h1><p style=\"color:#9fb0c3\">This request was already answered, has expired, or the link does not match it. Nothing was changed.</p>"
+                      "body": "<!doctype html><meta charset=\"utf-8\"><title>Confirm decision</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Confirm decision</h1><p style=\"margin:0 0 8px\">You are about to record <b>@{triggerOutputs()['queries']['decision']}</b> for request <code>@{triggerOutputs()['queries']['request_id']}</code>.</p><p style=\"color:#9fb0c3;margin:0 0 24px\">Nothing has been changed yet.</p><form method=\"POST\" action=\"@{listCallbackUrl()}\"><button type=\"submit\" style=\"background:#2ea043;color:#fff;border:0;border-radius:6px;padding:12px 22px;font-size:16px;cursor:pointer\">Confirm @{triggerOutputs()['queries']['decision']}</button></form>"
                     }
                   }
                 }

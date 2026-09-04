@@ -95,6 +95,12 @@ class Settings(BaseSettings):
     retry_table_name: str = "deferredretries"
     #: Baselines for the silent-failure detector. Same endpoint again.
     semantic_health_table_name: str = "semantichealth"
+
+    #: Distributed claims, so two invocations cannot remediate the same alert.
+
+    #: Shares the incident table endpoint; only the table name is separate.
+
+    claim_table_name: str = "claims"
     #: The detector's off switch. Configuration rather than routine state,
     #: because `azd deploy` re-enables a disabled routine from azure.yaml.
     silent_sweep_enabled: bool = True
