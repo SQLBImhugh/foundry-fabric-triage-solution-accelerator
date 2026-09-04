@@ -341,6 +341,34 @@ the population you mine to decide what to automate next.
 Redaction happens *inside* `record()`, not at call sites, so a new code path
 cannot forget it.
 
+## Claims: only one invocation acts
+
+The store above is checked *before* the work and written *after* it, and the
+processed-message log has the same shape. Both are correct for one process and
+wrong for two.
+
+A hosted agent can be invoked manually while a schedule fires, or run as more
+than one replica. Both invocations then see the same alert as untriaged and no
+open incident, and both dispatch the remediation. The write-action budget does
+not help: it is per run, and these are two runs. The only lock that existed was
+an `asyncio.Lock` on the agent instance — process-local, and a hosted agent is
+rebuilt per request, so it did not even span two requests to one replica.
+
+`store/claims.py` supplies the missing primitive. `create_entity` on an Azure
+Table fails with `ResourceExistsError` when the row already exists, which is an
+atomic compare-and-set against shared state and all a lease needs. The controller
+takes a claim keyed on the message id before doing anything with real effect, and
+releases it afterwards.
+
+Claims expire, so a container that dies mid-remediation does not hold one for
+ever — that would turn a duplicate-work bug into a lost-alert bug. Stealing an
+expired claim is itself conditional on the ETag, so two callers racing to take
+over the same dead claim cannot both succeed.
+
+Unlike the incident and processed stores, this one does **not** degrade quietly
+to in-memory when storage is unreachable. Those degrade because losing them makes
+the agent noisy; losing this one makes it act twice.
+
 ## Providers
 
 One interface, three implementations:
