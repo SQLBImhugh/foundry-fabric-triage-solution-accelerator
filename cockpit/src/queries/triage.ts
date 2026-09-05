@@ -29,8 +29,8 @@ ROW(
     "resolved", COALESCE(CALCULATE(COUNTROWS(triage_incidents), triage_incidents[status] = "resolved"), 0),
     "approvalsPending", COALESCE(CALCULATE(COUNTROWS(triage_approvals), ISBLANK(triage_approvals[decision]) || triage_approvals[decision] = ""), 0),
     "retriesPending", COALESCE(CALCULATE(COUNTROWS(triage_deferred_retries), triage_deferred_retries[status] = "pending"), 0),
-    "claimsHeld", COALESCE(COUNTROWS(triage_claims), 0),
-    "leasesHeld", COALESCE(COUNTROWS(triage_sweep_leases), 0),
+    "claimsHeld", COALESCE(CALCULATE(COUNTROWS(triage_claims), triage_claims[expires_at] > UTCNOW()), 0),
+    "leasesHeld", COALESCE(CALCULATE(COUNTROWS(triage_sweep_leases), triage_sweep_leases[expires_at] > UTCNOW()), 0),
     "processed", COALESCE(COUNTROWS(triage_processed_messages), 0),
     "suspectProbes", COALESCE(CALCULATE(COUNTROWS(triage_semantic_health), triage_semantic_health[suspect_count] > 0), 0)
 )
@@ -46,7 +46,13 @@ SUMMARIZECOLUMNS(
 ORDER BY [incidents] DESC
 `;
 
-/** Most recent incidents. Lexical ordering is valid for ISO-8601 text. */
+/**
+ * Most recent incidents. Lexical ordering is valid for ISO-8601 text.
+ *
+ * The ORDER BY repeats the TOPN sort deliberately: TOPN picks the 25 newest but
+ * makes no promise about the order it hands them back, so without this the
+ * "most recent" table was only coincidentally in order.
+ */
 export const RECENT_INCIDENTS = `
 EVALUATE
 TOPN(
@@ -60,24 +66,31 @@ TOPN(
     ),
     [Updated], DESC
 )
+ORDER BY [Updated] DESC
 `;
 
 /**
  * Claims and leases: the two primitives that stop a second invocation acting on
- * work already in flight. A row here means something holds one right now.
+ * work already in flight.
+ *
+ * Both are released by expiry, not by deletion — a claim is taken by a
+ * conditional UPDATE that overwrites an expired row, so expired rows sit in the
+ * table indefinitely. Counting rows therefore counts history, not what is held.
+ * Every query here filters on expires_at > UTCNOW(), which is what makes "held"
+ * true. expires_at is DATETIME2(3) written in UTC, so this compares like to like.
  */
 export const CONCURRENCY = `
 EVALUATE
 UNION(
     SELECTCOLUMNS(
-        triage_claims,
+        FILTER(triage_claims, triage_claims[expires_at] > UTCNOW()),
         "Kind", "claim",
         "Key", triage_claims[claim_key],
         "Owner", triage_claims[owner],
         "Expires", triage_claims[expires_at]
     ),
     SELECTCOLUMNS(
-        triage_sweep_leases,
+        FILTER(triage_sweep_leases, triage_sweep_leases[expires_at] > UTCNOW()),
         "Kind", "lease",
         "Key", triage_sweep_leases[lease_name],
         "Owner", triage_sweep_leases[owner],
@@ -87,7 +100,17 @@ UNION(
 ORDER BY [Expires] DESC
 `;
 
-/** Approvals, newest decision first. Undecided rows are the ones that matter. */
+/**
+ * Approvals. Undecided rows are the ones that matter, so they sort first.
+ *
+ * Ordering by decided_at alone put them last — it is blank until somebody
+ * answers — so once 25 requests had been settled every pending one fell off the
+ * end of the TOPN and the panel showed only closed work.
+ *
+ * The trailing ORDER BY is not redundant. TOPN's arguments decide *which* rows
+ * survive the cut, not the order they come back in; without an explicit ORDER BY
+ * the row order is undefined and the pending rows can still render anywhere.
+ */
 export const APPROVALS = `
 EVALUATE
 TOPN(
@@ -99,8 +122,10 @@ TOPN(
         "Responder", triage_approvals[responder],
         "Decided", triage_approvals[decided_at]
     ),
+    IF(ISBLANK([Decision]) || [Decision] = "", 1, 0), DESC,
     [Decided], DESC
 )
+ORDER BY IF(ISBLANK([Decision]) || [Decision] = "", 1, 0) DESC, [Decided] DESC
 `;
 
 /** Postponed work. A row that is due and still pending has not been drained. */

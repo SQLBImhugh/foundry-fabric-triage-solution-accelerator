@@ -14,7 +14,7 @@
     "dev": "rayfin up --exclude-services staticHosting && vite",
     "preview": "node scripts/preview-visual.mjs",
     "build": "tsc -b && vite build",
-    "build:fabric": "npx fabric-app-data generate -o src/fabric.generated.ts && tsc -b --noCheck && vite build",
+    "build:fabric": "npx fabric-app-data generate -o src/fabric.generated.ts && tsc -b && vite build",
     "lint": "eslint .",
     "test": "vitest run",
     "rayfin:up": "rayfin up",
@@ -63,3 +63,4 @@
     "vitest": "^4.1.8"
   }
 }
+

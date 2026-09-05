@@ -171,7 +171,6 @@ export function CockpitPage() {
                     valueKey="open"
                     accent="chart-1"
                     loading={headline.isLoading}
-                    error={headline.error}
                 />
                 <Stat
                     label="Awaiting a human"
@@ -180,7 +179,6 @@ export function CockpitPage() {
                     accent="chart-3"
                     secondary="approvals with no decision"
                     loading={headline.isLoading}
-                    error={headline.error}
                 />
                 <Stat
                     label="Retries pending"
@@ -189,7 +187,6 @@ export function CockpitPage() {
                     accent="chart-5"
                     secondary="postponed, not yet drained"
                     loading={headline.isLoading}
-                    error={headline.error}
                 />
                 <Stat
                     label="Claims held"
@@ -198,7 +195,6 @@ export function CockpitPage() {
                     accent="chart-2"
                     secondary="one holder per alert"
                     loading={headline.isLoading}
-                    error={headline.error}
                 />
                 <Stat
                     label="Suspect probes"
@@ -207,21 +203,24 @@ export function CockpitPage() {
                     accent="chart-4"
                     secondary="seen once, not confirmed"
                     loading={headline.isLoading}
-                    error={headline.error}
                 />
             </StatStrip>
 
             <DashboardGrid>
+                {/* The hero carries the densest panel, not the prettiest one.
+                    A `hero` is 8 columns by 2 rows: a table fills that height
+                    with rows, where a two-category bar chart just leaves a
+                    large empty rectangle under its bars. The 4-column gap
+                    beside it takes the two `md` tiles. */}
                 <Tile size="hero">
-                    <ChartCard
-                        title="Incidents by status"
-                        subtitle="Every terminal outcome is persisted, refusals included"
-                        variant="feature"
-                        accent="chart-1"
+                    <DataTableCard
+                        title="Recent incidents"
+                        subtitle="Newest first"
                         className="h-full"
-                        spec={statusSpec}
-                        loading={byStatus.isLoading}
-                        error={byStatus.error}
+                        height={560}
+                        spec={incidentsSpec}
+                        loading={incidents.isLoading}
+                        error={incidents.error}
                     />
                 </Tile>
 
@@ -230,7 +229,7 @@ export function CockpitPage() {
                         title="Claims and leases"
                         subtitle="What is holding work right now"
                         spec={concurrencySpec}
-                        height={300}
+                        height={220}
                         loading={concurrency.isLoading}
                         error={concurrency.error}
                     />
@@ -241,19 +240,20 @@ export function CockpitPage() {
                         title="Deferred retries"
                         subtitle="Postponed work, and whether anything drained it"
                         spec={retriesSpec}
-                        height={300}
+                        height={220}
                         loading={retries.isLoading}
                         error={retries.error}
                     />
                 </Tile>
 
-                <Tile size="full">
-                    <DataTableCard
-                        title="Recent incidents"
-                        subtitle="Newest first"
-                        spec={incidentsSpec}
-                        loading={incidents.isLoading}
-                        error={incidents.error}
+                <Tile size="lg">
+                    <ChartCard
+                        title="Incidents by status"
+                        subtitle="Every terminal outcome is persisted, refusals included"
+                        accent="chart-1"
+                        spec={statusSpec}
+                        loading={byStatus.isLoading}
+                        error={byStatus.error}
                     />
                 </Tile>
 
@@ -262,7 +262,7 @@ export function CockpitPage() {
                         title="Approvals"
                         subtitle="A blank decision is not a yes"
                         spec={approvalsSpec}
-                        height={300}
+                        height={280}
                         loading={approvals.isLoading}
                         error={approvals.error}
                     />
@@ -273,12 +273,13 @@ export function CockpitPage() {
                         title="Semantic health baselines"
                         subtitle="Silent-failure detector state"
                         spec={probesSpec}
-                        height={300}
+                        height={280}
                         loading={probes.isLoading}
                         error={probes.error}
                     />
                 </Tile>
-                <Tile size="full">
+
+                <Tile size="lg">
                     <DataTableCard
                         title="Ignored mail"
                         subtitle="The inbox filter is a security control — this is it firing"
@@ -292,4 +293,5 @@ export function CockpitPage() {
         </PageShell>
     );
 }
+
 

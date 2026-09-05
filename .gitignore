@@ -49,3 +49,8 @@ handoff/
 # failed comparison can be diagnosed without paying for every run again -- but
 # it is unreviewed model text about a real tenant, so it never gets committed.
 .compare-runs/
+
+# Playwright MCP captures. Screenshots of a live Fabric workspace --
+# real workspace names, item ids and incident rows -- do not belong in a
+# public repo, and bulk staging would otherwise sweep them in.
+.playwright-mcp/
