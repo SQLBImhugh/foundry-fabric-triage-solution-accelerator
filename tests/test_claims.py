@@ -64,9 +64,9 @@ def test_a_live_claim_is_not_stolen_early() -> None:
     assert claims.claim("message:abc") is False
 
 
-def test_no_storage_endpoint_yields_an_in_process_store() -> None:
+def test_no_database_configured_yields_an_in_process_store() -> None:
     """Offline, one process is all there is, so in-memory is the honest answer."""
-    claims = build_claim_store(endpoint="")
+    claims = build_claim_store(db=None)
 
     assert isinstance(claims, InMemoryClaimStore)
     assert claims.is_durable is False

@@ -2,293 +2,287 @@
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
   "contentVersion": "1.0.0.0",
   "metadata": {
-    "comment": [
-      "The callback behind the approval card's buttons.",
+    "comments": [
+      "The Approve/Decline buttons on the Teams approval card point here.",
       "",
-      "A card posted through a Teams incoming webhook has no bot behind it, so",
-      "Action.Submit does nothing. The buttons are links, and this is what they",
-      "link to: it records the human's decision in the same approvals table the",
-      "agent polls.",
+      "TWO workflows, and the split is forced by the platform rather than by",
+      "taste. A Consumption Logic App Request trigger accepts exactly one HTTP",
+      "method: with none declared it accepts POST only, and a GET is rejected by",
+      "the runtime with TriggerRequestMethodNotValid before the workflow starts.",
+      "triggerOutputs() has no 'method' property either -- only headers, queries",
+      "and body. So a single workflow cannot render a page on GET and write on",
+      "POST, however it is written. An earlier version of this file tried, by",
+      "branching on toupper(triggerOutputs()['method']), and that expression can",
+      "never evaluate.",
       "",
-      "GET NEVER CHANGES ANYTHING. The link opens a confirmation page and the",
-      "page's button POSTs. This is not ceremony: a link in a Teams message is",
-      "fetched by preview generators, scanners and prefetchers, and the first",
-      "version of this recorded a decision on GET. An approval that can be",
-      "granted by a link preview is not a human approval, it is a URL.",
+      "  bi-triage-approval-confirm   GET  -> renders a confirmation page.",
+      "                                       Holds no connection and has no",
+      "                                       action that can write anything.",
+      "  bi-triage-approval-callback  POST -> records the decision.",
       "",
-      "The write is conditional on the ETag read moments earlier, not 'If-Match:",
-      "*'. With '*', an Approve and a Decline arriving together could both pass",
-      "the 'already answered?' check and then overwrite each other, and the last",
-      "writer would win silently. Now the loser gets 412 and is told so.",
+      "That preserves the property the design actually needs: a link in a Teams",
+      "message is fetched by preview generators, link scanners and prefetchers,",
+      "and every one of those issues GET. GET reaches a workflow with nothing to",
+      "change. An approval a link preview can grant is not an approval.",
       "",
-      "Why a Logic App and not a Power Automate flow: the Azure Table connector",
-      "authenticates with a shared account key, and allowSharedKeyAccess is false",
-      "on this storage account by tenant policy. An HTTP-triggered flow is also a",
-      "premium trigger. This uses a system-assigned managed identity against the",
-      "Table REST API instead, so there is no key anywhere.",
+      "State lives in a Fabric SQL Database, which speaks TDS and has no REST",
+      "data plane, so the write uses the SQL managed connector authenticating as",
+      "the recording workflow's own system-assigned identity. No key and no",
+      "connection string appears anywhere in this deployment.",
       "",
-      "KNOWN LIMITATION: the responder is not an authenticated identity. Anyone",
-      "holding the link can answer, and the recorded name is whatever the query",
-      "string claimed, so it is stored as 'responder_claimed' rather than as an",
-      "audit fact. Put the workflow behind Entra authentication if you need to",
-      "know who actually clicked.",
+      "The write is a stored procedure call, never SQL built from the URL.",
+      "Everything in that URL is attacker-controllable: anyone holding the link",
+      "can edit it. Parameters cannot carry SQL.",
       "",
-      "It refuses a request that does not exist, one already answered, one that",
-      "has expired, and one whose fingerprint does not match the link. The agent",
-      "revalidates all of that independently - this is defence in depth, not the",
-      "control itself."
+      "Two guarantees live in the procedure, because a Logic App cannot hold a",
+      "transaction open across a read and a write:",
+      "  * the row moves from unanswered to answered exactly once, so two",
+      "    simultaneous clicks cannot overwrite each other;",
+      "  * fingerprint and expiry are checked in the statement that writes.",
+      "The agent revalidates all of it independently before acting."
     ]
   },
   "parameters": {
     "name": {
       "type": "string",
-      "defaultValue": "bi-triage-approval-callback"
+      "defaultValue": "bi-triage-approval-callback",
+      "metadata": { "description": "Name of the recording (POST) workflow." }
     },
-    "location": {
+    "confirmName": {
       "type": "string",
-      "defaultValue": "[resourceGroup().location]"
+      "defaultValue": "bi-triage-approval-confirm",
+      "metadata": { "description": "Name of the confirmation (GET) workflow the card links to." }
     },
-    "tableEndpoint": {
+    "location": { "type": "string", "defaultValue": "[resourceGroup().location]" },
+    "sqlServer": {
       "type": "string",
       "metadata": {
-        "description": "e.g. https://<storage-account>.table.core.windows.net"
+        "description": "Fabric SQL server FQDN, without the port. From the SQL database item's connection properties."
       }
     },
-    "tableName": {
+    "sqlDatabase": {
       "type": "string",
-      "defaultValue": "approvals"
+      "metadata": {
+        "description": "Fabric SQL database name, including the item GUID."
+      }
     },
     "owner": {
       "type": "string",
       "defaultValue": "unassigned",
-      "metadata": {
-        "description": "Tag value only. Set it to whoever should be asked before this is deleted."
-      }
+      "metadata": { "description": "Tag value only. Who to ask before deleting this." }
     },
     "costCenter": {
       "type": "string",
       "defaultValue": "unassigned",
-      "metadata": {
-        "description": "Tag value only. Your chargeback code."
-      }
+      "metadata": { "description": "Tag value only. Your chargeback code." }
     },
     "environment": {
       "type": "string",
       "defaultValue": "evaluation",
-      "metadata": {
-        "description": "Tag value only, e.g. evaluation, test, production."
-      }
+      "metadata": { "description": "Tag value only, e.g. evaluation, test, production." }
     }
   },
   "variables": {
-    "entityPrefix": "[concat(parameters('tableEndpoint'), '/', parameters('tableName'), '(PartitionKey=''approval'',RowKey=''')]",
-    "storageAudience": "https://storage.azure.com/"
-  },
+    "connectionName": "[concat(parameters('name'), '-sql')]",
+    "sqlApiId": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Web/locations/', parameters('location'), '/managedApis/sql')]"},
   "resources": [
     {
+      "comments": "Managed-identity auth for the SQL connector lives in the 'oauthMI' parameter value set, whose only parameter is a token of type managedIdentity constrained to location 'logicapp'. The identity is therefore supplied by the workflow at run time and the connection holds no credential of its own. Server and database are given per action, not here.",
+      "type": "Microsoft.Web/connections",
+      "apiVersion": "2016-06-01",
+      "name": "[variables('connectionName')]",
+      "location": "[parameters('location')]",
+      "tags": { "CostCenter": "[parameters('costCenter')]", "Owner": "[parameters('owner')]", "Environment": "[parameters('environment')]", "DataClassification": "synthetic", "Workload": "bi-triage-accelerator" },
+      "properties": {
+        "displayName": "[variables('connectionName')]",
+        "api": { "id": "[variables('sqlApiId')]" },
+        "parameterValueSet": {
+          "name": "oauthMI",
+          "values": {}
+        }
+      }
+    },
+    {
+      "comments": "The recording workflow. POST only, which is the platform default and is deliberately not widened.",
       "type": "Microsoft.Logic/workflows",
       "apiVersion": "2019-05-01",
       "name": "[parameters('name')]",
       "location": "[parameters('location')]",
-      "identity": {
-        "type": "SystemAssigned"
-      },
-      "tags": {
-        "CostCenter": "[parameters('costCenter')]",
-        "Owner": "[parameters('owner')]",
-        "Environment": "[parameters('environment')]",
-        "DataClassification": "synthetic"
-      },
+      "tags": { "CostCenter": "[parameters('costCenter')]", "Owner": "[parameters('owner')]", "Environment": "[parameters('environment')]", "DataClassification": "synthetic", "Workload": "bi-triage-accelerator" },
+      "identity": { "type": "SystemAssigned" },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/connections', variables('connectionName'))]"
+      ],
       "properties": {
         "state": "Enabled",
         "definition": {
           "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
           "contentVersion": "1.0.0.0",
           "parameters": {
-            "entityPrefix": {
-              "type": "String",
-              "defaultValue": "[variables('entityPrefix')]"
-            },
-            "storageAudience": {
-              "type": "String",
-              "defaultValue": "[variables('storageAudience')]"
+            "$connections": { "type": "Object", "defaultValue": {} },
+            "sqlServer": { "type": "String", "defaultValue": "" },
+            "sqlDatabase": { "type": "String", "defaultValue": "" }
+          },
+          "triggers": {
+            "manual": {
+              "type": "Request",
+              "kind": "Http",
+              "inputs": { "schema": {} }
             }
+          },
+          "actions": {
+            "Record_the_decision": {
+              "type": "ApiConnection",
+              "runAfter": {},
+              "description": "One parameterised stored-procedure call. It refuses a request that is unknown, already answered, expired, or whose fingerprint does not match the link, and reports how many rows it changed.",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['sql']['connectionId']"
+                  }
+                },
+                "method": "post",
+                "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(parameters('sqlServer')))},@{encodeURIComponent(encodeURIComponent(parameters('sqlDatabase')))}/procedures/@{encodeURIComponent(encodeURIComponent('[dbo].[triage_record_approval_decision]'))}",
+                "body": {
+                  "request_id": "@{coalesce(triggerOutputs()['queries']?['request_id'], '')}",
+                  "decision": "@{coalesce(triggerOutputs()['queries']?['decision'], '')}",
+                  "responder": "@{coalesce(triggerOutputs()['queries']?['responder'], 'teams-card')}",
+                  "reason": "@{coalesce(triggerOutputs()['queries']?['reason'], '')}",
+                  "fingerprint": "@{coalesce(triggerOutputs()['queries']?['fingerprint'], '')}"
+                }
+              }
+            },
+            "Was_it_recorded": {
+              "type": "If",
+              "runAfter": { "Record_the_decision": ["Succeeded"] },
+              "expression": {
+                "and": [
+                  {
+                    "equals": [
+                      "@int(coalesce(first(body('Record_the_decision')?['ResultSets']?['Table1'])?['recorded'], 0))",
+                      1
+                    ]
+                  }
+                ]
+              },
+              "actions": {
+                "Confirm": {
+                  "type": "Response",
+                  "kind": "Http",
+                  "runAfter": {},
+                  "inputs": {
+                    "statusCode": 200,
+                    "headers": { "Content-Type": "text/html; charset=utf-8" },
+                    "body": "<!doctype html><meta charset=\"utf-8\"><title>Decision recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Decision recorded</h1><p style=\"margin:0 0 8px\"><b>@{coalesce(triggerOutputs()['queries']?['decision'], '')}</b> &mdash; @{coalesce(triggerOutputs()['queries']?['request_id'], '')}</p><p style=\"color:#9fb0c3\">The agent picks this up on its next poll. You can close this tab.</p>"
+                  }
+                }
+              },
+              "else": {
+                "actions": {
+                  "Refuse": {
+                    "type": "Response",
+                    "kind": "Http",
+                    "runAfter": {},
+                    "description": "Zero rows changed. The request does not exist, was already answered, has expired, or the fingerprint does not match. All four are refusals, and none of them changed anything.",
+                    "inputs": {
+                      "statusCode": 409,
+                      "headers": { "Content-Type": "text/html; charset=utf-8" },
+                      "body": "<!doctype html><meta charset=\"utf-8\"><title>Not recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Not recorded</h1><p style=\"color:#9fb0c3\">This request was already answered, has expired, or the link does not match it. Nothing was changed.</p>"
+                    }
+                  }
+                }
+              }
+            },
+            "Could_not_reach_the_database": {
+              "type": "Response",
+              "kind": "Http",
+              "runAfter": { "Record_the_decision": ["Failed", "TimedOut"] },
+              "description": "A write that did not happen must never render as a decision. Failing loudly is what stops somebody closing the tab believing they approved something.",
+              "inputs": {
+                "statusCode": 502,
+                "headers": { "Content-Type": "text/html; charset=utf-8" },
+                "body": "<!doctype html><meta charset=\"utf-8\"><title>Not recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Not recorded</h1><p style=\"color:#9fb0c3\">The decision store could not be reached, so nothing was written. Answer from the CLI with <code>bi-triage approve</code>, or try again.</p>"
+              }
+            }
+          }
+        },
+        "parameters": {
+          "$connections": {
+            "value": {
+              "sql": {
+                "connectionId": "[resourceId('Microsoft.Web/connections', variables('connectionName'))]",
+                "connectionName": "[variables('connectionName')]",
+                "id": "[variables('sqlApiId')]",
+                "connectionProperties": {
+                  "authentication": { "type": "ManagedServiceIdentity" }
+                }
+              }
+            }
+          },
+          "sqlServer": { "value": "[parameters('sqlServer')]" },
+          "sqlDatabase": { "value": "[parameters('sqlDatabase')]" }
+        }
+      }
+    },
+    {
+      "comments": "The confirmation workflow. This is what the card's Action.OpenUrl link points at, so it is what preview generators and link scanners will fetch. It holds no connection and has no ApiConnection action, so it cannot change anything however many times it is replayed. The recording URL is injected at deploy time because a workflow cannot call listCallbackUrl() for a different workflow at run time.",
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2019-05-01",
+      "name": "[parameters('confirmName')]",
+      "location": "[parameters('location')]",
+      "tags": { "CostCenter": "[parameters('costCenter')]", "Owner": "[parameters('owner')]", "Environment": "[parameters('environment')]", "DataClassification": "synthetic", "Workload": "bi-triage-accelerator" },
+      "dependsOn": [
+        "[resourceId('Microsoft.Logic/workflows', parameters('name'))]"
+      ],
+      "properties": {
+        "state": "Enabled",
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "recordUrl": { "type": "SecureString", "defaultValue": "" }
           },
           "triggers": {
             "manual": {
               "type": "Request",
               "kind": "Http",
               "inputs": {
+                "method": "GET",
                 "schema": {}
               }
             }
           },
           "actions": {
-            "Is_it_a_confirmation": {
-              "type": "If",
+            "Ask_for_confirmation": {
+              "type": "Response",
+              "kind": "Http",
               "runAfter": {},
-              "expression": {
-                "and": [
-                  {
-                    "equals": [
-                      "@toupper(triggerOutputs()['method'])",
-                      "POST"
-                    ]
-                  }
-                ]
-              },
-              "actions": {
-                "Read_the_request": {
-                  "type": "Http",
-                  "runAfter": {},
-                  "inputs": {
-                    "method": "GET",
-                    "uri": "@{parameters('entityPrefix')}@{encodeUriComponent(triggerOutputs()['queries']['request_id'])}')",
-                    "headers": {
-                      "x-ms-version": "2019-02-02",
-                      "Accept": "application/json;odata=minimalmetadata"
-                    },
-                    "authentication": {
-                      "type": "ManagedServiceIdentity",
-                      "audience": "@parameters('storageAudience')"
-                    }
-                  }
-                },
-                "Is_it_answerable": {
-                  "type": "If",
-                  "runAfter": {
-                    "Read_the_request": [
-                      "Succeeded"
-                    ]
-                  },
-                  "expression": {
-                    "and": [
-                      {
-                        "equals": [
-                          "@empty(coalesce(body('Read_the_request')?['decision'], ''))",
-                          true
-                        ]
-                      },
-                      {
-                        "equals": [
-                          "@coalesce(body('Read_the_request')?['fingerprint'], '')",
-                          "@coalesce(triggerOutputs()['queries']?['fingerprint'], '')"
-                        ]
-                      },
-                      {
-                        "less": [
-                          "@utcNow()",
-                          "@coalesce(body('Read_the_request')?['expires_at'], '9999-01-01T00:00:00Z')"
-                        ]
-                      }
-                    ]
-                  },
-                  "actions": {
-                    "Record_the_decision": {
-                      "type": "Http",
-                      "runAfter": {},
-                      "inputs": {
-                        "method": "POST",
-                        "uri": "@{parameters('entityPrefix')}@{encodeUriComponent(triggerOutputs()['queries']['request_id'])}')",
-                        "headers": {
-                          "x-ms-version": "2019-02-02",
-                          "Content-Type": "application/json",
-                          "Accept": "application/json;odata=nometadata",
-                          "X-HTTP-Method": "MERGE",
-                          "If-Match": "@{coalesce(outputs('Read_the_request')?['headers']?['ETag'], '*')}"
-                        },
-                        "body": {
-                          "decision": "@{triggerOutputs()['queries']['decision']}",
-                          "responder_claimed": "@{coalesce(triggerOutputs()['queries']?['responder'], 'teams-card')}",
-                          "reason": "@{coalesce(triggerOutputs()['queries']?['reason'], '')}",
-                          "decided_at": "@{utcNow()}"
-                        },
-                        "authentication": {
-                          "type": "ManagedServiceIdentity",
-                          "audience": "@parameters('storageAudience')"
-                        }
-                      }
-                    },
-                    "Confirm": {
-                      "type": "Response",
-                      "kind": "Http",
-                      "runAfter": {
-                        "Record_the_decision": [
-                          "Succeeded"
-                        ]
-                      },
-                      "inputs": {
-                        "statusCode": 200,
-                        "headers": {
-                          "Content-Type": "text/html; charset=utf-8"
-                        },
-                        "body": "<!doctype html><meta charset=\"utf-8\"><title>Decision recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Decision recorded</h1><p style=\"margin:0 0 8px\"><b>@{triggerOutputs()['queries']['decision']}</b> &mdash; @{triggerOutputs()['queries']['request_id']}</p><p style=\"color:#9fb0c3\">The agent picks this up on its next poll. You can close this tab.</p>"
-                      }
-                    },
-                    "Lost_the_race": {
-                      "type": "Response",
-                      "kind": "Http",
-                      "runAfter": {
-                        "Record_the_decision": [
-                          "Failed",
-                          "TimedOut"
-                        ]
-                      },
-                      "inputs": {
-                        "statusCode": 409,
-                        "headers": {
-                          "Content-Type": "text/html; charset=utf-8"
-                        },
-                        "body": "<!doctype html><meta charset=\"utf-8\"><title>Not recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Not recorded</h1><p style=\"color:#9fb0c3\">Someone answered this request at the same moment. Their decision stands and nothing here was changed.</p>"
-                      }
-                    }
-                  },
-                  "else": {
-                    "actions": {
-                      "Refuse": {
-                        "type": "Response",
-                        "kind": "Http",
-                        "runAfter": {},
-                        "inputs": {
-                          "statusCode": 409,
-                          "headers": {
-                            "Content-Type": "text/html; charset=utf-8"
-                          },
-                          "body": "<!doctype html><meta charset=\"utf-8\"><title>Not recorded</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Not recorded</h1><p style=\"color:#9fb0c3\">This request was already answered, has expired, or the link does not match it. Nothing was changed.</p>"
-                        }
-                      }
-                    }
-                  }
-                }
-              },
-              "else": {
-                "actions": {
-                  "Ask_for_confirmation": {
-                    "type": "Response",
-                    "kind": "Http",
-                    "runAfter": {},
-                    "inputs": {
-                      "statusCode": 200,
-                      "headers": {
-                        "Content-Type": "text/html; charset=utf-8"
-                      },
-                      "body": "<!doctype html><meta charset=\"utf-8\"><title>Confirm decision</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Confirm decision</h1><p style=\"margin:0 0 8px\">You are about to record <b>@{triggerOutputs()['queries']['decision']}</b> for request <code>@{triggerOutputs()['queries']['request_id']}</code>.</p><p style=\"color:#9fb0c3;margin:0 0 24px\">Nothing has been changed yet.</p><form method=\"POST\" action=\"@{listCallbackUrl()}\"><button type=\"submit\" style=\"background:#2ea043;color:#fff;border:0;border-radius:6px;padding:12px 22px;font-size:16px;cursor:pointer\">Confirm @{triggerOutputs()['queries']['decision']}</button></form>"
-                    }
-                  }
-                }
+              "description": "Renders a page whose button POSTs to the recording workflow. Nothing has changed at this point, and nothing in this workflow is able to change anything.",
+              "inputs": {
+                "statusCode": 200,
+                "headers": { "Content-Type": "text/html; charset=utf-8" },
+                "body": "<!doctype html><meta charset=\"utf-8\"><title>Confirm decision</title><body style=\"background:#0d1117;color:#e8edf4;font:16px/1.6 'Segoe UI',sans-serif;padding:48px\"><h1 style=\"font-size:26px;margin:0 0 12px\">Confirm decision</h1><p style=\"margin:0 0 8px\">You are about to record <b>@{coalesce(triggerOutputs()['queries']?['decision'], '')}</b> for request <code>@{coalesce(triggerOutputs()['queries']?['request_id'], '')}</code>.</p><p style=\"color:#9fb0c3;margin:0 0 24px\">Nothing has been changed yet.</p><form method=\"POST\" action=\"@{parameters('recordUrl')}&amp;request_id=@{encodeUriComponent(coalesce(triggerOutputs()['queries']?['request_id'], ''))}&amp;decision=@{encodeUriComponent(coalesce(triggerOutputs()['queries']?['decision'], ''))}&amp;fingerprint=@{encodeUriComponent(coalesce(triggerOutputs()['queries']?['fingerprint'], ''))}&amp;responder=@{encodeUriComponent(coalesce(triggerOutputs()['queries']?['responder'], 'teams-card'))}&amp;reason=@{encodeUriComponent(coalesce(triggerOutputs()['queries']?['reason'], ''))}\"><button type=\"submit\" style=\"background:#2ea043;color:#fff;border:0;border-radius:6px;padding:12px 22px;font-size:16px;cursor:pointer\">Confirm @{coalesce(triggerOutputs()['queries']?['decision'], '')}</button></form>"
               }
             }
-          },
-          "outputs": {}
+          }
         },
-        "parameters": {}
+        "parameters": {
+          "recordUrl": {
+            "value": "[listCallbackUrl(resourceId('Microsoft.Logic/workflows/triggers', parameters('name'), 'manual'), '2019-05-01').value]"
+          }
+        }
       }
     }
   ],
   "outputs": {
     "principalId": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('name')), '2019-05-01', 'full').identity.principalId]"
+      "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('name')), '2019-05-01', 'Full').identity.principalId]"
+    },
+    "confirmUrl": {
+      "type": "string",
+      "value": "[listCallbackUrl(resourceId('Microsoft.Logic/workflows/triggers', parameters('confirmName'), 'manual'), '2019-05-01').value]"
     }
   }
 }
+

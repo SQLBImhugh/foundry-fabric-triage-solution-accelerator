@@ -510,56 +510,121 @@ def test_no_file_refers_to_the_repository_this_was_extracted_from() -> None:
     )
 
 
-def test_the_approval_callback_never_changes_state_on_a_get() -> None:
+def _approval_workflows() -> tuple[dict, dict]:
+    """Return (recording, confirmation) workflow definitions from the template."""
+    template = json.loads(
+        (REPO_ROOT / "infra" / "approval-callback.json").read_text(encoding="utf-8")
+    )
+    workflows = [
+        r for r in template["resources"] if r["type"] == "Microsoft.Logic/workflows"
+    ]
+    assert len(workflows) == 2, "expected a recording workflow and a confirmation one"
+
+    by_method = {}
+    for wf in workflows:
+        trigger = wf["properties"]["definition"]["triggers"]["manual"]["inputs"]
+        by_method[trigger.get("method", "POST").upper()] = wf["properties"]["definition"]
+
+    assert "GET" in by_method and "POST" in by_method, (
+        f"expected one GET workflow and one POST workflow, got {sorted(by_method)}"
+    )
+    return by_method["POST"], by_method["GET"]
+
+
+def test_no_workflow_branches_on_a_trigger_method() -> None:
+    """`triggerOutputs()['method']` does not exist, and silently fails the run.
+
+    This is the test that was missing. An earlier version of the callback was a
+    single workflow that rendered a confirmation page on GET and wrote on POST,
+    branching on `toupper(triggerOutputs()['method'])`. A Consumption Request
+    trigger exposes only `headers`, `queries` and `body` -- there is no `method`
+    -- so that expression fails at run time with `InvalidTemplate` and the whole
+    run dies before reaching either branch. A GET never even got that far: the
+    trigger accepts one method, and rejects anything else with
+    `TriggerRequestMethodNotValid` before the workflow starts.
+
+    The old test asserted that the template *contained* that expression, so it
+    passed for as long as the feature was broken. Shape is not behaviour.
+    """
+    template = json.loads(
+        (REPO_ROOT / "infra" / "approval-callback.json").read_text(encoding="utf-8")
+    )
+    definitions = json.dumps(
+        [
+            r["properties"]["definition"]
+            for r in template["resources"]
+            if r["type"] == "Microsoft.Logic/workflows"
+        ]
+    )
+    assert "triggerOutputs()['method']" not in definitions, (
+        "a Request trigger has no 'method' property; branching on it fails the run"
+    )
+
+
+def test_the_workflow_a_link_preview_reaches_cannot_change_anything() -> None:
     """A link in a Teams message is fetched by things that are not people.
 
-    Preview generators, link scanners and prefetchers all issue GET. The first
-    version of this workflow recorded the decision directly on GET, so an
-    approval could be granted by a mail client rendering a card. An approval
-    that a link preview can grant is not an approval, it is a URL.
-
-    GET must now return a confirmation page, and only POST may write.
+    Preview generators, link scanners and prefetchers all issue GET. The card's
+    Action.OpenUrl link therefore has to point at a workflow with nothing to
+    change -- not at one that decides whether to change something.
     """
-    workflow = json.loads(
-        (REPO_ROOT / "infra" / "approval-callback.json").read_text(encoding="utf-8")
+    _recording, confirmation = _approval_workflows()
+
+    actions = confirmation["actions"]
+    kinds = {a.get("type") for a in actions.values()}
+    assert kinds == {"Response"}, (
+        f"the GET workflow has non-Response actions {sorted(kinds)}; it must only render"
     )
-    definition = workflow["resources"][0]["properties"]["definition"]
+    assert "$connections" not in confirmation.get("parameters", {}), (
+        "the GET workflow holds a connection, so it is capable of writing"
+    )
+    assert "ApiConnection" not in json.dumps(confirmation)
 
-    trigger = definition["triggers"]["manual"]["inputs"]
-    assert trigger.get("method") != "GET", (
-        "the trigger accepts only GET, so the confirmation POST cannot reach it"
+
+def test_the_recording_workflow_is_not_reachable_by_get() -> None:
+    """Only the POST side writes, and it must not be widened to accept GET."""
+    recording, _confirmation = _approval_workflows()
+
+    trigger = recording["triggers"]["manual"]["inputs"]
+    assert trigger.get("method", "POST").upper() == "POST", (
+        "the recording workflow accepts GET, so a link preview could write"
     )
 
-    body = json.dumps(definition["actions"])
-    assert "toupper(triggerOutputs()['method'])" in body, (
-        "nothing branches on the HTTP method, so GET and POST do the same thing"
-    )
 
-    # The write must sit inside the POST branch, not at the top level.
-    post_branch = definition["actions"]["Is_it_a_confirmation"]["actions"]
-    assert "Read_the_request" in post_branch
-    assert "Ask_for_confirmation" in definition["actions"]["Is_it_a_confirmation"]["else"]["actions"]
+def test_the_decision_is_a_parameterised_procedure_call() -> None:
+    """Everything in the callback URL is attacker-controllable.
 
-
-def test_the_approval_write_is_conditional_on_the_etag_it_read() -> None:
-    """`If-Match: *` let two decisions overwrite each other silently.
-
-    An Approve and a Decline arriving together could both pass the "already
-    answered?" check and both write, and the last one to land would win with no
-    record that the other happened.
+    Anyone holding the link can edit the request id, decision and responder, so
+    they are procedure parameters. A query assembled from them by string
+    concatenation would be an injection point reachable by anyone who can read
+    a Teams channel.
     """
-    workflow = json.loads(
-        (REPO_ROOT / "infra" / "approval-callback.json").read_text(encoding="utf-8")
-    )
-    definition = workflow["resources"][0]["properties"]["definition"]
-    record = (
-        definition["actions"]["Is_it_a_confirmation"]["actions"]["Is_it_answerable"]
-        ["actions"]["Record_the_decision"]
-    )
+    recording, _confirmation = _approval_workflows()
+    record = recording["actions"]["Record_the_decision"]["inputs"]
 
-    if_match = record["inputs"]["headers"]["If-Match"]
-    assert if_match != "*", "unconditional write: concurrent decisions can overwrite"
-    assert "Read_the_request" in if_match, "the write does not use the ETag it read"
+    assert "/procedures/" in record["path"], "the write is not a stored procedure call"
+    assert "/query/sql" not in record["path"], "the write runs raw SQL"
+    for field in ("request_id", "decision", "responder", "fingerprint"):
+        assert field in record["body"], f"{field} is not passed as a parameter"
+
+
+def test_the_decision_write_is_conditional_and_checked() -> None:
+    """Zero rows changed is a refusal, and must be rendered as one.
+
+    The procedure moves the row from unanswered to answered in one statement, so
+    a second click matches nothing. If the workflow ignored the row count it
+    would tell the second clicker their decision was recorded when the first
+    one still stands.
+    """
+    recording, _confirmation = _approval_workflows()
+    branch = recording["actions"]["Was_it_recorded"]
+
+    expression = json.dumps(branch["expression"])
+    assert "recorded" in expression, "the workflow does not check the row count"
+    assert "Refuse" in json.dumps(branch["else"]), "there is no refusal branch"
+    assert "Could_not_reach_the_database" in recording["actions"], (
+        "a failed write has no branch, so it would fall through as success"
+    )
 
 
 def test_the_scheduler_waits_longer_than_the_approval_window() -> None:

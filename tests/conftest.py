@@ -31,10 +31,11 @@ def test_settings() -> Settings:
         powerbi_tenant_id="",
         teams_webhook_url="",
         applicationinsights_connection_string="",
-        # Without this an operator's populated .env would silently point the
-        # test suite at a live Azure table. Tests that reach the network are
-        # not tests.
-        incident_table_endpoint="",
+        # Without these an operator's populated .env would silently point the
+        # test suite at a live Fabric SQL database. Tests that reach the
+        # network are not tests.
+        fabric_sql_server="",
+        fabric_sql_database="",
     )
 
 

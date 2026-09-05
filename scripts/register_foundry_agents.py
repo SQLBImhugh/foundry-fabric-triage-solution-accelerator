@@ -173,6 +173,26 @@ def get_agent(client, endpoint: str, name: str) -> dict[str, Any] | None:
     resp = client.get(f"{endpoint}/agents/{name}", params={"api-version": API_VERSION})
     if resp.status_code == 404:
         return None
+    if resp.status_code == 403:
+        # Being told to read https://developer.mozilla.org about HTTP 403, via
+        # an httpx stack trace, is not a useful answer to "which role do I
+        # need". Subscription Owner is not enough here: Foundry agents are a
+        # data-plane resource and the Cognitive Services roles do not grant
+        # them, despite carrying Microsoft.CognitiveServices/* data actions.
+        raise SystemExit(
+            f"\nRefused (403) reading agent '{name}'.\n\n"
+            "Your identity needs a Foundry role on the Foundry ACCOUNT scope\n"
+            "(not the project, and not a 'Cognitive Services ...' role):\n\n"
+            "  az role assignment create \\\n"
+            "    --assignee-object-id <your object id> --assignee-principal-type User \\\n"
+            "    --role \"Foundry Project Manager\" \\\n"
+            "    --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/"
+            "Microsoft.CognitiveServices/accounts/<account>\n\n"
+            "A project created in the Foundry portal grants this automatically to\n"
+            "its creator; one created with the CLI or from IaC does not, which is\n"
+            "why this can fail for you and work for a colleague.\n"
+            "See https://learn.microsoft.com/azure/foundry/concepts/rbac-foundry\n"
+        )
     resp.raise_for_status()
     return resp.json()
 

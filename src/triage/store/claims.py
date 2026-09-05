@@ -18,9 +18,9 @@ not even span two requests to the same container.
 
 This is the missing primitive: a claim that exactly one caller can hold.
 
-``create_entity`` on Azure Tables fails with ``ResourceExistsError`` when the row
-is already there. That is an atomic compare-and-set against shared state, which
-is all a lease needs. No extra service, and it reuses the storage account the
+``INSERT`` on a primary key fails with ``IntegrityError`` when the row is
+already there. That is an atomic compare-and-set against shared state, which is
+all a lease needs. No extra service, and it reuses the Fabric SQL database the
 incident store already requires.
 
 Claims expire. A container that crashes mid-remediation must not hold a lock for
@@ -32,11 +32,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import secrets
 import threading
 import time
 from typing import Any, Protocol
-
-from triage.store.table_helpers import build_table_client
 
 logger = logging.getLogger("triage.store.claims")
 
@@ -46,14 +45,26 @@ DEFAULT_LEASE_SECONDS = 600
 
 
 def _row_key(key: str) -> str:
-    """Hash the key: a message id can contain characters Table keys reject."""
+    """Hash the key so the primary key is a fixed, bounded width.
+
+    A message id has no length limit worth relying on, and a primary key column
+    does. Hashing also keeps the key printable, which matters because the
+    readable original is stored alongside it in ``claim_text``.
+    """
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:48]
 
 
 def _owner() -> str:
-    """Who holds the claim. Only ever read by a human looking at the table."""
+    """Who holds this particular claim.
+
+    A short random token is appended to the host and pid because those two are
+    not unique enough: a hosted agent is constructed fresh per request inside
+    one container, so two overlapping invocations share both. Without the
+    token, the second invocation's release would match the first invocation's
+    row and hand the claim back while work was still running.
+    """
     host = os.environ.get("CONTAINER_APP_REPLICA_NAME") or os.environ.get("HOSTNAME") or "local"
-    return f"{host}:{os.getpid()}"
+    return f"{host}:{os.getpid()}:{secrets.token_hex(4)}"
 
 
 class ClaimStore(Protocol):
@@ -90,119 +101,130 @@ class InMemoryClaimStore:
             self._held.pop(key, None)
 
 
-class AzureTableClaimStore:
-    """A lease held in a table row, taken with a conditional create.
+class FabricSqlClaimStore:
+    """A lease held in a row, taken with a primary-key insert.
 
     Unlike the incident and processed stores, this one does **not** degrade
     silently to in-memory. Those degrade because losing them makes the agent
     noisy; losing this one makes it act twice, and acting twice is the thing it
-    exists to prevent. If the table cannot be reached, ``claim`` returns False
-    and the work is skipped until storage comes back.
+    exists to prevent. If the database cannot be reached, ``claim`` returns
+    False and the work is skipped until it comes back.
+
+    Two SQL properties do the whole job, and both are single statements:
+
+    * ``INSERT`` on a primary key raises ``IntegrityError`` when someone
+      already holds the claim. That is an atomic compare-and-set.
+    * ``UPDATE ... WHERE expires_at < SYSUTCDATETIME()`` steals an expired
+      claim and reports through ``rowcount`` whether this caller won. Two
+      racers cannot both get 1.
+
+    The Azure Table version needed a read, an ETag and a conditional replace to
+    express the second one. This is the same guarantee in one round trip, and
+    the expiry comparison happens on the server, so it does not depend on the
+    caller's clock being right.
     """
 
-    _PARTITION = "claim"
+    def __init__(self, *, db: Any, table: str = "triage_claims") -> None:
+        from triage.store.fabric_sql import quote_identifier
 
-    def __init__(
-        self,
-        *,
-        endpoint: str,
-        table_name: str = "claims",
-        credential: Any = None,
-    ) -> None:
-        self._table_name = table_name
-        self._client = None
-        try:
-            self._client = build_table_client(endpoint, table_name, credential)
-        except Exception as exc:
-            logger.error(
-                "Claim store unavailable (%s at %s, %s). Work that requires a "
-                "claim will be skipped rather than risk being done twice.",
-                table_name,
-                endpoint,
-                type(exc).__name__,
-            )
+        self._db = db
+        self._table = quote_identifier(table)
+        self._table_name = table
+        #: Claims this instance actually holds, so release can prove ownership
+        #: rather than deleting whatever row happens to have the key.
+        self._held: dict[str, str] = {}
 
     @property
     def is_durable(self) -> bool:
-        return self._client is not None
+        return self._db.is_available
 
     def claim(self, key: str, *, lease_seconds: int = DEFAULT_LEASE_SECONDS) -> bool:
-        if self._client is None:
-            return False
-
-        from azure.core.exceptions import ResourceExistsError
-
         row = _row_key(key)
-        now = time.time()
-        entity = {
-            "PartitionKey": self._PARTITION,
-            "RowKey": row,
-            "owner": _owner(),
-            "claimed_at": now,
-            "expires_at": now + lease_seconds,
-            # Kept for debugging: without it a row is an opaque hash.
-            "claim_key": key[:512],
-        }
+        owner = _owner()
 
         try:
-            self._client.create_entity(entity)
+            self._db.execute(
+                f"INSERT INTO {self._table} "
+                f"(claim_key, owner, claimed_at, expires_at, claim_text) "
+                f"VALUES (?, ?, SYSUTCDATETIME(), "
+                f"DATEADD(second, ?, SYSUTCDATETIME()), ?)",
+                row,
+                owner,
+                int(lease_seconds),
+                key[:512],
+            )
+            self._held[row] = owner
             return True
-        except ResourceExistsError:
-            pass
-        except Exception as exc:
-            logger.error("Could not take claim %r (%s); skipping", key, type(exc).__name__)
-            return False
-
-        # Someone holds it. Take it over only if their lease has expired, and
-        # use the ETag so two callers racing to steal the same dead claim cannot
-        # both win.
-        try:
-            existing = self._client.get_entity(self._PARTITION, row)
-            expires_at = float(existing.get("expires_at", 0) or 0)
-            if expires_at > now:
+        except Exception as exc:  # noqa: BLE001
+            if not _is_duplicate_key(self._db, exc):
+                logger.error(
+                    "Could not take claim %r (%s); skipping rather than risk "
+                    "doing the work twice",
+                    key,
+                    type(exc).__name__,
+                )
                 return False
 
-            from azure.core import MatchConditions
-
-            logger.warning(
-                "Stealing expired claim %r from %s (expired %.0fs ago)",
-                key,
-                existing.get("owner", "unknown"),
-                now - expires_at,
+        # Somebody holds it. Take it over only if their lease has expired. The
+        # WHERE clause is the arbiter, so a loser gets rowcount 0 rather than
+        # silently overwriting the winner.
+        try:
+            won = self._db.execute(
+                f"UPDATE {self._table} "
+                f"   SET owner = ?, claimed_at = SYSUTCDATETIME(), "
+                f"       expires_at = DATEADD(second, ?, SYSUTCDATETIME()) "
+                f" WHERE claim_key = ? AND expires_at < SYSUTCDATETIME()",
+                owner,
+                int(lease_seconds),
+                row,
             )
-            self._client.update_entity(
-                entity,
-                mode="replace",
-                etag=existing.metadata["etag"],
-                match_condition=MatchConditions.IfNotModified,
-            )
-            return True
-        except Exception as exc:
-            # Includes the lost race: the other caller updated first, its ETag
-            # no longer matches, and this one correctly does not get the claim.
+        except Exception as exc:  # noqa: BLE001
             logger.info("Did not take claim %r (%s)", key, type(exc).__name__)
             return False
 
+        if won:
+            logger.warning("Stole expired claim %r for %s", key, owner)
+            self._held[row] = owner
+            return True
+        return False
+
     def release(self, key: str) -> None:
-        """Give the claim back early.
+        """Give the claim back early, and only if this caller still holds it.
 
         Not required for correctness -- leases expire -- but releasing after a
         run means a retry of the same message does not wait ten minutes.
+
+        The owner check is load-bearing rather than tidy. A caller whose lease
+        expired mid-run, and whose claim was therefore stolen by somebody else,
+        would otherwise delete the *new* holder's live claim on its way out and
+        let a third caller straight in. Deleting by key alone quietly converts a
+        slow run into duplicate work.
         """
-        if self._client is None:
+        row = _row_key(key)
+        owner = self._held.pop(row, None)
+        if owner is None:
+            # Never held it in this process, so there is nothing to give back.
             return
         try:
-            self._client.delete_entity(self._PARTITION, _row_key(key))
-        except Exception as exc:
+            self._db.execute(
+                f"DELETE FROM {self._table} WHERE claim_key = ? AND owner = ?",
+                row,
+                owner,
+            )
+        except Exception as exc:  # noqa: BLE001
             logger.debug("Could not release claim %r (%s)", key, type(exc).__name__)
 
 
-def build_claim_store(
-    *, endpoint: str, table_name: str = "claims", credential: Any = None
-) -> ClaimStore:
-    """Durable when storage is configured, in-process when it is not."""
-    if not endpoint:
+def _is_duplicate_key(db: Any, exc: Exception) -> bool:
+    """True when the driver rejected an insert for violating the primary key."""
+    try:
+        return isinstance(exc, db.integrity_error())
+    except Exception:  # pragma: no cover - driver missing entirely
+        return False
+
+
+def build_claim_store(*, db: Any = None, table: str = "triage_claims") -> ClaimStore:
+    """Durable when a Fabric SQL database is configured, in-process when not."""
+    if db is None:
         return InMemoryClaimStore()
-    return AzureTableClaimStore(
-        endpoint=endpoint, table_name=table_name, credential=credential
-    )
+    return FabricSqlClaimStore(db=db, table=table)

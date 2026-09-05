@@ -17,7 +17,7 @@ Hosted agent: bi-triage-controller          <- container, Python, its own agent 
         |-- Prompt agent: bi-triage -----> reasoning       (no permissions at all)
         |-- Prompt agent: bi-data-quality-> evidence       (no permissions at all)
         |-- Power BI REST --------------> refresh history + retry  (agent identity)
-        |-- Azure Table ----------------> incident store   (agent identity)
+        |-- Fabric SQL -----------------> state store      (agent identity)
         `-- App Insights ---------------> traces           (agent identity)
 ```
 
@@ -57,7 +57,7 @@ This is the part worth knowing before designing around it.
 
 | Service | Accepts an Entra agent identity? | Evidence |
 |---|---|---|
-| Azure RBAC (Storage Tables) | **Yes** | Container wrote an incident; read back from another machine |
+| Azure RBAC (Fabric SQL) | **Yes** | Added as a Fabric workspace `ServicePrincipal` and a database user; container wrote an incident, read back from another machine |
 | App Insights | **Yes** | After granting `Monitoring Metrics Publisher` |
 | Microsoft Graph — directory | **Yes** | `GET /v1.0/users` returned **200** from inside the container |
 | Microsoft Graph — **mail** | **No** | Same token, same container: **401** |
@@ -122,24 +122,45 @@ The filter fails closed, including when its own regex is invalid — a typo that
 silently disabled filtering would reopen the injection surface while appearing
 configured.
 
-## Durable incident state
+## Durable state
 
-Incidents live in Azure Table Storage. This is not about history: incident state
-is what makes the agent **idempotent**. It is how a second alert about a problem
-already being worked is recognised as a duplicate rather than triggering a
-second remediation. A container that forgets on restart is a container licensed
-to act twice.
+State lives in a **Fabric SQL Database**, in the same workspace as the semantic
+models being triaged. This is not about history: incident state is what makes
+the agent **idempotent**. It is how a second alert about a problem already being
+worked is recognised as a duplicate rather than triggering a second
+remediation. A container that forgets on restart is a container licensed to act
+twice.
+
+It replaced Azure Table Storage. Three things came out of that:
+
+- **Claims and leases got simpler and stronger.** `UPDATE ... WHERE expires_at <
+  SYSUTCDATETIME()` is one atomic statement whose `rowcount` names the winner,
+  where the Table version needed a read, an ETag and a conditional replace. The
+  expiry is evaluated by the server, so it no longer depends on any container's
+  clock. Verified live with eight concurrent threads: exactly one winner.
+- **There is no key.** Fabric SQL accepts Entra tokens only, so the "no local
+  auth" posture is the platform default rather than something governance keeps
+  reverting.
+- **The driver had to be chosen for the container.** `pyodbc` needs the
+  `msodbcsql18` system package, and this image is built by pip from
+  `src/requirements.txt` with no chance to install one. `mssql-python` ships the
+  driver inside the wheel and has a cp313 manylinux build matching the
+  `python_3_13` runtime.
 
 The store degrades to in-memory and says so loudly rather than refusing to
-start. The agent should survive storage going away.
+start. The agent should survive its database going away.
 
-Two governance notes, both encountered rather than anticipated:
+**But degradation must end when the outage does**, and originally it did not.
+Tenant policy disabled public network access on the old storage account minutes
+after it was created. The container started while it was unreachable, fell back
+to in-memory, and then reported healthy triage outcomes while persisting none of
+them — including after connectivity was restored, because the client was opened
+once in `__init__` and nothing ever tried again. Three invocations were lost
+before a redeploy fixed it.
 
-- The storage account was created with **shared key access already disabled**.
-  That validates the identity-based design rather than fighting it.
-- **Public network access was disabled within minutes of creation.** Resolved
-  with the supported `SecurityControl=Ignore` exemption tag plus a
-  justification — not by arguing with the control.
+Availability is now re-evaluated on use, and recovery **reloads** rather than
+merely reconnecting: `find_open` is what stops a second remediation, and an
+empty cache answers "no open incident" to everything.
 
 ## Two entry paths, one code path
 
@@ -240,6 +261,8 @@ Grants the controller's agent identity needs:
 
 | Scope | Role |
 |---|---|
-| Storage account | `Storage Table Data Contributor` |
+| Fabric workspace | `Contributor` (principal type `ServicePrincipal`) |
+| Fabric SQL Database | database user + `db_datareader`, `db_datawriter`, `db_ddladmin` |
+| Foundry account | `Foundry Agent Consumer` (to invoke the prompt agents) |
 | Application Insights | `Monitoring Metrics Publisher` |
 | Power BI workspace | Admin (principal type `App`) |

@@ -78,16 +78,25 @@ services:
             # different thing from removing the check.
             - name: GRAPH_SENDER_ALLOWLIST
               value: ${GRAPH_SENDER_ALLOWLIST}
-            - name: INCIDENT_TABLE_ENDPOINT
-              value: ${INCIDENT_TABLE_ENDPOINT}
+            - name: FABRIC_SQL_SERVER
+              value: ${FABRIC_SQL_SERVER}
+            - name: FABRIC_SQL_DATABASE
+              value: ${FABRIC_SQL_DATABASE}
             - name: INCIDENT_TABLE_NAME
-              value: incidents
+              value: triage_incidents
+            # Traces. Without this the container emits nothing, and the first
+            # anyone knows of a failed run is that nobody was told about an
+            # incident. It was missing from this file for exactly that reason:
+            # the deployment guide said to set it, nothing here passed it in,
+            # and the deployed agent had no telemetry while appearing to.
+            - name: APPLICATIONINSIGHTS_CONNECTION_STRING
+              value: ${APPLICATIONINSIGHTS_CONNECTION_STRING}
             # Approval requests wait here and human decisions land here. It has
             # to be shared, durable state: the agent writes the request in one
             # invocation and a person answers from somewhere else entirely, a
             # Teams card or `bi-triage approve`.
             - name: APPROVAL_TABLE_NAME
-              value: approvals
+              value: triage_approvals
             # The URL behind the card's Approve/Decline buttons. A card posted
             # through an incoming webhook has no bot behind it, so Action.Submit
             # does nothing; the buttons have to be links to something that

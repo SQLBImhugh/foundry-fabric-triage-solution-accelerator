@@ -395,6 +395,20 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     live = settings.triage_tool_mode == "live"
     row("Graph tenant", settings.graph_tenant_id, bool(settings.graph_tenant_id), optional=not live)
     row("Power BI workspace", settings.powerbi_workspace_id, bool(settings.powerbi_workspace_id), optional=not live)
+    # Durable state is what makes the agent idempotent across invocations, so
+    # it is reported even offline: a hosted deployment without it silently
+    # forgets every open incident on restart and can remediate twice.
+    sql_target = (
+        f"{settings.fabric_sql_database} on {settings.fabric_sql_server}"
+        if settings.fabric_sql_server and settings.fabric_sql_database
+        else ""
+    )
+    row(
+        "Fabric SQL state",
+        sql_target or "(json files under runs/)",
+        bool(sql_target),
+        optional=not live,
+    )
     row("Teams webhook", "set" if settings.teams_webhook_url else "", bool(settings.teams_webhook_url), optional=not live)
     row(
         "App Insights",
@@ -641,6 +655,18 @@ def cmd_identity(args: argparse.Namespace) -> int:
 
     try:
         token = _operator_graph_token()
+    except ModuleNotFoundError as exc:
+        # This used to be reported as an authentication failure telling the
+        # operator to run `az login`, which is advice that cannot possibly
+        # help: the azure-identity package simply is not installed. A wrong
+        # diagnosis costs more than no diagnosis, because it sends people to
+        # re-authenticate repeatedly against a problem that is not auth.
+        console.print(
+            f"[red]Missing dependency[/red] ({exc.name}). Identity lookups need "
+            "the Azure extra:\n"
+            "  .\\.venv\\Scripts\\python.exe -m pip install -e \".[azure]\""
+        )
+        return 2
     except Exception as exc:
         console.print(
             f"[red]Could not authenticate to Microsoft Graph[/red] ({type(exc).__name__}). "

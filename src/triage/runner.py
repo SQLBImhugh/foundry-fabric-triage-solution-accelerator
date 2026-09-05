@@ -197,6 +197,10 @@ class TriageRunner:
         self.settings = settings
         self.base_dir = Path(base_dir)
         self.on_event = on_event
+        # One database handle shared by every store. A hosted agent is
+        # constructed fresh for each request, so six separate connections would
+        # mean six Entra logins per alert rather than one.
+        self._sql = self._build_sql()
         self.store: IncidentStore = store or self._build_store()
         self.flag_table = DataQualityFlagTable(
             flag_table_path or (self.base_dir / "runs" / "dq_flags.csv")
@@ -249,50 +253,96 @@ class TriageRunner:
             )
         return resolved
 
+    @property
+    def sql(self):
+        """The shared Fabric SQL handle, or None when running offline.
+
+        Exposed so the hosted entry point can build its claim store on the same
+        connection instead of opening a second one.
+        """
+        return self._sql
+
+    def _build_sql(self):
+        """Open the shared Fabric SQL handle, or return None when unconfigured.
+
+        Returning None is the offline path: every store then falls back to its
+        JSON file, which is correct on a laptop and needs no driver installed.
+        The schema is created here rather than by a migration step, so an
+        adopter pointing at an empty database gets a working system without a
+        separate command.
+        """
+        server = getattr(self.settings, "fabric_sql_server", "")
+        database = getattr(self.settings, "fabric_sql_database", "")
+        if not server or not database:
+            return None
+
+        from triage.store.fabric_sql import FabricSqlDatabase
+
+        db = FabricSqlDatabase(
+            server=server, database=database, tables=self._sql_tables()
+        )
+        if not db.ensure_schema_once():
+            logger.error(
+                "Could not prepare the triage schema in %s. Stores will run "
+                "degraded and will retry, including the schema, on use.",
+                db.target,
+            )
+        return db
+
+    def _sql_tables(self) -> dict[str, str]:
+        s = self.settings
+        return {
+            "incidents": s.incident_table_name,
+            "processed": s.processed_table_name,
+            "approvals": s.approval_table_name,
+            "retries": s.retry_table_name,
+            "semantic_health": s.semantic_health_table_name,
+            "leases": getattr(s, "lease_table_name", "triage_sweep_leases"),
+            "claims": s.claim_table_name,
+        }
+
     def _build_store(self) -> IncidentStore:
         """Choose where incidents live.
 
-        Falls back to the JSON file when no table is configured, so the offline
-        rehearsal path is unchanged and needs no Azure dependencies.
+        Falls back to the JSON file when no database is configured, so the
+        offline rehearsal path is unchanged and needs no SQL driver.
         """
-        endpoint = self.settings.incident_table_endpoint
-        if not endpoint:
+        if self._sql is None:
             return JsonFileIncidentStore(self.base_dir / "runs" / "incidents.json")
 
-        from triage.store.azure_table import AzureTableIncidentStore
+        from triage.store.sql_incidents import FabricSqlIncidentStore
 
-        store = AzureTableIncidentStore(
-            endpoint=endpoint, table_name=self.settings.incident_table_name
+        store = FabricSqlIncidentStore(
+            db=self._sql, table=self.settings.incident_table_name
         )
         if not store.is_durable:
             logger.warning(
                 "Incident table %s unavailable; incidents will not survive a restart",
-                endpoint,
+                self.settings.incident_table_name,
             )
         return store
 
     def build_processed_log(self):
         """Where the record of already-triaged mail lives.
 
-        Mirrors ``_build_store``: the table when one is configured, a JSON file
-        otherwise, so the offline path needs no Azure dependency. This has to
-        outlive the process -- a hosted agent is rebuilt for every invocation,
-        so anything held in memory here is always empty on arrival.
+        Mirrors ``_build_store``: the database when one is configured, a JSON
+        file otherwise. This has to outlive the process -- a hosted agent is
+        rebuilt for every invocation, so anything held in memory here is always
+        empty on arrival.
         """
-        endpoint = self.settings.incident_table_endpoint
-        if not endpoint:
+        if self._sql is None:
             return JsonFileProcessedLog(self.base_dir / "runs" / "processed.json")
 
-        from triage.store.processed import AzureTableProcessedLog
+        from triage.store.processed import FabricSqlProcessedLog
 
-        log = AzureTableProcessedLog(
-            endpoint=endpoint, table_name=self.settings.processed_table_name
+        log = FabricSqlProcessedLog(
+            db=self._sql, table=self.settings.processed_table_name
         )
         if not log.is_durable:
             logger.error(
-                "Processed-message log at %s is not durable; scheduled sweeps will "
+                "Processed-message log %s is not durable; scheduled sweeps will "
                 "re-triage the same mail and notify repeatedly",
-                endpoint,
+                self.settings.processed_table_name,
             )
         return log
 
@@ -583,20 +633,21 @@ class TriageRunner:
         if path is not None:
             return JsonFileSemanticHealthStore(path)
 
-        endpoint = self.settings.incident_table_endpoint
-        if not endpoint:
+        if self._sql is None:
             return JsonFileSemanticHealthStore(self.base_dir / "runs" / "semantic_health.json")
 
-        from triage.store.semantic_health import AzureTableSemanticHealthStore
+        from triage.store.semantic_health import FabricSqlSemanticHealthStore
 
-        store = AzureTableSemanticHealthStore(
-            endpoint=endpoint, table_name=self.settings.semantic_health_table_name
+        store = FabricSqlSemanticHealthStore(
+            db=self._sql,
+            table=self.settings.semantic_health_table_name,
+            lease_table=getattr(self.settings, "lease_table_name", "triage_sweep_leases"),
         )
         if not store.is_durable:
             logger.error(
-                "Semantic health store at %s is not durable; the silent-failure "
+                "Semantic health store %s is not durable; the silent-failure "
                 "detector will start blind on every sweep and detect nothing",
-                endpoint,
+                self.settings.semantic_health_table_name,
             )
         return store
 
@@ -627,44 +678,40 @@ class TriageRunner:
         if path is not None:
             return JsonFileRetryStore(path)
 
-        endpoint = self.settings.incident_table_endpoint
-        if not endpoint:
+        if self._sql is None:
             return JsonFileRetryStore(self.base_dir / "runs" / "retries.json")
 
-        from triage.store.retries import AzureTableRetryStore
+        from triage.store.retries import FabricSqlRetryStore
 
-        store = AzureTableRetryStore(
-            endpoint=endpoint, table_name=self.settings.retry_table_name
-        )
+        store = FabricSqlRetryStore(db=self._sql, table=self.settings.retry_table_name)
         if not store.is_durable:
             logger.error(
-                "Retry store at %s is not durable; deferred retries will be dropped "
+                "Retry store %s is not durable; deferred retries will be dropped "
                 "rather than performed",
-                endpoint,
+                self.settings.retry_table_name,
             )
         return store
 
     def build_approval_channel(self):
         """Where approval requests wait and decisions land.
 
-        Same choice as the incident store: the table when one is configured, a
-        JSON file otherwise. It has to be shared state either way -- the whole
+        Same choice as the incident store: the database when one is configured,
+        a JSON file otherwise. It has to be shared state either way -- the whole
         point is that a *different* process writes the answer.
         """
-        endpoint = self.settings.incident_table_endpoint
-        if not endpoint:
+        if self._sql is None:
             return JsonFileApprovalChannel(self.base_dir / "runs" / "approvals.json")
 
-        from triage.store.approvals import AzureTableApprovalChannel
+        from triage.store.approvals import FabricSqlApprovalChannel
 
-        channel = AzureTableApprovalChannel(
-            endpoint=endpoint, table_name=self.settings.approval_table_name
+        channel = FabricSqlApprovalChannel(
+            db=self._sql, table=self.settings.approval_table_name
         )
         if not channel.is_durable:
             logger.error(
-                "Approval channel at %s is not durable; no human can answer and every "
+                "Approval channel %s is not durable; no human can answer and every "
                 "gated action will fail closed",
-                endpoint,
+                self.settings.approval_table_name,
             )
         return channel
 

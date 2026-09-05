@@ -28,8 +28,14 @@ httpx>=0.28
 rich>=13.7
 pyyaml>=6.0
 
-# Identity, storage and telemetry. No client-secret libraries: this container
+# Identity, state and telemetry. No client-secret libraries: this container
 # authenticates as its own Entra agent identity.
+#
+# mssql-python rather than pyodbc, and the reason is the container: this image
+# is built by pip from this file, with no opportunity to apt-get anything.
+# pyodbc needs the msodbcsql18 system driver and therefore cannot work here.
+# mssql-python ships the driver in the wheel and publishes a cp313 manylinux
+# build matching the python_3_13 runtime declared in azure.yaml.
 azure-identity>=1.17
-azure-data-tables>=12.5
+mssql-python>=1.14
 azure-monitor-opentelemetry>=1.6

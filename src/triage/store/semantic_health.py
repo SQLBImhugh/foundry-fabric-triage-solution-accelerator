@@ -31,8 +31,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from triage.store.table_helpers import build_table_client
-
 logger = logging.getLogger("triage.store.semantic_health")
 
 
@@ -217,85 +215,115 @@ class JsonFileSemanticHealthStore(InMemorySemanticHealthStore):
             self._path.unlink()
 
 
-class AzureTableSemanticHealthStore(InMemorySemanticHealthStore):
-    """The deployed path. Degrades to in-memory, loudly.
+class FabricSqlSemanticHealthStore(InMemorySemanticHealthStore):
+    """The deployed path. Degrades to in-memory, loudly, and keeps retrying.
 
     Degraded, every sweep starts with no history and can never detect a
     watermark that failed to advance. The detector would run, find nothing,
     and report health it has not established -- so this logs an error rather
-    than a warning.
+    than a warning, and reconnects rather than staying blind for the life of
+    the container.
     """
-
-    _PARTITION = "probe"
-    _LEASE_PARTITION = "lease"
 
     def __init__(
         self,
         *,
-        endpoint: str,
-        table_name: str = "semantichealth",
-        credential: Any = None,
+        db: Any,
+        table: str = "triage_semantic_health",
+        lease_table: str = "triage_sweep_leases",
     ) -> None:
-        super().__init__()
-        self._endpoint = endpoint
-        self._table_name = table_name
-        self._client = None
-        self._degraded = False
+        from triage.store.fabric_sql import quote_identifier
 
-        try:
-            self._client = self._build_client(credential)
-            self._load()
-        except Exception as exc:
-            self._degraded = True
-            logger.error(
-                "Semantic health store degraded to in-memory: could not open %s at %s "
-                "(%s). Every sweep will start blind and cannot detect staleness.",
-                table_name,
-                endpoint,
-                type(exc).__name__,
-            )
+        super().__init__()
+        self._db = db
+        self._table = quote_identifier(table)
+        self._table_name = table
+        self._lease_table = quote_identifier(lease_table)
+        self._loaded = False
+        self._ensure_loaded()
 
     @property
     def is_durable(self) -> bool:
-        return self._client is not None and not self._degraded
+        return self._loaded and self._db.is_available
 
-    def _build_client(self, credential: Any):
-        return build_table_client(self._endpoint, self._table_name, credential)
+    def _ensure_loaded(self) -> bool:
+        if self._loaded:
+            return True
+        try:
+            self._load()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Semantic health store degraded to in-memory: cannot read %s (%s). "
+                "Every sweep will start blind and cannot detect staleness.",
+                self._table_name,
+                type(exc).__name__,
+            )
+            return False
+        self._loaded = True
+        logger.info(
+            "Loaded %d probe baseline(s) from %s", len(self._items), self._table_name
+        )
+        return True
 
     def _load(self) -> None:
-        if self._client is None:
-            return
-        loaded = 0
-        for entity in self._client.list_entities():
-            raw = entity.get("payload")
+        rows = self._db.query(f"SELECT probe_key, payload FROM {self._table}")
+        loaded: dict[str, dict[str, Any]] = {}
+        for key, raw in rows:
             if not raw:
                 continue
             try:
-                self._items[str(entity["RowKey"])] = json.loads(raw)
-                loaded += 1
-            except Exception:
-                logger.warning("Skipping unreadable probe state %s", entity.get("RowKey"))
-        logger.info("Loaded %d probe baseline(s) from %s", loaded, self._table_name)
+                loaded[str(key)] = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                logger.warning("Skipping unreadable probe state %s", key)
+        self._items = loaded
+
+    def get(self, workspace_id: str, dataset_id: str, probe_name: str) -> ProbeState | None:
+        # Guarded: a missing baseline reads as "first sighting", which silently
+        # suppresses the staleness finding this store exists to produce.
+        self._ensure_loaded()
+        return super().get(workspace_id, dataset_id, probe_name)
+
+    def all_states(self) -> list[ProbeState]:
+        self._ensure_loaded()
+        return super().all_states()
 
     def _persist(self, key: str, state: ProbeState) -> None:
-        if self._client is None:
-            return
+        payload = json.dumps(state.as_dict())
+        promoted = (
+            state.probe_name,
+            state.report_name,
+            state.last_max_date,
+            int(state.last_row_count or 0),
+            int(state.suspect_count),
+            payload,
+        )
         try:
-            self._client.upsert_entity(
-                {
-                    "PartitionKey": self._PARTITION,
-                    "RowKey": key,
-                    # Promoted for operator queries; payload stays authoritative.
-                    "probe_name": state.probe_name,
-                    "report_name": state.report_name,
-                    "last_max_date": state.last_max_date,
-                    "last_row_count": state.last_row_count or 0,
-                    "suspect_count": state.suspect_count,
-                    "payload": json.dumps(state.as_dict()),
-                }
+            updated = self._db.execute(
+                f"UPDATE {self._table} SET probe_name = ?, report_name = ?, "
+                f"last_max_date = ?, last_row_count = ?, suspect_count = ?, "
+                f"payload = ? WHERE probe_key = ?",
+                *promoted,
+                key,
             )
-        except Exception as exc:
-            self._degraded = True
+            if not updated:
+                try:
+                    self._db.execute(
+                        f"INSERT INTO {self._table} (probe_key, probe_name, "
+                        f"report_name, last_max_date, last_row_count, "
+                        f"suspect_count, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        key,
+                        *promoted,
+                    )
+                except self._db.integrity_error():
+                    self._db.execute(
+                        f"UPDATE {self._table} SET probe_name = ?, report_name = ?, "
+                        f"last_max_date = ?, last_row_count = ?, suspect_count = ?, "
+                        f"payload = ? WHERE probe_key = ?",
+                        *promoted,
+                        key,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            self._loaded = False
             logger.error(
                 "Could not persist probe baseline %s (%s); the next sweep will be blind",
                 state.probe_name,
@@ -303,7 +331,7 @@ class AzureTableSemanticHealthStore(InMemorySemanticHealthStore):
             )
 
     def try_acquire_lease(self, name: str, owner: str, ttl_seconds: int) -> bool:
-        """Claim the sweep across instances, using the table as the arbiter.
+        """Claim the sweep across instances, using the database as the arbiter.
 
         A hosted agent is rebuilt per request and a schedule can wake more than
         one instance, so an in-process lock decides nothing. Two sweeps running
@@ -313,80 +341,60 @@ class AzureTableSemanticHealthStore(InMemorySemanticHealthStore):
         generator of them.
 
         Insert-if-absent is the atomic primitive: whoever creates the row wins.
-        An expired row is taken over with an ETag match, so a late loser cannot
-        overwrite the winner.
+        An expired row, or one this same owner already holds, is taken over by a
+        conditional UPDATE whose WHERE clause is evaluated on the server, so two
+        instances racing on an expired lease cannot both get ``rowcount`` 1.
         """
-        if self._client is None:
-            return super().try_acquire_lease(name, owner, ttl_seconds)
-
-        from azure.core import MatchConditions
-        from azure.core.exceptions import (
-            ResourceExistsError,
-            ResourceModifiedError,
-            ResourceNotFoundError,
-        )
-
-        row = {
-            "PartitionKey": self._LEASE_PARTITION,
-            "RowKey": name,
-            "owner": owner,
-            "expires_at": time.time() + ttl_seconds,
-        }
         try:
-            self._client.create_entity(row)
-            return True
-        except ResourceExistsError:
-            pass
-        except Exception as exc:  # pragma: no cover - transient table failure
-            # Cannot arbitrate, so do not sweep. Declining is safe; proceeding
-            # risks the double confirmation this exists to prevent.
-            logger.warning("Could not take sweep lease (%s); skipping", type(exc).__name__)
-            return False
-
-        try:
-            held = self._client.get_entity(self._LEASE_PARTITION, name)
-        except ResourceNotFoundError:  # pragma: no cover - released in between
-            return False
-
-        if str(held.get("owner")) != owner and float(held.get("expires_at", 0)) > time.time():
-            return False
-
-        try:
-            from azure.data.tables import UpdateMode
-
-            self._client.update_entity(
-                row,
-                mode=UpdateMode.REPLACE,
-                etag=held.metadata["etag"],
-                match_condition=MatchConditions.IfNotModified,
+            self._db.execute(
+                f"INSERT INTO {self._lease_table} (lease_name, owner, expires_at) "
+                f"VALUES (?, ?, DATEADD(second, ?, SYSUTCDATETIME()))",
+                name,
+                owner,
+                int(ttl_seconds),
             )
             return True
-        except (ResourceModifiedError, KeyError):
-            return False
-        except Exception as exc:  # pragma: no cover - transient table failure
+        except Exception as exc:  # noqa: BLE001
+            try:
+                duplicate = isinstance(exc, self._db.integrity_error())
+            except Exception:  # pragma: no cover - driver missing
+                duplicate = False
+            if not duplicate:
+                # Cannot arbitrate, so do not sweep. Declining is safe;
+                # proceeding risks the double confirmation this prevents.
+                logger.warning(
+                    "Could not take sweep lease (%s); skipping", type(exc).__name__
+                )
+                return False
+
+        try:
+            won = self._db.execute(
+                f"UPDATE {self._lease_table} "
+                f"   SET owner = ?, expires_at = DATEADD(second, ?, SYSUTCDATETIME()) "
+                f" WHERE lease_name = ? "
+                f"   AND (expires_at < SYSUTCDATETIME() OR owner = ?)",
+                owner,
+                int(ttl_seconds),
+                name,
+                owner,
+            )
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Could not renew sweep lease (%s); skipping", type(exc).__name__)
             return False
+        return bool(won)
 
     def release_lease(self, name: str, owner: str) -> None:
-        if self._client is None:
-            super().release_lease(name, owner)
-            return
         try:
-            held = self._client.get_entity(self._LEASE_PARTITION, name)
-            if str(held.get("owner")) == owner:
-                self._client.delete_entity(
-                    partition_key=self._LEASE_PARTITION, row_key=name
-                )
-        except Exception:  # pragma: no cover - the TTL releases it anyway
+            self._db.execute(
+                f"DELETE FROM {self._lease_table} WHERE lease_name = ? AND owner = ?",
+                name,
+                owner,
+            )
+        except Exception:  # noqa: BLE001 - the TTL releases it anyway
             logger.debug("Could not release sweep lease %s", name)
 
     def _on_reset(self) -> None:
-        if self._client is None:
-            return
-        for entity in self._client.list_entities():
-            try:
-                self._client.delete_entity(
-                    partition_key=entity["PartitionKey"], row_key=entity["RowKey"]
-                )
-            except Exception:  # pragma: no cover - best effort
-                logger.warning("Could not delete probe state %s", entity.get("RowKey"))
+        try:
+            self._db.execute(f"DELETE FROM {self._table}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not clear %s (%s)", self._table_name, type(exc).__name__)

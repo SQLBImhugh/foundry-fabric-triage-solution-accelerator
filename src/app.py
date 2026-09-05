@@ -136,17 +136,19 @@ class TriageControllerAgent(BaseAgent):
         # nothing more. A hosted agent is constructed fresh per request, so
         # this does not even span two requests to the same replica.
         self._lock = asyncio.Lock()
-        # The one that actually prevents duplicate remediation. Durable when
-        # storage is configured; in-process, and therefore honest about what
-        # it can guarantee, when it is not.
+        # The one that actually prevents duplicate remediation. Durable when a
+        # Fabric SQL database is configured; in-process, and therefore honest
+        # about what it can guarantee, when it is not. It shares the runner's
+        # connection rather than opening a second one.
         self._claims = build_claim_store(
-            endpoint=settings.incident_table_endpoint,
-            table_name=settings.claim_table_name,
+            db=self._runner.sql,
+            table=settings.claim_table_name,
         )
         if not getattr(self._claims, "is_durable", False):
             logger.warning(
-                "Claim store is not durable: INCIDENT_TABLE_ENDPOINT is unset. "
-                "Two concurrent invocations could triage the same alert twice."
+                "Claim store is not durable: set FABRIC_SQL_SERVER and "
+                "FABRIC_SQL_DATABASE. Two concurrent invocations could triage "
+                "the same alert twice."
             )
 
     def run(  # type: ignore[override]

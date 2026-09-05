@@ -28,8 +28,6 @@ import threading
 from pathlib import Path
 from typing import Any, Protocol
 
-from triage.store.table_helpers import build_table_client
-
 logger = logging.getLogger("triage.store.processed")
 
 
@@ -115,92 +113,92 @@ class JsonFileProcessedLog(InMemoryProcessedLog):
             self._path.unlink()
 
 
-class AzureTableProcessedLog(InMemoryProcessedLog):
+class FabricSqlProcessedLog(InMemoryProcessedLog):
     """Survives a container restart, which is the case that actually matters.
 
-    Degrades to in-memory rather than failing to start, matching
-    ``AzureTableIncidentStore``. A demo that cannot reach storage should run
-    loudly degraded, not refuse to run in front of an audience -- though in
-    this degraded state repeat sweeps will re-triage, so it is logged as an
-    error rather than a warning.
+    Degrades to in-memory rather than failing to start, matching the other
+    stores -- but keeps retrying, because a permanent degradation here means
+    every sweep re-triages every message it has already handled and notifies
+    about all of them again.
     """
 
-    _PARTITION = "message"
+    def __init__(self, *, db: Any, table: str = "triage_processed_messages") -> None:
+        from triage.store.fabric_sql import quote_identifier
 
-    def __init__(
-        self,
-        *,
-        endpoint: str,
-        table_name: str = "processedmessages",
-        credential: Any = None,
-    ) -> None:
         super().__init__()
-        self._endpoint = endpoint
-        self._table_name = table_name
-        self._client = None
-        self._degraded = False
-
-        try:
-            self._client = self._build_client(credential)
-            self._load()
-        except Exception as exc:
-            self._degraded = True
-            logger.error(
-                "Processed-message log degraded to in-memory: could not open %s at %s "
-                "(%s). Repeat sweeps will re-triage the same mail.",
-                table_name,
-                endpoint,
-                type(exc).__name__,
-            )
+        self._db = db
+        self._table = quote_identifier(table)
+        self._table_name = table
+        self._loaded = False
+        self._ensure_loaded()
 
     @property
     def is_durable(self) -> bool:
-        return self._client is not None and not self._degraded
+        return self._loaded and self._db.is_available
 
-    def _build_client(self, credential: Any):
-        return build_table_client(self._endpoint, self._table_name, credential)
+    def _ensure_loaded(self) -> bool:
+        if self._loaded:
+            return True
+        try:
+            self._load()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Processed-message log degraded to in-memory: cannot read %s (%s). "
+                "Repeat sweeps will re-triage the same mail.",
+                self._table_name,
+                type(exc).__name__,
+            )
+            return False
+        self._loaded = True
+        logger.info(
+            "Loaded %d processed message(s) from %s", len(self._items), self._table_name
+        )
+        return True
 
     def _load(self) -> None:
-        if self._client is None:
-            return
-        loaded = 0
-        for entity in self._client.list_entities():
-            key = str(entity.get("RowKey", ""))
-            if key:
-                self._items[key] = str(entity.get("received_at", ""))
-                loaded += 1
-        logger.info("Loaded %d processed message(s) from table %s", loaded, self._table_name)
+        rows = self._db.query(f"SELECT fingerprint, received_at FROM {self._table}")
+        self._items = {str(k): str(v or "") for k, v in rows}
+
+    def seen(self, message_id: str) -> bool:
+        # Guarded: answering "not seen" from an empty cache is what causes the
+        # duplicate notification this log exists to prevent.
+        self._ensure_loaded()
+        return super().seen(message_id)
 
     def _persist(self, message_id: str, received_at: str) -> None:
-        if self._client is None:
-            return
+        fingerprint = _fingerprint(message_id)
         try:
-            self._client.upsert_entity(
-                {
-                    "PartitionKey": self._PARTITION,
-                    "RowKey": _fingerprint(message_id),
-                    "received_at": received_at,
-                    # Kept for debugging: without it a row is an opaque hash and
-                    # nobody can tell which mail it corresponds to.
-                    "message_id": (message_id or "")[:512],
-                }
+            updated = self._db.execute(
+                f"UPDATE {self._table} SET received_at = ?, message_id = ? "
+                f"WHERE fingerprint = ?",
+                received_at,
+                (message_id or "")[:512],
+                fingerprint,
             )
-        except Exception as exc:
+            if not updated:
+                try:
+                    self._db.execute(
+                        f"INSERT INTO {self._table} "
+                        f"(fingerprint, message_id, received_at) VALUES (?, ?, ?)",
+                        fingerprint,
+                        (message_id or "")[:512],
+                        received_at,
+                    )
+                except self._db.integrity_error():
+                    # Another invocation recorded it first. Nothing to do: the
+                    # message is marked processed either way.
+                    pass
+        except Exception as exc:  # noqa: BLE001
             # Failing to write means this message gets triaged again on the
             # next sweep. That is noisy but safe, so the run continues.
-            self._degraded = True
+            self._loaded = False
             logger.error(
                 "Could not record processed message (%s); it will be re-triaged",
                 type(exc).__name__,
             )
 
     def _on_reset(self) -> None:
-        if self._client is None:
-            return
-        for entity in self._client.list_entities():
-            try:
-                self._client.delete_entity(
-                    partition_key=entity["PartitionKey"], row_key=entity["RowKey"]
-                )
-            except Exception:  # pragma: no cover - best effort
-                logger.warning("Could not delete processed-message row %s", entity.get("RowKey"))
+        try:
+            self._db.execute(f"DELETE FROM {self._table}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not clear %s (%s)", self._table_name, type(exc).__name__)

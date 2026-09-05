@@ -29,8 +29,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
-from triage.store.table_helpers import build_table_client
-
 logger = logging.getLogger("triage.store.retries")
 
 #: First backoff. Doubles per attempt: 15, 30, 60 minutes.
@@ -251,96 +249,123 @@ class JsonFileRetryStore(InMemoryRetryStore):
             self._path.unlink()
 
 
-class AzureTableRetryStore(InMemoryRetryStore):
-    """The deployed path. Degrades to in-memory, loudly.
+class FabricSqlRetryStore(InMemoryRetryStore):
+    """The deployed path. Degrades to in-memory, loudly, and keeps retrying.
 
     In the degraded state a deferred retry is scheduled into a store that will
     not exist on the next invocation, so the work is silently dropped. That is
-    worse than not deferring at all, hence the error rather than a warning.
+    worse than not deferring at all, hence the error rather than a warning --
+    and it is why this reconnects instead of giving up for the life of the
+    process.
     """
-
-    _PARTITION = "retry"
 
     def __init__(
         self,
         *,
-        endpoint: str,
-        table_name: str = "deferredretries",
-        credential: Any = None,
+        db: Any,
+        table: str = "triage_deferred_retries",
         max_attempts: int = MAX_ATTEMPTS,
     ) -> None:
-        super().__init__(max_attempts=max_attempts)
-        self._endpoint = endpoint
-        self._table_name = table_name
-        self._client = None
-        self._degraded = False
+        from triage.store.fabric_sql import quote_identifier
 
-        try:
-            self._client = self._build_client(credential)
-            self._load()
-        except Exception as exc:
-            self._degraded = True
-            logger.error(
-                "Retry store degraded to in-memory: could not open %s at %s (%s). "
-                "Deferred retries will be dropped rather than performed.",
-                table_name,
-                endpoint,
-                type(exc).__name__,
-            )
+        super().__init__(max_attempts=max_attempts)
+        self._db = db
+        self._table = quote_identifier(table)
+        self._table_name = table
+        self._loaded = False
+        self._ensure_loaded()
 
     @property
     def is_durable(self) -> bool:
-        return self._client is not None and not self._degraded
+        return self._loaded and self._db.is_available
 
-    def _build_client(self, credential: Any):
-        return build_table_client(self._endpoint, self._table_name, credential)
+    def _ensure_loaded(self) -> bool:
+        if self._loaded:
+            return True
+        try:
+            self._load()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Retry store degraded to in-memory: cannot read %s (%s). "
+                "Deferred retries will be dropped rather than performed.",
+                self._table_name,
+                type(exc).__name__,
+            )
+            return False
+        self._loaded = True
+        logger.info(
+            "Loaded %d deferred retry row(s) from %s", len(self._items), self._table_name
+        )
+        return True
 
     def _load(self) -> None:
-        if self._client is None:
-            return
-        loaded = 0
-        for entity in self._client.list_entities():
-            raw = entity.get("payload")
+        rows = self._db.query(f"SELECT signature, payload FROM {self._table}")
+        loaded: dict[str, dict[str, Any]] = {}
+        for signature, raw in rows:
             if not raw:
                 continue
             try:
                 row = json.loads(raw)
-            except Exception:
-                logger.warning("Skipping unreadable retry row %s", entity.get("RowKey"))
+            except Exception:  # noqa: BLE001
+                logger.warning("Skipping unreadable retry row %s", signature)
                 continue
-            self._items[str(row.get("signature", entity.get("RowKey")))] = row
-            loaded += 1
-        logger.info("Loaded %d deferred retry row(s) from %s", loaded, self._table_name)
+            loaded[str(row.get("signature", signature))] = row
+        self._items = loaded
+
+    def due(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
+        # Guarded: the sweep that performs deferred work reads this, and an
+        # empty cache silently drops every retry that was scheduled.
+        self._ensure_loaded()
+        return super().due(now=now)
+
+    def pending(self) -> list[dict[str, Any]]:
+        self._ensure_loaded()
+        return super().pending()
 
     def _persist(self, row: dict[str, Any]) -> None:
-        if self._client is None:
-            return
+        signature = str(row["signature"])
+        payload = json.dumps(row)
+        args = (
+            row.get("status", ""),
+            row.get("due_at", ""),
+            int(row.get("attempts", 0)),
+            payload,
+            signature,
+        )
         try:
-            self._client.upsert_entity(
-                {
-                    "PartitionKey": self._PARTITION,
-                    "RowKey": str(row["signature"]),
-                    "status": row.get("status", ""),
-                    "due_at": row.get("due_at", ""),
-                    "attempts": int(row.get("attempts", 0)),
-                    "payload": json.dumps(row),
-                }
+            updated = self._db.execute(
+                f"UPDATE {self._table} SET status = ?, due_at = ?, attempts = ?, "
+                f"payload = ? WHERE signature = ?",
+                *args,
             )
-        except Exception as exc:
-            self._degraded = True
+            if not updated:
+                try:
+                    self._db.execute(
+                        f"INSERT INTO {self._table} "
+                        f"(signature, status, due_at, attempts, payload) "
+                        f"VALUES (?, ?, ?, ?, ?)",
+                        signature,
+                        row.get("status", ""),
+                        row.get("due_at", ""),
+                        int(row.get("attempts", 0)),
+                        payload,
+                    )
+                except self._db.integrity_error():
+                    self._db.execute(
+                        f"UPDATE {self._table} SET status = ?, due_at = ?, "
+                        f"attempts = ?, payload = ? WHERE signature = ?",
+                        *args,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            self._loaded = False
             logger.error(
                 "Could not persist deferred retry %s (%s); it will not run",
-                row.get("signature"),
+                signature,
                 type(exc).__name__,
             )
 
     def _on_reset(self) -> None:
-        if self._client is None:
-            return
-        for entity in self._client.list_entities():
-            try:
-                self._client.delete_entity(
-                    partition_key=entity["PartitionKey"], row_key=entity["RowKey"]
-                )
-            except Exception:  # pragma: no cover - best effort
-                logger.warning("Could not delete retry row %s", entity.get("RowKey"))
+        try:
+            self._db.execute(f"DELETE FROM {self._table}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not clear %s (%s)", self._table_name, type(exc).__name__)

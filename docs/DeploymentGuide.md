@@ -130,13 +130,104 @@ The Foundry catalog exposes `outlook` (consumer/MSA, `oauth2generic`) and
 
 ---
 
-## 3. Monitored mailbox
+## 3. Fabric SQL Database (durable state)
+
+Everything the agent must remember between invocations lives here: incidents,
+which mail has been triaged, approvals, deferred retries, sweep leases and
+silent-failure baselines. Without it a hosted agent forgets every open incident
+on restart and can remediate the same failure twice.
+
+Create a **Fabric SQL Database** in a workspace on a capacity (a trial capacity
+is fine), then read its connection properties:
+
+```powershell
+$tok = az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv
+$h = @{ Authorization = "Bearer $tok" }
+(Invoke-RestMethod -Headers $h `
+  "https://api.fabric.microsoft.com/v1/workspaces/<workspace-id>/sqlDatabases").value |
+  Select-Object displayName, @{n='server';e={$_.properties.serverFqdn}},
+                             @{n='database';e={$_.properties.databaseName}}
+```
+
+Set both in `.env` (and in the azd environment for the hosted deployment):
+
+```
+FABRIC_SQL_SERVER=<serverFqdn>          # e.g. abc123-xyz.database.fabric.microsoft.com,1433
+FABRIC_SQL_DATABASE=<databaseName>      # includes the item GUID; copy it exactly
+```
+
+Leave both empty and the accelerator writes JSON files under `runs/` instead,
+which is correct on a laptop and wrong in a container.
+
+**There is no connection secret.** Fabric SQL accepts Microsoft Entra tokens
+only, so there is no SQL login to create, no password to rotate, and no
+local-authentication setting for governance to keep switching off.
+
+### The tables
+
+Created automatically on first use — there is no migration step. Seven tables:
+`triage_incidents`, `triage_processed_messages`, `triage_approvals`,
+`triage_deferred_retries`, `triage_semantic_health`, `triage_sweep_leases`,
+`triage_claims`. Rename them with the `*_TABLE_NAME` settings if one database
+hosts more than one deployment.
+
+### Granting the identity that runs the controller
+
+Two grants, and both are needed. The workspace role lets the identity see the
+item; the database user is what SQL actually authorises against.
+
+```powershell
+# 1. Workspace role. An Entra agent identity is accepted as 'ServicePrincipal'.
+$body = @{ principal = @{ id = "<agent principal id>"; type = "ServicePrincipal" }
+           role = "Contributor" } | ConvertTo-Json -Depth 4
+Invoke-RestMethod -Method Post -Headers $h -ContentType application/json -Body $body `
+  "https://api.fabric.microsoft.com/v1/workspaces/<workspace-id>/roleAssignments"
+```
+
+```sql
+-- 2. Database user. Run against the Fabric SQL Database as yourself.
+CREATE USER [bi-triage-controller] WITH SID = 0x<sid>, TYPE = E;
+ALTER ROLE db_datareader ADD MEMBER [bi-triage-controller];
+ALTER ROLE db_datawriter ADD MEMBER [bi-triage-controller];
+ALTER ROLE db_ddladmin  ADD MEMBER [bi-triage-controller];  -- creates the tables
+```
+
+`CREATE USER ... FROM EXTERNAL PROVIDER` is the usual form, but it asks SQL to
+resolve the name through Microsoft Graph, which fails behind a Conditional
+Access challenge. The `SID` form needs no Graph call. The SID is the identity's
+**client id** as little-endian GUID bytes:
+
+```powershell
+"0x" + [guid]::Parse("<agent client id>").ToByteArray().ForEach{$_.ToString("X2")} -join ""
+```
+
+Find the agent's principal and client id with `bi-triage identity --check-scope`,
+or straight from the agent definition, which needs no Graph access:
+
+```powershell
+$t = az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv
+(Invoke-RestMethod -Headers @{Authorization="Bearer $t"} `
+  "<project endpoint>/agents/bi-triage-controller?api-version=v1").instance_identity
+```
+
+### Verify
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[azure]"   # installs the SQL driver
+.\.venv\Scripts\bi-triage.exe preflight                   # 'Fabric SQL state' must be ok
+.\.venv\Scripts\bi-triage.exe run scenario1-transient
+.\.venv\Scripts\bi-triage.exe incidents                   # the row you just wrote
+```
+
+---
+
+## 3b. Monitored mailbox
 
 A shared mailbox or licensed user, e.g. `bi-alerts@<tenant>.onmicrosoft.com`.
 
 The accelerator **does not mark messages as read** — runs must be repeatable, and
-dedup is by message id held in memory. Confirm nothing else is auto-processing
-the mailbox.
+dedup is by message id in the processed-message table. Confirm nothing else is
+auto-processing the mailbox.
 
 Send the sample emails from `mock/emails/` into it ahead of time, or send them
 live during the session for effect. Live is better; have the pre-sent ones as
@@ -147,8 +238,56 @@ backup.
 ## 4. Azure AI Foundry project
 
 - A Foundry project; note the endpoint
-- A model deployment (`gpt-4o` or similar) — set `FOUNDRY_AGENT_MODEL`
-- Your identity needs project-level rights to create agent versions
+- A model deployment (`gpt-5.6-luna` or similar) — set `FOUNDRY_AGENT_MODEL`
+
+Creating the project from the CLI needs `--location` even though the account
+already has one:
+
+```powershell
+az cognitiveservices account project create `
+  -n <account> -g <rg> --project-name <project> -l <region>
+```
+
+### The role you need, and the one that looks right and is not
+
+**Assign yourself `Foundry Project Manager` on the Foundry *account*.**
+
+```powershell
+az role assignment create `
+  --assignee-object-id <your object id> --assignee-principal-type User `
+  --role "Foundry Project Manager" `
+  --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/<account>
+```
+
+Subscription **Owner is not sufficient** — it carries no data-plane access. Nor
+is `Cognitive Services User`, despite its data actions reading
+`Microsoft.CognitiveServices/*`: Microsoft's own guidance is not to use any role
+beginning `Cognitive Services`, or `Azure AI Developer`, for Foundry work. Both
+were tried here, at account and project scope, and both returned:
+
+```
+403 ... does not have permissions for
+Microsoft.CognitiveServices/accounts/AIServices/agents/read
+```
+
+The trap is that this only bites some people. A project created **in the Foundry
+portal** auto-assigns `Foundry User` to its creator and to the project's managed
+identity. A project created with the CLI or from IaC gets neither, so the same
+script works for a colleague and 403s for you. Assign it explicitly.
+
+Also assign `Foundry User` to the **project's own managed identity** on the
+account, which the portal would have done for you:
+
+```powershell
+az cognitiveservices account project show -n <account> -g <rg> `
+  --project-name <project> --query identity.principalId -o tsv
+```
+
+Roles were renamed recently: `Foundry User`, `Foundry Owner`,
+`Foundry Account Owner` and `Foundry Project Manager` were previously
+`Azure AI User`, `Azure AI Owner`, `Azure AI Account Owner` and
+`Azure AI Project Manager`. See
+[RBAC for Microsoft Foundry](https://learn.microsoft.com/azure/foundry/concepts/rbac-foundry).
 
 ```powershell
 az login
@@ -209,39 +348,66 @@ The approval card's Approve/Decline buttons are `Action.OpenUrl` links. They
 have to be: a card posted through an incoming webhook has no bot behind it, so
 `Action.Submit` renders a button that silently does nothing.
 
-They point at a Consumption Logic App that writes the decision into the same
-`approvals` table the agent polls:
+`infra/approval-callback.json` deploys **two** Consumption Logic Apps, because a
+Request trigger accepts exactly one HTTP method — with none declared it takes
+POST only, and a GET is rejected with `TriggerRequestMethodNotValid` before the
+workflow starts:
+
+| Workflow | Method | What it does |
+|---|---|---|
+| `bi-triage-approval-confirm` | GET | Renders a confirmation page. Holds no connection and cannot write. **This is what the card links to.** |
+| `bi-triage-approval-callback` | POST | Records the decision. |
+
+That is the two-step: a link in a Teams message is fetched by preview
+generators, scanners and prefetchers, and all of them issue GET, which reaches
+a workflow with nothing to change.
 
 ```powershell
 az deployment group create -g <resource-group> -n approval-callback `
   --template-file infra\approval-callback.json `
-  --parameters tableEndpoint=https://<account>.table.core.windows.net
-
-# grant its identity table access - no keys involved
-az role assignment create --assignee-object-id <principalId from the output> `
-  --assignee-principal-type ServicePrincipal `
-  --role "Storage Table Data Contributor" --scope <storage account id>
-
-# capture the trigger URL into the azd environment (gitignored)
-azd env set APPROVAL_CALLBACK_URL "<listCallbackUrl value>"
-azd deploy
+  --parameters sqlServer=<serverFqdn-without-port> `
+               sqlDatabase=<databaseName> owner=<you>
 ```
 
-**Why a Logic App and not a Power Automate flow.** The Azure Table connector
-authenticates with a shared account key, and `allowSharedKeyAccess` is `false`
-on this storage account by tenant policy — correctly, and not worth fighting.
-An HTTP-triggered flow is also a premium trigger the tenant may not be
-licensed for. The Logic App uses a system-assigned managed identity against the
-Table REST API, so there is no key anywhere.
+The recording workflow gets a system-assigned identity, printed as the
+deployment's `principalId` output. Give it Fabric access — the same two grants
+as section 3, but **only** `EXECUTE` on the decision procedure, because the
+callback answers approvals and has no business reading incidents:
 
-**Approving takes two steps, on purpose.** The link in the card opens a
-confirmation page; the page's button POSTs the decision. GET never changes
-anything. A link in a Teams message is fetched by preview generators, scanners
-and prefetchers, and an approval a link preview can grant is not an approval.
+```sql
+CREATE USER [bi-triage-approval-callback] WITH SID = 0x<sid>, TYPE = E;
+GRANT EXECUTE ON OBJECT::dbo.triage_record_approval_decision
+  TO [bi-triage-approval-callback];
+```
+
+Then capture the **confirm** workflow's URL — the card links to the GET side:
+
+```powershell
+azd env set APPROVAL_CALLBACK_URL "<confirmUrl output>"
+azd deploy bi-triage-controller --no-prompt
+```
+
+**Redeploying the workflow rotates its identity.** The old database user then
+authenticates nothing, and the failure looks like a network problem rather than
+a permissions one. Drop and recreate the user against the new SID after any
+redeploy that recreates the workflow.
+
+**No key anywhere.** Fabric SQL has no REST data plane, so the write goes
+through the SQL managed connector authenticating with that managed identity —
+support for which lives in the connector's `oauthMI` parameter value set, whose
+only parameter is a token constrained to `location: "logicapp"`. The connection
+itself carries no credential.
+
+**The write is a stored procedure, not a query.** Everything in the callback URL
+is editable by anyone holding the link, so `request_id`, `decision`, `responder`
+and `fingerprint` are procedure parameters. `dbo.triage_record_approval_decision`
+does the whole decision in one statement — unanswered, fingerprint matches, not
+expired — and returns `@@ROWCOUNT`. Zero rows is a refusal, and the workflow
+renders it as one rather than as a recorded decision. A failed write renders as
+a failure. The agent revalidates all of it independently afterwards.
 
 **The responder is not an authenticated identity.** Anyone holding the link can
-answer, and the name recorded is whatever the query string claimed, which is why
-the table stores it as `responder_claimed` rather than as an audit fact. Put the
+answer, and the name recorded is whatever the query string claimed. Put the
 workflow behind Entra authentication if you need to know who actually clicked.
 
 **An approval that arrives after the run has ended is not applied.** The run
@@ -253,24 +419,38 @@ test fails if the two ever cross.
 
 **The callback URL is a bearer credential.** Anyone holding the link can answer
 an approval. It lives in the azd environment, never in the repo, and
-`scripts/scan_secrets.py` treats it as a secret. The fingerprint in the link binds it
-to one action, and the Logic App refuses a request that is unknown, already
-answered, expired, or whose fingerprint does not match — after which the agent
-revalidates all of it anyway.
+`scripts/scan_secrets.py` treats it as a secret. The fingerprint in the link
+binds it to one action.
 
 **Leaving it unset is a valid configuration.** The card then shows the request
 id and says to answer with `bi-triage approve <request>`, which needs no
 infrastructure at all.
 
-Treat the URL as a secret: anyone holding it can post to the channel. That is
-acceptable in a test tenant — say so out loud rather than letting someone assume
-otherwise.
+**Production path for notifications** — post via Graph with an app registration
+so messages are attributable to an identity. Note that app-only posting to
+channel messages is restricted (it is gated behind protected APIs / migration
+scenarios), so most production designs use a bot or a delegated flow rather than
+raw app-only Graph. Confirm the path against current docs before committing to
+it.
 
-**Production path** — post via Graph with an app registration so messages are
-attributable to an identity. Note that app-only posting to channel messages is
-restricted (it is gated behind protected APIs / migration scenarios), so most
-production designs use a bot or a delegated flow rather than raw app-only Graph.
-Confirm the path against current docs before committing to it.
+**None of the safety properties changed.** Validation was always on the reading
+side and stays there: an approval counts only if it is explicit,
+fingerprint-matched to the exact action and arguments, unexpired and unused.
+What was lost is a click, not a control.
+
+**An approval that arrives after the run has ended is not applied.** The run
+waits `APPROVAL_TIMEOUT_SECONDS` (default 300) and then abandons the action. A
+decision recorded later sits unused and expires, which is fail-closed and safe,
+but it is not resumed. If you schedule sweeps, the Logic App's HTTP timeout must
+exceed the approval window -- `infra/scheduled-sweep.json` uses `PT10M`, and a
+test fails if the two ever cross.
+
+**Production path for notifications** — post via Graph with an app registration
+so messages are attributable to an identity. Note that app-only posting to
+channel messages is restricted (it is gated behind protected APIs / migration
+scenarios), so most production designs use a bot or a delegated flow rather than
+raw app-only Graph. Confirm the path against current docs before committing to
+it.
 
 ## 6c. Scheduled sweeps
 
@@ -293,20 +473,26 @@ az deployment group create -g <resource-group> -n sched-silent `
 # grant its identity permission to invoke the agent
 az role assignment create --assignee-object-id <principalId from the output> `
   --assignee-principal-type ServicePrincipal `
-  --role "Cognitive Services User" `
+  --role "Foundry Agent Consumer" `
   --scope <the project resource id, not the account>
 ```
 
 Repeat with `name=bi-triage-mailbox-sweep`, `command="sweep"`,
 `frequency=Minute interval=5` for the mailbox drain. The two are separate jobs:
-the mailbox sweep does not run the health scan.
+the mailbox sweep does not run the health scan. Leave the mailbox sweep
+**disabled** until section 2 is finished, or it fails every five minutes.
 
-`Cognitive Services User` is the role that carries data-plane access to a
-`Microsoft.CognitiveServices` account, which is what a Foundry project is.
-`Azure AI Developer` is not sufficient — its data actions are scoped to the
-`OpenAI`, `SpeechServices`, `ContentSafety` and `MaaS` sub-paths, and invoking a
-hosted agent is none of them. There is no `Azure AI User` role in this
-subscription despite the name appearing in some docs.
+`Foundry Agent Consumer` is the least-privileged role for a principal that only
+invokes agents and never creates or modifies them, which is exactly what a
+scheduler does. It works at **project** scope, so the schedule can invoke this
+project's agents and nothing else. Verified: the first triggered run failed with
+`SweepFailed` before the assignment propagated, and succeeded afterwards.
+
+Do not use `Cognitive Services User` here, and do not use `Azure AI Developer`.
+Microsoft's RBAC guidance for Foundry says not to use roles beginning
+`Cognitive Services` at all, and `Azure AI Developer`'s data actions are scoped
+to the `OpenAI`, `SpeechServices`, `ContentSafety` and `MaaS` sub-paths, none of
+which covers invoking a hosted agent.
 
 Scope the assignment to the **project**, not the account, so the schedule can
 invoke this agent and nothing else.
@@ -482,17 +668,32 @@ bi-triage health --baselines  # what healthy looked like last time
 
 ## 8. Application Insights (optional)
 
-Set `APPLICATIONINSIGHTS_CONNECTION_STRING` and install the extra:
+Create the component, then set the connection string in **both** places — the
+azd environment feeds it into the container through `azure.yaml`:
+
+```powershell
+azd env set APPLICATIONINSIGHTS_CONNECTION_STRING (
+  az monitor app-insights component show --app <name> -g <rg> --query connectionString -o tsv)
+```
+
+The container needs no extra install: `mssql-python` and the telemetry packages
+are already in `src/requirements.txt`. Locally, install the extra:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -e ".[azure]"
 ```
 
+That extra is **not** optional in practice. It carries `azure-identity` and the
+SQL driver, so without it `bi-triage identity`, `bi-triage incidents` and every
+other command that touches Fabric SQL fail on a missing module.
+
 Spans appear within roughly five minutes. Check the **failed-run** view, not
 just the healthy one — that is the question that gets asked.
 
 Without the connection string every telemetry helper is a no-op. Telemetry is
-never a hard dependency of the accelerator running.
+never a hard dependency of the accelerator running. Note that only **spans** go
+to Application Insights; Python log records do not, so container diagnostics
+come from `azd ai agent monitor --tail 300` rather than from a KQL query.
 
 ---
 
@@ -539,9 +740,11 @@ unattended in Azure rather than from a laptop.
 | Resource | Purpose |
 |---|---|
 | Foundry hosted agent `bi-triage-controller` | The orchestration loop, as a container |
-| Foundry routine `bi-triage-schedule` | Wakes it on a cron schedule |
-| Storage account + `incidents` table | Durable incident state across restarts |
+| Foundry routine `bi-triage-schedule` | Declared, ships disabled — routines do not fire |
+| Logic App `bi-triage-silent-sweep` | The scheduled trigger that actually works |
 | Application Insights | Traces from the container |
+
+The Fabric SQL Database from section 3 already exists; nothing here creates it.
 
 ### Deploy
 
@@ -553,29 +756,53 @@ azd env set AZURE_LOCATION              eastus
 azd env set AZURE_AI_PROJECT_ENDPOINT   "<project endpoint>"
 azd env set AZURE_AI_PROJECT_ID         "<project ARM id>"
 
+# azd resolves the azure.ai.project service from FOUNDRY_PROJECT_ENDPOINT, not
+# from AZURE_AI_PROJECT_ENDPOINT. Setting only the latter fails the first deploy
+# with "Foundry dependencies are not ready: FOUNDRY_PROJECT_ENDPOINT is not set"
+# and a suggestion to run `azd provision`, which is not the fix. Set both.
+azd env set FOUNDRY_PROJECT_ENDPOINT    "<project endpoint>"
+
+# Durable state (section 3).
+azd env set FABRIC_SQL_SERVER   "<serverFqdn>"
+azd env set FABRIC_SQL_DATABASE "<databaseName>"
+
 # Mailbox ingestion credentials. Never committed; .azure/ is gitignored.
 azd env set GRAPH_CLIENT_ID     "<ingestion app id>"
 azd env set GRAPH_CLIENT_SECRET "<ingestion secret>"
 
 azd deploy bi-triage-controller --no-prompt
-azd deploy bi-triage-schedule   --no-prompt
 ```
 
 ### Grant the controller identity what it needs
 
 Deploying creates a **new** Entra agent identity for the controller, with no
 permissions. Each agent gets its own identity, so each needs its own grants —
-that is least privilege working, not a misconfiguration. Find it with:
+that is least privilege working, not a misconfiguration.
+
+`bi-triage identity --check-scope` prints it, but that command needs Microsoft
+Graph. If Graph is blocked, read the identity straight off the agent definition,
+which needs no Graph call:
 
 ```powershell
-.\.venv\Scripts\bi-triage.exe identity --check-scope
+$t = az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv
+(Invoke-RestMethod -Headers @{Authorization="Bearer $t"} `
+  "<project endpoint>/agents/bi-triage-controller?api-version=v1").instance_identity
 ```
+
+Grant to `instance_identity.principal_id` — that is what the container presents:
 
 | Scope | Role | Why |
 |---|---|---|
-| Storage account | `Storage Table Data Contributor` | Persist incidents |
+| Fabric workspace | `Contributor`, principal type `ServicePrincipal` | See the SQL database item |
+| Fabric SQL Database | Database user + `db_datareader`, `db_datawriter`, `db_ddladmin` | Persist state and create the tables |
+| Foundry account | `Foundry Agent Consumer` | Invoke the two prompt agents it reasons through |
 | Application Insights | `Monitoring Metrics Publisher` | Emit traces; without it the log floods with 403s |
 | Power BI workspace | Admin, principal type `App` | Read refresh history, trigger a retry |
+
+The first two are section 3. The Foundry grant is easy to miss: with
+`TRIAGE_PROVIDER_MODE=foundry` the controller calls `bi-triage` and
+`bi-data-quality` over the responses API, so without it every run fails at the
+first model call.
 
 **Do not grant it `Mail.Read`.** Exchange rejects Entra agent identities for
 app-only mailbox access — verified as a 401 against the same token Graph's
@@ -586,29 +813,31 @@ from section 2, which is why that one secret still exists.
 
 ```powershell
 azd ai agent invoke bi-triage-controller "sweep"      # reads the mailbox
-azd ai agent monitor bi-triage-controller             # shows what it ignored, and why
-.\.venv\Scripts\bi-triage.exe incidents             # written by the container, read from here
+azd ai agent monitor bi-triage-controller --tail 300  # shows what it ignored, and why
+.\.venv\Scripts\bi-triage.exe incidents               # written by the container, read from here
 ```
 
 The last one is the real proof: an incident written by the container in Azure,
-read back on another machine, means the container authenticated to storage as
+read back on another machine, means the container authenticated to Fabric SQL as
 itself with no secret in the deployment.
+
+Raise `--tail` when diagnosing. The default is 50 lines and the OpenTelemetry
+metric dump fills that easily, hiding the line you need; 300 is the maximum.
 
 ### Governance notes
 
-Both encountered rather than anticipated, and both worth expecting again:
+Expect tenant policy to act on this deployment within minutes of creating it,
+and design around it rather than fighting it:
 
-- The storage account is created with **shared key access already disabled**.
-  Do not try to re-enable it; the identity-based path is the supported one.
-- **Public network access is disabled within minutes** by tenant policy. Resolve
-  with the supported `SecurityControl=Ignore` exemption tag plus a written
-  justification, not by fighting the control:
-
-```powershell
-az storage account update -n <account> -g <rg> `
-  --set tags.SecurityControl=Ignore tags.Justification="<why>"
-az storage account update -n <account> -g <rg> --public-network-access Enabled
-```
+- **Fabric SQL needs no exemption**, which is part of why state moved there. It
+  accepts Entra tokens only, so there is no local-authentication setting to be
+  switched off and no shared key to be disabled underneath you.
+- **A degraded store must not be permanent.** Policy disabled public network
+  access on the storage account this accelerator used to depend on, minutes
+  after it was created. The container started while it was unreachable and then
+  reported healthy triage outcomes while persisting none of them — and kept
+  doing so after connectivity returned, because nothing retried. The store layer
+  now re-checks and reloads on use. If you write another store, do the same.
 
 ### Restarting the container
 

@@ -13,13 +13,21 @@ updated in place when a decision arrives:
     decide()  a human writes an answer against that request id
     poll()    the agent reads it back
 
-Two things write decisions, and they share this one table so the agent cannot
-tell them apart:
+Decisions are written by two things, and the store cannot tell them apart:
 
 * ``bi-triage approve|deny`` -- needs no infrastructure at all, and is how an
-  on-call engineer holding the repo would answer.
-* a Power Automate flow behind the card's buttons -- the demo path, where the
-  click in Teams lands here.
+  on-call engineer holding the repo answers.
+* the card's Approve/Decline buttons, which lead to a pair of Logic Apps in
+  ``infra/approval-callback.json``. The GET side renders a confirmation page and
+  can change nothing; the POST side calls
+  ``dbo.triage_record_approval_decision`` with its own managed identity. Two
+  workflows because a Request trigger accepts exactly one HTTP method.
+
+``decide()`` is a single conditional UPDATE rather than a read followed by a
+write, and the stored procedure the callback uses has the same ``WHERE`` clause
+for the same reason. Two responders can both read an unanswered request, and a
+check-then-write would let the later one silently overwrite the earlier.
+``rowcount`` reports who won.
 
 The store never decides anything itself. Validation stays in
 ``approvals.py``: the fingerprint check, the expiry check and the single-use
@@ -35,8 +43,6 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
-
-from triage.store.table_helpers import build_table_client
 
 logger = logging.getLogger("triage.store.approvals")
 
@@ -200,56 +206,51 @@ class JsonFileApprovalChannel(InMemoryApprovalChannel):
             self._path.unlink()
 
 
-class AzureTableApprovalChannel(InMemoryApprovalChannel):
+class FabricSqlApprovalChannel(InMemoryApprovalChannel):
     """The deployed path: the agent polls here, a human writes here.
 
-    Degrades to in-memory rather than refusing to start, like the other
-    stores -- but logs an error, because in that state no human can answer and
-    every gated action will fail closed.
+    The row is the meeting point between two processes that never share
+    memory. The agent writes the request in one invocation; a person answers
+    from a Teams card or the CLI, in a different process and often a different
+    container; the agent reads the answer back on a later poll.
+
+    Every read goes to the database rather than to the in-memory copy, because
+    the in-memory copy cannot contain a decision made somewhere else. Degrades
+    loudly: in that state no human can answer and every gated action fails
+    closed, which is safe but useless, so it keeps retrying.
     """
 
-    _PARTITION = "approval"
+    def __init__(self, *, db: Any, table: str = "triage_approvals") -> None:
+        from triage.store.fabric_sql import quote_identifier
 
-    def __init__(
-        self,
-        *,
-        endpoint: str,
-        table_name: str = "approvals",
-        credential: Any = None,
-    ) -> None:
         super().__init__()
-        self._endpoint = endpoint
-        self._table_name = table_name
-        self._client = None
-        self._degraded = False
-
-        try:
-            self._client = self._build_client(credential)
-        except Exception as exc:
-            self._degraded = True
-            logger.error(
-                "Approval channel degraded to in-memory: could not open %s at %s (%s). "
-                "No human will be able to answer; gated actions will fail closed.",
-                table_name,
-                endpoint,
-                type(exc).__name__,
-            )
+        self._db = db
+        self._table = quote_identifier(table)
+        self._table_name = table
 
     @property
     def is_durable(self) -> bool:
-        return self._client is not None and not self._degraded
-
-    def _build_client(self, credential: Any):
-        return build_table_client(self._endpoint, self._table_name, credential)
+        return self._db.is_available
 
     def _fetch(self, request_id: str) -> dict[str, Any] | None:
-        if self._client is None:
+        try:
+            rows = self._db.query(
+                f"SELECT payload FROM {self._table} WHERE request_id = ?", request_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Could not read approval %s (%s); the gate will fail closed",
+                request_id,
+                type(exc).__name__,
+            )
+            return None
+        if not rows:
             return None
         try:
-            entity = self._client.get_entity(self._PARTITION, request_id)
-        except Exception:
+            return json.loads(rows[0][0])
+        except Exception:  # noqa: BLE001
+            logger.warning("Approval %s has an unreadable payload", request_id)
             return None
-        return {k: v for k, v in entity.items() if not k.startswith(("PartitionKey", "RowKey", "odata", "Timestamp"))}
 
     async def poll(self, request_id: str) -> dict[str, Any] | None:
         row = self._fetch(request_id)
@@ -260,6 +261,17 @@ class AzureTableApprovalChannel(InMemoryApprovalChannel):
     def decide(
         self, request_id: str, *, decision: str, responder: str, reason: str = ""
     ) -> dict[str, Any]:
+        """Record a decision, and refuse if one is already there.
+
+        The check and the write are **one conditional statement**. Reading the
+        row, seeing no decision, and then writing is a race: two responders can
+        both read an unanswered request and both write, and the later one wins
+        silently. The Azure Table version closed that with an ETag; here the
+        ``WHERE`` clause does it, and ``rowcount`` reports who won.
+
+        Losing this race is not an error condition to paper over -- it means
+        somebody else answered first, and their answer stands.
+        """
         row = self._fetch(request_id)
         if row is None:
             raise KeyError(f"No approval request with id {request_id!r}")
@@ -268,6 +280,7 @@ class AzureTableApprovalChannel(InMemoryApprovalChannel):
                 f"Approval {request_id} was already answered "
                 f"({row['decision']} by {row.get('responder') or 'unknown'})"
             )
+
         row.update(
             {
                 "decision": decision,
@@ -276,36 +289,95 @@ class AzureTableApprovalChannel(InMemoryApprovalChannel):
                 "decided_at": _utcnow(),
             }
         )
-        self._write(request_id, row)
+        payload = json.dumps(row, default=str)
+
+        try:
+            won = self._db.execute(
+                f"UPDATE {self._table} "
+                f"   SET decision = ?, responder = ?, decided_at = ?, payload = ? "
+                f" WHERE request_id = ? AND (decision IS NULL OR decision = '')",
+                decision,
+                responder,
+                row["decided_at"],
+                payload,
+                request_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A write that did not happen must not read as a decision. The gate
+            # polls the database, so returning normally here would report an
+            # approval nobody recorded.
+            raise RuntimeError(
+                f"Could not record the decision for {request_id} "
+                f"({type(exc).__name__}); it has not been answered"
+            ) from exc
+
+        if not won:
+            current = self._fetch(request_id) or {}
+            raise ValueError(
+                f"Approval {request_id} was already answered "
+                f"({current.get('decision', 'unknown')} by "
+                f"{current.get('responder') or 'unknown'})"
+            )
+
         logger.info("Approval %s -> %s by %s", request_id, decision, responder)
         return row
 
     def pending(self) -> list[dict[str, Any]]:
-        if self._client is None:
-            return super().pending()
+        try:
+            rows = self._db.query(
+                f"SELECT payload FROM {self._table} WHERE decision IS NULL OR decision = ''"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not list pending approvals (%s)", type(exc).__name__)
+            return []
         out: list[dict[str, Any]] = []
-        for entity in self._client.list_entities():
-            if not entity.get("decision"):
-                out.append({k: v for k, v in entity.items() if not k.startswith(("PartitionKey", "odata", "Timestamp"))})
+        for (raw,) in rows:
+            try:
+                out.append(json.loads(raw))
+            except Exception:  # noqa: BLE001
+                continue
         return out
 
     def get(self, request_id: str) -> dict[str, Any] | None:
         return self._fetch(request_id)
 
-    def open(self, request: Any) -> None:
-        super().open(request)
-
     def _persist(self, row: dict[str, Any]) -> None:
         self._write(row["request_id"], row)
 
     def _write(self, request_id: str, row: dict[str, Any]) -> None:
-        if self._client is None:
-            return
-        entity = {"PartitionKey": self._PARTITION, "RowKey": request_id, **row}
+        payload = json.dumps(row, default=str)
+        args = (
+            row.get("decision") or None,
+            row.get("responder") or None,
+            row.get("decided_at") or None,
+            payload,
+            request_id,
+        )
         try:
-            self._client.upsert_entity(entity)
-        except Exception as exc:
-            self._degraded = True
+            updated = self._db.execute(
+                f"UPDATE {self._table} SET decision = ?, responder = ?, "
+                f"decided_at = ?, payload = ? WHERE request_id = ?",
+                *args,
+            )
+            if not updated:
+                try:
+                    self._db.execute(
+                        f"INSERT INTO {self._table} "
+                        f"(request_id, decision, responder, decided_at, payload) "
+                        f"VALUES (?, ?, ?, ?, ?)",
+                        request_id,
+                        row.get("decision") or None,
+                        row.get("responder") or None,
+                        row.get("decided_at") or None,
+                        payload,
+                    )
+                except self._db.integrity_error():
+                    self._db.execute(
+                        f"UPDATE {self._table} SET decision = ?, responder = ?, "
+                        f"decided_at = ?, payload = ? WHERE request_id = ?",
+                        *args,
+                    )
+        except Exception as exc:  # noqa: BLE001
             logger.error(
                 "Could not write approval %s (%s); the gate will fail closed",
                 request_id,
@@ -313,12 +385,7 @@ class AzureTableApprovalChannel(InMemoryApprovalChannel):
             )
 
     def _on_reset(self) -> None:
-        if self._client is None:
-            return
-        for entity in self._client.list_entities():
-            try:
-                self._client.delete_entity(
-                    partition_key=entity["PartitionKey"], row_key=entity["RowKey"]
-                )
-            except Exception:  # pragma: no cover - best effort
-                logger.warning("Could not delete approval row %s", entity.get("RowKey"))
+        try:
+            self._db.execute(f"DELETE FROM {self._table}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not clear %s (%s)", self._table_name, type(exc).__name__)

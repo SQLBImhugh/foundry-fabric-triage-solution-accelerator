@@ -37,10 +37,11 @@ It runs **fully offline** with mock providers and mock tools, so you can read it
 run it and evaluate its behaviour before it touches a tenant. That is also how
 the test suite runs: no credentials, no network.
 
-**Bring your own Foundry project.** This repository deploys the agents and the
-supporting Logic Apps *into* an Azure AI Foundry project you already have; it
-does not provision the project, the storage account or Application Insights for
-you. [`docs/DeploymentGuide.md`](./docs/DeploymentGuide.md) lists every
+**Bring your own Foundry project and Fabric workspace.** This repository deploys
+the agents and the supporting Logic App *into* an Azure AI Foundry project and a
+Microsoft Fabric workspace you already have; it does not provision the project,
+the Fabric SQL Database or Application Insights for you.
+[`docs/DeploymentGuide.md`](./docs/DeploymentGuide.md) lists every
 prerequisite in the order its lead time demands, and
 [`docs/AzureAccountSetUp.md`](./docs/AzureAccountSetUp.md) covers the
 subscription and tenant permissions you need first.
@@ -119,6 +120,13 @@ ships around it rather than pretending otherwise — see
   and disagreements are logged. Redaction happens inside the store boundary, so a
   call site cannot forget it.
 
+- **Monitoring cockpit** <br/>A read-only Fabric App (`cockpit/`) over the
+  controller's own state: incidents, approvals, deferred retries, semantic-health
+  baselines, and the claims and leases that stop two invocations acting on the
+  same alert. It reads a Direct Lake semantic model over the state database, so
+  it adds no writer and no second copy of the truth — nothing in it can change
+  the system it watches.
+
 </details>
 
 <br /><br />
@@ -165,9 +173,8 @@ The table below lists the major Microsoft products used.
 |---|---|---|
 | [Azure AI Foundry](https://learn.microsoft.com/azure/ai-foundry/) | Hosts the reasoning agents and the deployed controller, and issues the agent identity the controller authenticates as. | [Pricing](https://azure.microsoft.com/pricing/details/ai-foundry/) |
 | [Power BI](https://learn.microsoft.com/power-bi/) | The estate being monitored. The accelerator reads refresh history, triggers refreshes, manages refresh schedules and queries semantic models. | [Pricing](https://www.microsoft.com/power-platform/products/power-bi/pricing) |
-| [Microsoft Fabric](https://learn.microsoft.com/fabric/) | Optional. Provides the capacity that Power BI semantic models run on, and is where capacity throttling originates. | [Pricing](https://azure.microsoft.com/pricing/details/microsoft-fabric/) |
-| [Azure Storage (Tables)](https://learn.microsoft.com/azure/storage/tables/) | Durable state: incidents, processed messages, approvals, deferred retries and semantic health baselines. | [Pricing](https://azure.microsoft.com/pricing/details/storage/tables/) |
-| [Azure Logic Apps](https://learn.microsoft.com/azure/logic-apps/) | The scheduled trigger and the approval callback. Consumption tier, managed identity, no keys. | [Pricing](https://azure.microsoft.com/pricing/details/logic-apps/) |
+| [Microsoft Fabric](https://learn.microsoft.com/fabric/) | Provides the capacity that Power BI semantic models run on, where capacity throttling originates, and the Fabric SQL Database holding durable state: incidents, processed messages, approvals, deferred retries, sweep leases and semantic health baselines. | [Pricing](https://azure.microsoft.com/pricing/details/microsoft-fabric/) |
+| [Azure Logic Apps](https://learn.microsoft.com/azure/logic-apps/) | The scheduled trigger. Consumption tier, managed identity, no keys. | [Pricing](https://azure.microsoft.com/pricing/details/logic-apps/) |
 | [Application Insights](https://learn.microsoft.com/azure/azure-monitor/app/app-insights-overview) | Optional. Traces every run as spans carrying metadata only. | [Pricing](https://azure.microsoft.com/pricing/details/monitor/) |
 | [Microsoft 365 / Exchange Online](https://learn.microsoft.com/exchange/exchange-online) | Supplies the monitored mailbox that Power BI failure alerts arrive in. | [Pricing](https://www.microsoft.com/microsoft-365/business/compare-all-microsoft-365-business-products) |
 | [Microsoft Teams](https://learn.microsoft.com/microsoftteams/) | Optional. Receives notification and approval cards. | [Pricing](https://www.microsoft.com/microsoft-teams/compare-microsoft-teams-business-options) |
@@ -262,17 +269,18 @@ named human for permission with the evidence already gathered.
 
 This accelerator authenticates with [Managed Identity](https://learn.microsoft.com/entra/identity/managed-identities-azure-resources/overview)
 and Entra agent identity wherever the platform allows it. The controller reaches
-Power BI and Azure Storage as itself, with no key and no secret.
+Power BI and its Fabric SQL Database as itself, with no key and no secret —
+Fabric SQL accepts Entra tokens only, so there is no connection string to leak
+and no local-authentication fallback to switch off.
 
-Three bearer credentials remain, and each is a deliberate exception:
+Two bearer credentials remain, and each is a deliberate exception:
 
 | Credential | Why it exists | Scope |
 |---|---|---|
 | App registration client secret | Exchange does not yet accept an Entra agent identity for app-only mailbox reads. | One mailbox, enforced by an Exchange `ApplicationAccessPolicy`. |
 | Teams Workflows webhook URL | The URL *is* the credential; there is no identity on an incoming webhook. | One channel. |
-| Approval callback URL | Anyone holding the link can answer an approval, so the link is fingerprint-bound to a single action. | One approval request. |
 
-All three live in the azd environment, which is gitignored, and never in the
+Both live in the azd environment, which is gitignored, and never in the
 repository. Only the first expires, and its expiry will stop mail ingestion
 silently, so track it.
 

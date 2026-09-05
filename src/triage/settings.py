@@ -75,32 +75,39 @@ class Settings(BaseSettings):
     graph_sender_allowlist: str = "no-reply-powerbi@microsoft.com,no-reply@powerbi.com"
     graph_subject_pattern: str = r"(?i)\b(power\s*bi|fabric|refresh|semantic model|dataset)\b"
 
-    # Durable incident store. Empty = JSON file next to the repo, which is the
-    # right choice on a laptop and the wrong one in a container: the filesystem
-    # goes away on recycle and takes the open incidents with it, which would let
-    # the agent remediate the same failure twice after a restart.
-    incident_table_endpoint: str = ""
-    incident_table_name: str = "incidents"
-    # Which alert mail has already been triaged. Shares the incident table's
-    # endpoint because it shares its lifetime: both must outlive a hosted
-    # agent invocation or a scheduled sweep re-triages everything it sees.
-    processed_table_name: str = "processedmessages"
-    # Where approval requests wait and decisions land. Same endpoint again:
+    # Durable state lives in a Fabric SQL Database. Empty = JSON files next to
+    # the repo, which is the right choice on a laptop and the wrong one in a
+    # container: the filesystem goes away on recycle and takes the open
+    # incidents with it, which would let the agent remediate the same failure
+    # twice after a restart.
+    #
+    # A Fabric SQL Database accepts Microsoft Entra tokens and nothing else, so
+    # there is no connection string to leak and no local-auth setting for
+    # governance to keep switching off. Read both values from the item's
+    # connection properties (Fabric portal, or the sqlDatabases REST API).
+    fabric_sql_server: str = ""
+    fabric_sql_database: str = ""
+    # Table names, so one database can host more than one deployment.
+    incident_table_name: str = "triage_incidents"
+    # Which alert mail has already been triaged. Shares the database because it
+    # shares its lifetime: both must outlive a hosted agent invocation or a
+    # scheduled sweep re-triages everything it sees.
+    processed_table_name: str = "triage_processed_messages"
+    # Where approval requests wait and decisions land. Same database again:
     # the agent writes the request, a human writes the answer, and the agent
     # reads it back on a later poll -- possibly in a different process.
-    approval_table_name: str = "approvals"
-    #: Retries the agent postponed rather than performing. Same endpoint, same
+    approval_table_name: str = "triage_approvals"
+    #: Retries the agent postponed rather than performing. Same database, same
     #: reason: the run that defers and the sweep that performs it are different
     #: processes, often different invocations.
-    retry_table_name: str = "deferredretries"
-    #: Baselines for the silent-failure detector. Same endpoint again.
-    semantic_health_table_name: str = "semantichealth"
+    retry_table_name: str = "triage_deferred_retries"
+    #: Baselines for the silent-failure detector.
+    semantic_health_table_name: str = "triage_semantic_health"
+    #: Arbitrates one sweep at a time across instances.
+    lease_table_name: str = "triage_sweep_leases"
 
     #: Distributed claims, so two invocations cannot remediate the same alert.
-
-    #: Shares the incident table endpoint; only the table name is separate.
-
-    claim_table_name: str = "claims"
+    claim_table_name: str = "triage_claims"
     #: The detector's off switch. Configuration rather than routine state,
     #: because `azd deploy` re-enables a disabled routine from azure.yaml.
     silent_sweep_enabled: bool = True

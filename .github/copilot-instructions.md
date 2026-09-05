@@ -30,15 +30,47 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 
 .\.venv\Scripts\python.exe -m pytest -q                  # the offline suite -- no network
+.\.venv\Scripts\python.exe -m pytest -q tests\test_policy.py::test_second_remediation_is_refused
+.\.venv\Scripts\python.exe -m pytest -q "tests\test_scenarios.py::test_scenario_meets_its_expectations[scenario1-transient]"
 .\.venv\Scripts\python.exe -m ruff check .
 .\.venv\Scripts\python.exe scripts\scan_secrets.py       # the CI credential gate
+.\.venv\Scripts\python.exe -m pip install -e ".[azure]"  # needed for any live command
 .\.venv\Scripts\bi-triage.exe run scenario1-transient
+.\.venv\Scripts\bi-triage.exe preflight                  # incl. Fabric SQL state
 .\.venv\Scripts\bi-triage.exe identity --check-scope     # who the agents are
 
 azd deploy bi-triage-controller --no-prompt              # hosted controller
 azd ai agent invoke bi-triage-controller "sweep"
 azd ai agent monitor bi-triage-controller
 ```
+
+## Architecture
+
+- `triage.cli:main` is the offline and operator entry point. `src/app.py` wraps
+  the same `TriageRunner` as the Foundry hosted controller for interactive
+  alerts, mailbox sweeps and deterministic silent-failure sweeps.
+- `TriageRunner` owns orchestration outside the model: client and store
+  construction, failure signatures, open-incident lookup, durable run state,
+  agent construction and persistence of the terminal outcome.
+- `TriageAgent` owns the reasoning loop. The provider proposes tool calls;
+  `ToolDispatcher` charges the shared `PolicyLedger`, checks the allowlist,
+  deterministic preconditions and approval state, then dispatches permitted
+  calls. The agent's final outcome is validated against recorded actions and
+  evidence before it is accepted.
+- `DataQualityAgent` is a separate typed agent exposed to the orchestrator as
+  one tool. Deterministic scans and silent-failure detectors establish facts;
+  agents interpret and report them. The controller decides what action follows.
+- Providers are selected per role through `triage.providers.get_provider`:
+  `mock` is a scripted state machine for offline evaluation, `direct` uses Azure
+  OpenAI, and `foundry` invokes registered Foundry agents. Live imports are
+  deferred so the base install and test path stay Azure-free.
+- Stores under `triage.store` hold incidents, processed messages, approvals,
+  retries, claims and semantic-health baselines. JSON/CSV implementations keep
+  local runs reproducible; Azure Table implementations provide hosted
+  durability. State that crosses invocations belongs here, not on an agent.
+- YAML files in `scenarios/` are executable specifications. `TriageRunner`
+  wires their mock inputs into the same controller path used by the application,
+  and each `expect` block is checked by `tests/test_scenarios.py`.
 
 ## Rules that are not negotiable
 
@@ -86,6 +118,15 @@ azd ai agent monitor bi-triage-controller
     date-stamped betas that make breaking changes without a major bump; a
     floating floor once crash-looped the deployed container at startup, and
     nothing reported it.
+19. **A store that degrades must recover.** Falling back to in-memory is
+    correct; staying there after the database returns is silent data loss. A
+    store that cannot reach its backend re-checks on use and reloads, because
+    an empty cache answers "no open incident" to everything and licenses a
+    second remediation.
+20. **Durable state lives in Fabric SQL, reached with an Entra token.** No
+    connection string, no SQL login, no shared key. Claims and leases are
+    arbitrated by a single conditional statement whose `rowcount` names the
+    winner, never by read-then-write.
 
 ## Style
 
@@ -102,6 +143,10 @@ azd ai agent monitor bi-triage-controller
 
 - **A remediation tool**: schema in `TRIAGE_TOOLS` → branch in
   `ToolDispatcher._execute` → name in an action allowlist → a scenario → a test.
+- **A durable store**: subclass the in-memory store and override `_load`,
+  `_persist` and `_on_reset`, as `FabricSqlIncidentStore` does. Keep redaction
+  inside `record`, and make the store retry — a store that gives up on its first
+  failure persists nothing for the life of the process and says so once.
 - **An agent**: mirror `DataQualityAgent`. Own provider, prompt and tools,
   returns a typed Pydantic model, exposed to the orchestrator as one tool. It
   reports; the orchestrator decides.
@@ -114,6 +159,9 @@ azd ai agent monitor bi-triage-controller
   than the cap.
 - **A prompt change**: prompts are hashed onto every incident. If running in
   Foundry mode, **re-register the agents** or the change has no effect.
+- **Anything touching durable state**: prove it live as well as offline. The
+  offline suite uses fakes, and a fake cannot tell you that a connection dies
+  under concurrency or that a managed identity has no database user.
 
 > **Sourcing rule.** Playbook content must come from public documentation. This
 > repository is shared publicly, so internal engineering guides may inform *what

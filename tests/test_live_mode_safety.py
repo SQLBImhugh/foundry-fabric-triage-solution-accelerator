@@ -39,7 +39,8 @@ _BLANK: dict[str, object] = {
     "powerbi_workspace_id": "",
     "powerbi_dataset_id": "",
     "teams_webhook_url": "",
-    "incident_table_endpoint": "",
+    "fabric_sql_server": "",
+    "fabric_sql_database": "",
     "approval_callback_url": "",
 }
 

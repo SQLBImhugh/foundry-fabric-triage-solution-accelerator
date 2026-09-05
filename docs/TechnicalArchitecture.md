@@ -195,26 +195,68 @@ different processes, and on a hosted agent often different invocations.
 
 | Channel | Needs | Use |
 |---|---|---|
-| `bi-triage approve` / `deny` | nothing | Offline, and how an on-call engineer would actually answer |
+| `bi-triage approve` / `deny` | nothing | Offline, and how an on-call engineer holding the repo would answer |
 | The card's buttons | `APPROVAL_CALLBACK_URL` | A click in Teams |
 
 The buttons are `Action.OpenUrl`, not `Action.Submit`. A card posted through an
 incoming webhook has no bot behind it, so a submit button renders a control that
 silently does nothing — which looks exactly like a recorded decision.
 
-**What the buttons point at.** A Consumption Logic App
-(`infra/approval-callback.json`) with an HTTP trigger, which writes the decision
-to the approvals table using its own managed identity. Not a Power Automate
-flow: the Azure Table connector authenticates with a shared account key and
-`allowSharedKeyAccess` is `false` here by tenant policy, and an HTTP-triggered
-flow is a premium trigger. The Logic App needs no key and no licence.
+**What the buttons point at.** `infra/approval-callback.json`, which deploys
+**two** Consumption Logic Apps. The split is forced by the platform rather than
+by taste: a Request trigger accepts exactly one HTTP method. With none declared
+it takes POST only, and a GET is rejected with `TriggerRequestMethodNotValid`
+before the workflow starts. `triggerOutputs()` has no `method` property either —
+only `headers`, `queries` and `body`.
 
-It refuses a request that does not exist, one already answered, one that has
-expired, and one whose fingerprint does not match the link — then the agent
-revalidates all of it independently. The callback URL is a bearer credential:
-anyone holding the link can answer. The fingerprint binding limits it to that
-one action, it lives in the azd environment rather than the repo, and the
-handoff scanner treats it as a secret.
+| Workflow | Method | Can it change anything? |
+|---|---|---|
+| `bi-triage-approval-confirm` | GET | No. Holds no connection; every action is a `Response`. |
+| `bi-triage-approval-callback` | POST | Yes. The only one that writes. |
+
+The card links to the GET workflow, so what preview generators, link scanners
+and prefetchers fetch is a workflow with nothing to change. An approval a link
+preview can grant is not an approval.
+
+An earlier single-workflow version tried to do both by branching on
+`toupper(triggerOutputs()['method'])`. That expression can never evaluate, so
+the run died with `InvalidTemplate` — and a GET never reached it in the first
+place. The test guarding it asserted the template *contained* that expression,
+so it passed for exactly as long as the feature was broken. Its replacements
+assert properties instead: that no definition references a trigger method, and
+that the GET workflow holds no connection and no `ApiConnection` action.
+
+**How it writes.** Fabric SQL has no REST data plane, so the recording workflow
+uses the SQL managed connector as its own system-assigned identity. Managed
+identity lives in the connector's `oauthMI` parameter value set, whose only
+parameter is a token constrained to `location: "logicapp"` — supplied by the
+workflow at run time, so the connection holds no credential. The database user
+is granted `EXECUTE` on one stored procedure and nothing else; it cannot read an
+incident.
+
+The write is `dbo.triage_record_approval_decision`, parameterised, never SQL
+assembled from the URL — everything in that URL is editable by anyone holding
+the link. The procedure makes the whole decision in one statement:
+
+```sql
+UPDATE triage_approvals SET decision = @decision, ...
+ WHERE request_id = @request_id
+   AND (decision IS NULL OR decision = '')           -- unanswered, exactly once
+   AND (@fingerprint IS NULL OR ... = @fingerprint)  -- bound to this action
+   AND (... expires_at > SYSDATETIMEOFFSET())        -- still open
+```
+
+`@@ROWCOUNT` tells the workflow whether it won. Zero means unknown, already
+answered, expired, or fingerprint mismatch; all four render as a refusal and
+none changed anything. A failed write renders as a failure rather than falling
+through to a success page. The agent revalidates all of it independently.
+
+Verified end to end against a live Fabric SQL Database: GET renders the page and
+changes nothing, POST records, a second POST is refused with the first decision
+intact, and mismatched-fingerprint, expired and unknown requests are all
+refused.
+
+**The clock stops while a person decides.** `PolicyLedger.awaiting_human()`
 
 **The clock stops while a person decides.** `PolicyLedger.awaiting_human()`
 excludes that time from the wall clock. The run timeout and the approval timeout
@@ -222,21 +264,11 @@ both default to 300s, so charging the agent for reading time would fail the run
 as `timed_out` at the moment the approval was granted. Turns, tool calls and
 tokens stay charged — those are the agent's consumption, not the human's.
 
-Validation is unchanged and stays on the reading side: explicit, fingerprint
-matches the exact action *and* arguments, unexpired, single-use. Anything else
-is not approved.
-
-**The card cannot show that it was answered.** `Action.OpenUrl` is a link — it
-cannot alter the card it sits on — and an incoming webhook cannot edit a message
-it already posted. So the original card keeps its Approve/Decline buttons
-forever. A second click is refused by the callback and again by the agent, but
-nothing on the card itself says so.
-
-The controller therefore posts a short acknowledgement naming who decided and
-what happens next. That is what a channel reading back over an outage actually
-needs. It goes straight to the notifier rather than through `notify_teams`: that
-path is deduplicated per incident, so routing an acknowledgement through it
-would consume the incident's one announcement and silence the real outcome.
+The controller posts a short acknowledgement naming who decided and what happens
+next. That is what a channel reading back over an outage actually needs. It goes
+straight to the notifier rather than through `notify_teams`: that path is
+deduplicated per incident, so routing an acknowledgement through it would
+consume the incident's one announcement and silence the real outcome.
 
 ## Capacity throttling and deferred retries
 
@@ -320,7 +352,7 @@ deduplication applies: a detector polling every fifteen minutes announces once.
 `bi-triage health` runs a sweep; `--baselines` shows what healthy looked like.
 The hosted agent answers `silent sweep` as a second sentinel alongside `sweep`.
 
-## The incident store
+## The state store
 
 Every terminal outcome is persisted:
 
@@ -341,6 +373,82 @@ the population you mine to decide what to automate next.
 Redaction happens *inside* `record()`, not at call sites, so a new code path
 cannot forget it.
 
+### Why a Fabric SQL Database
+
+State lives in a **Fabric SQL Database**, in the same workspace as the semantic
+models being triaged. It replaced Azure Table Storage, and the reasons were
+practical rather than tidy:
+
+* **The state is relational.** An incident has occurrences, an approval belongs
+  to an action, a deferred retry belongs to a signature. An operator asking
+  "which reports failed most this quarter, and were they the ones we retried"
+  can answer it in one query against the same estate they already report on,
+  instead of exporting a key-value table first.
+* **A conditional `UPDATE` is atomic on its own.** Claims and leases used to be
+  read-then-write guarded by an ETag: three round trips and a race the code had
+  to reason about explicitly. `UPDATE ... WHERE expires_at < SYSUTCDATETIME()`
+  is one statement, `rowcount` says whether this caller won, and the expiry is
+  evaluated on the server, so it does not depend on any container's clock. A
+  primary-key `INSERT` raising `IntegrityError` gives the same compare-and-set
+  the old code got from `ResourceExistsError`.
+* **There is no key to leak.** Fabric SQL accepts Entra tokens and nothing else.
+  There is no SQL-authentication fallback to switch off, so "no local auth" is
+  the platform default rather than a setting governance has to keep reverting.
+  The storage account it replaced arrived with shared-key access already
+  disabled by policy; this removes the argument entirely.
+
+Seven tables, created on startup by `ensure_schema` rather than by a migration
+step, so an adopter pointing at an empty database gets a working system with no
+extra command:
+
+| Table | Holds |
+|---|---|
+| `triage_incidents` | every terminal outcome, keyed by incident id, indexed on (signature, status) because `find_open` runs before every remediation |
+| `triage_processed_messages` | which alert mail has already been triaged |
+| `triage_approvals` | approval requests and the decisions written against them |
+| `triage_deferred_retries` | work postponed by capacity backoff |
+| `triage_semantic_health` | silent-failure baselines |
+| `triage_sweep_leases` | one sweep at a time, across instances |
+| `triage_claims` | one invocation acts, across instances |
+
+Each table carries promoted columns an operator can filter on plus a `payload`
+column holding the authoritative JSON. The payload is what the code reads back,
+so adding a field to a model never needs a migration.
+
+### The driver choice is a container constraint
+
+`mssql-python`, not `pyodbc`. The controller runs as a Foundry hosted agent: a
+managed Linux image built with `dependency_resolution: remote_build`, which
+installs `src/requirements.txt` with pip and nothing else. `pyodbc` needs the
+`msodbcsql18` **system** driver, which is an apt package, so it cannot work
+there at all. `mssql-python` ships the driver inside the wheel as an ordinary
+pip dependency and publishes a cp313 manylinux build matching the declared
+`python_3_13` runtime.
+
+Connections are **per thread**. One shared connection behind a lock was tried
+first and failed under eight concurrent callers with an `OperationalError`
+followed by `InterfaceError` on every subsequent use.
+
+### Degradation must be temporary
+
+Stores degrade to in-memory rather than refusing to start — an accelerator that
+cannot reach its database should still triage, loudly degraded, rather than fail
+to start in front of an audience. What changed is that the degradation now ends
+when the outage does.
+
+The previous implementation opened its client once in `__init__` and, on
+failure, stayed in-memory for the life of the process. Tenant policy disabled
+public network access on the state store minutes after it was created; the
+container started while it was unreachable, and then reported healthy triage
+outcomes while persisting none of them. Restoring connectivity changed nothing,
+because nothing ever tried again. Three invocations were lost before a forced
+redeploy fixed it.
+
+Recovery has to include a **reload**, not just a reconnect. `find_open` is what
+stops the agent remediating the same failure twice, and an empty cache answers
+"no open incident" to everything. `tests/test_store_sql.py` holds the regression
+test, and reverting the fix makes it fail.
+
 ## Claims: only one invocation acts
 
 The store above is checked *before* the work and written *after* it, and the
@@ -354,20 +462,82 @@ not help: it is per run, and these are two runs. The only lock that existed was
 an `asyncio.Lock` on the agent instance — process-local, and a hosted agent is
 rebuilt per request, so it did not even span two requests to one replica.
 
-`store/claims.py` supplies the missing primitive. `create_entity` on an Azure
-Table fails with `ResourceExistsError` when the row already exists, which is an
-atomic compare-and-set against shared state and all a lease needs. The controller
-takes a claim keyed on the message id before doing anything with real effect, and
-releases it afterwards.
+`store/claims.py` supplies the missing primitive, in two statements:
+
+```sql
+INSERT INTO triage_claims (claim_key, ...) VALUES (?, ...)      -- I hold it
+UPDATE triage_claims SET owner = ?                              -- or I steal it,
+ WHERE claim_key = ? AND expires_at < SYSUTCDATETIME()          -- if it is dead
+```
+
+The insert raises `IntegrityError` when somebody already holds the claim. The
+update reports through `rowcount` whether this caller won, and two racers
+cannot both get 1. Verified against the live database with eight concurrent
+threads: exactly one winner.
 
 Claims expire, so a container that dies mid-remediation does not hold one for
-ever — that would turn a duplicate-work bug into a lost-alert bug. Stealing an
-expired claim is itself conditional on the ETag, so two callers racing to take
-over the same dead claim cannot both succeed.
+ever — that would turn a duplicate-work bug into a lost-alert bug.
 
 Unlike the incident and processed stores, this one does **not** degrade quietly
-to in-memory when storage is unreachable. Those degrade because losing them makes
-the agent noisy; losing this one makes it act twice.
+to in-memory when the database is unreachable. Those degrade because losing them
+makes the agent noisy; losing this one makes it act twice.
+
+## The monitoring cockpit
+
+`cockpit/` is a read-only [Fabric App](https://github.com/microsoft/rayfin) over
+the controller's own state — incidents, approvals, deferred retries,
+semantic-health baselines, and the claims and leases that stop two invocations
+acting on the same alert. It has no trigger buttons, no reset, and no scripted
+scenarios: nothing in it can change the system it watches.
+
+### Why it reads a semantic model rather than the database
+
+A Fabric App can only reach Fabric data through a semantic model. That is a
+property of the SDK, not a preference: `@microsoft/fabric-app-data`'s
+`FabricClient` exposes `semanticModel()` and nothing else, and although
+`IFabricApiProxy` *declares* `lakehouse.executeSql` and `warehouse.executeSql`,
+the embedded host ships no implementation of either. So the chain is:
+
+```
+Fabric SQL Database        the controller writes here, over TDS
+      |  auto-mirrored to OneLake
+      v
+SQL analytics endpoint     types itself MirroredWarehouse
+      |  Direct Lake
+      v
+Semantic model             bi-triage-state
+      |  DAX, through the Fabric embed proxy
+      v
+Fabric App                 the cockpit
+```
+
+Every hop is read-only, so the state database keeps exactly one writer. The
+alternative — projecting rows into the app's own store — was rejected because a
+deployed Fabric app accepts Fabric SSO only, leaving no headless credential for
+the controller to write with, and because a second copy of the truth is a second
+thing that can be wrong.
+
+Direct Lake rather than import: a monitoring surface that lags a scheduled
+refresh is describing an estate that no longer exists.
+
+### Two things that will bite the next person
+
+**The `.dark` class is load-bearing, not cosmetic.** The dashboard kit resolves
+its chart palette with `base: root.classList.contains("dark") ? "dark" : "light"`.
+The Fabric portal sets `data-appearance` on `<html>`, and the kit's `useAppTheme`
+follows it — so in a light-themed portal the class comes off and every chart
+renders on a white canvas inside otherwise dark cards. CSS variable overrides
+cannot fix that, because the chart library resolves its own palette from the
+class. `useCanonicalDarkTheme` pins it and re-asserts it through a
+`MutationObserver` rather than racing the host.
+
+**Chart and table specs fail silently when their shape is wrong.** Graphein
+discriminates on `type`, not Vega-Lite's `mark`, and its table columns are
+`{ field, title }`, not `{ key, label }`. Neither mistake is a type error; both
+produce an empty card or a render-time crash visible only in the browser
+console. `npm run preview -- --spec s.json --query <alias> --dax-file q.dax`
+renders a single visual headlessly against live data and catches them before a
+deploy does.
 
 ## Providers
 
@@ -411,8 +581,10 @@ property that makes the allowlist worth anything.
 **A new agent**: mirror `DataQualityAgent`. Own provider, own prompt, own tools,
 returns a typed model. Expose it to the orchestrator as one tool.
 
-**A durable store**: implement `find_open`, `record`, `list_all`, `reset` against
-Cosmos or SQL. Keep redaction inside `record`.
+**A different durable store**: subclass the in-memory store and override
+`_load`, `_persist` and `_on_reset`, as `FabricSqlIncidentStore` does. Keep
+redaction inside `record`, and make sure a failed open can recover rather than
+degrading for the life of the process.
 
 **A real flag table**: replace `DataQualityFlagTable` with three methods against
 the real table. Keep the CSV path for evaluation — a table you can open in Excel is
