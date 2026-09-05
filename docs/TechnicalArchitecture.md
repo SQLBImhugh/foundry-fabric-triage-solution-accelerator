@@ -558,6 +558,69 @@ client SDK. Preview SDKs churn; a deployment that breaks because a package minor
 the week before is a bad outcome. It also puts the wire format on screen, which is
 what was asked for.
 
+## Network isolation
+
+This accelerator ships public endpoints and relies on Entra identity plus
+governance tags. That is the right default for an evaluation, and the wrong one
+for production. What follows is the shape to move to, and — more usefully — why
+the obvious pattern does not transfer.
+
+### Why you cannot copy the Azure SQL pattern
+
+The reference implementation this project was compared against
+([ZacharyZurloMSFT/agentic-pbi-error-triage](https://github.com/ZacharyZurloMSFT/agentic-pbi-error-triage))
+isolates its state with a textbook Azure design: a VNet, a private endpoint on
+the SQL server, a `privatelink.database.windows.net` private DNS zone, and
+delegated subnets for the Function App and the Foundry agent runtime. It is a
+good model and it is worth reading.
+
+**It does not port here.** That design isolates `Microsoft.Sql/servers`, an ARM
+resource that takes a private endpoint. This accelerator's state is a **Fabric
+SQL Database** — a Fabric item, not an ARM resource. It has no
+`Microsoft.Network/privateEndpoints` of its own and no
+`privatelink.database.windows.net` zone to link. Copying the Bicep would produce
+a VNet protecting nothing.
+
+### The Fabric equivalent
+
+Fabric secures **inbound** access with private links at two scopes:
+
+| Scope | Effect | Use when |
+|---|---|---|
+| [Tenant-level](https://learn.microsoft.com/fabric/security/security-private-links-overview) | Network policy across the entire tenant | The whole tenant is private |
+| [Workspace-level](https://learn.microsoft.com/fabric/security/security-workspace-level-private-links-overview) | One workspace mapped to a VNet; others stay public | **This accelerator** — isolate the triage workspace without a tenant-wide change |
+
+Workspace-level is the one to reach for: it maps the workspace holding the SQL
+database, the semantic model and the cockpit to an approved VNet, and restricts
+inbound public access to just that workspace.
+
+Two settings in the admin portal govern the tenant-level behaviour — **Azure
+Private Links** and **Block Public Internet Access** — and the second is the one
+that actually closes the door. With private links configured but public access
+still allowed, the workspace is reachable both ways; Microsoft's own guidance
+calls that a testing configuration rather than a production one, because it
+provides no inbound protection.
+
+### The half it does not cover
+
+**A private endpoint secures traffic *into* Fabric. It does nothing for traffic
+*out* of Fabric.** The controller calls Power BI, Microsoft Graph and Azure
+OpenAI, and every one of those egress paths is unaffected by anything above.
+Securing them is a separate exercise in firewall rules and data-source
+configuration.
+
+That asymmetry is worth stating plainly, because "we enabled Private Link" is
+routinely heard as "the agent is network-isolated", and for an agent — which is
+mostly an egress client — the inbound half is the smaller half.
+
+### Not shipped as Bicep, deliberately
+
+There is no `network.bicep` in this repository. Workspace-level private links
+are configured against Fabric, not ARM, and shipping a template that had never
+been applied would be a claim rather than a capability. The rule in `AGENTS.md`
+is to verify against the platform before asserting; this section documents the
+shape and cites the source, and stops there.
+
 ## Observability
 
 Every LLM call emits an OTel GenAI span: `gen_ai.system`, `gen_ai.request.model`,

@@ -12,8 +12,7 @@ An [Azure subscription](https://azure.microsoft.com/free/) where you hold:
 - **Role Based Access Control Administrator** (or **User Access Administrator**,
   or **Owner**), to assign roles. Several components authenticate by managed
   identity or agent identity, and each needs a role assignment. Without this you
-  can create the resources and none of them will be able to reach each other.
-- **Foundry Project Manager** (or **Foundry Owner**) on the Foundry *account*.
+  can create the resources and none of them will be able to reach each other.- **Foundry Project Manager** (or **Foundry Owner**) on the Foundry *account*.
   Subscription Owner is not enough: Foundry agents are a data-plane resource,
   and the roles beginning `Cognitive Services` do not grant access to them even
   though they carry `Microsoft.CognitiveServices/*` data actions. A project
@@ -77,3 +76,13 @@ If your tenant applies governance automation that stops or resizes idle
 resources overnight, expect it to act on this deployment too, and tag the
 resource group according to your organization's exemption process if it needs to
 keep running unattended.
+
+## Network isolation
+
+The accelerator ships public endpoints and relies on Entra identity. That is the
+right default for an evaluation and the wrong one for production. Moving to
+private access is a Fabric configuration rather than an Azure one — the state
+database is a Fabric item, so it takes **workspace-level private links**, not an
+ARM private endpoint. See
+[`TechnicalArchitecture.md`](TechnicalArchitecture.md#network-isolation) for the
+shape, including the half that private links do not cover.
