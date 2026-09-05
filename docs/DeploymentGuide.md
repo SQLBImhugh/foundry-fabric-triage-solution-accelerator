@@ -165,11 +165,11 @@ local-authentication setting for governance to keep switching off.
 
 ### The tables
 
-Created automatically on first use — there is no migration step. Seven tables:
+Created automatically on first use — there is no migration step. Eight tables:
 `triage_incidents`, `triage_processed_messages`, `triage_approvals`,
 `triage_deferred_retries`, `triage_semantic_health`, `triage_sweep_leases`,
-`triage_claims`. Rename them with the `*_TABLE_NAME` settings if one database
-hosts more than one deployment.
+`triage_claims`, `triage_inbox_audit`. Rename them with the `*_TABLE_NAME`
+settings if one database hosts more than one deployment.
 
 ### Granting the identity that runs the controller
 
@@ -214,10 +214,25 @@ $t = az account get-access-token --resource https://ai.azure.com --query accessT
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -e ".[azure]"   # installs the SQL driver
-.\.venv\Scripts\bi-triage.exe preflight                   # 'Fabric SQL state' must be ok
+.\.venv\Scripts\bi-triage.exe preflight --check-sql       # 'connection' must be ok
 .\.venv\Scripts\bi-triage.exe run scenario1-transient
 .\.venv\Scripts\bi-triage.exe incidents                   # the row you just wrote
 ```
+
+Use `--check-sql` here rather than plain `preflight`. Without it the row reads
+`configured`, which means only that two settings are non-empty — a typo'd
+server, an identity with no database user, or a missing `GRANT` all still show
+green and then fail on the first write. `--check-sql` opens a real connection
+and runs `SELECT 1`. It is opt-in because plain `preflight` is expected to work
+with no network at all.
+
+> **`run` will not clear a shared incident table without being told to.**
+> Scenarios normally reset the incident store so they are reproducible. Once
+> `FABRIC_SQL_*` is set, that store is the same table the hosted controller
+> writes to, so `bi-triage run <scenario>` refuses and exits 2. Choose
+> explicitly: `--keep-incidents` to leave it alone, or `--reset-shared-state`
+> to clear it anyway. Offline runs, where the store is a JSON file under
+> `runs/`, are unaffected and still reset by default.
 
 ---
 

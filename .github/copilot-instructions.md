@@ -65,9 +65,10 @@ azd ai agent monitor bi-triage-controller
   OpenAI, and `foundry` invokes registered Foundry agents. Live imports are
   deferred so the base install and test path stay Azure-free.
 - Stores under `triage.store` hold incidents, processed messages, approvals,
-  retries, claims and semantic-health baselines. JSON/CSV implementations keep
-  local runs reproducible; Azure Table implementations provide hosted
-  durability. State that crosses invocations belongs here, not on an agent.
+  retries, claims, semantic-health baselines and the inbox-filter audit.
+  JSON/CSV implementations keep local runs reproducible; Fabric SQL
+  implementations provide hosted durability. State that crosses invocations
+  belongs here, not on an agent.
 - YAML files in `scenarios/` are executable specifications. `TriageRunner`
   wires their mock inputs into the same controller path used by the application,
   and each `expect` block is checked by `tests/test_scenarios.py`.

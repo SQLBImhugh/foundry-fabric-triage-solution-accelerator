@@ -418,7 +418,9 @@ class TriageRunner:
             retry_after_seconds=(scenario.retry_after_seconds if scenario else 0),
         )
 
-    async def drain_due_retries(self, *, now: datetime | None = None) -> list[str]:
+    async def drain_due_retries(
+        self, *, now: datetime | None = None, claims: Any = None
+    ) -> list[str]:
         """Perform the retries whose window has passed.
 
         Deliberately deterministic and model-free. The decision was already
@@ -432,6 +434,13 @@ class TriageRunner:
 
         ``now`` is injectable so the wait can be tested without waiting, the
         same reason :class:`PolicyLedger` takes a clock.
+
+        ``claims`` is optional and should be supplied by any caller that can run
+        concurrently with itself. A refresh is a real, effectful action, and
+        ``due()`` and ``complete()`` are separate statements: two replicas
+        draining at the same moment both see the same row as due and both issue
+        the refresh. The mailbox path has always claimed per message; this is
+        the same primitive applied to the path that acts without a message.
         """
         if self.retries is None:
             return []
@@ -445,59 +454,85 @@ class TriageRunner:
 
         for row in due:
             signature = str(row.get("signature", ""))
-            report = str(row.get("report_name") or "the dataset")
-            try:
-                outcome = await powerbi.refresh_dataset(
-                    str(row.get("workspace_id", "")), str(row.get("dataset_id", ""))
-                )
-            except Exception as exc:  # noqa: BLE001 - a failed retry is data
-                logger.warning(
-                    "Deferred retry for %s raised %s", signature, type(exc).__name__
-                )
-                self.retries.complete(signature, outcome=f"error:{type(exc).__name__}")
-                lines.append(f"- {report}: retry failed ({type(exc).__name__})")
-                continue
 
-            if outcome.succeeded:
-                self.retries.complete(signature, outcome="resolved")
-                # Close the incident too. An incident left open after the thing
-                # was fixed keeps suppressing new alerts, so a genuine
-                # recurrence is silently swallowed.
-                open_incident = self.store.find_open(signature)
-                if open_incident is not None:
-                    self.store.mark(
-                        open_incident.id,
-                        "resolved",
-                        "Deferred retry completed after the throttling window.",
+            # Claimed on the signature, which is what identifies the work --
+            # a retry row has no message id to key on.
+            claim_key = f"retry:{signature}" if signature else ""
+            if claims is not None and claim_key:
+                if not claims.claim(claim_key):
+                    logger.info(
+                        "Skipping deferred retry for %s: claimed by another "
+                        "invocation", signature
                     )
-                lines.append(f"- {report}: deferred retry completed")
-            elif outcome.throttled:
-                # Still throttled. Back off further, or give up and say so --
-                # the store enforces the attempt limit.
-                again = self.retries.defer(
-                    signature=signature,
-                    request_id=str(row.get("request_id", "")),
-                    workspace_id=str(row.get("workspace_id", "")),
-                    dataset_id=str(row.get("dataset_id", "")),
-                    report_name=report,
-                    reason="Still throttled when the retry window arrived.",
-                    retry_after_seconds=outcome.retry_after_seconds,
-                )
-                if again.get("status") == "pending":
-                    lines.append(
-                        f"- {report}: still throttled, retry {again.get('attempts')} "
-                        f"due {again.get('due_at')}"
-                    )
-                else:
-                    lines.append(
-                        f"- {report}: still throttled after the deferral limit; "
-                        "needs a human"
-                    )
-            else:
-                self.retries.complete(signature, outcome=f"failed:{outcome.status}")
-                lines.append(f"- {report}: retry ran and failed ({outcome.status})")
+                    continue
+            try:
+                lines.extend(await self._drain_one_retry(row, powerbi))
+            finally:
+                # Held until the row is completed or re-deferred, not just until
+                # the refresh returns: releasing at the refresh would let a
+                # second drainer see the row as still due and fire again.
+                if claims is not None and claim_key:
+                    claims.release(claim_key)
 
         logger.info("Drained %d due retry/retries", len(due))
+        return lines
+
+    async def _drain_one_retry(self, row: dict, powerbi: Any) -> list[str]:
+        """One due retry, start to finish. Caller owns the claim."""
+        assert self.retries is not None
+        lines: list[str] = []
+        signature = str(row.get("signature", ""))
+        report = str(row.get("report_name") or "the dataset")
+        try:
+            outcome = await powerbi.refresh_dataset(
+                str(row.get("workspace_id", "")), str(row.get("dataset_id", ""))
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed retry is data
+            logger.warning(
+                "Deferred retry for %s raised %s", signature, type(exc).__name__
+            )
+            self.retries.complete(signature, outcome=f"error:{type(exc).__name__}")
+            return [f"- {report}: retry failed ({type(exc).__name__})"]
+
+        if outcome.succeeded:
+            self.retries.complete(signature, outcome="resolved")
+            # Close the incident too. An incident left open after the thing
+            # was fixed keeps suppressing new alerts, so a genuine
+            # recurrence is silently swallowed.
+            open_incident = self.store.find_open(signature)
+            if open_incident is not None:
+                self.store.mark(
+                    open_incident.id,
+                    "resolved",
+                    "Deferred retry completed after the throttling window.",
+                )
+            lines.append(f"- {report}: deferred retry completed")
+        elif outcome.throttled:
+            # Still throttled. Back off further, or give up and say so --
+            # the store enforces the attempt limit.
+            again = self.retries.defer(
+                signature=signature,
+                request_id=str(row.get("request_id", "")),
+                workspace_id=str(row.get("workspace_id", "")),
+                dataset_id=str(row.get("dataset_id", "")),
+                report_name=report,
+                reason="Still throttled when the retry window arrived.",
+                retry_after_seconds=outcome.retry_after_seconds,
+            )
+            if again.get("status") == "pending":
+                lines.append(
+                    f"- {report}: still throttled, retry {again.get('attempts')} "
+                    f"due {again.get('due_at')}"
+                )
+            else:
+                lines.append(
+                    f"- {report}: still throttled after the deferral limit; "
+                    "needs a human"
+                )
+        else:
+            self.retries.complete(signature, outcome=f"failed:{outcome.status}")
+            lines.append(f"- {report}: retry ran and failed ({outcome.status})")
+
         return lines
 
     async def silent_sweep(self, *, now: datetime | None = None) -> list[str]:

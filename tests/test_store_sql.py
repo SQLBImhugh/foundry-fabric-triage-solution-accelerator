@@ -411,3 +411,90 @@ def test_build_claim_store_without_a_database_is_in_process() -> None:
     from triage.store.claims import InMemoryClaimStore as InMem
 
     assert isinstance(build_claim_store(db=None), InMem)
+
+
+def _last_payload(db: FakeSql) -> str:
+    """The payload of the most recent write, whichever statement carried it."""
+    for sql, params in reversed(db.executed):
+        head = sql.strip().upper()
+        if head.startswith("UPDATE"):
+            return params[3]
+        if head.startswith("INSERT"):
+            return params[4]
+    raise AssertionError("nothing was written")
+
+
+def test_find_open_sees_an_incident_opened_by_another_instance() -> None:
+    """find_open must read through, not answer from a cache loaded once.
+
+    The cache is only refreshed when a write fails, so an incident opened by a
+    second container was invisible here -- and this call is what decides whether
+    the agent may remediate. A stale "no open incident" is exactly how the same
+    failure gets remediated twice.
+    """
+    db = FakeSql(rows=[])
+    store = FabricSqlIncidentStore(db=db)
+    assert store.find_open("sig-1") is None
+
+    # Another instance opens an incident for the same signature.
+    db.rows = [(
+        '{"id": "inc-other", "signature": "sig-1", "status": "open", '
+        '"outcome": "needs_human", "summary": "s", "request_id": "r-9", '
+        '"occurrence_count": 1}',
+    )]
+
+    found = store.find_open("sig-1")
+    assert found is not None, "answered from a stale cache; a second remediation follows"
+    assert found.id == "inc-other"
+
+
+def test_find_open_drops_a_cached_incident_the_database_no_longer_has() -> None:
+    """Otherwise a row deleted or resolved elsewhere lingers as open forever."""
+    db = FakeSql(rows=[(
+        '{"id": "inc-1", "signature": "sig-1", "status": "open", '
+        '"outcome": "needs_human", "summary": "s", "request_id": "r-0", '
+        '"occurrence_count": 1}',
+    )])
+    store = FabricSqlIncidentStore(db=db)
+    assert store.find_open("sig-1") is not None
+
+    db.rows = []
+    assert store.find_open("sig-1") is None
+
+
+def test_recovery_does_not_discard_a_change_made_while_the_database_was_down() -> None:
+    """A failed write is what triggers the reload, so the reload must not throw
+    away the change that failed.
+
+    Regression: recovery kept the local copy only for incident ids the database
+    had never seen. An incident that already existed was 'in' the reloaded set,
+    so the stale database row won and the local update vanished -- a regressed
+    occurrence_count or notified_count then licenses a second announcement.
+    """
+    db = FakeSql(rows=[])
+    store = FabricSqlIncidentStore(db=db)
+    first = store.record(_result(), report_name="R")
+    stale = _last_payload(db)
+    assert first.occurrence_count == 1
+
+    # The database goes read-only: reads still work, writes fail.
+    db.fail_writes = True
+    second = store.record(_result(), report_name="R")
+    assert second.occurrence_count == 2, "the in-memory copy still advances"
+    assert store.is_durable is False
+
+    # It comes back, still holding the pre-outage row.
+    db.fail_writes = False
+    db.rows = [(stale,)]
+    db.executed.clear()
+
+    store.find_open("sig-1")
+
+    assert db.executed, (
+        "recovery wrote nothing: the local change was dropped in favour of the "
+        "stale database row"
+    )
+    flushed = _last_payload(db)
+    assert '"occurrence_count":2' in flushed.replace(" ", ""), (
+        "recovery overwrote the local change with the stale database row"
+    )

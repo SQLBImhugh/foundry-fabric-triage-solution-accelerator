@@ -46,6 +46,10 @@ class FabricSqlIncidentStore(InMemoryIncidentStore):
         self._table = quote_identifier(table)
         self._table_name = table
         self._loaded = False
+        #: Incidents whose in-memory copy is ahead of the database because a
+        #: write failed. They must survive a reload, or recovery would throw
+        #: away precisely the changes that could not be saved.
+        self._dirty: set[str] = set()
         self._ensure_loaded()
 
     @property
@@ -98,28 +102,107 @@ class FabricSqlIncidentStore(InMemoryIncidentStore):
                 continue
             loaded[incident.id] = incident
 
-        # Anything written while the database was unreachable exists only here.
-        # Replacing the dictionary outright would drop those terminal outcomes
-        # at the exact moment recovery made it possible to save them -- turning
-        # "degraded, and saying so" into permanent data loss, which is the bug
-        # this store was rewritten to fix. So the database wins for rows it
-        # has, and rows it has never seen are flushed to it now.
-        unsaved = [inc for iid, inc in self._items.items() if iid not in loaded]
+        # Anything the database has not got, or has an out-of-date copy of,
+        # exists only here. Replacing the dictionary outright would drop those
+        # terminal outcomes at the exact moment recovery made it possible to
+        # save them -- turning "degraded, and saying so" into permanent data
+        # loss, which is the bug this store was rewritten to fix.
+        #
+        # Membership of `loaded` is not the test. An incident that already
+        # existed before the outage *is* in `loaded`, so an earlier version of
+        # this method kept the stale database row and silently discarded the
+        # local update -- and since a failed write is what sets `_loaded` to
+        # False, the reload threw away the very change that had just failed to
+        # persist. A regressed occurrence_count or notified_count then licenses
+        # a second announcement, or a second remediation.
+        #
+        # So the test is `_dirty`: rows with a pending local change win, and
+        # the database wins for everything else.
+        pending = {
+            iid: inc
+            for iid, inc in self._items.items()
+            if iid not in loaded or iid in self._dirty
+        }
         self._items = loaded
-        for incident in unsaved:
+        for iid, incident in pending.items():
             logger.warning(
-                "Flushing incident %s that was recorded while the database was "
-                "unreachable",
-                incident.id,
+                "Flushing incident %s that was recorded or modified while the "
+                "database was unreachable",
+                iid,
             )
-            self._items[incident.id] = incident
+            self._items[iid] = incident
             self._upsert(incident)
+            # Only clear the flag once the write has actually gone through;
+            # _upsert raises on failure, so reaching here means it did.
+            self._dirty.discard(iid)
 
     # --- reads, guarded so a recovered database is picked up ---------------
 
     def find_open(self, signature: str) -> Incident | None:
-        self._ensure_loaded()
-        return super().find_open(signature)
+        """Read through to the database for this signature, not just the cache.
+
+        The cache is loaded once and then only refreshed when a write fails, so
+        an incident opened by *another* instance was invisible here — and this
+        call is the one that decides whether the agent may remediate. A stale
+        "no open incident" is how the same failure gets remediated twice, which
+        is the outcome the whole store exists to prevent.
+
+        `triage_incidents` carries an index on (signature, status) for exactly
+        this query; until now nothing issued it. Scoping the refresh to one
+        signature keeps it cheap enough to run on every check, which a full
+        reload would not be.
+        """
+        with self._lock:
+            if self._ensure_loaded():
+                self._refresh_signature(signature)
+            return super().find_open(signature)
+
+    def _refresh_signature(self, signature: str) -> None:
+        """Make the database authoritative for one signature. Caller holds the lock."""
+        try:
+            rows = self._db.query(
+                f"SELECT payload FROM {self._table} WHERE signature = ?",
+                signature[:200],
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Fall back to the cached view rather than failing the lookup. A
+            # refusal here would stop triage entirely; a stale read only risks
+            # the duplicate this method is trying to avoid, and the claim taken
+            # before remediation is the second line of defence.
+            self._loaded = False
+            logger.warning(
+                "Could not re-read signature from %s (%s); answering from cache",
+                self._table_name,
+                type(exc).__name__,
+            )
+            return
+
+        fresh: dict[str, Incident] = {}
+        for (raw,) in rows:
+            if not raw:
+                continue
+            try:
+                incident = Incident.model_validate(json.loads(raw))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Skipping unreadable incident row (%s)", type(exc).__name__)
+                continue
+            fresh[incident.id] = incident
+
+        # Drop cached incidents for this signature that the database no longer
+        # has, so a locally-resolved-then-deleted row cannot linger as open.
+        # Dirty rows are exempt: their local copy is the newer one.
+        stale = [
+            iid
+            for iid, inc in self._items.items()
+            if inc.signature == signature and iid not in fresh and iid not in self._dirty
+        ]
+        for iid in stale:
+            self._items.pop(iid, None)
+
+        for iid, incident in fresh.items():
+            if iid in self._dirty:
+                continue
+            self._items[iid] = incident
 
     def list_all(self) -> list[Incident]:
         self._ensure_loaded()
@@ -138,10 +221,15 @@ class FabricSqlIncidentStore(InMemoryIncidentStore):
         except Exception as exc:  # noqa: BLE001
             # The in-memory copy is already correct, so the run continues -- but
             # this incident is not durable, and the next restart forgets it.
+            # Marking it dirty is what stops the recovery reload overwriting it
+            # with the stale row still sitting in the database.
             self._loaded = False
+            self._dirty.add(incident.id)
             logger.error(
                 "Could not persist incident %s (%s)", incident.id, type(exc).__name__
             )
+        else:
+            self._dirty.discard(incident.id)
 
     def _upsert(self, incident: Incident) -> None:
         """Update, and insert only if the row was not there.

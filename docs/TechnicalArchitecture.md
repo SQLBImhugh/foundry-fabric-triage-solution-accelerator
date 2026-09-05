@@ -397,7 +397,7 @@ practical rather than tidy:
   The storage account it replaced arrived with shared-key access already
   disabled by policy; this removes the argument entirely.
 
-Seven tables, created on startup by `ensure_schema` rather than by a migration
+Eight tables, created on startup by `ensure_schema` rather than by a migration
 step, so an adopter pointing at an empty database gets a working system with no
 extra command:
 
@@ -410,6 +410,7 @@ extra command:
 | `triage_semantic_health` | silent-failure baselines |
 | `triage_sweep_leases` | one sweep at a time, across instances |
 | `triage_claims` | one invocation acts, across instances |
+| `triage_inbox_audit` | what the inbox filter refused, and why |
 
 Each table carries promoted columns an operator can filter on plus a `payload`
 column holding the authoritative JSON. The payload is what the code reads back,
@@ -481,6 +482,32 @@ ever — that would turn a duplicate-work bug into a lost-alert bug.
 Unlike the incident and processed stores, this one does **not** degrade quietly
 to in-memory when the database is unreachable. Those degrade because losing them
 makes the agent noisy; losing this one makes it act twice.
+
+### Which paths are claimed, and one that is not
+
+Three entry paths can reach a real action, and they are not equally protected:
+
+| Path | Claim key | Covered |
+|---|---|---|
+| Mailbox sweep | `message:{request_id}` | Yes |
+| Deferred retry drain | `retry:{signature}` | Yes |
+| Interactive alert pasted into the Playground | — | **No** |
+
+The retry drain was unclaimed until recently, which was the sharper of the two
+gaps: `due()` and `complete()` are separate statements, so two replicas
+draining at the same moment both saw the same row as due and both issued a
+dataset refresh. The claim is held until the row is completed or re-deferred,
+not merely until the refresh returns — releasing at the refresh would let a
+second drainer see the row as still due.
+
+The interactive path remains unclaimed and is documented rather than fixed.
+There is no message id to key on, and the signature is not known until the
+request has been run. `find_open` reading through to SQL on every check narrows
+it — an incident already opened by a sweep is visible and suppresses — but two
+callers can still pass that check before either persists. Closing it properly
+means claiming on the signature inside `TriageRunner`, which would cover all
+three paths uniformly and is a larger change than it appears, because the
+offline scenarios drive the same runner.
 
 ## The monitoring cockpit
 
@@ -587,12 +614,35 @@ Fabric secures **inbound** access with private links at two scopes:
 
 | Scope | Effect | Use when |
 |---|---|---|
-| [Tenant-level](https://learn.microsoft.com/fabric/security/security-private-links-overview) | Network policy across the entire tenant | The whole tenant is private |
-| [Workspace-level](https://learn.microsoft.com/fabric/security/security-workspace-level-private-links-overview) | One workspace mapped to a VNet; others stay public | **This accelerator** — isolate the triage workspace without a tenant-wide change |
+| [Tenant-level](https://learn.microsoft.com/fabric/security/security-private-links-overview) | Network policy across the entire tenant | **This accelerator** — the only scope that covers a Fabric SQL Database |
+| [Workspace-level](https://learn.microsoft.com/fabric/security/security-workspace-level-private-links-overview) | One workspace mapped to a VNet; others stay public | Workspaces built from supported items — which this one is not |
 
-Workspace-level is the one to reach for: it maps the workspace holding the SQL
-database, the semantic model and the cockpit to an approved VNet, and restricts
-inbound public access to just that workspace.
+**Workspace-level is the obvious choice and it is the wrong one here.** Two
+entries on Microsoft's
+[supported-scenarios list](https://learn.microsoft.com/fabric/security/security-workspace-level-private-links-support)
+rule it out, and they are precisely the two items this design is built on:
+
+- **SQL databases** — "Tenant-level private links are available for SQL
+  database, but currently, workspace-level private links are not available in
+  SQL database." The state store is the one thing most worth isolating, and it
+  is the one thing workspace-level scope does not reach.
+- **Semantic models** — "Power BI semantic models aren't supported in workspaces
+  with workspace-level private links enabled. If a workspace contains any Power
+  BI semantic models, you can't enable workspace-level private links for that
+  workspace." The cockpit reads through a semantic model, because a Fabric App
+  has no other way to query. Its presence does not merely go unprotected: it
+  blocks the feature being turned on at all.
+
+So a workspace holding the SQL database, the semantic model and the cockpit
+cannot have workspace-level private links enabled, and **tenant-level is the
+only scope that applies to this architecture**. That is a heavier change — it is
+a tenant-wide network policy, not a per-workspace one — and worth knowing before
+it is planned as a workspace-scoped task.
+
+An earlier revision of this document recommended the opposite, having reasoned
+from what the feature is for rather than from its support matrix. It is recorded
+here rather than quietly corrected because the mistake is the instructive part:
+the two unsupported item types were exactly the two in use.
 
 Two settings in the admin portal govern the tenant-level behaviour — **Azure
 Private Links** and **Block Public Internet Access** — and the second is the one

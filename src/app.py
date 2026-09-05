@@ -221,7 +221,25 @@ class TriageControllerAgent(BaseAgent):
     # --- the two entry paths ----------------------------------------------
 
     async def _triage_text(self, text: str) -> str:
-        """Triage an alert pasted straight into the Playground."""
+        """Triage an alert pasted straight into the Playground.
+
+        Unclaimed, unlike the mailbox and retry paths, and that is a known gap
+        rather than an oversight. There is no message id to key a claim on, and
+        the signature -- the thing that actually identifies the work -- is not
+        known until the request has been run. So a human pasting an alert while
+        a scheduled sweep is processing the same underlying failure can both
+        reach remediation.
+
+        What narrows it: `find_open` reads through to SQL on every check, so an
+        incident already opened by the sweep is visible here and suppresses.
+        What remains: both callers can pass that check before either persists.
+
+        Closing it properly means claiming on the signature inside the runner,
+        which would cover all three entry paths uniformly. That is a larger
+        change than it looks -- it moves claim ownership out of the hosted app
+        and into the runner, which the offline scenarios also drive -- so it is
+        recorded here rather than half-done.
+        """
         subject, _, body = text.partition("\n")
         hints = parse_hints(subject, text)
         request = BIRequest(
@@ -262,7 +280,7 @@ class TriageControllerAgent(BaseAgent):
         # Done first: a retry that succeeds closes its incident, so a fresh
         # alert for the same signature arriving in this sweep is judged against
         # the current state rather than a stale open one.
-        retried = await self._runner.drain_due_retries()
+        retried = await self._runner.drain_due_retries(claims=self._claims)
 
         # Say which identity we are actually presenting. A container can hold a
         # valid token for the wrong principal, which surfaces as a 401 and

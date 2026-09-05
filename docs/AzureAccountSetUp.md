@@ -82,7 +82,11 @@ keep running unattended.
 The accelerator ships public endpoints and relies on Entra identity. That is the
 right default for an evaluation and the wrong one for production. Moving to
 private access is a Fabric configuration rather than an Azure one — the state
-database is a Fabric item, so it takes **workspace-level private links**, not an
-ARM private endpoint. See
+database is a Fabric item, so it takes a **Fabric private link**, not an ARM
+private endpoint.
+
+Reach for the tenant-level scope, not the workspace-level one. Workspace-level
+private links do not cover Fabric SQL Database, and a workspace containing a
+Power BI semantic model cannot enable them at all — this workspace has both. See
 [`TechnicalArchitecture.md`](TechnicalArchitecture.md#network-isolation) for the
-shape, including the half that private links do not cover.
+shape, the citations, and the half that private links do not cover.

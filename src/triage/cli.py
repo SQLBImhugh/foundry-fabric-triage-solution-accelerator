@@ -304,6 +304,32 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
         )
 
+    # A scenario resets the incident store so it is reproducible, which is
+    # right when that store is a JSON file under runs/. It stops being right
+    # the moment the store is Fabric SQL, because that table is the one the
+    # hosted controller writes to -- so `run` would silently delete real
+    # incidents to make a rehearsal tidy. Discovered the hard way: a single
+    # `bi-triage run scenario1-transient` against the live database took the
+    # table from seven rows to one.
+    #
+    # Refuse rather than guess. Both answers are one flag away and the command
+    # says which is which; deleting somebody's incident history to avoid
+    # asking is not a trade worth making.
+    if (
+        scenario.reset_incidents
+        and not args.keep_incidents
+        and not args.reset_shared_state
+        and getattr(runner.store, "is_durable", False)
+    ):
+        console.print(
+            "[red]Refusing to run:[/red] this scenario clears the incident "
+            "store, and the store is durable (Fabric SQL), not a local file. "
+            "That table is shared with the hosted controller.\n\n"
+            "  --keep-incidents       run without clearing anything\n"
+            "  --reset-shared-state   clear it anyway, deliberately"
+        )
+        return 2
+
     all_artifacts = asyncio.run(runner.run_scenario(scenario, keep_incidents=args.keep_incidents))
 
     for idx, artifacts in enumerate(all_artifacts, start=1):
@@ -365,6 +391,28 @@ def cmd_incidents(args: argparse.Namespace) -> int:
     return 0
 
 
+def _probe_fabric_sql() -> tuple[str, str, str]:
+    """Actually connect, and report what happened.
+
+    Separate from the settings row on purpose. This is the only part of
+    preflight that touches the network, so it runs solely under --check-sql and
+    reports the exception type rather than raising: a diagnostic that aborts the
+    rest of the table is worse than one that prints a red line.
+    """
+    try:
+        from triage.settings import settings as _s
+        from triage.store.fabric_sql import FabricSqlDatabase
+
+        db = FabricSqlDatabase(server=_s.fabric_sql_server, database=_s.fabric_sql_database)
+        rows = db.query("SELECT 1")
+        if rows and rows[0][0] == 1:
+            return ("  \u2514 connection", "SELECT 1 succeeded", "[green]ok[/green]")
+        return ("  \u2514 connection", "unexpected result", "[red]failed[/red]")
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not raise
+        detail = f"{type(exc).__name__}: {exc}"
+        return ("  \u2514 connection", detail[:70], "[red]failed[/red]")
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     from triage.observability import otel_available
 
@@ -373,8 +421,9 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     table.add_column("Value")
     table.add_column("Status")
 
-    def row(name: str, value: str, ok: bool, optional: bool = False) -> None:
-        mark = "[green]ok[/green]" if ok else ("[yellow]optional[/yellow]" if optional else "[red]missing[/red]")
+    def row(name: str, value: str, ok: bool, optional: bool = False,
+            ok_label: str = "ok") -> None:
+        mark = f"[green]{ok_label}[/green]" if ok else ("[yellow]optional[/yellow]" if optional else "[red]missing[/red]")
         table.add_row(name, value or "(unset)", mark)
 
     row("Provider mode", settings.triage_provider_mode, True)
@@ -398,6 +447,12 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     # Durable state is what makes the agent idempotent across invocations, so
     # it is reported even offline: a hosted deployment without it silently
     # forgets every open incident on restart and can remediate twice.
+    #
+    # "configured" is deliberately not "ok". This row reads two settings; it
+    # does not connect. A typo'd server, a managed identity with no database
+    # user, or a missing GRANT all produce a perfectly green row and then fail
+    # at the first write. Use --check-sql to actually open a connection, which
+    # is opt-in because preflight must stay runnable with no network.
     sql_target = (
         f"{settings.fabric_sql_database} on {settings.fabric_sql_server}"
         if settings.fabric_sql_server and settings.fabric_sql_database
@@ -408,7 +463,10 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         sql_target or "(json files under runs/)",
         bool(sql_target),
         optional=not live,
+        ok_label="configured",
     )
+    if getattr(args, "check_sql", False) and sql_target:
+        table.add_row(*_probe_fabric_sql())
     row("Teams webhook", "set" if settings.teams_webhook_url else "", bool(settings.teams_webhook_url), optional=not live)
     row(
         "App Insights",
@@ -1196,6 +1254,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not clear the incident store first (keeps prior runs' evidence visible)",
     )
+    run.add_argument(
+        "--reset-shared-state",
+        action="store_true",
+        help="Permit clearing a durable (Fabric SQL) incident store. Required "
+             "when the scenario resets incidents and the store is not a local "
+             "file, because that table is shared with the hosted controller.",
+    )
     run.set_defaults(func=cmd_run)
 
     watch = sub.add_parser("watch", help="Poll a mailbox and triage each new message")
@@ -1240,7 +1305,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("flags", help="Show the data quality flag table").set_defaults(func=cmd_flags)
     sub.add_parser("incidents", help="Show the incident store").set_defaults(func=cmd_incidents)
-    sub.add_parser("preflight", help="Verify configuration").set_defaults(func=cmd_preflight)
+    p_pre = sub.add_parser("preflight", help="Verify configuration")
+    p_pre.add_argument(
+        "--check-sql",
+        action="store_true",
+        help="Also open a real connection to Fabric SQL. Off by default so "
+             "preflight works with no network.",
+    )
+    p_pre.set_defaults(func=cmd_preflight)
     sub.add_parser("reset", help="Clear flags and incidents").set_defaults(func=cmd_reset)
     sub.add_parser("tools", help="Print agent tool schemas").set_defaults(func=cmd_tools)
 

@@ -145,6 +145,29 @@ def test_redaction_happens_inside_the_store() -> None:
     assert stored["redaction_applied"] is True
 
 
+def test_the_reason_is_redacted_not_just_the_sender() -> None:
+    """The allowlist rejection interpolates the sender into its reason text, so
+    an unredacted reason would put back exactly what the sender column strips.
+
+    Regression: `reason` was stored raw while `sender` and `subject` were
+    redacted, which made the redaction on `sender` decorative for the one
+    rejection path an attacker controls.
+    """
+    audit = InMemoryInboxAudit()
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    audit.record(
+        message_id="m",
+        sender=f"{secret}@evil.example",
+        subject="Refresh failed",
+        reason=f"sender {secret}@evil.example not on the allowlist",
+    )
+
+    stored = audit.recent()[0]
+    assert secret not in stored["sender"]
+    assert secret not in stored["reason"], "the reason leaked what the sender hid"
+    assert stored["redaction_applied"] is True
+
+
 def test_the_audit_is_bounded() -> None:
     """Evidence, not history. An unbounded table nothing reads back is a leak."""
     audit = InMemoryInboxAudit(max_rows=10)

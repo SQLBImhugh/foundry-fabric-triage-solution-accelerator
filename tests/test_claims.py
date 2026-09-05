@@ -97,3 +97,119 @@ def test_a_simulated_race_produces_exactly_one_winner() -> None:
         thread.join()
 
     assert len(won) == 1, f"{len(won)} callers claimed the same message"
+
+
+# --- the deferred-retry drain -------------------------------------------------
+
+
+class _RefusingClaims:
+    """A claim store where somebody else already holds everything."""
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+        self.released: list[str] = []
+
+    def claim(self, key: str, **_kw) -> bool:
+        self.asked.append(key)
+        return False
+
+    def release(self, key: str) -> None:  # pragma: no cover - never reached
+        self.released.append(key)
+
+
+def _retry_runner(refreshes: list[str]):
+    """A stand-in with just the collaborators drain_due_retries touches."""
+    import types
+
+    from triage.runner import TriageRunner
+
+    class _Outcome:
+        succeeded = True
+        throttled = False
+        status = "Completed"
+        retry_after_seconds = 0
+
+    class _PowerBI:
+        async def refresh_dataset(self, workspace_id: str, dataset_id: str):
+            refreshes.append(dataset_id)
+            return _Outcome()
+
+    class _Retries:
+        def due(self, now=None):
+            return [{"signature": "sig-1", "dataset_id": "ds-1",
+                     "workspace_id": "ws-1", "report_name": "R",
+                     "request_id": "r-1"}]
+
+        def complete(self, *_a, **_kw):
+            return None
+
+    class _Store:
+        def find_open(self, _sig):
+            return None
+
+    fake = types.SimpleNamespace(
+        retries=_Retries(),
+        store=_Store(),
+        build_powerbi=lambda: _PowerBI(),
+    )
+    fake._drain_one_retry = types.MethodType(TriageRunner._drain_one_retry, fake)
+    return fake, TriageRunner.drain_due_retries
+
+
+def test_a_claimed_retry_is_not_drained_twice() -> None:
+    """A deferred retry issues a real dataset refresh, and `due` and `complete`
+    are separate statements — so two replicas draining at the same moment both
+    see the row as due. The mailbox path has always claimed per message; the
+    retry path acts without a message and needs the same guard.
+    """
+    import asyncio
+
+    refreshes: list[str] = []
+    fake, drain = _retry_runner(refreshes)
+    claims = _RefusingClaims()
+
+    lines = asyncio.run(drain(fake, claims=claims))
+
+    assert claims.asked == ["retry:sig-1"], "the drain did not try to claim"
+    assert refreshes == [], "refreshed a dataset another invocation had claimed"
+    assert lines == []
+
+
+def test_an_unclaimed_retry_still_runs_and_releases() -> None:
+    """The guard must not stop the ordinary single-instance path."""
+    import asyncio
+
+    refreshes: list[str] = []
+    fake, drain = _retry_runner(refreshes)
+    claims = InMemoryClaimStore()
+
+    lines = asyncio.run(drain(fake, claims=claims))
+
+    assert refreshes == ["ds-1"]
+    assert any("deferred retry completed" in ln for ln in lines)
+    # Released, so a later drain in the same process is not locked out.
+    assert claims.claim("retry:sig-1") is True
+
+
+def test_the_retry_claim_is_held_until_the_row_is_finished() -> None:
+    """Releasing at the refresh would let a second drainer see the row as still
+    due and fire again before it was marked complete."""
+    import asyncio
+
+    held: list[bool] = []
+    claims = InMemoryClaimStore()
+
+    refreshes: list[str] = []
+    fake, drain = _retry_runner(refreshes)
+
+    original = fake.retries.complete
+
+    def complete(*a, **kw):
+        # A second drainer trying to claim at this exact moment must lose.
+        held.append(InMemoryClaimStore.claim(claims, "retry:sig-1") is False)
+        return original(*a, **kw)
+
+    fake.retries.complete = complete
+    asyncio.run(drain(fake, claims=claims))
+
+    assert held == [True], "the claim was released before the row was completed"

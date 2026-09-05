@@ -78,16 +78,23 @@ class InMemoryInboxAudit:
     def record(self, *, message_id: str, sender: str, subject: str, reason: str) -> None:
         # Redact before anything is stored, not at the call site. A rejected
         # message is unvetted input by definition.
+        #
+        # `reason` is redacted too, and that is not belt-and-braces: the
+        # allowlist rejection interpolates the sender into its text
+        # ("sender x@y not on the allowlist", mail_filter.py), so leaving it raw
+        # would reinstate in one column exactly what the next line strips out of
+        # another.
         clean_subject, subject_hits = redact(subject or "")
         clean_sender, sender_hits = redact(sender or "")
+        clean_reason, reason_hits = redact(reason or "")
 
         row = {
             "fingerprint": _fingerprint(message_id),
             "sender": clean_sender[:200],
             "subject": clean_subject[:400],
-            "reason": (reason or "")[:200],
+            "reason": clean_reason[:200],
             "ignored_at": _utcnow(),
-            "redaction_applied": bool(subject_hits or sender_hits),
+            "redaction_applied": bool(subject_hits or sender_hits or reason_hits),
         }
         with self._lock:
             # Keyed on the message, so a sweep that re-reads the same mail does
