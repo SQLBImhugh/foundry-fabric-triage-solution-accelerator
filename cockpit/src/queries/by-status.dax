@@ -1,0 +1,6 @@
+EVALUATE
+SUMMARIZECOLUMNS(
+    triage_incidents[status],
+    "incidents", COALESCE(COUNTROWS(triage_incidents), 0)
+)
+ORDER BY [incidents] DESC

@@ -1,0 +1,10 @@
+// fabric.generated.ts — AUTO-GENERATED from fabric.yaml (profile: default). Do not edit.
+
+export const fabricConfig = {
+  semanticModels: {
+    'triageState': {
+      workspaceId: 'f926dabe-5b3a-42a6-9adb-75526c01a7f9',
+      itemId: 'ade9befe-57c8-4dd8-b160-fa9917632896',
+    },
+  },
+} as const;

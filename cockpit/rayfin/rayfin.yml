@@ -1,0 +1,25 @@
+id: cockpit
+name: cockpit
+version: 1.0.0
+services:
+  auth:
+    enabled: true
+    fabric:
+      enabled: true
+    password:
+      enabled: true
+    allowedRedirectUris:
+      - http://localhost:5173
+      - https://raven-moon-d7109b67a8-centralus.webapp.fabricapps.net
+  data:
+    enabled: false
+    dialect: mssql
+  staticHosting:
+    enabled: true
+    folder: dist
+    buildCommand: npm run build:fabric
+    indexDocument: index.html
+  storage:
+    enabled: false
+  functions:
+    enabled: false
