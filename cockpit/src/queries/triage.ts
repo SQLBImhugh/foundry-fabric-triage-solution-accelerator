@@ -116,6 +116,29 @@ SELECTCOLUMNS(
 `;
 
 /**
+ * Messages the inbox filter refused.
+ *
+ * The filter is a security control — an agent that acts on every message it
+ * receives is steerable by anyone who can email it — and this is the evidence
+ * that it fired. A count cannot distinguish a filter correctly rejecting noise
+ * from one silently rejecting the real alerts; the reason column can.
+ */
+export const INBOX_AUDIT = `
+EVALUATE
+TOPN(
+    25,
+    SELECTCOLUMNS(
+        triage_inbox_audit,
+        "Sender", triage_inbox_audit[sender],
+        "Subject", triage_inbox_audit[subject],
+        "Reason", triage_inbox_audit[reason],
+        "Ignored", triage_inbox_audit[ignored_at]
+    ),
+    [Ignored], DESC
+)
+`;
+
+/**
  * Silent-failure baselines. `suspect_count` above zero means a probe saw
  * something it has not yet confirmed — the suspect-then-confirm rule mid-flight,
  * not a finding.

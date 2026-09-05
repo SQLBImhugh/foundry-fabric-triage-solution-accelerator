@@ -165,6 +165,7 @@ class GraphInbox:
         mailbox: str,
         mail_filter: MailFilter | None = None,
         processed_log: ProcessedMessageLog | None = None,
+        audit_log: Any = None,
     ):
         self._tenant_id = tenant_id
         self._client_id = client_id
@@ -179,6 +180,10 @@ class GraphInbox:
         # every message in the mailbox, which makes it steerable by anyone
         # who can send it mail.
         self._filter = mail_filter
+        # Optional, and optional on purpose: the filter must refuse the message
+        # whether or not anything is recording the refusal. Losing the audit
+        # costs evidence, never the control itself.
+        self._audit = audit_log
 
     def mark_processed(self, message_id: str, *, received_at: str = "") -> None:
         """Record that this message reached a terminal outcome.
@@ -369,9 +374,23 @@ class GraphInbox:
         if self._filter is not None:
             accepted, reason = self._filter.accepts(sender=sender, subject=subject)
             if not accepted:
-                # Counted, not silently dropped: an operator needs to know the
-                # agent saw this and chose not to act.
+                # Recorded, not silently dropped: an operator needs to know the
+                # agent saw this and chose not to act -- and *which* message,
+                # because "ignored 10 messages" reads identically whether the
+                # filter is rejecting noise or has gone deaf to real alerts.
                 logger.info("Skipped message (%s)", reason)
+                if self._audit is not None:
+                    try:
+                        self._audit.record(
+                            message_id=mid, sender=sender, subject=subject, reason=reason
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # Evidence is not the control. A failure to record must
+                        # never turn a refused message into an accepted one.
+                        logger.warning(
+                            "Could not audit an ignored message (%s)",
+                            type(exc).__name__,
+                        )
                 return "filtered"
 
         body = ((msg.get("body") or {}).get("content") or "")[:20000]

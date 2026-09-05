@@ -420,6 +420,17 @@ def schema_statements(tables: dict[str, str]) -> list[str]:
             expires_at   DATETIME2(3)   NOT NULL,
             claim_text   NVARCHAR(512)  NULL
         )""",
+        # Evidence that the inbox filter refused a message. Append-only and
+        # bounded; nothing reads these rows back to reconsider a message.
+        f"""
+        IF OBJECT_ID('{_bare(t["inbox_audit"])}') IS NULL
+        CREATE TABLE {t["inbox_audit"]} (
+            fingerprint  NVARCHAR(64)   NOT NULL PRIMARY KEY,
+            sender       NVARCHAR(200)  NULL,
+            subject      NVARCHAR(400)  NULL,
+            reason       NVARCHAR(200)  NULL,
+            ignored_at   NVARCHAR(40)   NOT NULL
+        )""",
         # The approval callback runs as a Logic App, which has no way to hold a
         # transaction open across a read and a write. Putting the whole decision
         # in one procedure gives it the same guarantee `decide()` has in Python:
@@ -487,6 +498,7 @@ DEFAULT_TABLES: dict[str, str] = {
     "semantic_health": "triage_semantic_health",
     "leases": "triage_sweep_leases",
     "claims": "triage_claims",
+    "inbox_audit": "triage_inbox_audit",
 }
 
 

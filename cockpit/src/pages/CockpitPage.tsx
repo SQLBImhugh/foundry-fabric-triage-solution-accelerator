@@ -40,6 +40,7 @@ export function CockpitPage() {
     const approvals = useSemanticModelQuery({ connection: CONNECTION, query: Q.APPROVALS });
     const retries = useSemanticModelQuery({ connection: CONNECTION, query: Q.RETRIES });
     const probes = useSemanticModelQuery({ connection: CONNECTION, query: Q.PROBES });
+    const inboxAudit = useSemanticModelQuery({ connection: CONNECTION, query: Q.INBOX_AUDIT });
 
     const kpis = useMemo(
         // Columns are emitted under their short name — DAX `[incidents]` becomes
@@ -142,6 +143,19 @@ export function CockpitPage() {
                 ],
             }),
         [probes.data],
+    );
+
+    const inboxAuditSpec = useMemo(
+        () =>
+            toTable(inboxAudit.data, {
+                columns: [
+                    { field: "Sender", title: "Sender" },
+                    { field: "Subject", title: "Subject" },
+                    { field: "Reason", title: "Why it was ignored" },
+                    { field: "Ignored", title: "At (UTC)" },
+                ],
+            }),
+        [inboxAudit.data],
     );
 
     return (
@@ -262,6 +276,16 @@ export function CockpitPage() {
                         height={300}
                         loading={probes.isLoading}
                         error={probes.error}
+                    />
+                </Tile>
+                <Tile size="full">
+                    <DataTableCard
+                        title="Ignored mail"
+                        subtitle="The inbox filter is a security control — this is it firing"
+                        spec={inboxAuditSpec}
+                        height={280}
+                        loading={inboxAudit.isLoading}
+                        error={inboxAudit.error}
                     />
                 </Tile>
             </DashboardGrid>

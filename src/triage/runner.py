@@ -299,6 +299,7 @@ class TriageRunner:
             "semantic_health": s.semantic_health_table_name,
             "leases": getattr(s, "lease_table_name", "triage_sweep_leases"),
             "claims": s.claim_table_name,
+            "inbox_audit": getattr(s, "inbox_audit_table_name", "triage_inbox_audit"),
         }
 
     def _build_store(self) -> IncidentStore:
@@ -346,6 +347,28 @@ class TriageRunner:
             )
         return log
 
+    def build_inbox_audit(self, path: Path | None = None):
+        """Where refused messages are recorded.
+
+        Durable when a database is configured, a JSON file otherwise. Losing it
+        costs evidence rather than correctness — the filter refuses the message
+        either way — so unlike the claim store this one never blocks ingestion.
+        """
+        from triage.store.inbox_audit import JsonFileInboxAudit
+
+        if path is not None:
+            return JsonFileInboxAudit(path)
+
+        if self._sql is None:
+            return JsonFileInboxAudit(self.base_dir / "runs" / "inbox_audit.json")
+
+        from triage.store.inbox_audit import FabricSqlInboxAudit
+
+        return FabricSqlInboxAudit(
+            db=self._sql,
+            table=getattr(self.settings, "inbox_audit_table_name", "triage_inbox_audit"),
+        )
+
     def build_inbox(self):
         if self.settings.triage_tool_mode == "live":
             _require_live_config(
@@ -369,6 +392,9 @@ class TriageRunner:
                     subject_pattern=self.settings.graph_subject_pattern,
                 ),
                 processed_log=self.build_processed_log(),
+                # Refusals are recorded, not just counted: "ignored 10 messages"
+                # reads the same whether the filter is working or has gone deaf.
+                audit_log=self.build_inbox_audit(),
             )
         return MockInbox(directory=self.base_dir / "mock" / "emails")
 

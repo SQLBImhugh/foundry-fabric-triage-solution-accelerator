@@ -108,6 +108,10 @@ class Settings(BaseSettings):
 
     #: Distributed claims, so two invocations cannot remediate the same alert.
     claim_table_name: str = "triage_claims"
+    #: Evidence of what the inbox filter refused. The filter is a security
+    #: control, and a count alone cannot distinguish it correctly rejecting
+    #: noise from it silently rejecting the real alerts.
+    inbox_audit_table_name: str = "triage_inbox_audit"
     #: The detector's off switch. Configuration rather than routine state,
     #: because `azd deploy` re-enables a disabled routine from azure.yaml.
     silent_sweep_enabled: bool = True
