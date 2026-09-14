@@ -1,0 +1,39 @@
+name: scenario10-pipeline-rerun-approved
+title: Approved pipeline rerun with verified completion
+description: A scheduled copy reports an ADLS internal service error. Reviewed replay parameters and an explicit approval permit one new run.
+approval:
+  mode: auto_approve
+pipeline:
+  target:
+    name: Orders ingestion
+    workspace_id: "10000000-0000-0000-0000-000000000001"
+    pipeline_id: "20000000-0000-0000-0000-000000000002"
+    rerun_safe: true
+    rerun_parameters:
+      businessDate: "2026-09-10"
+  runs:
+    - id: "30000000-0000-0000-0000-000000000003"
+      item_id: "20000000-0000-0000-0000-000000000002"
+      job_type: Pipeline
+      invoke_type: Scheduled
+      status: Failed
+      start_time: "2026-09-11T06:00:00Z"
+      end_time: "2026-09-11T06:01:00Z"
+      error_code: ADLSGen2OperationFailed
+      failure_reason: "The storage operation failed. Inner error: InternalServerError."
+  activities:
+    - name: CopyOrders
+      activity_type: Copy
+      status: Failed
+      error_code: ADLSGen2OperationFailed
+      message: "The storage operation failed. Inner error: InternalServerError."
+  rerun_status: Completed
+expect:
+  outcome: resolved
+  remediation_applied: true
+  approval_requested: true
+  approval_granted: true
+  blocked_attempts: 0
+  flags_written: 0
+  pipeline_reruns: 1
+  incident_source: fabric_pipeline_failure

@@ -12,13 +12,15 @@ store, and the dedup/persistence behaviour can be tested without a model.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import socket
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import yaml
 
@@ -30,17 +32,38 @@ from triage.detectors.silent_failures import (
     load_probes,
 )
 from triage.models import BIRequest, Incident, TriageResult
+from triage.pipeline_models import (
+    PIPELINE_JOB_TYPES,
+    PIPELINE_TERMINAL_STATUSES,
+    PipelineActivity,
+    PipelineFailure,
+    PipelineRun,
+    PipelineTarget,
+    load_pipeline_targets,
+)
 from triage.policy import TriagePolicy
 from triage.providers import get_provider
-from triage.signature import compute_signature
+from triage.signature import compute_signature, incident_id
 from triage.store.approvals import JsonFileApprovalChannel
+from triage.store.claims import ClaimStore, build_claim_store
 from triage.store.incidents import IncidentStore, JsonFileIncidentStore
+from triage.store.pipeline_reruns import (
+    FabricSqlPipelineRerunStore,
+    JsonFilePipelineRerunStore,
+    PipelineRerunStore,
+)
 from triage.store.processed import JsonFileProcessedLog
 from triage.store.retries import JsonFileRetryStore
 from triage.store.semantic_health import JsonFileSemanticHealthStore
 from triage.tools.dataset import DatasetSource
+from triage.tools.fabric_pipeline import (
+    FabricPipelineClient,
+    MockFabricPipelineClient,
+    PipelineApiError,
+)
 from triage.tools.flags import DataQualityFlagTable
 from triage.tools.inbox import GraphInbox, MockInbox
+from triage.tools.pipeline_actions import PipelineToolContext, verify_rerun
 from triage.tools.powerbi import LivePowerBIClient, MockPowerBIClient
 from triage.tools.semantic_health import (
     LiveSemanticHealthClient,
@@ -53,6 +76,15 @@ from triage.tools.teams import (
 )
 
 logger = logging.getLogger("triage.runner")
+
+
+def _pipeline_signature(failure: PipelineFailure) -> str:
+    return compute_signature(
+        source="fabric_pipeline_failure",
+        error=failure.error_text() or "Unspecified pipeline failure",
+        artifact_kind="pipeline", artifact_name=failure.target.key,
+        exception_class=failure.run.error_code,
+    )[0]
 
 
 def _require_live_config(component: str, **values: str) -> None:
@@ -113,6 +145,8 @@ class Expectation:
     approval_requested: bool | None = None
     approval_granted: bool | None = None
     denied_actions: int | None = None
+    pipeline_reruns: int | None = None
+    incident_source: str = ""
 
 
 @dataclass
@@ -143,6 +177,7 @@ class Scenario:
     repeat: int = 1
     expect: Expectation = field(default_factory=Expectation)
     narration: list[str] = field(default_factory=list)
+    pipeline: dict[str, Any] | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> Scenario:
@@ -180,6 +215,25 @@ class RunArtifacts:
     flag_rows_after: int
     teams_messages: list[Any] = field(default_factory=list)
     powerbi_calls: list[Any] = field(default_factory=list)
+    pipeline_calls: list[Any] = field(default_factory=list)
+    run_id: str = ""
+
+
+@dataclass
+class PipelineSweepReport:
+    status: str = "completed"
+    checked: int = 0
+    skipped: int = 0
+    artifacts: list[RunArtifacts] = field(default_factory=list)
+    lines: list[str] = field(default_factory=list)
+    faults: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        heading = (
+            f"Pipeline sweep {self.status}: checked {self.checked} target(s), "
+            f"triaged {len(self.artifacts)} run(s), skipped {self.skipped}."
+        )
+        return "\n".join([heading, *self.lines, *self.faults])
 
 
 class TriageRunner:
@@ -193,6 +247,7 @@ class TriageRunner:
         flag_table_path: Path | None = None,
         retry_store_path: Path | None = None,
         semantic_health_path: Path | None = None,
+        command_center_store: Any = None,
     ):
         self.settings = settings
         self.base_dir = Path(base_dir)
@@ -210,6 +265,8 @@ class TriageRunner:
         self.retries = self.build_retry_store(retry_store_path)
         self.semantic_health = self.build_semantic_health_store(semantic_health_path)
         self._teams = None
+        self._pipeline_claims: ClaimStore | None = None
+        self._command_center_store = command_center_store
 
     # --- inbox -------------------------------------------------------------
 
@@ -300,6 +357,11 @@ class TriageRunner:
             "leases": getattr(s, "lease_table_name", "triage_sweep_leases"),
             "claims": s.claim_table_name,
             "inbox_audit": getattr(s, "inbox_audit_table_name", "triage_inbox_audit"),
+            "pipeline_reruns": s.pipeline_rerun_table_name,
+            "agent_runs": s.agent_run_table_name,
+            "agent_events": s.agent_event_table_name,
+            "agent_commands": s.agent_command_table_name,
+            "incident_activity": s.incident_activity_table_name,
         }
 
     def _build_store(self) -> IncidentStore:
@@ -552,8 +614,8 @@ class TriageRunner:
         if not probes:
             return []
         if not self.settings.silent_sweep_enabled:
-            # Configuration, not routine state. A deploy re-enables a disabled
-            # routine, so the off switch cannot live there.
+            # Disabling one scheduler does not disable manual calls to the
+            # controller. Every entry point must honor the same off switch.
             logger.info("Silent sweep is disabled in configuration; skipping %d probe(s)", len(probes))
             return []
 
@@ -725,6 +787,272 @@ class TriageRunner:
             )
         return MockSemanticHealthClient()
 
+    def build_pipeline_client(self) -> FabricPipelineClient:
+        if self.settings.triage_tool_mode != "live":
+            return MockFabricPipelineClient()
+        _require_live_config("Fabric pipeline client", fabric_tenant_id=self.settings.fabric_tenant_id)
+        from triage.tools.fabric_pipeline import LiveFabricPipelineClient
+
+        return LiveFabricPipelineClient(
+            tenant_id=self.settings.fabric_tenant_id,
+            client_id=self.settings.fabric_client_id,
+            max_pages=self.settings.pipeline_max_pages,
+        )
+
+    def build_pipeline_rerun_store(self) -> PipelineRerunStore:
+        if self._sql is not None:
+            return FabricSqlPipelineRerunStore(
+                db=self._sql, table=self.settings.pipeline_rerun_table_name,
+            )
+        return JsonFilePipelineRerunStore(self.base_dir / "runs" / "pipeline_reruns.json")
+
+    def _pipeline_claim_store(self) -> ClaimStore:
+        if self._pipeline_claims is None:
+            self._pipeline_claims = build_claim_store(
+                db=self._sql, table=self.settings.claim_table_name,
+            )
+        return self._pipeline_claims
+
+    async def _triage_pipeline(
+        self, failure: PipelineFailure, *, client: FabricPipelineClient,
+        reruns: PipelineRerunStore, scenario: Scenario | None = None,
+    ) -> RunArtifacts:
+        signature = _pipeline_signature(failure)
+        assert failure.run.end_time is not None
+        request = BIRequest(
+            request_id=f"pipeline:{failure.key}",
+            received_at=failure.run.end_time.isoformat(),
+            sender="fabric-job-monitor",
+            subject=f"Scheduled Fabric pipeline failed: {failure.target.name}",
+            body=failure.error_text() or "Fabric returned no failure reason.",
+            report_name=failure.target.name,
+            workspace_id=failure.target.workspace_id,
+            error_code=failure.run.error_code,
+            source="pipeline",
+        )
+        context = PipelineToolContext(
+            failure=failure, client=client, reruns=reruns, signature=signature,
+            live=self.settings.triage_tool_mode == "live",
+        )
+        timeout = self.settings.triage_timeout_seconds + self.settings.approval_timeout_seconds + 30
+        try:
+            async with asyncio.timeout(timeout):
+                return await self.run_request(request, scenario=scenario, pipeline=context)
+        except Exception as exc:
+            logger.exception("Pipeline triage could not finish")
+            result = TriageResult(
+                outcome="timed_out" if isinstance(exc, TimeoutError) else "agent_crashed",
+                request_id=request.request_id, signature=signature,
+                summary=f"Pipeline triage failed ({type(exc).__name__}); inspect the rerun journal before replay.",
+                exception_class=type(exc).__name__,
+            )
+            incident = self.store.record(
+                result, report_name=failure.target.name,
+                original_error=request.error_text(), source="fabric_pipeline_failure",
+                agent_name="TriageAgent", pipeline_failure=failure,
+            )
+            return RunArtifacts(
+                result=result, incident=incident, request=request,
+                flag_rows_before=self.flag_table.row_count,
+                flag_rows_after=self.flag_table.row_count,
+                pipeline_calls=list(getattr(client, "calls", [])),
+            )
+
+    async def run_pipeline_failure(
+        self, failure: PipelineFailure, *, client: FabricPipelineClient,
+        reruns: PipelineRerunStore, scenario: Scenario | None = None,
+    ) -> RunArtifacts | None:
+        """Serialize this pipeline and re-check processed state inside the claim."""
+        claims = self._pipeline_claim_store()
+        claim_key = f"pipeline:{failure.target.key}"
+        ttl = self.settings.triage_timeout_seconds + self.settings.approval_timeout_seconds + 90
+        if not claims.claim(claim_key, lease_seconds=ttl):
+            logger.info("Pipeline is already claimed: %s", failure.target.key)
+            return None
+        try:
+            # Construct after acquisition: another invocation may have finished
+            # while this one was reading the job history.
+            processed = self.build_processed_log()
+            event_key = f"pipeline:{failure.key}"
+            if processed.seen(event_key):
+                return None
+            current = await client.get_run(failure.target, failure.run.id)
+            if not current.failed_scheduled:
+                logger.warning("Skipping pipeline run whose terminal/trigger evidence changed")
+                return None
+            try:
+                activities = await client.activity_runs(failure.target, current)
+                diagnostics_error = ""
+            except PipelineApiError as exc:
+                logger.warning("Activity diagnostics unavailable for pipeline run %s", current.id)
+                activities, diagnostics_error = [], str(exc)
+            failure = PipelineFailure(
+                target=failure.target, run=current, recent_runs=failure.recent_runs,
+                activities=activities, diagnostics_error=diagnostics_error,
+            )
+            signature = _pipeline_signature(failure)
+            # Refresh this signature before considering old observations. A
+            # bounded sweep can leave older failures in its backlog after a
+            # newer failure has already been rerun and verified.
+            self.store.find_open(signature)
+            for resolved in (False, True):
+                historical = self.store.note_pipeline_occurrence(
+                    incident_id(signature, resolved=resolved), failure,
+                )
+                if historical is not None:
+                    if self._sql is None or getattr(self.store, "is_durable", False):
+                        processed.mark(event_key, received_at=failure.run.end_time.isoformat())
+                    logger.info("Recorded historical pipeline observation without reopening %s", historical.id)
+                    return None
+            artifacts = await self._triage_pipeline(
+                failure, client=client, reruns=reruns, scenario=scenario,
+            )
+            if self._sql is None or getattr(self.store, "is_durable", False):
+                processed.mark(event_key, received_at=artifacts.request.received_at)
+            else:
+                logger.error("Pipeline outcome is not durable; leaving the source run unprocessed")
+            return artifacts
+        finally:
+            claims.release(claim_key)
+
+    async def _follow_pipeline_reruns(
+        self, target: PipelineTarget, client: FabricPipelineClient,
+        reruns: PipelineRerunStore,
+    ) -> list[str]:
+        claims = self._pipeline_claim_store()
+        key = f"pipeline:{target.key}"
+        if not claims.claim(key):
+            return []
+        lines: list[str] = []
+        try:
+            for record in reruns.pending(target.workspace_id, target.pipeline_id):
+                if record.next_poll_at is not None and record.next_poll_at > datetime.now(UTC):
+                    continue
+                run = await client.get_run(target, record.rerun_id)
+                if run.id != record.rerun_id or run.item_id != target.pipeline_id:
+                    raise ValueError("Rerun evidence belongs to a different job or pipeline")
+                if run.status not in PIPELINE_TERMINAL_STATUSES:
+                    if not reruns.update(record.model_copy(update={
+                        "next_poll_at": datetime.now(UTC) + timedelta(seconds=run.retry_after_seconds),
+                    }), expected="submitted"):
+                        raise RuntimeError("Could not retain the pipeline polling interval")
+                    continue
+                outcome = await verify_rerun(client, target, run)
+                known = self.store.find_open(record.signature)
+                if known is not None and (
+                    known.pipeline_failure is not None
+                    and known.pipeline_failure.run.id == record.failed_run_id
+                ):
+                    self.store.mark(
+                        known.id, "resolved" if outcome.succeeded else "investigating",
+                        f"Correlated pipeline rerun {run.id} verified {outcome.status}. {outcome.detail}",
+                    )
+                    if self._sql is not None and not getattr(self.store, "is_durable", False):
+                        raise RuntimeError("Could not persist the verified pipeline rerun outcome")
+                finished = record.model_copy(update={
+                    "state": "completed" if outcome.succeeded else "failed",
+                    "detail": outcome.detail,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                })
+                if not reruns.update(finished, expected="submitted"):
+                    raise RuntimeError("Pipeline rerun changed while recording its final status")
+                lines.append(f"- {target.name}: rerun {run.id} verified {outcome.status}")
+        finally:
+            claims.release(key)
+        return lines
+
+    def _record_pipeline_monitor_fault(self, target: PipelineTarget, exc: Exception) -> str:
+        from triage.redaction import redact_text
+
+        detail = redact_text(str(exc))[:1000]
+        signature, _ = compute_signature(
+            source="fabric_pipeline_monitor", error=f"{type(exc).__name__}: {detail}",
+            artifact_kind="pipeline", artifact_name=target.key,
+        )
+        self.store.record(
+            TriageResult(
+                outcome="needs_human", signature=signature,
+                request_id=f"pipeline-monitor:{target.key}",
+                root_cause=f"Monitoring could not verify pipeline jobs: {detail}",
+                summary="Monitor failure, not evidence of a failed pipeline run.",
+            ),
+            report_name=target.name, source="fabric_pipeline_monitor",
+            agent_name="PipelineMonitor", original_error=detail,
+        )
+        logger.error("Pipeline monitor failed for %s: %s", target.key, detail)
+        return f"- {target.name}: monitoring incomplete ({type(exc).__name__}: {detail})"
+
+    async def pipeline_sweep(
+        self, *, now: datetime | None = None,
+        client: FabricPipelineClient | None = None,
+        targets: list[PipelineTarget] | None = None,
+    ) -> PipelineSweepReport:
+        report = PipelineSweepReport()
+        if not self.settings.pipeline_sweep_enabled:
+            report.status = "disabled"
+            return report
+        targets = targets if targets is not None else load_pipeline_targets(self.settings.fabric_pipeline_targets)
+        if not targets:
+            report.status = "unconfigured"
+            return report
+        if self.settings.triage_tool_mode == "live" and self._sql is None:
+            raise ValueError("Live pipeline sweeps require Fabric SQL state and claims")
+        instant = now or datetime.now(UTC)
+        if instant.tzinfo is None:
+            raise ValueError("Pipeline sweep time must include a time zone")
+        cutoff = instant - timedelta(hours=self.settings.pipeline_lookback_hours)
+        api = client or self.build_pipeline_client()
+        reruns = self.build_pipeline_rerun_store()
+        try:
+            for target in targets:
+                try:
+                    report.lines.extend(await self._follow_pipeline_reruns(target, api, reruns))
+                    history = await api.list_runs(target)
+                    report.checked += 1
+                    completed = [run for run in history if run.end_time is not None]
+                    if len(completed) >= 100 and min(run.end_time for run in completed) > cutoff:
+                        report.faults.append(self._record_pipeline_monitor_fault(
+                            target, PipelineApiError(
+                                "The recent-job retention window may not cover the configured lookback. "
+                                "Poll more frequently or use workspace monitoring for longer history."
+                            ),
+                        ))
+                    candidates = sorted(
+                        {
+                            run.id: run for run in history
+                            if run.failed_scheduled and run.end_time is not None
+                            and cutoff <= run.end_time <= instant
+                        }.values(),
+                        key=lambda run: (run.end_time, run.id), reverse=True,
+                    )
+                    for run in history:
+                        if run.status == "Failed" and (
+                            run.invoke_type not in {"Scheduled", "Manual"} or run.end_time is None
+                            or run.invoke_type == "Scheduled" and run.job_type not in PIPELINE_JOB_TYPES
+                        ):
+                            raise ValueError("A failed run has missing/unknown trigger or completion evidence")
+                    for run in candidates:
+                        if len(report.artifacts) >= self.settings.pipeline_max_runs_per_sweep:
+                            report.lines.append("Pipeline triage limit reached; remaining runs stay eligible for the next sweep.")
+                            break
+                        failure = PipelineFailure(target=target, run=run, recent_runs=history)
+                        artifacts = await self.run_pipeline_failure(
+                            failure, client=api, reruns=reruns,
+                        )
+                        if artifacts is None:
+                            report.skipped += 1
+                            continue
+                        report.artifacts.append(artifacts)
+                        report.lines.append(f"- {target.name}: run {run.id}, {artifacts.result.outcome}")
+                except Exception as exc:
+                    report.faults.append(self._record_pipeline_monitor_fault(target, exc))
+            if report.faults:
+                report.status = "incomplete"
+            return report
+        finally:
+            if client is None:
+                await api.close()
+
     def build_retry_store(self, path: Path | None = None):
         """Where postponed retries live.
 
@@ -793,10 +1121,17 @@ class TriageRunner:
             AutoDenyGate,
             TeamsCardApprovalGate,
             TimeoutGate,
+            WebApprovalGate,
         )
 
         if scenario is None:
             channel = self.build_approval_channel()
+            if self.settings.approval_delivery_mode == "web":
+                return WebApprovalGate(
+                    channel,
+                    notifier=self.build_teams() if self.settings.teams_webhook_url else None,
+                    command_center_url=self.settings.command_center_url,
+                )
             return TeamsCardApprovalGate(
                 self.build_teams(),
                 decision_source=channel,
@@ -863,7 +1198,40 @@ class TriageRunner:
     async def run_scenario(
         self, scenario: Scenario, *, keep_incidents: bool = False
     ) -> list[RunArtifacts]:
+        if scenario.pipeline is not None and self.settings.triage_tool_mode != "mock":
+            raise ValueError(
+                "Pipeline scenario fixtures require TRIAGE_TOOL_MODE=mock. "
+                "Use the pipelines command for live job monitoring."
+            )
         self.prepare(scenario, keep_incidents=keep_incidents)
+        if scenario.pipeline is not None:
+            target = PipelineTarget.model_validate(scenario.pipeline["target"])
+            runs = [PipelineRun.model_validate(row) for row in scenario.pipeline["runs"]]
+            client = MockFabricPipelineClient(
+                runs, rerun_status=scenario.pipeline.get("rerun_status", "Completed"),
+                activities=[
+                    PipelineActivity.model_validate(row)
+                    for row in scenario.pipeline.get("activities", [])
+                ],
+            )
+            # Scenario inputs still traverse run_request and the same agent,
+            # dispatcher, approval gate, stores and policy as a polled failure.
+            # The per-scenario journal is isolated from operator runs.
+            from triage.store.pipeline_reruns import InMemoryPipelineRerunStore
+
+            journal = InMemoryPipelineRerunStore()
+            pipeline_out: list[RunArtifacts] = []
+            for run in runs:
+                if run.failed_scheduled:
+                    failure = PipelineFailure(
+                        target=target, run=run, recent_runs=runs, activities=client.activities,
+                    )
+                    pipeline_out.append(await self._triage_pipeline(
+                        failure, client=client, reruns=journal, scenario=scenario,
+                    ))
+            if not pipeline_out:
+                raise ValueError("A pipeline triage scenario needs a failed scheduled job")
+            return pipeline_out
         request = MockInbox.load(self.base_dir / scenario.email)
 
         datasets = {
@@ -887,23 +1255,128 @@ class TriageRunner:
             out.append(await self.run_request(run_request, scenario=scenario, datasets=datasets))
         return out
 
+    def build_command_center_store(self):
+        if self._command_center_store is not None:
+            return self._command_center_store
+        from triage.store.command_center import (
+            FabricSqlCommandCenterStore,
+            JsonFileCommandCenterStore,
+        )
+
+        self._command_center_store = (
+            FabricSqlCommandCenterStore(
+                self._sql, run_table=self.settings.agent_run_table_name,
+                event_table=self.settings.agent_event_table_name,
+                command_table=self.settings.agent_command_table_name,
+            )
+            if self._sql is not None
+            else JsonFileCommandCenterStore(self.base_dir / "runs" / "command_center.json")
+        )
+        return self._command_center_store
+
     async def run_request(
+        self, request: BIRequest, *, scenario: Scenario | None = None,
+        datasets: dict[str, DatasetSource] | None = None,
+        pipeline: PipelineToolContext | None = None,
+    ) -> RunArtifacts:
+        if not self.settings.run_history_enabled:
+            return await self._run_request_impl(
+                request, scenario=scenario, datasets=datasets, pipeline=pipeline,
+                event_hook=self.on_event,
+            )
+        from triage.store.command_center import RunEvent, RunRecord
+
+        history = self.build_command_center_store()
+        run_id = str(uuid4())
+        signature = pipeline.signature if pipeline else compute_signature(
+            source="powerbi_refresh_failure", error=request.error_text(),
+            artifact_kind="dataset", artifact_name=request.report_name or request.dataset_id or "",
+        )[0]
+        history.start_run(RunRecord(
+            id=run_id, request_id=request.request_id, signature=signature,
+            target=request.report_name or request.dataset_id or "",
+            workload="fabric_pipeline" if pipeline else "powerbi",
+        ))
+        sequence = 0
+        allowed = {
+            "triage_started", "tool_started", "tool_completed", "policy_violation",
+            "agent_crashed", "outcome_downgraded", "notification_failed",
+            "triage_finished", "notification",
+        }
+
+        def persist_event(kind: str, payload: dict[str, Any]) -> None:
+            nonlocal sequence
+            if kind not in allowed:
+                return
+            sequence += 1
+            # Explicit metadata contract: never capture thinking/prompt content
+            # or arbitrary tool arguments from the UI hook.
+            history.append_event(RunEvent(
+                run_id=run_id, sequence=sequence, kind=kind,
+                label=str(payload.get("label") or payload.get("tool") or kind.replace("_", " ")),
+                status=str(payload.get("status") or payload.get("outcome") or ""),
+                detail=str(payload.get("detail") or payload.get("reason") or payload.get("message") or ""),
+                tool_name=str(payload.get("tool") or ""),
+            ))
+
+        def emit(kind: str, payload: dict[str, Any]) -> None:
+            persist_event(kind, payload)
+            if self.on_event is not None:
+                self.on_event(kind, payload)
+
+        try:
+            artifacts = await self._run_request_impl(
+                request, scenario=scenario, datasets=datasets, pipeline=pipeline,
+                event_hook=emit, run_id=run_id, notification_emit=persist_event,
+            )
+        except BaseException as exc:
+            history.finish_run(run_id, TriageResult(
+                outcome="timed_out" if isinstance(exc, (TimeoutError, asyncio.CancelledError)) else "agent_crashed",
+                request_id=request.request_id, signature=signature,
+                summary=f"Triage did not return a complete result ({type(exc).__name__}).",
+                exception_class=type(exc).__name__,
+            ))
+            raise
+        history.finish_run(
+            run_id, artifacts.result,
+            incident_id=artifacts.incident.id if artifacts.incident is not None else "",
+        )
+        artifacts.run_id = run_id
+        return artifacts
+
+    async def _run_request_impl(
         self,
         request: BIRequest,
         *,
         scenario: Scenario | None = None,
         datasets: dict[str, DatasetSource] | None = None,
+        pipeline: PipelineToolContext | None = None,
+        event_hook: EventHook | None = None,
+        run_id: str = "",
+        notification_emit: Any = None,
     ) -> RunArtifacts:
-        signature, _payload = compute_signature(
-            source="powerbi_refresh_failure",
-            error=request.error_text(),
-            artifact_kind="dataset",
-            artifact_name=request.report_name or request.dataset_id or "",
-        )
+        if request.source == "pipeline" and pipeline is None:
+            raise ValueError("Pipeline requests require controller-verified job evidence")
+        if pipeline is not None:
+            signature = pipeline.signature
+        else:
+            signature, _payload = compute_signature(
+                source="powerbi_refresh_failure",
+                error=request.error_text(),
+                artifact_kind="dataset",
+                artifact_name=request.report_name or request.dataset_id or "",
+            )
         known = self.store.find_open(signature)
 
-        powerbi = self.build_powerbi(scenario)
-        teams = self.build_teams()
+        powerbi = None if pipeline is not None else self.build_powerbi(scenario)
+        if self.settings.notification_channel == "web":
+            if notification_emit is None:
+                raise ValueError("Web notifications require RUN_HISTORY_ENABLED")
+            from triage.command_center.notifier import CommandCenterNotifier
+
+            teams = CommandCenterNotifier(notification_emit)
+        else:
+            teams = self.build_teams()
 
         triage_provider = get_provider(
             "triage",
@@ -930,13 +1403,16 @@ class TriageRunner:
                     rogue_second_refresh=scenario.rogue_second_refresh,
                     rogue_unknown_action=scenario.rogue_unknown_action,
                 )
-        dq_agent = DataQualityAgent(get_provider("data_quality", self.settings))
+        dq_agent = (
+            None if pipeline is not None
+            else DataQualityAgent(get_provider("data_quality", self.settings))
+        )
 
         agent = TriageAgent(
             triage_provider,
             policy=TriagePolicy.from_settings(self.settings),
             dq_agent=dq_agent,
-            on_event=self.on_event,
+            on_event=event_hook,
         )
 
         deps = TriageDeps(
@@ -944,14 +1420,14 @@ class TriageRunner:
             teams=teams,
             flag_table=self.flag_table,
             datasets=datasets or {},
-            workspace_id=self._resolve_id(
+            workspace_id=pipeline.failure.target.workspace_id if pipeline else self._resolve_id(
                 scenario.workspace_id if scenario else "",
                 self.settings.powerbi_workspace_id,
                 request.workspace_id,
                 untrusted=request.workspace_id,
                 label="workspace",
             ),
-            dataset_id=self._resolve_id(
+            dataset_id="" if pipeline else self._resolve_id(
                 scenario.dataset_id if scenario else "",
                 self.settings.powerbi_dataset_id,
                 request.dataset_id,
@@ -963,6 +1439,8 @@ class TriageRunner:
             approval_gate=self.build_approval_gate(scenario),
             approval_timeout_seconds=int(self.settings.approval_timeout_seconds),
             retries=self.retries,
+            pipeline=pipeline,
+            run_id=run_id,
         )
 
         flags_before = self.flag_table.row_count
@@ -983,6 +1461,8 @@ class TriageRunner:
             # Only a card that actually went out counts. Passing "attempted"
             # here would let one failed delivery silence every future one.
             notified=result.notification_delivered,
+            source="fabric_pipeline_failure" if pipeline else "powerbi_refresh_failure",
+            pipeline_failure=pipeline.failure if pipeline else None,
         )
 
         return RunArtifacts(
@@ -993,6 +1473,7 @@ class TriageRunner:
             flag_rows_after=self.flag_table.row_count,
             teams_messages=list(getattr(teams, "messages", [])),
             powerbi_calls=list(getattr(powerbi, "calls", [])),
+            pipeline_calls=list(getattr(pipeline.client, "calls", [])) if pipeline else [],
         )
 
 
@@ -1047,6 +1528,15 @@ def check_expectations(scenario: Scenario, artifacts: RunArtifacts) -> list[str]
         denied = len(result.denied_actions)
         if denied != expect.denied_actions:
             failures.append(f"denied_actions: expected {expect.denied_actions}, got {denied}")
+
+    if expect.pipeline_reruns is not None:
+        count = sum(call[0] == "rerun" for call in artifacts.pipeline_calls)
+        if count != expect.pipeline_reruns:
+            failures.append(f"pipeline_reruns: expected {expect.pipeline_reruns}, got {count}")
+    if expect.incident_source and (
+        artifacts.incident is None or artifacts.incident.source != expect.incident_source
+    ):
+        failures.append(f"incident_source: expected {expect.incident_source}")
 
     return failures
 

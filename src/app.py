@@ -5,26 +5,15 @@ expects from a hosted agent. Deploying it changes *where* the loop runs, not
 what it does -- the policy ledger, approval gate, deterministic scans and
 incident dedup are all the existing code paths.
 
-Two ways in, deliberately
--------------------------
-1. **Scheduled (a Foundry routine).** Invoked with no meaningful input, it
-   drains the alerts mailbox and triages whatever is new. This is the
-   production shape: nobody is watching, and the agent runs on a timer.
-2. **Interactive (the Foundry Playground).** Invoked with the text of an alert,
-   it triages just that alert. This is what makes the thing demoable without
-   waiting for a real email to land.
+Interactive alerts and explicit mailbox, silent-health, pipeline and queued
+command sweeps reach the same controller. Hosting changes the process lifetime
+and invocation contract, not the policy rules.
 
-Both paths run identical logic. That matters: a demo path that diverges from
-the production path eventually demos something that does not exist.
-
-Why the controller is hosted rather than left on a laptop
----------------------------------------------------------
-Running here means the process can authenticate as the agent's own Microsoft
-Entra agent identity. That removes the client secret entirely -- not rotated,
-not vaulted, *absent*. It also means the mailbox read, the Power BI call and
-the incident write are all attributable to one identity with one named human
-sponsor, which is the difference between "an automation did it" and "this
-agent, owned by this person, did it".
+Service identities and permissions belong to the component making each call.
+Power BI, Fabric and SQL integrations can use managed identity; the current
+mailbox adapter still uses its separately configured Graph application
+credentials. Hosting does not remove that credential dependency or prove
+that all operations use one identity.
 """
 
 from __future__ import annotations
@@ -69,6 +58,8 @@ _SWEEP_COMMANDS = frozenset({"sweep", "scheduled sweep", "run", "check mail", ""
 #: there is nothing to react to -- these failures never announce themselves, so
 #: the only way to find them is to go and measure.
 _SILENT_COMMANDS = frozenset({"silent sweep", "silent-sweep", "health sweep", "scan"})
+_PIPELINE_COMMANDS = frozenset({"pipeline sweep", "pipeline-sweep"})
+_WEB_COMMANDS = frozenset({"command sweep", "command-sweep"})
 
 
 def _latest_text(messages: Any) -> str:
@@ -197,6 +188,23 @@ class TriageControllerAgent(BaseAgent):
         command = text.strip().lower()
         is_sweep = command in _SWEEP_COMMANDS
         is_silent = command in _SILENT_COMMANDS
+        is_pipeline = command in _PIPELINE_COMMANDS
+        if command in _WEB_COMMANDS:
+            from triage.command_center.worker import drain_commands
+
+            async with self._lock:
+                lines = await drain_commands(self._runner)
+                summary = "\n".join(lines) if lines else "No operator command executed; inspect pending or blocked work in the command center."
+                return AgentResponse(messages=[Message("assistant", [summary])])
+
+        if is_pipeline:
+            # Propagate monitor/configuration faults to the host instead of
+            # returning a success-shaped agent message to the scheduler.
+            async with self._lock:
+                report = await self._runner.pipeline_sweep()
+                if report.status in {"incomplete", "unconfigured"}:
+                    raise RuntimeError(report.summary())
+                return AgentResponse(messages=[Message("assistant", [report.summary()])])
 
         # One triage at a time. Two concurrent runs would race on the incident
         # store and could remediate the same failure twice -- the exact

@@ -11,6 +11,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from triage.pipeline_models import PipelineFailure
+
 # ---------------------------------------------------------------------------
 # Terminal outcomes
 # ---------------------------------------------------------------------------
@@ -68,7 +70,7 @@ class BIRequest(BaseModel):
     # refresh reported success and the scanner found the data wrong anyway.
     # Worth distinguishing, because "nobody was told" is the interesting part
     # of those incidents.
-    source: Literal["mock", "graph", "interactive", "detector"] = "mock"
+    source: Literal["mock", "graph", "interactive", "detector", "pipeline", "web"] = "mock"
 
     def error_text(self) -> str:
         """The blob a signature is computed over."""
@@ -269,6 +271,7 @@ class Incident(BaseModel):
     request_id: str = ""
     report_name: str = ""
     source: str = "powerbi_refresh_failure"
+    pipeline_failure: PipelineFailure | None = None
 
     occurrence_count: int = 1
     first_seen_at: str = Field(default_factory=_utcnow)

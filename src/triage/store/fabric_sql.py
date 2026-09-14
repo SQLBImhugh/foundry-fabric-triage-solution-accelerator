@@ -58,6 +58,8 @@ import threading
 import time
 from typing import Any
 
+from triage.redaction import redact_text
+
 logger = logging.getLogger("triage.store.sql")
 
 #: SQL_COPT_SS_ACCESS_TOKEN. Pre-login connection attribute carrying an Entra
@@ -133,8 +135,11 @@ class FabricSqlDatabase:
         self._schema_ready = False
         self._local = threading.local()
         self._state_lock = threading.Lock()
-        self._last_failure_at = 0.0
+        # Fresh hosted sandboxes can have under 30 seconds of monotonic uptime.
+        # Zero is a valid failure time, not a never-failed sentinel.
+        self._last_failure_at: float | None = None
         self._last_error = ""
+        self._last_error_detail = ""
 
     def ensure_schema_once(self) -> bool:
         """Create the tables if they are missing, at most once per success.
@@ -156,6 +161,12 @@ class FabricSqlDatabase:
     @property
     def target(self) -> str:
         return f"{self._database} on {self._server}"
+
+    @property
+    def connection_error(self) -> str:
+        """Keep a sanitized cause available when hosted console logs are unavailable."""
+        with self._state_lock:
+            return f"{self._last_error}: {self._last_error_detail}" if self._last_error else ""
 
     def _connect(self) -> Any:
         import mssql_python
@@ -209,16 +220,21 @@ class FabricSqlDatabase:
             return conn
 
         with self._state_lock:
-            unreachable = time.monotonic() - self._last_failure_at < self._cooldown
+            unreachable = (
+                self._last_failure_at is not None
+                and time.monotonic() - self._last_failure_at < self._cooldown
+            )
         if unreachable:
             return None
 
         try:
             conn = self._connect()
         except Exception as exc:  # noqa: BLE001 - every failure is the same here
+            detail = redact_text(str(exc))[:400]
             with self._state_lock:
                 self._last_failure_at = time.monotonic()
                 self._last_error = type(exc).__name__
+                self._last_error_detail = detail
             # The message matters more than the class here. "Login failed for
             # user '<token-identified principal>'" means the identity
             # authenticated but has no database user; a timeout means the
@@ -228,7 +244,7 @@ class FabricSqlDatabase:
                 "Cannot reach Fabric SQL (%s): %s: %s. Retrying in %.0fs.",
                 self.target,
                 type(exc).__name__,
-                str(exc)[:400],
+                detail,
                 self._cooldown,
             )
             return None
@@ -238,7 +254,8 @@ class FabricSqlDatabase:
             if self._last_error:
                 logger.info("Reconnected to Fabric SQL (%s)", self.target)
             self._last_error = ""
-            self._last_failure_at = 0.0
+            self._last_error_detail = ""
+            self._last_failure_at = None
         return conn
 
     def _drop(self) -> None:
@@ -273,6 +290,7 @@ class FabricSqlDatabase:
         conn = self._ensure()
         if conn is None:
             raise SqlUnavailable(f"Fabric SQL unavailable ({self.target})")
+        cur = None
         try:
             cur = conn.cursor()
             cur.execute(sql, *params)
@@ -281,11 +299,14 @@ class FabricSqlDatabase:
             if _is_connection_error(exc):
                 self._drop()
             raise
+        finally:
+            self._close_cursor(cur)
 
     def query(self, sql: str, *params: Any) -> list[tuple]:
         conn = self._ensure()
         if conn is None:
             raise SqlUnavailable(f"Fabric SQL unavailable ({self.target})")
+        cur = None
         try:
             cur = conn.cursor()
             cur.execute(sql, *params)
@@ -294,6 +315,17 @@ class FabricSqlDatabase:
             if _is_connection_error(exc):
                 self._drop()
             raise
+        finally:
+            self._close_cursor(cur)
+
+    def _close_cursor(self, cursor: Any) -> None:
+        if cursor is None:
+            return
+        try:
+            cursor.close()
+        except Exception as exc:
+            logger.warning("Could not close SQL cursor (%s); discarding this connection", type(exc).__name__)
+            self._drop()
 
     def integrity_error(self) -> type[Exception]:
         """The exception a duplicate primary key raises.
@@ -350,7 +382,11 @@ def schema_statements(tables: dict[str, str]) -> list[str]:
     ``tables`` maps a logical name to the configured table name, so an adopter
     can prefix them to share a database with something else.
     """
-    t = {k: quote_identifier(v) for k, v in tables.items()}
+    from triage.store.command_center import schema_statements as command_center_schema
+    from triage.store.incident_workflow import schema_statements as incident_activity_schema
+
+    names = DEFAULT_TABLES | tables
+    t = {k: quote_identifier(v) for k, v in names.items()}
     return [
         f"""
         IF OBJECT_ID('{_bare(t["incidents"])}') IS NULL
@@ -431,6 +467,15 @@ def schema_statements(tables: dict[str, str]) -> list[str]:
             reason       NVARCHAR(200)  NULL,
             ignored_at   NVARCHAR(40)   NOT NULL
         )""",
+        f"""
+        IF OBJECT_ID('{_bare(t["pipeline_reruns"])}') IS NULL
+        CREATE TABLE {t["pipeline_reruns"]} (
+            run_key       NVARCHAR(64)  NOT NULL PRIMARY KEY,
+            workspace_id  NVARCHAR(36)  NOT NULL,
+            pipeline_id   NVARCHAR(36)  NOT NULL,
+            state         NVARCHAR(40)  NOT NULL,
+            payload       NVARCHAR(MAX) NOT NULL
+        )""",
         # The approval callback runs as a Logic App, which has no way to hold a
         # transaction open across a read and a write. Putting the whole decision
         # in one procedure gives it the same guarantee `decide()` has in Python:
@@ -468,6 +513,9 @@ def schema_statements(tables: dict[str, str]) -> list[str]:
                                     '$.reason', @reason),
                                   '$.decided_at', @now)
              WHERE request_id = @request_id
+               -- Web proposals require the authenticated command-center API,
+               -- not an older bearer-link callback carrying a claimed actor.
+               AND COALESCE(JSON_VALUE(payload, '$.delivery_channel'), 'teams') <> 'web'
                -- Unanswered. This is the single-assignment guarantee: a second
                -- click matches no row and is told so, rather than overwriting.
                AND (decision IS NULL OR decision = '')
@@ -482,7 +530,9 @@ def schema_statements(tables: dict[str, str]) -> list[str]:
 
             SELECT @@ROWCOUNT AS recorded;
         END""",
-    ]
+    ] + command_center_schema(
+        names["agent_runs"], names["agent_events"], names["agent_commands"],
+    ) + incident_activity_schema(names["incident_activity"])
 
 
 def _bare(quoted: str) -> str:
@@ -499,6 +549,11 @@ DEFAULT_TABLES: dict[str, str] = {
     "leases": "triage_sweep_leases",
     "claims": "triage_claims",
     "inbox_audit": "triage_inbox_audit",
+    "pipeline_reruns": "triage_pipeline_reruns",
+    "agent_runs": "triage_agent_runs",
+    "agent_events": "triage_agent_events",
+    "agent_commands": "triage_agent_commands",
+    "incident_activity": "triage_incident_activity",
 }
 
 

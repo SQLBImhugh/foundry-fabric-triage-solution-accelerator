@@ -7,6 +7,8 @@ labels: enhancement
 ## The failure this addresses
 
 What breaks in Power BI or Fabric, and how a person currently finds out.
+For a UI request, identify the read-only Fabric cockpit or the separate
+Azure-hosted command center and describe the operator workflow.
 
 ## Who is affected
 
@@ -16,12 +18,19 @@ The role, and what they do about it today.
 
 What should the agent do? Be specific about whether it should **act** or only
 **report** -- the split matters more than the detection.
+For a human workflow, distinguish an approval, an investigation request and a
+tracking-only resolution. Resolving an incident in the UI is not verified
+remediation and must not reset its budget.
 
 ## Automation tier
 
 - [ ] Tier 1 -- transient and idempotent; safe to remediate unattended
 - [ ] Tier 2 -- deterministic fix, but needs human approval first
 - [ ] Tier 3 -- never automate; escalate with evidence
+
+These describe the proposed behavior, not permission to bypass an existing
+guard. Fabric pipeline reruns currently require explicit approval even when the
+failure is transient and the target has been reviewed for replay safety.
 
 ## Blast radius
 
@@ -39,3 +48,6 @@ precondition; a controller cannot.
 Which Power BI, Fabric or Graph endpoint, and does it accept app-only service
 principal auth? Several plausible remediations have no API at all, and saying so
 is more useful than assuming one exists.
+Name the component that calls it and the permission it needs. Grant service
+permissions to the component that acts, not to the reasoning agent; human
+command-center access is controlled by Entra app-role claims.

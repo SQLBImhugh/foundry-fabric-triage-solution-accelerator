@@ -42,6 +42,33 @@ jobs:
             exit 1
           fi
 
+  command-center:
+    name: Command-center tests and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: command-center
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: command-center/package-lock.json
+
+      - name: Install locked frontend dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck and lint
+        run: npm run typecheck && npm run lint
+
+      - name: Offline UI tests
+        run: npm run test -- --reporter=dot
+
+      - name: Production build and asset verification
+        run: npm run build
+
   secrets:
     name: No credentials in the tree
     runs-on: ubuntu-latest

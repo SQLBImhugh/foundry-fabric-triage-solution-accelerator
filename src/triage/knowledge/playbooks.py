@@ -1,4 +1,4 @@
-"""Retrieved playbooks for Power BI refresh failures.
+"""Retrieved playbooks for Power BI refresh and Fabric pipeline failures.
 
 Why playbooks, and why retrieved
 --------------------------------
@@ -59,6 +59,8 @@ class Playbook:
     source: str
     #: Things that are true, non-obvious, and that change the decision.
     watch_out: str = ""
+    workload: Literal["powerbi", "fabric_pipeline"] = "powerbi"
+    activity_types: tuple[str, ...] = ()
 
     def render(self) -> str:
         lines = [
@@ -349,6 +351,174 @@ PLAYBOOKS: list[Playbook] = [
     ),
 ]
 
+_FABRIC_FACTORY = "https://learn.microsoft.com/fabric/data-factory/"
+
+PLAYBOOKS += [
+    Playbook(
+        name="Pipeline ADLS transient service error",
+        workload="fabric_pipeline",
+        triggers=(r"re:(?s)(?=.*\badlsgen2operationfailed\b)(?=.*\binternalservererror\b)",),
+        summary="The ADLS connector reported an internal service error, rather than a permission or path error.",
+        retry_useful=True,
+        suggested_tier="tier_2",
+        guidance=(
+            "Inspect the failed activity and service correlation details. A bounded retry "
+            "may help after service recovery, but a full pipeline rerun also needs reviewed "
+            "parameters, safe sink replay and explicit approval."
+        ),
+        watch_out="ADLSGen2OperationFailed alone has several causes. It does not establish a transient failure or rollback.",
+        source=_FABRIC_FACTORY + "connector-troubleshoot-azure-data-lake-storage",
+    ),
+    Playbook(
+        name="Pipeline SQL transient connection failure",
+        workload="fabric_pipeline",
+        triggers=("SqlOpenConnectionTimeout", "SqlConnectionIsClosed"),
+        summary="A SQL connection timed out while opening or was closed unexpectedly.",
+        retry_useful=True,
+        suggested_tier="tier_2",
+        guidance=(
+            "Check connection health and the failing phase. Propose one approved rerun "
+            "only with reviewed replay parameters and safe effects across the whole "
+            "pipeline. Do not classify a login denial or generic SqlFailedToConnect as transient."
+        ),
+        watch_out="A connection failure in one activity does not undo successful earlier activities.",
+        source=_FABRIC_FACTORY + "connector-troubleshoot-synapse-sql",
+    ),
+    Playbook(
+        name="Pipeline throttling or capacity pressure",
+        workload="fabric_pipeline",
+        triggers=("RequestBlocked", "CapacityLimitExceeded", "TooManyRequestsForCapacity"),
+        summary="The request or capacity rejected work, or the execution is waiting for resources.",
+        retry_useful=False,
+        suggested_tier="needs_human",
+        guidance=(
+            "Distinguish a throttled monitor read from a failed pipeline activity. Honor "
+            "Retry-After for reads. Do not add a pipeline execution while work is queued. "
+            "Inspect overlapping runs and capacity metrics before arranging a later replay."
+        ),
+        watch_out=(
+            "A later retry may help, but this controller does not establish capacity "
+            "recovery or an activity's elapsed backoff window. It therefore does not "
+            "automatically propose a rerun for this class."
+        ),
+        source="https://learn.microsoft.com/rest/api/fabric/articles/throttling",
+    ),
+    Playbook(
+        name="Pipeline identity or authorization failure",
+        workload="fabric_pipeline",
+        triggers=(
+            "LSROBOTokenFailure", "SqlUnauthorizedAccess",
+            r"re:(?s)(?=.*sqlfailedtoconnect)(?=.*login failed for user)",
+        ),
+        summary="The execution identity or its cached authentication context could not access the required resource.",
+        retry_useful=False,
+        suggested_tier="needs_human",
+        guidance=(
+            "Identify the connection and executing principal. Ask the owner to correct "
+            "access or refresh the affected authentication context. An unchanged rerun "
+            "presents the same failing identity. Do not disable access controls or add a secret."
+        ),
+        source=(
+            _FABRIC_FACTORY + "pipeline-troubleshoot-guide and "
+            + _FABRIC_FACTORY + "connector-troubleshoot-synapse-sql"
+        ),
+    ),
+    Playbook(
+        name="Pipeline private path or gateway failure",
+        workload="fabric_pipeline",
+        triggers=("SqlDeniedPublicAccess", "Your data gateway is offline or couldn't be reached"),
+        summary="The selected gateway or approved network path is unavailable.",
+        retry_useful=False,
+        suggested_tier="needs_human",
+        guidance=(
+            "Check the selected gateway, private DNS, target FQDN and port reachability. "
+            "Use gateway diagnostics and restore the approved private path. Do not switch "
+            "the source to public access or disable TLS validation as a repair."
+        ),
+        source=(
+            _FABRIC_FACTORY + "connector-troubleshoot-synapse-sql and "
+            "https://learn.microsoft.com/data-integration/gateway/service-gateway-tshoot"
+        ),
+    ),
+    Playbook(
+        name="Pipeline storage object missing",
+        workload="fabric_pipeline",
+        triggers=("BlobNotFound", "ContainerNotFound"),
+        summary="The storage operation could not find the referenced object.",
+        retry_useful=False,
+        suggested_tier="needs_human",
+        guidance=(
+            "Determine whether the activity failed on the source, sink or metadata lookup. "
+            "Inspect the resolved path and data-window parameters and confirm upstream "
+            "publication. Do not create an empty substitute or enable skip-missing to pass."
+        ),
+        source="https://learn.microsoft.com/rest/api/storageservices/blob-service-error-codes",
+    ),
+    Playbook(
+        name="Pipeline delimited-text contract failure",
+        workload="fabric_pipeline",
+        triggers=("DelimitedTextMoreColumnsThanDefined", "DelimitedTextColumnNameNotAllowNull", "DelimitedTextBadDataDetected"),
+        summary="The source text does not match its declared column or parsing contract.",
+        retry_useful=False,
+        suggested_tier="needs_human",
+        guidance=(
+            "Compare the failing header or row with the configured delimiter, quote rules "
+            "and mapping. Correct the agreed contract before replay. Do not automatically "
+            "drop malformed rows or widen the schema."
+        ),
+        source=_FABRIC_FACTORY + "connector-troubleshoot-delimited-text",
+    ),
+    Playbook(
+        name="Pipeline SQL schema mismatch",
+        workload="fabric_pipeline",
+        triggers=("SqlInvalidColumnName", "SqlAutoCreateTableTypeMapFailed", "SqlBulkCopyInvalidColumnLength"),
+        summary="The copy mapping or value types do not match the SQL data contract.",
+        retry_useful=False,
+        suggested_tier="needs_human",
+        guidance=(
+            "Compare source and destination column definitions, mapping and the failing "
+            "value. Have the data owner correct the contract and reconcile partial writes "
+            "before rerunning. Do not auto-alter the destination."
+        ),
+        source=_FABRIC_FACTORY + "connector-troubleshoot-synapse-sql",
+    ),
+    Playbook(
+        name="Pipeline notebook code or resource failure",
+        workload="fabric_pipeline",
+        triggers=("OutOfMemoryError", "AnalysisException"),
+        summary="The notebook or Spark execution reported a code, schema or resource failure.",
+        retry_useful=False,
+        suggested_tier="needs_human",
+        guidance=(
+            "Inspect the exact notebook execution snapshot, parameters, driver logs and "
+            "failed stage. Determine the corrective change before replay. A generic "
+            "notebook failure is not permission to regenerate or publish its code."
+        ),
+        source="https://learn.microsoft.com/fabric/data-engineering/spark-monitoring-best-practices",
+    ),
+    Playbook(
+        name="Pipeline write effects need reconciliation",
+        workload="fabric_pipeline",
+        triggers=(
+            "SqlBatchWriteTimeout", "SqlBatchWriteTransactionFailed",
+            "AzureStorageOperationFailedConcurrentWrite", "AzureAppendBlobConcurrentWriteConflict",
+        ),
+        summary="A write timed out, failed transaction handling, or conflicted with another writer.",
+        retry_useful=False,
+        suggested_tier="needs_human",
+        guidance=(
+            "Inspect sink commits, business keys, append/upsert mode and concurrent writers. "
+            "Reconcile partial or ambiguous commits before recovery. A missing or zero "
+            "write counter is not proof that the whole pipeline had no effects."
+        ),
+        watch_out="This blocker outranks a transient connection match and a previously reviewed replay-safety flag.",
+        source=(
+            _FABRIC_FACTORY + "connector-troubleshoot-synapse-sql and "
+            + _FABRIC_FACTORY + "connector-troubleshoot-azure-blob-storage"
+        ),
+    ),
+]
+
 
 # ---------------------------------------------------------------------------
 # Matching
@@ -365,7 +535,10 @@ def _matches(trigger: str, haystack: str) -> bool:
     return trigger.lower() in haystack
 
 
-def select_playbooks(error_message: str, *, limit: int = 3) -> list[Playbook]:
+def select_playbooks(
+    error_message: str, *, limit: int = 3,
+    workload: Literal["powerbi", "fabric_pipeline"] = "powerbi",
+) -> list[Playbook]:
     """Return the playbooks whose triggers match, most specific first.
 
     Capped deliberately. Injecting nine playbooks would recreate the problem
@@ -379,6 +552,8 @@ def select_playbooks(error_message: str, *, limit: int = 3) -> list[Playbook]:
 
     scored: list[tuple[int, int, Playbook]] = []
     for index, pb in enumerate(PLAYBOOKS):
+        if pb.workload != workload:
+            continue
         hits = sum(1 for t in pb.triggers if _matches(t, haystack))
         if hits:
             # `index` keeps ordering stable for equal scores, so the same input
@@ -386,7 +561,7 @@ def select_playbooks(error_message: str, *, limit: int = 3) -> list[Playbook]:
             scored.append((-hits, index, pb))
 
     scored.sort()
-    return [pb for _, _, pb in scored[:limit]]
+    return [pb for _, _, pb in scored[:max(0, min(limit, 3))]]
 
 
 def format_playbooks(playbooks: list[Playbook]) -> str:
@@ -410,3 +585,19 @@ def retry_is_discouraged(playbooks: list[Playbook]) -> bool:
     fix this" is not something the agent has to infer from paragraphs.
     """
     return bool(playbooks) and all(not pb.retry_useful for pb in playbooks)
+
+
+def pipeline_retry_is_allowed(error_message: str, *, activity_type: str = "") -> bool:
+    """Prompt retrieval is capped; a safety blocker must not fall off that cap."""
+    haystack = (error_message or "").lower()
+    matches = [
+        playbook for playbook in PLAYBOOKS
+        if playbook.workload == "fabric_pipeline"
+        and (
+            not activity_type
+            or activity_type in playbook.activity_types
+            or not playbook.activity_types and activity_type != "Fail"
+        )
+        and any(_matches(trigger, haystack) for trigger in playbook.triggers)
+    ]
+    return bool(matches) and all(playbook.retry_useful for playbook in matches)

@@ -28,6 +28,7 @@ from rich.table import Table
 
 from triage.detectors.silent_failures import load_probes
 from triage.observability import configure_telemetry
+from triage.pipeline_models import load_pipeline_targets
 from triage.runner import (
     RunArtifacts,
     Scenario,
@@ -47,6 +48,7 @@ _TOOL_STYLE = {
     "consult_data_quality_agent": "bold magenta",
     "refresh_powerbi_dataset": "bold yellow",
     "rebind_dataset_gateway": "bold red",
+    "rerun_fabric_pipeline": "bold yellow",
     "write_data_quality_flag": "bold cyan",
     "notify_teams": "bold blue",
     "report_resolution": "bold green",
@@ -1204,6 +1206,87 @@ def cmd_health(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pipelines(args: argparse.Namespace) -> int:
+    """Inspect configuration without network, or perform one bounded sweep."""
+    try:
+        targets = load_pipeline_targets(settings.fabric_pipeline_targets)
+    except ValueError as exc:
+        console.print(f"[red]Invalid pipeline configuration:[/red] {escape(str(exc))}")
+        return 2
+    if args.targets:
+        table = Table(title="Configured Fabric pipelines")
+        for heading in ("Name", "Workspace", "Pipeline", "Reviewed replay"):
+            table.add_column(heading)
+        for target in targets:
+            table.add_row(
+                escape(target.name), target.workspace_id, target.pipeline_id,
+                "approval required" if target.permits_rerun else "disabled",
+            )
+        console.print(table)
+        return 0
+    if args.preflight:
+        if not targets or not settings.pipeline_sweep_enabled:
+            console.print("[yellow]Pipeline monitoring is disabled or has no targets.[/yellow]")
+            return 1
+        if settings.triage_tool_mode == "live" and not (
+            settings.fabric_tenant_id and settings.fabric_sql_server and settings.fabric_sql_database
+        ):
+            console.print("[red]Live pipeline monitoring needs FABRIC_TENANT_ID and both FABRIC_SQL settings.[/red]")
+            return 1
+        console.print(
+            f"{len(targets)} pipeline target(s) configured; tools={settings.triage_tool_mode}. "
+            "Configuration only, not a connection or permission check."
+        )
+        return 0
+    runner = TriageRunner(settings, base_dir=REPO_ROOT)
+    try:
+        report = asyncio.run(runner.pipeline_sweep(targets=targets))
+    except (ValueError, RuntimeError) as exc:
+        console.print(f"[red]Pipeline sweep failed:[/red] {escape(str(exc))}")
+        return 1
+    console.print(escape(report.summary()))
+    return 1 if report.status in {"disabled", "unconfigured", "incomplete"} else 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Serve the command center without making the base CLI depend on web packages."""
+    try:
+        import uvicorn
+
+        from triage.command_center.api import create_app
+        from triage.command_center.models import WebSettings
+    except ImportError as exc:
+        console.print("[red]Install the web dependencies first:[/red] python -m pip install -e \".[web]\"")
+        logger = logging.getLogger("triage.cli")
+        logger.error("Command-center dependency is unavailable (%s)", type(exc).__name__)
+        return 2
+    web = WebSettings(mode=args.mode)
+    if web.mode == "demo" and args.host not in {"localhost", "127.0.0.1", "::1"}:
+        console.print("[red]Demo mode must bind to loopback; it cannot expose synthetic authorization on a network.[/red]")
+        return 2
+    console.print(f"Command center: http://{args.host}:{args.port} ({web.mode})")
+    uvicorn.run(create_app(web_settings=web), host=args.host, port=args.port, log_level="info")
+    return 0
+
+
+def cmd_commands(args: argparse.Namespace) -> int:
+    runner = TriageRunner(settings, base_dir=REPO_ROOT)
+    if args.drain:
+        from triage.command_center.worker import drain_commands
+
+        for line in asyncio.run(drain_commands(runner, limit=args.limit)):
+            console.print(escape(line))
+        return 0
+    rows = runner.build_command_center_store().commands(limit=50)
+    table = Table(title="Operator commands")
+    for name in ("Command", "Kind", "Target", "State", "Created"):
+        table.add_column(name)
+    for row in rows:
+        table.add_row(row.id, row.kind, row.target_id, row.state, row.created_at)
+    console.print(table)
+    return 0
+
+
 def cmd_tools(args: argparse.Namespace) -> int:
     """Print the tool schemas — useful when the audience asks what the agent can do."""
     import json
@@ -1345,6 +1428,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Check probe configuration for mistakes that would silently detect nothing",
     )
     health.set_defaults(func=cmd_health)
+
+    pipelines = sub.add_parser(
+        "pipelines", help="Triage failed scheduled Fabric pipeline runs"
+    )
+    pipeline_modes = pipelines.add_mutually_exclusive_group()
+    pipeline_modes.add_argument("--targets", action="store_true", help="List configured pipeline targets")
+    pipeline_modes.add_argument("--preflight", action="store_true", help="Check pipeline configuration without network")
+    pipelines.set_defaults(func=cmd_pipelines)
+
+    serve = sub.add_parser("serve", help="Run the operator command center")
+    serve.add_argument("--mode", choices=["demo", "live"], default="demo")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
+    serve.set_defaults(func=cmd_serve)
+
+    commands = sub.add_parser("commands", help="Inspect or drain operator commands")
+    commands.add_argument("--drain", action="store_true")
+    commands.add_argument("--limit", type=int, default=1)
+    commands.set_defaults(func=cmd_commands)
 
     for verb, handler, helptext in (
         ("approve", cmd_approve, "Authorise a pending action"),

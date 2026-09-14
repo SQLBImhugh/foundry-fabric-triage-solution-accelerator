@@ -74,9 +74,10 @@ const rows = [
 
 ## Target / reference value
 
-Graphein has no built-in reference-line option. To draw a goal or average, add
-it as an extra **series** — a constant value repeated across every x — so it plots
-as its own flat line:
+Graphein 0.18.0 supports reference-line `annotations`, for example
+`{ type: "line", axis: "y", value: goal, label: "Goal" }` in the annotations
+array. A constant **series** is an alternative when the target should behave
+as a plotted series rather than an annotation:
 
 ```tsx
 const goal = 1_000_000;
@@ -121,8 +122,14 @@ array — not multi-series:
                 color: { field: "channel" } } }} />
 ```
 
-## Combos & marks Graphein lacks
+## Combo, treemap and waterfall support
 
-There is **no dual-axis combo** and no radar/treemap/waterfall in this version.
-Re-express the question with a supported type, or split it across two stacked
-`ChartCard`s. See [choosing the closest type](custom-charts.md).
+Graphein 0.18.0 provides `combo` with per-layer `left`/`right` axes, plus
+`treemap` and `waterfall`. Separate `ChartCard`s are a layout choice, not a
+workaround for missing combo support. The installed `ChartSpec` union does not
+include a radar type; use a supported alternative. See
+[choosing the closest type](custom-charts.md).
+
+These claims use the installed `graphein@0.18.0` public API documentation in
+`dist/index.d.ts`: `Annotation`, `ComboLayer`, `ComboSpec`, `TreemapSpec`,
+`WaterfallSpec` and `ChartSpec`. Re-check the installed API when changing versions.

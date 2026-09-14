@@ -373,6 +373,12 @@ MIN_TURN_HEADROOM = 3
         "scenario6-approval-denied",
         "scenario7-schedule-reenable",
         "scenario8-capacity-backoff",
+        "scenario9-pipeline-authentication",
+        "scenario10-pipeline-rerun-approved",
+        "scenario11-pipeline-rerun-denied",
+        "scenario12-pipeline-schema-mismatch",
+        "scenario13-pipeline-rerun-pending",
+        "scenario14-pipeline-write-timeout",
     ],
 )
 async def test_scenarios_keep_turn_headroom(scenario_name, repo_root, runner) -> None:
@@ -428,6 +434,25 @@ def test_scenarios_that_should_differ_have_distinct_signatures(repo_root) -> Non
 
     signatures: dict[str, str] = {}
     for scenario in discover_scenarios(repo_root / "scenarios"):
+        if scenario.pipeline is not None:
+            from triage.pipeline_models import (
+                PipelineActivity,
+                PipelineFailure,
+                PipelineRun,
+                PipelineTarget,
+            )
+            from triage.runner import _pipeline_signature
+
+            failure = PipelineFailure(
+                target=PipelineTarget.model_validate(scenario.pipeline["target"]),
+                run=PipelineRun.model_validate(scenario.pipeline["runs"][0]),
+                activities=[
+                    PipelineActivity.model_validate(row)
+                    for row in scenario.pipeline.get("activities", [])
+                ],
+            )
+            signatures.setdefault(_pipeline_signature(failure), scenario.name)
+            continue
         request = MockInbox.load(repo_root / scenario.email)
         sig, _ = compute_signature(
             source="powerbi_refresh_failure",

@@ -34,6 +34,7 @@ from triage.policy import (
 )
 from triage.tools.dataset import DatasetSource
 from triage.tools.flags import DataQualityFlagTable, build_flag
+from triage.tools.pipeline_actions import PipelineToolContext
 from triage.tools.powerbi import PowerBIClient
 from triage.tools.teams import ResolutionSummary, TeamsNotifier
 
@@ -46,6 +47,7 @@ _PRECONDITIONED_ACTIONS: frozenset[str] = frozenset(
     {
         "refresh_powerbi_dataset",
         "reenable_refresh_schedule",
+        "rerun_fabric_pipeline",
     }
 )
 
@@ -55,6 +57,47 @@ _PRECONDITIONED_ACTIONS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 TRIAGE_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pipeline_run_evidence",
+            "description": (
+                "Read controller-collected evidence for a failed scheduled Fabric pipeline "
+                "job, including the configured target, run ID, trigger, failure reason, "
+                "history and deterministic replay eligibility. Not a dataset refresh."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rerun_fabric_pipeline",
+            "description": (
+                "REMEDIATION REQUIRING HUMAN APPROVAL. Start at most one full pipeline "
+                "rerun using operator-reviewed replay parameters. The controller refuses "
+                "unknown replay safety, active/newer runs, a prior submission, or a "
+                "non-retryable failure. A submitted job is not yet a resolution."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"justification": {"type": "string"}},
+                "required": ["justification"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pipeline_rerun_status",
+            "description": (
+                "Read the exact new pipeline job returned by the approved submission. "
+                "Only Completed is success; do not confuse HTTP acceptance with execution."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -361,7 +404,7 @@ class ToolContext:
 
     request: BIRequest
     ledger: PolicyLedger
-    powerbi: PowerBIClient
+    powerbi: PowerBIClient | None
     teams: TeamsNotifier
     flag_table: DataQualityFlagTable
     datasets: dict[str, DatasetSource] = field(default_factory=dict)
@@ -390,6 +433,8 @@ class ToolContext:
     #: Where postponed retries live. None means deferring is unavailable, which
     #: the tool reports rather than silently dropping the work.
     retries: Any = None
+    pipeline: PipelineToolContext | None = None
+    run_id: str = ""
     retry_deferred: bool = False
     # How long a gated action waits for an answer. Carried on the context
     # because the dispatcher has no settings object, and hardcoding it here
@@ -402,6 +447,11 @@ class ToolContext:
 
     def default_dataset(self) -> DatasetSource | None:
         return next(iter(self.datasets.values()), None)
+
+    def require_powerbi(self) -> PowerBIClient:
+        if self.powerbi is None:
+            raise ValueError("A dataset client is not available for this workload")
+        return self.powerbi
 
 
 class ToolDispatcher:
@@ -478,7 +528,14 @@ class ToolDispatcher:
                 }
             raise
 
-        blocked_reason = await self._precondition_failure(name)
+        if name == "rerun_fabric_pipeline" and (
+            set(arguments) != {"justification"}
+            or not isinstance(arguments.get("justification"), str)
+            or not arguments["justification"].strip()
+        ):
+            blocked_reason = "Supply only a non-empty justification. The controller owns target IDs and replay parameters."
+        else:
+            blocked_reason = await self._precondition_failure(name)
         if blocked_reason is not None:
             # For a gated action this also means the human is never asked:
             # sending an approval request for something the controller will
@@ -502,6 +559,23 @@ class ToolDispatcher:
                     blocked=True,
                 )
                 return approval_result
+            if name == "rerun_fabric_pipeline":
+                # A human can take minutes. Recheck execution state after the
+                # decision, then atomically reserve before spending or acting.
+                blocked_reason = await self._precondition_failure(name)
+                if blocked_reason is None:
+                    try:
+                        if self.ctx.pipeline is None or not self.ctx.pipeline.reserve():
+                            blocked_reason = "A rerun was already reserved by another invocation."
+                    except ValueError as exc:
+                        logger.warning("Pipeline rerun reservation refused: %s", exc)
+                        blocked_reason = str(exc)
+                    except Exception as exc:
+                        logger.exception("Pipeline rerun reservation failed")
+                        blocked_reason = f"Could not persist the rerun reservation ({type(exc).__name__})."
+                if blocked_reason is not None:
+                    self._record(name, arguments, blocked_reason, started, blocked=True)
+                    return {"status": "blocked_by_policy", "reason": blocked_reason}
             try:
                 self.ctx.ledger.charge_write(name)
             except PolicyViolation as violation:
@@ -556,15 +630,21 @@ class ToolDispatcher:
         gate = ctx.approval_gate
         started = time.monotonic()
 
+        approval_arguments = (
+            ctx.pipeline.approval_arguments(str(arguments.get("justification", "")))
+            if name == "rerun_fabric_pipeline" and ctx.pipeline is not None
+            else dict(arguments or {})
+        )
         request = ApprovalRequest(
             action=name,
-            arguments=dict(arguments or {}),
+            arguments=approval_arguments,
             justification=str(arguments.get("justification", "")),
             request_id=f"{ctx.request.request_id}:{name}",
             report_name=ctx.request.report_name or "",
             signature=ctx.signature,
-            impact=_impact_of(name, arguments),
+            impact=_impact_of(name, approval_arguments),
             timeout_seconds=ctx.approval_timeout_seconds,
+            run_id=ctx.run_id,
         )
 
         if gate is None:
@@ -645,6 +725,22 @@ class ToolDispatcher:
         """
         ctx = self.ctx
 
+        if name == "rerun_fabric_pipeline":
+            if ctx.pipeline is None:
+                return "This request has no controller-verified pipeline failure."
+            if not ctx.pipeline.evidence_read:
+                return "Read the pipeline run evidence before proposing a rerun."
+            if ctx.known_incident is not None:
+                return "The failure already has an open incident; do not remediate it again."
+            if ctx.ledger.write_actions >= ctx.ledger.policy.max_write_actions:
+                ctx.ledger.blocked_attempts.append(name)
+                return "The remediation budget is already exhausted."
+            try:
+                return await ctx.pipeline.refusal()
+            except Exception as exc:
+                logger.exception("Could not verify pipeline rerun prerequisites")
+                return f"Pipeline prerequisites could not be verified ({type(exc).__name__})."
+
         if name == "refresh_powerbi_dataset":
             # The one case where the obvious fix makes the outage worse. If a
             # retry has already been scheduled for this failure and its window
@@ -673,7 +769,7 @@ class ToolDispatcher:
         # Otherwise the common real case: somebody fixed the cause by hand and
         # ran a manual refresh, but nobody re-armed the schedule.
         try:
-            history = await ctx.powerbi.get_refresh_history(
+            history = await ctx.require_powerbi().get_refresh_history(
                 ctx.workspace_id, ctx.dataset_id, top=1
             )
         except Exception as exc:  # noqa: BLE001
@@ -757,6 +853,7 @@ class ToolDispatcher:
         if name == "get_request_context":
             return {
                 "status": "ok",
+                "workload": "fabric_pipeline" if ctx.pipeline is not None else "powerbi",
                 "request_id": ctx.request.request_id,
                 "received_at": ctx.request.received_at,
                 "subject": ctx.request.subject,
@@ -767,6 +864,25 @@ class ToolDispatcher:
                 "error_code": ctx.request.error_code,
                 "signature": ctx.signature,
             }
+
+        if name == "get_pipeline_run_evidence":
+            if ctx.pipeline is None:
+                raise ValueError("No pipeline evidence is attached to this request")
+            return await ctx.pipeline.evidence()
+
+        if name == "rerun_fabric_pipeline":
+            if ctx.pipeline is None:
+                raise ValueError("No verified pipeline target")
+            result = await ctx.pipeline.submit()
+            ctx.remediation_outcome = ctx.pipeline.outcome
+            return result
+
+        if name == "get_pipeline_rerun_status":
+            if ctx.pipeline is None:
+                raise ValueError("No pipeline rerun is attached to this request")
+            result = await ctx.pipeline.check_rerun()
+            ctx.remediation_outcome = ctx.pipeline.outcome
+            return result
 
         if name == "get_known_incidents":
             known = ctx.known_incident
@@ -788,7 +904,7 @@ class ToolDispatcher:
 
         if name == "get_dataset_refresh_history":
             top = max(1, min(int(args.get("top", 5) or 5), 20))
-            history = await ctx.powerbi.get_refresh_history(
+            history = await ctx.require_powerbi().get_refresh_history(
                 ctx.workspace_id, ctx.dataset_id, top=top
             )
             # Counting consecutive SCHEDULED failures is an exact question, so
@@ -817,7 +933,7 @@ class ToolDispatcher:
             return finding.model_dump()
 
         if name == "refresh_powerbi_dataset":
-            outcome = await ctx.powerbi.refresh_dataset(ctx.workspace_id, ctx.dataset_id)
+            outcome = await ctx.require_powerbi().refresh_dataset(ctx.workspace_id, ctx.dataset_id)
             ctx.remediation_outcome = outcome
             return {
                 "status": outcome.status,
@@ -831,7 +947,7 @@ class ToolDispatcher:
             target = str(args.get("target_gateway") or "").strip()
             if not target:
                 return {"status": "refused", "reason": "No target gateway supplied."}
-            outcome = await ctx.powerbi.rebind_gateway(
+            outcome = await ctx.require_powerbi().rebind_gateway(
                 ctx.workspace_id, ctx.dataset_id, target
             )
             ctx.remediation_outcome = outcome
@@ -873,14 +989,28 @@ class ToolDispatcher:
             return {"status": "written", "flag": flag.model_dump()}
 
         if name == "notify_teams":
+            reported_outcome = str(args.get("outcome", ""))
+            reported_action = str(args.get("action_taken", ""))
+            reported_detail = str(args.get("detail", ""))
+            if ctx.pipeline is not None and reported_outcome == "resolved":
+                if ctx.remediation_outcome is None or not ctx.remediation_outcome.succeeded:
+                    logger.warning("Pipeline notification claimed resolution without a completed rerun")
+                    reported_outcome = "needs_human"
+                    reported_detail = "Pipeline execution has not been verified successful. " + reported_detail
+            if ctx.pipeline is not None:
+                actual = ctx.pipeline.outcome
+                reported_action = (
+                    f"Pipeline rerun {actual.run_id or '(submission unconfirmed)'}: {actual.status}."
+                    if actual is not None else "No pipeline rerun was performed."
+                )
             summary = ResolutionSummary(
                 title=str(args.get("title", "BI request triage")),
                 report_name=ctx.request.report_name or "",
                 error=ctx.request.subject,
-                action_taken=str(args.get("action_taken", "")),
-                outcome=str(args.get("outcome", "")),
+                action_taken=reported_action,
+                outcome=reported_outcome,
                 timestamp=ctx.request.received_at,
-                detail=str(args.get("detail", "")),
+                detail=reported_detail,
                 facts=_facts_for(ctx),
             )
             ctx.notifications.append(summary)
@@ -927,7 +1057,7 @@ class ToolDispatcher:
             return delivery
 
         if name == "get_refresh_schedule":
-            schedule = await ctx.powerbi.get_refresh_schedule(
+            schedule = await ctx.require_powerbi().get_refresh_schedule(
                 ctx.workspace_id, ctx.dataset_id
             )
             enabled = schedule.get("enabled")
@@ -948,7 +1078,7 @@ class ToolDispatcher:
             }
 
         if name == "reenable_refresh_schedule":
-            outcome = await ctx.powerbi.set_refresh_schedule_enabled(
+            outcome = await ctx.require_powerbi().set_refresh_schedule_enabled(
                 ctx.workspace_id, ctx.dataset_id, True
             )
             # Records the completed remediation, which is what
@@ -1037,6 +1167,15 @@ def _impact_of(action: str, arguments: dict[str, Any]) -> str:
     An approval request that does not state the consequence is a rubber stamp
     with extra steps.
     """
+    if action == "rerun_fabric_pipeline":
+        return (
+            f"Starts the entire pipeline {arguments.get('pipeline_id')} in workspace "
+            f"{arguments.get('workspace_id')} after failed run {arguments.get('failed_run_id')}. "
+            f"Replay parameter fingerprint: {arguments.get('parameter_hash')}. "
+            f"Redacted parameter preview: {arguments.get('parameter_preview')}. "
+            "Earlier activities may already have committed output; this is not rollback "
+            "or resume-from-failed-activity."
+        )
     if action == "rebind_dataset_gateway":
         target = arguments.get("target_gateway", "the target gateway")
         return (
@@ -1061,6 +1200,17 @@ def _facts_for(ctx: ToolContext) -> dict[str, str]:
         facts["Known incident"] = (
             f"{ctx.known_incident.id} (seen {ctx.known_incident.occurrence_count}x)"
         )
+    if ctx.pipeline is not None:
+        failure = ctx.pipeline.failure
+        facts.update({
+            "Pipeline": failure.target.name,
+            "Workspace": failure.target.workspace_id,
+            "Pipeline ID": failure.target.pipeline_id,
+            "Failed run": failure.run.id,
+            "Trigger": failure.run.invoke_type,
+        })
+        if ctx.pipeline.outcome is not None:
+            facts["Rerun"] = f"{ctx.pipeline.outcome.run_id}: {ctx.pipeline.outcome.status}"
     return facts
 
 

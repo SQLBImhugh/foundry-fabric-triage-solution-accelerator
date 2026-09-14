@@ -13,27 +13,32 @@
       "docs/foundry/README.md records the evidence and the commands to",
       "reproduce it.",
       "",
-      "Deploy it twice with different parameters - once for the mailbox drain",
-      "and once for the silent-failure scan - because they are different jobs on",
-      "different cadences:",
+      "Deploy once per enabled sweep with distinct names and parameters.",
+      "Mailbox ingestion, semantic-health scans and pipeline triage are separate",
+      "jobs with independently chosen cadences:",
       "",
       "  command='sweep'         every 5 minutes   drains the mailbox and runs",
       "                                            deferred retries",
       "  command='silent sweep'  hourly            runs the freshness, volume",
       "                                            and schema probes, which no",
       "                                            alert will ever tell you about",
+      "  command='pipeline sweep' every 5 minutes  triages failed scheduled",
+      "                                            pipelines and verifies reruns",
+      "  command='command sweep' every minute     drains authenticated operator",
+      "                                            investigations from SQL",
       "",
       "Why a Logic App and not a Function or a VM cron: it authenticates with a",
       "system-assigned managed identity, so there is no key anywhere, which the",
       "tenant requires. It also keeps its own run history, so a failed sweep is",
       "visible after the fact rather than being a thing that quietly stopped.",
       "",
-      "The HTTP timeout is PT10M and that number is not arbitrary: it must exceed",
-      "APPROVAL_TIMEOUT_SECONDS (default 300s), because a sweep that triages an",
-      "alert requiring approval blocks while it waits for a human. At the previous",
+      "The HTTP timeout is PT15M. It must outlast the command worker's combined",
+      "triage and approval budgets plus 30 seconds (300 + 300 + 30 by default).",
+      "PT10M covered the approval window but not that combined deadline.",
+      "A sweep requiring approval blocks while it waits for a human. At the earlier",
       "PT3M the scheduler killed the run BEFORE the approval window closed, so a",
       "person could approve inside the documented five minutes and find the work",
-      "had already been abandoned. Raise both together.",
+      "had already been abandoned. Keep the caller timeout above the full budget.",
       "",
       "The identity needs permission to invoke the agent. That grant is not in",
       "this template because it is a role assignment on the Foundry project,",
@@ -67,7 +72,9 @@
       "defaultValue": "sweep",
       "allowedValues": [
         "sweep",
-        "silent sweep"
+        "silent sweep",
+        "pipeline sweep",
+        "command sweep"
       ],
       "metadata": {
         "description": "Constrained on purpose. The controller routes anything it does not recognise to 'triage this text as an alert', so a typo here would not fail - it would quietly triage the word as if it were a Power BI alert."
@@ -188,15 +195,49 @@
                 }
               },
               "limit": {
-                "timeout": "PT10M"
+                "timeout": "PT15M"
+              }
+            },
+            "Validate_agent_response": {
+              "type": "ParseJson",
+              "runAfter": {
+                "Invoke_the_agent": [
+                  "Succeeded"
+                ]
+              },
+              "inputs": {
+                "content": "@if(contains(body('Invoke_the_agent'), '$content'), json(base64ToString(body('Invoke_the_agent')['$content'])), body('Invoke_the_agent'))",
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "completed"
+                      ]
+                    },
+                    "error": {
+                      "type": "null"
+                    }
+                  }
+                }
               }
             },
             "Did_it_fail": {
               "type": "If",
               "runAfter": {
                 "Invoke_the_agent": [
+                  "Succeeded",
                   "Failed",
                   "TimedOut"
+                ],
+                "Validate_agent_response": [
+                  "Failed",
+                  "TimedOut",
+                  "Skipped"
                 ]
               },
               "expression": {
@@ -241,7 +282,7 @@
                               {
                                 "type": "TextBlock",
                                 "wrap": true,
-                                "text": "The agent did not answer. Nothing was triaged on this run."
+                                "text": "The agent did not return a confirmed result. Work may have executed; review run history and target state before retrying."
                               },
                               {
                                 "type": "FactSet",
@@ -280,14 +321,16 @@
               "type": "Terminate",
               "runAfter": {
                 "Did_it_fail": [
-                  "Succeeded"
+                  "Succeeded",
+                  "Failed",
+                  "TimedOut"
                 ]
               },
               "inputs": {
                 "runStatus": "Failed",
                 "runError": {
                   "code": "SweepFailed",
-                  "message": "The agent did not answer. Handling the failure must not mark the run successful, or the run history stops being evidence."
+                  "message": "The agent invocation or response validation failed. Work may have executed; review run history and target state before retrying."
                 }
               }
             }

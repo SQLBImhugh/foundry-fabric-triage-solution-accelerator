@@ -2,8 +2,8 @@
 
 ## Can I run it without an Azure subscription?
 
-Yes, and you should start there. With no configuration at all the accelerator
-runs against a deterministic provider and in-memory tools:
+Yes. With no configuration the accelerator runs against a deterministic
+provider and in-memory tools:
 
 ```powershell
 .\.venv\Scripts\bi-triage.exe list
@@ -15,19 +15,21 @@ That is the same path the test suite uses. No credentials, no network.
 ## What does it actually change in my tenant?
 
 Only what is on an allowlist, and only within budget. By default that is one
-write action per incident, drawn from a short list: trigger a refresh, re-enable
-a disabled refresh schedule, defer a retry. Everything else is refused before
-dispatch and escalated to a human.
+remediation per incident. The Power BI path can trigger a refresh, re-enable a
+disabled refresh schedule or defer a retry. The separate pipeline path can
+submit a full-pipeline rerun only after reviewed replay-safety configuration,
+deterministic prerequisites and explicit approval. Everything else is refused
+before dispatch and escalated to a human.
 
-Set `TRIAGE_MAX_WRITE_ACTIONS=0` to make it read-only while you evaluate it.
+Set `TRIAGE_MAX_WRITE_ACTIONS=0` to disable remediation while evaluating it.
+Incident records, reporting and audit writes still occur.
 
 ## Which model should I use?
 
 Any model that supports function calling. `FOUNDRY_AGENT_MODEL` selects it.
 
-The choice matters less than it looks, because the controller — not the model —
-decides what is permitted. A stronger model classifies causes and writes
-explanations better; it does not gain authority. When evaluating a swap, run the
+The controller, not the model, decides what is permitted. Model choice affects
+classification and explanations, not authority. When evaluating a swap, run the
 scenarios and compare the tool sequences, not the prose.
 
 Keep a second agent pair registered on a fallback model if you depend on this
@@ -59,7 +61,9 @@ agent for the rest of the incident.
 
 Graph change notifications need a public HTTPS endpoint that answers a validation
 handshake, plus subscription renewal before expiry. Polling has no such
-dependencies and its worst case is half the poll interval.
+dependencies. With a healthy scheduler and no backlog, arrival-to-next-poll
+delay is up to one interval; evenly distributed arrivals average half an
+interval. Processing time and backlog add further delay.
 
 `GRAPH_INGESTION_MODE=subscription` is rejected at startup rather than silently
 polling, because believing you have push while getting a poll is a latency
@@ -67,10 +71,10 @@ assumption nothing will correct.
 
 ## Why is the scheduled trigger a Logic App rather than a Foundry routine?
 
-Because Foundry routines do not currently fire. Verified six days after
-registration: the routine reported itself enabled, accepted dispatches, produced
-no runs, and telemetry showed agent activity only in hours when a person invoked
-it by hand. `azd deploy` does not manage routines either.
+Foundry routines did not fire in the evaluation verified on 2026-09-02, six days
+after registration: the routine reported itself enabled, accepted dispatches,
+produced no runs, and telemetry showed agent activity only in hours when a
+person invoked it by hand. `azd deploy` does not manage routines either.
 
 Both routines are declared in `azure.yaml` and ship disabled, with the evidence
 in the file. Use [`infra/scheduled-sweep.json`](../infra/scheduled-sweep.json),
@@ -100,12 +104,87 @@ fine.
 
 ## Can I use this for something other than Power BI?
 
-Yes. The policy ledger, allowlists, approval gate, signature and suppression
-logic, incident model and outcome validation are domain-independent. The Power BI
-specifics are the tools, the playbooks and the parsing.
+Scheduled Fabric Data Factory pipeline triage is already implemented for
+explicitly configured targets. It reads failed scheduled jobs and activity
+evidence; it does not infer missing starts or disabled schedules. Notebook
+activities can be evidence within a pipeline, but standalone notebook-job
+monitoring is not implemented. See [PipelineTriage.md](PipelineTriage.md).
+
+The policy ledger, allowlists, approval gate, signature and suppression logic,
+incident model and outcome validation can also be reused for another domain.
+Domain-specific tools, playbooks and parsing still need implementation.
 
 See [`CustomizationGuide.md`](CustomizationGuide.md), which has a section on
 moving to a different domain.
+
+## What does the command center add?
+
+The [command center](CommandCenter.md) provides an authenticated queue and
+inspector, full incident pages, run history and tool timelines, durable notes
+and read-only discussion, approvals and a durable investigation queue. It reads
+the same Fabric SQL state as the controller; it does not own the database.
+The existing read-only Fabric App can remain deployed.
+
+Teams is optional. **New investigation** records a request for a configured
+target; a separate `command sweep` worker executes it. A queued receipt, an
+approval decision or a completed observer answer is not proof of remediation.
+An empty target list never selects a resource implicitly.
+
+## Who can use the application?
+
+The API validates Entra app-role claims on every authenticated request. Reader
+can view records and ask read-only questions. Operator adds investigations,
+notes and human tracking resolution. Approver adds approval/denial decisions,
+not Operator permissions. Admin has all app capabilities, including scenario
+validation and uncertainty reconciliation, but no Entra directory
+administration. These roles grant no direct Azure, Fabric or SQL access.
+
+Use the four ordinary Entra security groups assigned to those roles; group
+owners manage membership and authorized IT administrators manage assignments.
+Group-based assignment requires Entra P1/P2 and does not cascade through nested
+groups. See [Entra-managed groups](CommandCenter.md#entra-managed-groups).
+
+## How do I change or refresh permissions?
+
+Request the appropriate group membership from its owner or IT in Entra.
+**Access & permissions** is a Reader-visible, read-only view of the current
+token's roles and issued/expiry timestamps. It does not read current group
+membership or offer Add/Edit user, invite or local-grant operations. The SQL
+permission editor and importer are retired; old `?view=admin` links open this
+read-only page.
+
+After a change, select **Refresh permissions** to request a fresh API token and
+reload access information and the snapshot. Actions remain locked until fresh
+records confirm permission. Entra changes may take time to propagate; refreshing
+one session does not revoke other sessions' already-issued tokens. Profile
+photos use a separate delegated Graph `User.Read` token, not a directory access
+or authorization-management permission.
+
+## What does Resolved by user mean?
+
+An Operator or Admin explicitly closed human incident tracking with a reason.
+It is an append-only decision bound to the reviewed source revision and tracking
+version, not an agent-verified repair. It does not reset remediation budgets,
+approve a proposal or clear an execution uncertainty block.
+
+A changed source payload invalidates the older closure without deleting its
+history. A conflicting resolution request returns `409` and requires a fresh
+review. Notes and the saved question/answer thread remain available; the
+read-only observer cannot act on requests to repair or approve anything.
+
+## What does Scenario validation prove?
+
+It checks the 15 canonical cases against deployed code, using synthetic tools
+and isolated state. Mock validation is deterministic; Foundry validation also
+uses registered agents and model calls. Both preserve production incident state.
+A pass means the case's expectations matched, including expected refusals,
+escalation or pending verification; it does not mean a production repair
+succeeded.
+
+The page is Admin-only. At most two cases run concurrently. **Stop queue** stops
+new requests, not already accepted work. Review the durable result and run ID
+after an uncertain response; cases are not automatically retried. See
+[validation and evidence](CommandCenter.md#validation-and-evidence).
 
 ## How do I know it is still running?
 

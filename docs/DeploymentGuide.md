@@ -1,862 +1,946 @@
-# Provisioning
+# Deployment guide
 
-What must exist in your tenant before the live scenarios will run. Ordered
-by lead time, not by importance — **item 1 is the one that blocks everything else.**
+Provisioning, identity and release requirements for the live paths. Start with
+[AzureAccountSetUp.md](AzureAccountSetUp.md); the default local scenario path
+remains fully offline.
 
-Verify progress at any point with:
+The command center is an independent **Python 3.13 App Service API and Vite UI**.
+The Foundry hosted controller remains a separate deployment. Both use a
+standalone Fabric SQL Database. The read-only Rayfin cockpit is another client,
+not the owner of that database and not the command center's authorization layer.
+
+Use [CommandCenter.md](CommandCenter.md) for the web workflow and
+[PipelineTriage.md](PipelineTriage.md) for scheduled Fabric pipeline monitoring.
+Web approvals and notifications do not require Teams, a mailbox or the legacy
+approval callback.
+
+## 0. Establish the operator context
+
+All names and identifiers below are placeholders or synthetic examples. Keep
+filled-in settings, deployment evidence and tokens out of the repository.
 
 ```powershell
+$subscription = "<subscription-name-or-id>"
+$tenantId = "<tenant-id>"
+az account set --subscription $subscription
+az account show --subscription $subscription --query "{subscription:id,tenant:tenantId}" -o json
+
 .\.venv\Scripts\bi-triage.exe preflight
 ```
 
----
+Confirm the reported tenant before continuing. Reassert the subscription before
+each live sequence and after reauthentication: other shells can change shared
+CLI state. Fabric has no subscription argument; the token selects the tenant.
+An unfamiliar workspace list can be a valid response from the wrong tenant.
+`DefaultAzureCredential` can use the same CLI identity for local SQL commands.
 
-## 1. Power BI service principal access ← start here
+If the CLI token cache is unavailable, an explicitly tenant-pinned operator
+token, for example from `azureauth`, can authorize appropriate REST calls.
+That does not authenticate CLI-backed registration/deployment scripts or change
+the identity used by `DefaultAzureCredential`. Use an approved interactive
+operator flow, never a copied token file or a new client secret as a shortcut.
 
-Dataset refresh needs a token the *dataset* accepts. Two identity options, and
-the choice is not obvious:
+Plain `preflight` checks configuration without network access. A `configured`
+SQL result is not proof of connectivity; use `preflight --check-sql` explicitly
+when a live connection is intended.
 
-| | Service principal | Managed identity |
-|---|---|---|
-| Callable from | Anywhere | Azure-hosted compute only |
-| Secret handling | You rotate it, and it expires | Platform-managed, no secret |
-| Workspace membership | Supported | Also supported — add it like any other principal |
+## 1. Power BI workload identity
 
-A managed identity **can** be added to a Fabric/Power BI workspace via *Manage
-access → Add people or groups*. If your orchestrator runs in Azure (Functions,
-Container Apps, Automation), prefer it — there is no secret to rotate. Use a
-service principal when the caller is outside Azure, which is the case for a local run
-driven from a laptop.
+The identity that executes a refresh must be accepted by Power BI. In the
+hosted path this is the controller's identity, not a prompt agent or the browser
+user. For Azure-hosted adapters, prefer managed identity or supported workload
+federation. Do not provision a client secret for this deployment.
 
-Note also that Fabric removed the default Contributor grant for workspace
-identities in 2025; assign the role explicitly rather than assuming it.
+A managed identity can be added to a Fabric/Power BI workspace as a principal.
+Assign the required role explicitly; do not assume a workspace identity has
+an automatic Contributor grant. The local live clients deliberately exclude
+human CLI credentials from their workload credential chains, so `az login`
+alone does not turn a laptop into the hosted controller.
 
-Either way, two approvals are needed.
+### Tenant setting and workspace access
 
-### Tenant setting (tenant admin)
+Have a tenant administrator enable the applicable service-principal API
+setting, scoped to a security group containing the acting principal. Power BI
+documentation calls this **Allow service principals to use Power BI APIs**;
+Fabric also exposes **Service principals can call Fabric public APIs**.
 
-Power BI admin portal → Tenant settings → Developer settings →
-**Allow service principals to use Power BI APIs** → Enabled, scoped to a
-security group containing the principal.
+Assign the narrowest supported workload access and verify the intended
+operation. Member was used for refresh evaluation; an earlier hosted test used
+Admin. Neither observation makes Admin a required default. Contributor carries
+Build for the semantic-model probes described in section 7b. The web UAMI does
+not need these workload grants merely to queue an investigation.
 
-This is the item that has blocked more first runs than everything else combined. It is
-a tenant admin action, and until it is on, refresh returns 401 with a message
-that does not mention it.
+Verify target IDs, a read of refresh history and an explicitly approved test
+operation as the actual runtime identity. A successful delegated operator read
+does not prove the controller can act. Do not diagnose solely from the HTTP
+status: tenant restrictions, identity type, workspace access and model
+configuration can all produce 401/403, and some missing permissions appear as
+404. See
+[Power BI service-principal access](https://learn.microsoft.com/power-bi/developer/embedded/embed-service-principal).
 
-### Workspace membership
+## 2. Optional mailbox ingestion
 
-Add the principal to the workspace as **Member** (Contributor cannot trigger
-refresh on all dataset types; Member avoids the ambiguity).
+Skip this section for the Teams-independent command-center path. Do not enable
+a mailbox schedule until its identity, mailbox scope and filter have been
+verified.
 
-### Verify
+An unattended mailbox reader needs app-only access, not a signed-in user's
+delegated token. The older hosted implementation observed the same Entra agent
+token returning 200 for Graph directory access and 401 for the Exchange-backed
+mail endpoint, despite a `Mail.Read` role and a scoped mailbox policy. That is
+an observed compatibility limit, not proof that every Graph API accepts every
+agent identity.
 
-```powershell
-$body = @{
-  grant_type="client_credentials"; client_id=$env:POWERBI_CLIENT_ID
-  client_secret=$env:POWERBI_CLIENT_SECRET
-  scope="https://analysis.windows.net/powerbi/api/.default"
-}
-$tok = (Invoke-RestMethod -Method Post -Body $body `
-  "https://login.microsoftonline.com/$env:POWERBI_TENANT_ID/oauth2/v2.0/token").access_token
+The source still exposes `GRAPH_CLIENT_SECRET` and a conventional
+client-secret fallback in `azure.yaml` and the inbox client. **That legacy
+path is not part of the secretless deployment.** Do not fill it in to make
+preflight green. Use a separately verified, supported secretless mail identity
+or leave mailbox ingestion off. Expiring secrets, including tenant automation
+that removes them, would otherwise stop an unattended trigger after deployment.
 
-Invoke-RestMethod -Headers @{Authorization="Bearer $tok"} `
-  "https://api.powerbi.com/v1.0/myorg/groups/$env:POWERBI_WORKSPACE_ID/datasets"
-```
+### Scope the reader to the alerts mailbox
 
-Datasets listed = both approvals landed. 401 = tenant setting. 403 = workspace
-membership.
+An unscoped Entra application `Mail.Read` grant can read every mailbox.
+Successful access to one mailbox does not prove isolation.
 
----
-
-## 2. App registration for Microsoft Graph (inbox trigger)
-
-**Verified working on a work tenant, 2026-08-27** — see
-[`foundry/README.md`](foundry/README.md).
-
-- Permission: **`Mail.Read`** — *Application*, not Delegated
-- **Admin consent granted** (the agent runs with no signed-in user)
-- Identity: prefer a **managed identity or federated credential**. A client
-  secret works for evaluation, but it expires and then the trigger silently stops
-
-Application permission is the right choice specifically *because* the agent is
-unattended. Delegated permission needs a signed-in user; there isn't one when a
-routine fires at 05:00.
-
-### Scope it to one mailbox — do this at the same time
-
-> **`Mail.Read` as an application permission is tenant-wide.** Verified: a spike
-> app created to read one mailbox successfully read the global
-> administrator's inbox. Unscoped, "an agent that reads the BI alerts inbox" is
-> an agent that can read every mailbox in the organisation.
+For an existing Application Access Policy deployment, the Exchange operator's
+verification commands are:
 
 ```powershell
-# Exchange Online PowerShell
-New-ApplicationAccessPolicy -AppId <app-id> `
-  -PolicyScopeGroupId bi-alerts@contoso.com `
+New-ApplicationAccessPolicy -AppId <mail-reader-client-id> `
+  -PolicyScopeGroupId <mail-enabled-security-group> `
   -AccessRight RestrictAccess `
-  -Description "BI triage: BI alerts mailbox only"
+  -Description "BI triage alerts mailbox only"
 
-Test-ApplicationAccessPolicy -Identity bi-alerts@contoso.com -AppId <app-id>
+Test-ApplicationAccessPolicy -Identity bi-alerts@contoso.com `
+  -AppId <mail-reader-client-id>
 ```
 
-Treat this as part of the app registration, not a follow-up task. It is the
-difference between a scoped integration and a tenant-wide mailbox read.
+The policy scope is a mail-enabled security group containing the permitted
+mailboxes, not an arbitrary mailbox address. This Exchange scope group is
+separate from the command center's four ordinary app-role groups.
 
-### Verify
+For new integrations, review
+[Exchange RBAC for Applications](https://learn.microsoft.com/exchange/permissions-exo/application-rbac),
+which replaces Application Access Policies. Exchange RBAC and existing
+unscoped Entra grants are independent/additive; a narrow RBAC assignment does
+not cancel a broad grant. Revalidate the application's actual mailbox requests
+when adopting a different permission model rather than assuming the current
+scope checker covers it.
+
+Set `GRAPH_CANARY_MAILBOX` to a distinct existing mailbox that the reader must
+not access. The application requires the canary read to return **403**.
+Missing configuration, a failed check, 401/404, or a successful canary read
+does not prove confinement and is refused. The hosted path also refuses a
+token carrying `upn`; a delegated operator token is not unattended proof.
+
+The Outlook/Office 365 connector catalog is not used by this code. Catalog
+availability and per-user OAuth consent are not substitutes for the verified
+app-only mailbox path.
+
+## 3. Fabric SQL Database
+
+Incidents, processed messages, approvals, deferred retries, claims, leases,
+baselines, run history, commands and incident collaboration must survive
+invocations. A restarted controller that forgets an open incident can remediate
+the same failure twice.
+
+Create or use a standalone **Fabric SQL Database** in a workspace on a
+capacity. Read the item's connection properties in Fabric or through
+`GET /v1/workspaces/<workspace-id>/sqlDatabases`. Configure the exact hostname
+and catalog name:
+
+```text
+FABRIC_SQL_SERVER=<serverFqdn>
+FABRIC_SQL_DATABASE=<databaseName>
+```
+
+The command-center deployment helper requires a hostname without protocol or
+port. Copy the database name exactly, including any item identifier. These
+settings are not a username/password connection string.
+
+With both settings empty, local runs use JSON state under `runs/`. That is
+appropriate offline, not in a recycling hosted container. The live web API
+requires SQL and does not substitute an empty local permission or history store.
+Fabric SQL accepts Entra authentication; there is no SQL-authentication fallback.
+See [Fabric SQL authentication](https://learn.microsoft.com/fabric/database/sql/authentication).
+
+### Schema and ownership
+
+The current schema has these default tables:
+
+| Purpose | Tables |
+|---|---|
+| Incident and mailbox state | `triage_incidents`, `triage_processed_messages`, `triage_inbox_audit` |
+| Approval and retry state | `triage_approvals`, `triage_deferred_retries`, `triage_pipeline_reruns` |
+| Detector and concurrency state | `triage_semantic_health`, `triage_sweep_leases`, `triage_claims` |
+| Command-center history and queue | `triage_agent_runs`, `triage_agent_events`, `triage_agent_commands` |
+| Append-only collaboration | `triage_incident_activity` |
+
+Use the corresponding `*_TABLE_NAME` settings consistently on both deployments
+when sharing a database. `schema_statements()` in
+`src\triage\store\fabric_sql.py` includes the command/history and incident
+activity schema and the legacy approval procedure. It contains no application
+membership permission table.
+
+The controller's store initialization can install missing schema when its
+identity has DDL rights. The web history and incident workflow stores do **not**
+install schema at runtime; apply the reviewed statements as a schema operator
+before deploying web code. Do not grant the web identity `db_ddladmin` to hide
+a missed deployment step.
+
+Preserve the database independently of the web applications. An Entra
+authorization cutover or code release must not reset incidents, processed
+messages, approvals, retries, claims, leases, baselines, rerun journals, run
+history, commands or incident activity.
+
+### Fabric access and SQL users
+
+The principal needs Fabric access to the database item and the SQL permissions
+appropriate to its work. For the object-scoped web identity, use **Read item**
+access, not a broad workspace role or a blanket ReadData grant that bypasses
+the intended SQL boundary. Workspace roles may imply broader database rights.
+
+The existing controller provisioning pattern uses workspace Contributor
+(principal type `ServicePrincipal`) and a database user with
+`db_datareader`, `db_datawriter` and `db_ddladmin` to support its automatic schema
+installation. Those broad controller grants are not the web identity's grant
+set and are not a production least-privilege claim.
+
+`CREATE USER ... FROM EXTERNAL PROVIDER` resolves the identity through Entra;
+directory permissions or Conditional Access can prevent that lookup. For an
+operator-verified identity, the explicit SID form avoids the lookup:
 
 ```powershell
-$body = @{
-  grant_type="client_credentials"; client_id=$env:GRAPH_CLIENT_ID
-  client_secret=$env:GRAPH_CLIENT_SECRET; scope="https://graph.microsoft.com/.default"
-}
-$tok = (Invoke-RestMethod -Method Post -Body $body `
-  "https://login.microsoftonline.com/$env:GRAPH_TENANT_ID/oauth2/v2.0/token").access_token
-
-Invoke-RestMethod -Headers @{Authorization="Bearer $tok"} `
-  "https://graph.microsoft.com/v1.0/users/$env:GRAPH_MAILBOX/mailFolders/inbox/messages?`$top=1"
-```
-
-A successful read with a token carrying `roles: Mail.Read` and **no** `upn`
-claim confirms the unattended path.
-
-### Not the Outlook connector
-
-The Foundry catalog exposes `outlook` (consumer/MSA, `oauth2generic`) and
-`office365` (work/school, `aadcertificate`). Neither is used here:
-
-- the connector catalog returned no entries in the tenant tested, and
-- gateway connectors authenticate by **per-user OAuth consent**, which has no
-  meaning for an unattended agent.
-
----
-
-## 3. Fabric SQL Database (durable state)
-
-Everything the agent must remember between invocations lives here: incidents,
-which mail has been triaged, approvals, deferred retries, sweep leases and
-silent-failure baselines. Without it a hosted agent forgets every open incident
-on restart and can remediate the same failure twice.
-
-Create a **Fabric SQL Database** in a workspace on a capacity (a trial capacity
-is fine), then read its connection properties:
-
-```powershell
-$tok = az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv
-$h = @{ Authorization = "Bearer $tok" }
-(Invoke-RestMethod -Headers $h `
-  "https://api.fabric.microsoft.com/v1/workspaces/<workspace-id>/sqlDatabases").value |
-  Select-Object displayName, @{n='server';e={$_.properties.serverFqdn}},
-                             @{n='database';e={$_.properties.databaseName}}
-```
-
-Set both in `.env` (and in the azd environment for the hosted deployment):
-
-```
-FABRIC_SQL_SERVER=<serverFqdn>          # e.g. abc123-xyz.database.fabric.microsoft.com,1433
-FABRIC_SQL_DATABASE=<databaseName>      # includes the item GUID; copy it exactly
-```
-
-Leave both empty and the accelerator writes JSON files under `runs/` instead,
-which is correct on a laptop and wrong in a container.
-
-**There is no connection secret.** Fabric SQL accepts Microsoft Entra tokens
-only, so there is no SQL login to create, no password to rotate, and no
-local-authentication setting for governance to keep switching off.
-
-### The tables
-
-Created automatically on first use — there is no migration step. Eight tables:
-`triage_incidents`, `triage_processed_messages`, `triage_approvals`,
-`triage_deferred_retries`, `triage_semantic_health`, `triage_sweep_leases`,
-`triage_claims`, `triage_inbox_audit`. Rename them with the `*_TABLE_NAME`
-settings if one database hosts more than one deployment.
-
-### Granting the identity that runs the controller
-
-Two grants, and both are needed. The workspace role lets the identity see the
-item; the database user is what SQL actually authorises against.
-
-```powershell
-# 1. Workspace role. An Entra agent identity is accepted as 'ServicePrincipal'.
-$body = @{ principal = @{ id = "<agent principal id>"; type = "ServicePrincipal" }
-           role = "Contributor" } | ConvertTo-Json -Depth 4
-Invoke-RestMethod -Method Post -Headers $h -ContentType application/json -Body $body `
-  "https://api.fabric.microsoft.com/v1/workspaces/<workspace-id>/roleAssignments"
+$sid = '0x' + (([guid]::Parse('<runtime-client-id>').ToByteArray() |
+  ForEach-Object { $_.ToString('X2') }) -join '')
 ```
 
 ```sql
--- 2. Database user. Run against the Fabric SQL Database as yourself.
-CREATE USER [bi-triage-controller] WITH SID = 0x<sid>, TYPE = E;
-ALTER ROLE db_datareader ADD MEMBER [bi-triage-controller];
-ALTER ROLE db_datawriter ADD MEMBER [bi-triage-controller];
-ALTER ROLE db_ddladmin  ADD MEMBER [bi-triage-controller];  -- creates the tables
+CREATE USER [<runtime-sql-user>] WITH SID = 0x<verified-sid-bytes>, TYPE = E;
 ```
 
-`CREATE USER ... FROM EXTERNAL PROVIDER` is the usual form, but it asks SQL to
-resolve the name through Microsoft Graph, which fails behind a Conditional
-Access challenge. The `SID` form needs no Graph call. The SID is the identity's
-**client id** as little-endian GUID bytes:
+For a service principal or UAMI, use its **client ID**, converted to
+little-endian GUID bytes, not its directory object ID. For a user/group,
+Fabric SQL uses the object ID; groups use `TYPE = X`. The SID form does not
+validate the name, so independently verify the target identity before creating
+the user. Do not generalize an observed equality of agent object/client IDs
+to ordinary service principals.
 
-```powershell
-"0x" + [guid]::Parse("<agent client id>").ToByteArray().ForEach{$_.ToString("X2")} -join ""
+### Web UAMI object permissions
+
+After the schema exists, the current web operations require these grants on
+the configured objects. The names below are the defaults:
+
+```sql
+GRANT SELECT ON OBJECT::dbo.triage_incidents TO [<web-sql-user>];
+GRANT SELECT ON OBJECT::dbo.triage_pipeline_reruns TO [<web-sql-user>];
+GRANT SELECT, UPDATE ON OBJECT::dbo.triage_approvals TO [<web-sql-user>];
+GRANT SELECT, INSERT, UPDATE ON OBJECT::dbo.triage_agent_runs TO [<web-sql-user>];
+GRANT SELECT, INSERT ON OBJECT::dbo.triage_agent_events TO [<web-sql-user>];
+GRANT SELECT, INSERT, UPDATE ON OBJECT::dbo.triage_agent_commands TO [<web-sql-user>];
+GRANT SELECT, INSERT ON OBJECT::dbo.triage_incident_activity TO [<web-sql-user>];
 ```
 
-Find the agent's principal and client id with `bi-triage identity --check-scope`,
-or straight from the agent definition, which needs no Graph access:
+Run/history writes include read-only observer requests and isolated validation
+results. Command updates include expiry/reconciliation, so the queue is not
+SELECT/INSERT-only. Human closure appends activity; it does **not** UPDATE the
+core incident. Grant no permission-table rights, core-incident writes,
+`db_datawriter`, `db_owner` or runtime DDL to the web UAMI. Check inherited
+workspace/database roles as well as explicit grants.
+
+### Verify persistence without clearing shared state
 
 ```powershell
-$t = az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv
-(Invoke-RestMethod -Headers @{Authorization="Bearer $t"} `
-  "<project endpoint>/agents/bi-triage-controller?api-version=v1").instance_identity
+.\.venv\Scripts\python.exe -m pip install -e ".[azure]"
+az account set --subscription $subscription
+.\.venv\Scripts\bi-triage.exe preflight --check-sql
+.\.venv\Scripts\bi-triage.exe incidents
 ```
 
-### Verify
+`--check-sql` opens a real connection and runs `SELECT 1`; it does not prove
+every object grant or runtime identity. Read back an explicitly authorized
+runtime-written record and retain permission/denial evidence separately.
+
+Scenarios normally reset their incident store. With Fabric SQL configured,
+`run` refuses that shared reset unless you explicitly choose
+`--keep-incidents` or `--reset-shared-state`. Prefer isolated mock state for
+validation; `--keep-incidents` preserves history but does not make a live
+scenario side-effect-free. Never use `bi-triage reset` as deployment preflight.
+
+The SQL driver uses per-thread connections and atomic conditional statements.
+One shared connection failed under concurrent use; server-side `rowcount`
+names the claim/lease winner without a read-then-write race. Connection failure
+causes a reconnect on later use, with a 30-second unreachable-backend cooldown.
+Stores reload after recovery: reconnecting with an empty cache would still
+answer "no open incident" incorrectly. Command/history and collaboration
+writes fail explicitly rather than reporting a local fallback as durable.
+
+## 3b. Monitored mailbox and filter
+
+Use a shared or licensed alerts mailbox, for example `bi-alerts@contoso.com`.
+The reader does not mark messages as read; deduplication uses message IDs in
+the processed-message store. Check that another process is not moving or
+consuming alerts before this reader sees them.
+
+`GRAPH_SENDER_ALLOWLIST` and `GRAPH_SUBJECT_PATTERN` are security controls,
+not presentation filters. Invalid patterns fail closed. Never broaden either
+to make a test message trigger; send a synthetic message that matches the
+approved configuration. The ignored-message audit records why mail was
+refused without weakening the filter if that audit fails.
+
+Only polling is implemented. `GRAPH_INGESTION_MODE=subscription` is rejected,
+not silently treated as push delivery. `GRAPH_POLL_SECONDS` defaults to 30 for
+the local watch loop; a hosted schedule has its own cadence.
+
+## 4. Foundry project and prompt registration
+
+Provide a project endpoint and a model deployment available in that project.
+Set `FOUNDRY_AGENT_MODEL` to the deployment name, not an assumed global model
+alias. Model catalog availability is not quota or admission proof.
+
+If the operator must create a project, the CLI requires a location even when
+the parent account already has one:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[azure]"   # installs the SQL driver
-.\.venv\Scripts\bi-triage.exe preflight --check-sql       # 'connection' must be ok
-.\.venv\Scripts\bi-triage.exe run scenario1-transient
-.\.venv\Scripts\bi-triage.exe incidents                   # the row you just wrote
-```
-
-Use `--check-sql` here rather than plain `preflight`. Without it the row reads
-`configured`, which means only that two settings are non-empty — a typo'd
-server, an identity with no database user, or a missing `GRANT` all still show
-green and then fail on the first write. `--check-sql` opens a real connection
-and runs `SELECT 1`. It is opt-in because plain `preflight` is expected to work
-with no network at all.
-
-> **`run` will not clear a shared incident table without being told to.**
-> Scenarios normally reset the incident store so they are reproducible. Once
-> `FABRIC_SQL_*` is set, that store is the same table the hosted controller
-> writes to, so `bi-triage run <scenario>` refuses and exits 2. Choose
-> explicitly: `--keep-incidents` to leave it alone, or `--reset-shared-state`
-> to clear it anyway. Offline runs, where the store is a JSON file under
-> `runs/`, are unaffected and still reset by default.
-
----
-
-## 3b. Monitored mailbox
-
-A shared mailbox or licensed user, e.g. `bi-alerts@<tenant>.onmicrosoft.com`.
-
-The accelerator **does not mark messages as read** — runs must be repeatable, and
-dedup is by message id in the processed-message table. Confirm nothing else is
-auto-processing the mailbox.
-
-Send the sample emails from `mock/emails/` into it ahead of time, or send them
-live during the session for effect. Live is better; have the pre-sent ones as
-backup.
-
----
-
-## 4. Azure AI Foundry project
-
-- A Foundry project; note the endpoint
-- A model deployment (`gpt-5.6-luna` or similar) — set `FOUNDRY_AGENT_MODEL`
-
-Creating the project from the CLI needs `--location` even though the account
-already has one:
-
-```powershell
+az account set --subscription $subscription
 az cognitiveservices account project create `
-  -n <account> -g <rg> --project-name <project> -l <region>
+  -n <account> -g <resource-group> --project-name <project> -l <region>
 ```
 
-### The role you need, and the one that looks right and is not
+Review the account's Entra-only authentication and managed network isolation
+before use. Creating a project does not establish private connectivity for
+every dependent service.
 
-**Assign yourself `Foundry Project Manager` on the Foundry *account*.**
+### Foundry roles
 
-```powershell
-az role assignment create `
-  --assignee-object-id <your object id> --assignee-principal-type User `
-  --role "Foundry Project Manager" `
-  --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/<account>
-```
+Use **Foundry User** for agent development, **Foundry Project Manager** when
+project management is needed, and **Foundry Agent Consumer** for invoke-only
+callers. The project's own managed identity also needs its Foundry role.
+Subscription Owner alone does not supply Foundry data-plane permissions.
 
-Subscription **Owner is not sufficient** — it carries no data-plane access. Nor
-is `Cognitive Services User`, despite its data actions reading
-`Microsoft.CognitiveServices/*`: Microsoft's own guidance is not to use any role
-beginning `Cognitive Services`, or `Azure AI Developer`, for Foundry work. Both
-were tried here, at account and project scope, and both returned:
+The portal can assign Foundry User to the creator and project identity if the
+creator may assign roles. CLI/IaC creation must not assume those assignments.
+Missing access has appeared as:
 
-```
+```text
 403 ... does not have permissions for
 Microsoft.CognitiveServices/accounts/AIServices/agents/read
 ```
 
-The trap is that this only bites some people. A project created **in the Foundry
-portal** auto-assigns `Foundry User` to its creator and to the project's managed
-identity. A project created with the CLI or from IaC gets neither, so the same
-script works for a colleague and 403s for you. Assign it explicitly.
+Do not use a `Cognitive Services` role or `Azure AI Developer` as a substitute
+for Foundry project access. The Foundry User, Owner, Account Owner and Project
+Manager roles were previously named Azure AI User, Owner, Account Owner and
+Project Manager; their role IDs did not change with the rename. See
+[Foundry RBAC](https://learn.microsoft.com/azure/foundry/concepts/rbac-foundry).
 
-Also assign `Foundry User` to the **project's own managed identity** on the
-account, which the portal would have done for you:
-
-```powershell
-az cognitiveservices account project show -n <account> -g <rg> `
-  --project-name <project> --query identity.principalId -o tsv
-```
-
-Roles were renamed recently: `Foundry User`, `Foundry Owner`,
-`Foundry Account Owner` and `Foundry Project Manager` were previously
-`Azure AI User`, `Azure AI Owner`, `Azure AI Account Owner` and
-`Azure AI Project Manager`. See
-[RBAC for Microsoft Foundry](https://learn.microsoft.com/azure/foundry/concepts/rbac-foundry).
+### Register the definitions
 
 ```powershell
-az login
-python scripts\register_foundry_agents.py --dry-run
-python scripts\register_foundry_agents.py
+.\.venv\Scripts\python.exe scripts\register_foundry_agents.py --dry-run
+az account set --subscription $subscription
+.\.venv\Scripts\python.exe scripts\register_foundry_agents.py
 ```
 
-**Re-register after any prompt or tool change.** A Foundry-registered agent does
-not pick up local edits — it keeps running the previous definition, silently. Put
-this on the pre-flight checklist, not in someone's memory.
+The definitions include `bi-triage`, `bi-data-quality` and the tool-free
+`bi-triage-observer`. **Re-register after a prompt or tool change**: a deployed
+prompt agent does not load local files. The script compares normalized
+definitions and creates a new version only when needed. Remote null fields
+are normalized so they do not cause false version churn.
 
----
+Registration and code deployment are separate operations. The triage and data
+quality agents reason; the observer explains recorded evidence. None needs
+Power BI, Fabric SQL or directory administration grants.
 
-## 5. Power BI workspace + semantic model
+## 5. Power BI workspace and sample model
 
-- A workspace, with the SP as Member (item 1)
-- A semantic model over the daily sales table, so the report is real
-- A report — optional for the flow, but it makes the failure concrete on screen
+Choose a configured workspace and semantic model that the acting controller
+may access. A report is optional. For a synthetic evaluation, seed an isolated
+model from `mock\data\daily_sales.csv` or `daily_sales_clean.csv`, depending
+on the scenario.
 
-Seed the model from `mock/data/daily_sales.csv` (with duplicates) or
-`daily_sales_clean.csv`, depending on which scenario you are staging.
+Do not replace an existing model's data or repoint a production workload merely
+to run a scenario. The command center accepts server-configured targets, not
+arbitrary workspace/model IDs supplied by the browser.
 
----
+## 6. Optional Teams notifications
 
-## 6. Teams channel + notification path
+For the secretless web path, set `NOTIFICATION_CHANNEL=web` and
+`APPROVAL_DELIVERY_MODE=web` on the controller. Teams delivery is optional and
+its absence must not prevent a web decision.
 
-> **Do not use "Channel → Connectors → Incoming Webhook".** Office 365
-> connectors, including Teams Incoming Webhooks, were **retired on 22 May 2026**
-> and no longer deliver. Any guide that still describes that flow predates the
-> retirement.
+The legacy notifier uses a Power Automate Workflows webhook carrying an
+Adaptive Card envelope. It does not provision an identity-authenticated Teams
+bot. Do not use the retired Office 365 Incoming Webhook connector as a new
+deployment dependency; confirm current availability and supported migration
+with [Teams webhook guidance](https://learn.microsoft.com/microsoftteams/platform/webhooks-and-connectors/what-are-webhooks-and-connectors).
 
-**Use the Power Automate Workflows webhook.** In the channel: **⋯ → Workflows →
-"Post to a channel when a webhook request is received"**. Complete the template
-and copy the generated HTTP POST URL into `TEAMS_WEBHOOK_URL`.
+A workflow URL is a bearer credential. Do not create or publish one as part of
+this secretless deployment. If maintaining an already approved legacy
+integration, protect the URL, verify the tenant before creating or editing the
+workflow, and never print the value for confirmation. Browser SSO can select a
+different organization while the workflow appears to have been created
+successfully. Workflows posts use the Workflows bot; custom connector names,
+icons and interactive MessageCard buttons do not carry over.
 
-**On automating this — don't, without checking which tenant you land in.** It
-was tested rather than assumed. A browser automation driving Edge reaches Power
-Automate fully signed in with no credentials, because Windows SSO applies, but
-it signs in to the **corporate** tenant rather than the one you are deploying
-to. A webhook created that way lands in the wrong place and still looks like it
-worked. Create it by hand, or verify the tenant before trusting the result.
+App-only Graph channel posting is not a general replacement: ordinary channel
+message application access is restricted to migration scenarios. A separately
+designed bot or delegated flow needs its own review.
 
-The URL is a bearer credential: anyone holding it can post to that channel. Keep
-it in the azd environment, which is gitignored, and never in the repository. If
-you echo it for confirmation, print a fingerprint (length and last six
-characters) rather than the value, so it does not end up in a terminal buffer or
-a screen share.
+## 6b. Legacy approval callback
 
-The payload shape is standard — the notifier posts an Adaptive Card envelope —
-so only the URL source moved. Two differences worth knowing:
+The command center does not need `infra\approval-callback.json`. Its web API
+records decisions as the validated Entra actor, and the shared approval gate
+still checks fingerprint, expiry and single use.
 
-- posts appear as the **Workflows bot**; custom name and icon are not carried over
-- interactive MessageCard buttons are not supported; use Adaptive Card actions
+For operators maintaining the older callback, preserve these constraints:
 
-## 6b. Approval callback
+| Component | Method and boundary |
+|---|---|
+| Confirmation workflow | GET renders confirmation only; it has no SQL connection or write action. |
+| Recording workflow | POST calls `dbo.triage_record_approval_decision` through the SQL managed connector and its managed identity. |
 
-The approval card's Approve/Decline buttons are `Action.OpenUrl` links. They
-have to be: a card posted through an incoming webhook has no bot behind it, so
-`Action.Submit` renders a button that silently does nothing.
+The split prevents link previewers, scanners and prefetchers from approving
+on GET. Request triggers accept one method; an undeclared method defaults to
+POST and rejects GET with `TriggerRequestMethodNotValid`. An incoming-webhook
+card has no bot to handle `Action.Submit`, so the legacy card uses
+`Action.OpenUrl` to the confirmation workflow.
 
-`infra/approval-callback.json` deploys **two** Consumption Logic Apps, because a
-Request trigger accepts exactly one HTTP method — with none declared it takes
-POST only, and a GET is rejected with `TriggerRequestMethodNotValid` before the
-workflow starts:
+The recording identity needs only the necessary Fabric item access and
+`EXECUTE` on the decision procedure, not incident read/write permissions.
+The SQL connector's `oauthMI` parameter set uses managed identity; the callback
+URL itself is still a bearer credential. Recheck the identity after workflow
+recreation, which can change its SID. Do not drop/recreate a database user
+blindly on every ordinary code deployment.
 
-| Workflow | Method | What it does |
-|---|---|---|
-| `bi-triage-approval-confirm` | GET | Renders a confirmation page. Holds no connection and cannot write. **This is what the card links to.** |
-| `bi-triage-approval-callback` | POST | Records the decision. |
+All decision fields are procedure parameters, never concatenated SQL. A
+conditional update and `@@ROWCOUNT` distinguish a recorded decision from a
+refusal. The procedure refuses web-delivery proposals. Its link's responder
+text is not an authenticated identity; do not use it to bypass web authorization.
 
-That is the two-step: a link in a Teams message is fetched by preview
-generators, scanners and prefetchers, and all of them issue GET, which reaches
-a workflow with nothing to change.
-
-```powershell
-az deployment group create -g <resource-group> -n approval-callback `
-  --template-file infra\approval-callback.json `
-  --parameters sqlServer=<serverFqdn-without-port> `
-               sqlDatabase=<databaseName> owner=<you>
-```
-
-The recording workflow gets a system-assigned identity, printed as the
-deployment's `principalId` output. Give it Fabric access — the same two grants
-as section 3, but **only** `EXECUTE` on the decision procedure, because the
-callback answers approvals and has no business reading incidents:
-
-```sql
-CREATE USER [bi-triage-approval-callback] WITH SID = 0x<sid>, TYPE = E;
-GRANT EXECUTE ON OBJECT::dbo.triage_record_approval_decision
-  TO [bi-triage-approval-callback];
-```
-
-Then capture the **confirm** workflow's URL — the card links to the GET side:
-
-```powershell
-azd env set APPROVAL_CALLBACK_URL "<confirmUrl output>"
-azd deploy bi-triage-controller --no-prompt
-```
-
-**Redeploying the workflow rotates its identity.** The old database user then
-authenticates nothing, and the failure looks like a network problem rather than
-a permissions one. Drop and recreate the user against the new SID after any
-redeploy that recreates the workflow.
-
-**No key anywhere.** Fabric SQL has no REST data plane, so the write goes
-through the SQL managed connector authenticating with that managed identity —
-support for which lives in the connector's `oauthMI` parameter value set, whose
-only parameter is a token constrained to `location: "logicapp"`. The connection
-itself carries no credential.
-
-**The write is a stored procedure, not a query.** Everything in the callback URL
-is editable by anyone holding the link, so `request_id`, `decision`, `responder`
-and `fingerprint` are procedure parameters. `dbo.triage_record_approval_decision`
-does the whole decision in one statement — unanswered, fingerprint matches, not
-expired — and returns `@@ROWCOUNT`. Zero rows is a refusal, and the workflow
-renders it as one rather than as a recorded decision. A failed write renders as
-a failure. The agent revalidates all of it independently afterwards.
-
-**The responder is not an authenticated identity.** Anyone holding the link can
-answer, and the name recorded is whatever the query string claimed. Put the
-workflow behind Entra authentication if you need to know who actually clicked.
-
-**An approval that arrives after the run has ended is not applied.** The run
-waits `APPROVAL_TIMEOUT_SECONDS` (default 300) and then abandons the action. A
-decision recorded later sits unused and expires, which is fail-closed and safe,
-but it is not resumed. If you schedule sweeps, the Logic App's HTTP timeout must
-exceed the approval window -- `infra/scheduled-sweep.json` uses `PT10M`, and a
-test fails if the two ever cross.
-
-**The callback URL is a bearer credential.** Anyone holding the link can answer
-an approval. It lives in the azd environment, never in the repo, and
-`scripts/scan_secrets.py` treats it as a secret. The fingerprint in the link
-binds it to one action.
-
-**Leaving it unset is a valid configuration.** The card then shows the request
-id and says to answer with `bi-triage approve <request>`, which needs no
-infrastructure at all.
-
-**Production path for notifications** — post via Graph with an app registration
-so messages are attributable to an identity. Note that app-only posting to
-channel messages is restricted (it is gated behind protected APIs / migration
-scenarios), so most production designs use a bot or a delegated flow rather than
-raw app-only Graph. Confirm the path against current docs before committing to
-it.
-
-**None of the safety properties changed.** Validation was always on the reading
-side and stays there: an approval counts only if it is explicit,
-fingerprint-matched to the exact action and arguments, unexpired and unused.
-What was lost is a click, not a control.
-
-**An approval that arrives after the run has ended is not applied.** The run
-waits `APPROVAL_TIMEOUT_SECONDS` (default 300) and then abandons the action. A
-decision recorded later sits unused and expires, which is fail-closed and safe,
-but it is not resumed. If you schedule sweeps, the Logic App's HTTP timeout must
-exceed the approval window -- `infra/scheduled-sweep.json` uses `PT10M`, and a
-test fails if the two ever cross.
-
-**Production path for notifications** — post via Graph with an app registration
-so messages are attributable to an identity. Note that app-only posting to
-channel messages is restricted (it is gated behind protected APIs / migration
-scenarios), so most production designs use a bot or a delegated flow rather than
-raw app-only Graph. Confirm the path against current docs before committing to
-it.
+An answer arriving after the waiting run has ended is not automatically
+resumed. `APPROVAL_TIMEOUT_SECONDS` defaults to 300. The waiting gate still
+rejects missing, malformed, expired, reused or mismatched approval. For an
+approved legacy configuration without a callback, the card displays a request
+ID for the operator CLI; the web path does not rely on that fallback.
 
 ## 6c. Scheduled sweeps
 
-Nothing runs on a timer until you deploy this. Foundry routines are declared in
-`azure.yaml` but ship disabled because they do not fire — see
-[`foundry/README.md`](foundry/README.md) for the evidence.
+Nothing runs on a timer merely because a monitor setting is enabled.
+Foundry routines in `azure.yaml` ship disabled after the preview produced no
+runs despite reporting an enabled schedule. Keep that historical limitation
+qualified and reverify in the target tenant before using routines; see
+[foundry/README.md](foundry/README.md#foundry-routine-observations).
 
-Deploy [`infra/scheduled-sweep.json`](../infra/scheduled-sweep.json) once per
-cadence. It is a Consumption Logic App with a system-assigned managed identity
-that POSTs to the agent's responses endpoint:
+`infra\scheduled-sweep.json` is the separate Consumption Logic App scheduler.
+Its system-assigned identity invokes the hosted controller with one explicit
+command. Choose each job and cadence independently:
+
+| Command | Purpose | Example cadence |
+|---|---|---|
+| `sweep` | Mailbox drain and due retries; only after mailbox scope/filter checks | Every five minutes |
+| `silent sweep` | Configured semantic-health probes | Hourly |
+| `pipeline sweep` | Failed scheduled runs of configured Fabric pipelines and correlated rerun verification | Every five minutes |
+| `command sweep` | Durable authenticated operator investigations | Every minute |
+
+For example, after its prerequisites are ready:
 
 ```powershell
-$ep = "https://<account>.services.ai.azure.com/api/projects/<project>"
-
-az deployment group create -g <resource-group> -n sched-silent `
+az account set --subscription $subscription
+az deployment group create -g <resource-group> -n sched-commands `
   --template-file infra\scheduled-sweep.json `
-  --parameters name=bi-triage-silent-sweep projectEndpoint=$ep `
-               command="silent sweep" frequency=Hour interval=1 owner=<you>
+  --parameters name=bi-triage-command-sweep `
+    projectEndpoint="<project-endpoint>" command="command sweep" `
+    frequency=Minute interval=1 owner="<owner>" costCenter="<cost-center>" `
+    environment="evaluation"
 
-# grant its identity permission to invoke the agent
-az role assignment create --assignee-object-id <principalId from the output> `
+az role assignment create --assignee-object-id <scheduler-principal-id> `
   --assignee-principal-type ServicePrincipal `
-  --role "Foundry Agent Consumer" `
-  --scope <the project resource id, not the account>
+  --role "Foundry Agent Consumer" --scope <project-resource-id>
 ```
 
-Repeat with `name=bi-triage-mailbox-sweep`, `command="sweep"`,
-`frequency=Minute interval=5` for the mailbox drain. The two are separate jobs:
-the mailbox sweep does not run the health scan. Leave the mailbox sweep
-**disabled** until section 2 is finished, or it fails every five minutes.
+The template creates the workflow **enabled**; it has no disabled-state
+parameter. Do not deploy a mailbox schedule before its prerequisites are ready.
+Until the invoke grant propagates, runs may fail with 403. The project-scoped
+grant permits that project's agent endpoints, not just the named controller;
+use a narrower supported scope when required.
 
-`Foundry Agent Consumer` is the least-privileged role for a principal that only
-invokes agents and never creates or modifies them, which is exactly what a
-scheduler does. It works at **project** scope, so the schedule can invoke this
-project's agents and nothing else. Verified: the first triggered run failed with
-`SweepFailed` before the assignment propagated, and succeeded afterwards.
+The caller timeout is `PT15M`, covering the default combined triage and
+approval budgets plus worker allowance (`300 + 300 + 30` seconds). `PT10M`
+covered the approval window alone but not the combined deadline. A shorter
+caller timeout can abandon work while a person's approval is still valid.
+HTTP invocation retries are disabled: an ambiguous POST must not replay a
+possibly executed action.
 
-Do not use `Cognitive Services User` here, and do not use `Azure AI Developer`.
-Microsoft's RBAC guidance for Foundry says not to use roles beginning
-`Cognitive Services` at all, and `Azure AI Developer`'s data actions are scoped
-to the `OpenAI`, `SpeechServices`, `ContentSafety` and `MaaS` sub-paths, none of
-which covers invoking a hosted agent.
+The workflow records failed invocations/invalid responses as `SweepFailed`.
+Its run history is not an alerting channel. The optional `alertWebhookUrl`
+is a legacy bearer-URL integration; use an approved alerting route without
+making it a prerequisite for the web deployment. Review both schedule history
+and durable triage outcomes: a transport-completed response is not necessarily
+a healthy business result.
 
-Scope the assignment to the **project**, not the account, so the schedule can
-invoke this agent and nothing else.
+Pipeline monitoring additionally requires `PIPELINE_SWEEP_ENABLED=true`,
+explicit `FABRIC_PIPELINE_TARGETS` and shared SQL state. It neither discovers
+arbitrary targets nor monitors standalone notebook jobs. A notebook activity
+inside a configured pipeline may provide evidence. A full-pipeline rerun needs
+reviewed replay safety/parameters, explicit approval and a durable reservation;
+a submitted job is not verified recovery. See [PipelineTriage.md](PipelineTriage.md).
 
-Until the grant propagates, runs fail with 403. That is correct behaviour and it
-is visible: the workflow terminates with `SweepFailed` rather than reporting
-success, so a failed sweep stays in run history as evidence.
+## 7. Data quality flags
 
-Set `alertWebhookUrl` to a Teams incoming webhook if a failed sweep should also
-announce itself. Without it, failures are recorded but nobody is told.
+The default flag table is `runs\dq_flags.csv`. It is reproducible local output,
+not a durable hosted database. A Fabric/SQL implementation must provide the
+same `read_all`, `append` and `reset` contract and retain store-boundary
+redaction. Do not present a container-local CSV as durable evidence.
 
----
+## 7b. Silent-failure detector
 
-## 7. Data quality flag table
-
-Default is `runs/dq_flags.csv` — visible, diffable, openable in Excel, and
-easy to show before and after.
-
-For a Fabric or SQL table instead, replace `DataQualityFlagTable` with three
-methods (`read_all`, `append`, `reset`) against the real table.
-
-Keep the CSV available regardless. Showing a spreadsheet gain a row is a better
-signal than showing a query result change.
-
----
-
-## 7b. Silent-failure detector (optional)
-
-The detector reads semantic models directly rather than waiting for an alert.
-It is off until `SILENT_HEALTH_PROBES` is configured, which is the right
-default: "fresh" is a business question and guessing it produces the false
-positives that get a detector muted.
-
-### What a probe looks like
+`SILENT_SWEEP_ENABLED` alone watches nothing. Configure
+`SILENT_HEALTH_PROBES` explicitly because freshness expectations are business
+rules, not model guesses:
 
 ```json
-[{"name":"sales-invoices",
-  "workspace_id":"<guid>",
-  "dataset_id":"<guid>",
-  "table":"fact_sales_invoice",
-  "date_table":"dim_date",
-  "date_column":"date",
-  "report_name":"Sales invoices",
-  "expected_lag_hours":24,
-  "min_absolute_drop":40,
-  "watch_schema":true,
-  "load_weekdays":[1,2,3,4,5]}]
+[{
+  "name": "sales-invoices",
+  "workspace_id": "<workspace-id>",
+  "dataset_id": "<dataset-id>",
+  "table": "fact_sales_invoice",
+  "date_table": "dim_date",
+  "date_column": "date",
+  "report_name": "Sales invoices",
+  "expected_lag_hours": 24,
+  "min_absolute_drop": 40,
+  "watch_schema": true,
+  "load_weekdays": [1, 2, 3, 4, 5]
+}]
 ```
 
-Check it before trusting it:
-
 ```powershell
-bi-triage health --preflight   # mistakes that would silently detect nothing
-bi-triage health --probes      # what is watched, and how
+.\.venv\Scripts\bi-triage.exe health --preflight
+.\.venv\Scripts\bi-triage.exe health --probes
 ```
 
-`--preflight` exits non-zero on a configuration that cannot detect anything —
-a probe with no ids, a duplicate name on the same model (both overwrite the same
-baseline, so neither accumulates history), or `confirmations: 0`, which disables
-the guard against false positives. That failure mode is the dangerous one: it
-looks like monitoring and reports nothing, indefinitely.
+`--preflight` rejects missing IDs, duplicate names for the same model and
+invalid confirmation thresholds. Duplicate names overwrite one baseline;
+`confirmations: 0` would disable the false-positive guard.
 
-**Set `date_table` whenever the measured table holds a date *key* rather than a
-date**, which is what a star schema looks like. Without it the only way to get a
-watermark is to point the probe at the date dimension, and a calendar dimension
-is populated years ahead: on a real model that returned `2030-12-31` while the
-data stopped at `2024-12-23`. The probe would have called a two-year-stale model
-fresh for ever, and looked like it was working.
+Use `date_table` when the fact table contains a date key. Reading the calendar
+dimension alone can return a future date rather than the latest loaded fact:
+the synthetic failure example has a calendar ending `2030-12-31` while facts
+stop at `2024-12-23`. Check `min_absolute_drop` against table size: its default
+1,000 cannot detect a drop in a 400-row table. Use `load_weekdays` for feeds
+that do not load on weekends.
 
-**Check `min_absolute_drop` against the table's real size.** It defaults to
-1,000 rows, so on a 400-row table row-loss can never fire.
+Two scans are required by default (`confirmations=2`). The first records
+suspicion; it does not announce a confirmed finding. Probes run sequentially
+with `SILENT_PROBE_PACE_SECONDS=1`, and one durable sweep lease prevents
+parallel sweeps from counting the same observation twice.
 
-**Set `load_weekdays` for anything that does not load daily.** A weekday-only
-feed read on a Sunday is legitimately two days behind; reporting that every
-weekend is how a detector earns a filter rule and stops being read.
+### Schema checks and platform limits
 
-Two scans are needed before anything is announced (`confirmations`, default 2).
-A single sweep marks a probe suspect and says nothing — that is the
-suspect-then-confirm rule, not a fault.
+`watch_schema=true` adds a query for visible columns and measures; removals
+matter, additions are ignored. The implementation uses DAX `INFO.VIEW` rather
+than a separate XMLA client stack. This is a compatibility check to prove on
+the actual model: the public execute-queries contract excludes INFO functions.
+Do not treat a successful tenant-specific test as universal API support.
+An unreadable schema is a detector fault, never evidence that every column
+was deleted.
 
-### Schema drift
+The public
+[execute-queries contract](https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries)
+requires read/Build permission, the tenant setting, and allows 120 requests
+per minute per user across datasets. It excludes service principals for
+SSO-enabled and RLS models. An observed Direct Lake SSO failure returned
+`401 PowerBINotAuthorizedException`; granting broader workspace rights did
+not fix it. Review a supported fixed-identity connection or an Import model
+where appropriate, and verify before enabling probes. Do not generalize that
+failure to every Direct Lake configuration.
 
-`watch_schema: true` adds a second query per sweep that lists visible columns
-and measures, and reports anything that **disappears**. Additions are ignored on
-purpose: models gain columns constantly, and a detector that fires on ordinary
-development gets switched off, taking the removal case with it.
+Contributor was the evaluated workspace role carrying Build for an app-only
+probe. Viewer plus a per-dataset Build grant was not usable through the tested
+dataset-users API, which rejected `principalType: App` with
+`API supported only for User or Group principal types`. Verify the current
+supported permission route rather than escalating to Admin.
 
-It uses DAX `INFO.VIEW` functions over the same read-only endpoint rather than
-XMLA. XMLA would need ADOMD or TOM, which in practice means a .NET dependency
-and a Windows host; the controller runs in a Linux container. A schema that
-cannot be read is a detector fault, never "every column was deleted".
+Missing workspace access can appear as `PowerBIEntityNotFound` (404), while
+tenant settings and unsupported SSO can both appear as
+`PowerBINotAuthorizedException` (401). A failed measurement is not healthy data.
 
-### Accepting a planned change
-
-When a change is intentional — a table renamed, a feed genuinely halved — accept
-it rather than waiting for the alert to be ignored:
+### Baseline changes and repeated faults
 
 ```powershell
-bi-triage health --accept sales-invoices
-bi-triage health --accept all
+.\.venv\Scripts\bi-triage.exe health --baselines
+.\.venv\Scripts\bi-triage.exe health --accept sales-invoices
 ```
 
-This clears the suspicion, not the data: the next sweep records what it finds and
-compares from there. Without it, the only alternatives are to let a standing
-finding train people to skim past the output, or to reset the whole store and
-lose every other baseline with it.
+`--accept` is an explicit operational write: it clears suspicion for the named
+planned change and lets the next scan establish the new baseline. `--accept all`
+affects every probe; it is not deployment preflight. Do not reset unrelated
+baselines to acknowledge one intentional change.
 
-### When a probe keeps failing
+After five consecutive faults by default, a probe is parked for 60 minutes.
+Time permits a new attempt; one successful reading clears the error streak.
+This bounds repeated load from a persistent permission or unsupported-model
+failure without requiring a redeploy after the cause is fixed.
 
-After `max_consecutive_errors` faults (default 5) a probe is **parked** for
-`circuit_cooldown_minutes` (default 60) and reports that it stopped. Time
-reopens it, so a fixed permission is picked up without a redeploy, and one
-successful reading clears it immediately.
+## 8. Observability
 
-This exists because it was needed: a probe pointed at a Direct Lake model, which
-app-only callers cannot query at all, reached twelve consecutive 401s — pure load
-on the capacity being watched, and a fault line in every sweep.
+Spans carry metadata only, never prompt/completion content. Container logs,
+durable run/events, the authenticated API and scheduler history provide
+different evidence; none alone proves all dependencies are healthy.
 
-### Cost of watching
+The existing `configure_telemetry` helper is optional and consumes
+`APPLICATIONINSIGHTS_CONNECTION_STRING`; without it telemetry is a no-op.
+It does not explicitly pass an Entra credential to the exporter. The
+command-center deployment helper rejects connection-string settings, and its
+`-ApplicationInsightsResourceId` only adds a portal link. **Neither setting
+proves secretless telemetry is configured.** An Entra-authorized exporter and
+private ingestion path need separate implementation/configuration and proof;
+do not generate a key or claim the portal link does this.
 
-Probes run sequentially with `SILENT_PROBE_PACE_SECONDS` (default 1) between
-them. `executeQueries` is throttled per user across *all* datasets, so a
-detector that fires them concurrently becomes the capacity incident it exists to
-watch for. Only one sweep runs at a time across instances, arbitrated by a lease
-in the state table — two concurrent sweeps would each increment the same suspect
-count and confirm a finding on its first real occurrence, turning the
-false-positive guard into a source of them.
+When Entra-authenticated telemetry is configured, grant only the needed
+monitoring role, such as Monitoring Metrics Publisher, to the exporting
+identity. Preserve governance-created diagnostic settings; add separate
+diagnostics rather than deleting them. Do not disable content filters or
+Defender to make an evaluation succeed.
 
-### Permissions, and the limit that will actually stop you
+Use `azd ai agent monitor bi-triage-controller --tail 300` for hosted
+diagnostics. The default 50 lines can hide the error behind SDK output; 300 is
+the observed CLI maximum. Do not infer log delivery from a few visible spans.
+Keep the hosting library pinned to the exact checked-in version: floating
+date-stamped betas previously broke container startup.
 
-**Direct Lake models cannot be probed by an app-only caller.** A Direct Lake
-model reaches OneLake as the *caller*, and Microsoft does not support service
-principals for that, so `executeQueries` is refused whatever permission the
-identity holds. Verified against a real Fabric medallion workspace: every table
-Direct Lake, the identity already workspace Contributor, and the response a bare
-`401 PowerBINotAuthorizedException` with an empty parameter bag and no message.
+## 9. Foundry hosted controller deployment
 
-Nothing in that response mentions Direct Lake, OneLake or SSO, and the obvious
-reading — grant it more access — does not work. To probe a Direct Lake model,
-set its OneLake connection to a **fixed identity** rather than SSO. Import-mode
-models have no such restriction.
-
-The detector reports this as a **detector fault**, never as a data finding. "I
-could not check" is not "everything is fine", and reporting it as bad data would
-tell somebody their numbers are wrong because of a platform limitation.
-
-Beyond that, the identity that runs the sweep needs **workspace Contributor**,
-not Viewer. Viewer plus Build permission on the one dataset would be the
-least-privileged combination, and it is not available to an app-only caller: the
-dataset users API rejects `principalType: App` with *"API supported only for User
-or Group principal types"*, and `executeQueries` requires Build. Contributor is
-the least-privileged workspace role that carries Build for a service principal.
-
-Also confirm, under **Admin portal → Tenant settings**:
-
-| Setting | Needs |
-|---|---|
-| *Semantic Model Execute Queries REST API* | Enabled, and the identity inside any security group it is scoped to |
-| *Service principals can call Fabric public APIs* | Enabled, same caveat |
-
-Neither failure status describes its own cause. Missing workspace permission
-reports `PowerBIEntityNotFound` (HTTP 404) rather than 403, so it reads as a
-wrong id; the Direct Lake and tenant-setting refusals both report
-`PowerBINotAuthorizedException` (HTTP 401) with no detail at all. The detector
-attaches a hint to each rather than passing the bare platform error along.
+The Foundry project, model and standalone database already exist. Deploying
+the controller neither deploys the App Service UI nor creates a working timer.
+Use the existing azd environment for updates; create a new one only for a
+separate deployment.
 
 ```powershell
-bi-triage health              # what the probes found
-bi-triage health --baselines  # what healthy looked like last time
-```
-
----
-
-## 8. Application Insights (optional)
-
-Create the component, then set the connection string in **both** places — the
-azd environment feeds it into the container through `azure.yaml`:
-
-```powershell
-azd env set APPLICATIONINSIGHTS_CONNECTION_STRING (
-  az monitor app-insights component show --app <name> -g <rg> --query connectionString -o tsv)
-```
-
-The container needs no extra install: `mssql-python` and the telemetry packages
-are already in `src/requirements.txt`. Locally, install the extra:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[azure]"
-```
-
-That extra is **not** optional in practice. It carries `azure-identity` and the
-SQL driver, so without it `bi-triage identity`, `bi-triage incidents` and every
-other command that touches Fabric SQL fail on a missing module.
-
-Spans appear within roughly five minutes. Check the **failed-run** view, not
-just the healthy one — that is the question that gets asked.
-
-Without the connection string every telemetry helper is a no-op. Telemetry is
-never a hard dependency of the accelerator running. Note that only **spans** go
-to Application Insights; Python log records do not, so container diagnostics
-come from `azd ai agent monitor --tail 300` rather than from a KQL query.
-
----
-
-## Final check
-
-```powershell
-.\.venv\Scripts\bi-triage.exe preflight
-.\.venv\Scripts\bi-triage.exe reset
-
-# Real side effects, deterministic reasoning - isolates tool problems from model problems
-$env:TRIAGE_PROVIDER_MODE="mock"; $env:TRIAGE_TOOL_MODE="live"
-.\.venv\Scripts\bi-triage.exe run scenario1-transient
-
-# Then the real thing
-$env:TRIAGE_PROVIDER_MODE="foundry"
-.\.venv\Scripts\bi-triage.exe run scenario1-transient
-.\.venv\Scripts\bi-triage.exe run scenario2-data-quality --show-data
-```
-
-Run the mixed mode first. When something breaks, it tells you immediately
-whether the problem is the tools or the model — otherwise the two present
-identically and you lose twenty minutes.
-
----
-
-## Security notes
-
-- **Never commit a filled-in `.env`.** `.gitignore` covers it; check anyway.
-- Secrets are redacted at the persistence boundary (`redaction.py`, 11 patterns)
-  before anything reaches an incident, a Teams message or a trace attribute.
-- Traces carry metadata only — no prompt or completion content.
-- The Teams webhook URL is a bearer credential in URL form. Rotate it after the
-  exposure if the recording is shared.
-
----
-
-## 9. Hosted deployment (the production shape)
-
-Everything above describes the components. This section is how they run
-unattended in Azure rather than from a laptop.
-
-### What gets created
-
-| Resource | Purpose |
-|---|---|
-| Foundry hosted agent `bi-triage-controller` | The orchestration loop, as a container |
-| Foundry routine `bi-triage-schedule` | Declared, ships disabled — routines do not fire |
-| Logic App `bi-triage-silent-sweep` | The scheduled trigger that actually works |
-| Application Insights | Traces from the container |
-
-The Fabric SQL Database from section 3 already exists; nothing here creates it.
-
-### Deploy
-
-```powershell
-azd config set auth.useAzCliAuth true          # reuse the az login; no browser flow
-azd env new <environment-name>
-azd env set AZURE_SUBSCRIPTION_ID       (az account show --query id -o tsv)
-azd env set AZURE_LOCATION              eastus
-azd env set AZURE_AI_PROJECT_ENDPOINT   "<project endpoint>"
-azd env set AZURE_AI_PROJECT_ID         "<project ARM id>"
-
-# azd resolves the azure.ai.project service from FOUNDRY_PROJECT_ENDPOINT, not
-# from AZURE_AI_PROJECT_ENDPOINT. Setting only the latter fails the first deploy
-# with "Foundry dependencies are not ready: FOUNDRY_PROJECT_ENDPOINT is not set"
-# and a suggestion to run `azd provision`, which is not the fix. Set both.
-azd env set FOUNDRY_PROJECT_ENDPOINT    "<project endpoint>"
-
-# Durable state (section 3).
-azd env set FABRIC_SQL_SERVER   "<serverFqdn>"
+az account set --subscription $subscription
+azd config set auth.useAzCliAuth true
+azd env set AZURE_SUBSCRIPTION_ID "<subscription-id>"
+azd env set AZURE_TENANT_ID "<tenant-id>"
+azd env set AZURE_LOCATION "<region>"
+azd env set AZURE_AI_PROJECT_ENDPOINT "<project-endpoint>"
+azd env set AZURE_AI_PROJECT_ID "<project-resource-id>"
+azd env set FOUNDRY_PROJECT_ENDPOINT "<project-endpoint>"
+azd env set FOUNDRY_AGENT_MODEL "<model-deployment>"
+azd env set FABRIC_SQL_SERVER "<serverFqdn>"
 azd env set FABRIC_SQL_DATABASE "<databaseName>"
-
-# Mailbox ingestion credentials. Never committed; .azure/ is gitignored.
-azd env set GRAPH_CLIENT_ID     "<ingestion app id>"
-azd env set GRAPH_CLIENT_SECRET "<ingestion secret>"
-
+azd env set RUN_HISTORY_ENABLED true
+azd env set APPROVAL_DELIVERY_MODE web
+azd env set NOTIFICATION_CHANNEL web
+azd env set COMMAND_CENTER_URL "https://<app-name>.azurewebsites.net"
 azd deploy bi-triage-controller --no-prompt
 ```
 
-### Grant the controller identity what it needs
+Set both project-endpoint variables. Setting only
+`AZURE_AI_PROJECT_ENDPOINT` previously failed dependency resolution with
+`Foundry dependencies are not ready: FOUNDRY_PROJECT_ENDPOINT is not set`.
+Running an unrelated provision operation does not fix a missing setting.
+Keep optional legacy credential variables unconfigured; review the effective
+environment rather than treating all historical `azure.yaml` entries as
+required integrations.
 
-Deploying creates a **new** Entra agent identity for the controller, with no
-permissions. Each agent gets its own identity, so each needs its own grants —
-that is least privilege working, not a misconfiguration.
+Inspect `instance_identity` on the actual hosted agent definition after
+creation/recreation. `bi-triage identity --check-scope` reads the directory;
+when that operator query is unavailable, the Foundry definition supplies
+`instance_identity` without a Graph lookup. New identities start without grants;
+ordinary updates are not a reason to assume the identity always changes.
 
-`bi-triage identity --check-scope` prints it, but that command needs Microsoft
-Graph. If Graph is blocked, read the identity straight off the agent definition,
-which needs no Graph call:
+| Actor/scope | Permission and reason |
+|---|---|
+| Hosted controller / Fabric | Item/workspace access and SQL rights for durable state; see section 3 |
+| Hosted controller / Power BI or configured pipeline | Only the workload permissions needed by its tools |
+| Hosted controller / Foundry project | Foundry Agent Consumer to invoke its reasoning agents |
+| Web UAMI / Foundry project | Foundry Agent Consumer if model-backed observer or permitted model validation is enabled |
+| Scheduler / Foundry project | Foundry Agent Consumer to invoke the hosted controller |
+| Prompt agents | No Power BI, SQL, mailbox or directory grants |
+
+Verify a harmless configured read before an approved live action. A
+container-written row read back through an independent authorized connection
+proves more than a local scenario does. Do not issue `sweep` as a generic
+health probe: it drains mail and due retries. `command sweep` executes queued
+work, and pipeline/silent sweeps also have operational effects.
+
+`azd deploy` with no effective change can finish without restarting the
+container. Verify the deployed version and observed restart rather than
+assuming a successful deploy cleared process state. See
+[the hosted architecture](foundry/README.md) for concurrency and routine limits.
+
+## 10. Command-center Entra authorization
+
+The API validates RS256 v2 Entra access tokens for the configured tenant and
+API client ID, including signature, issuer, audience, tenant, required
+timestamps and `oid`. It requires delegated `access_as_user` plus recognized
+app-role claims. An ID token, an app-only token, a SQL grant or a client-supplied
+actor header is not an alternative.
+
+| App role | Capability |
+|---|---|
+| `CommandCenter.Reader` | Read authorized records, health/history and ask tool-free questions |
+| `CommandCenter.Operator` | Reader capabilities, configured investigations, notes and human tracking resolution |
+| `CommandCenter.Approver` | Reader capabilities and explicit pending approval/denial decisions |
+| `CommandCenter.Admin` | All app capabilities, isolated validation and reconciliation; no directory administration |
+
+Operator and Approver do not imply each other. App roles do not grant the
+person Azure/Fabric service permissions.
+
+### Register or update the SPA/API
+
+Run the offline plan first:
 
 ```powershell
-$t = az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv
-(Invoke-RestMethod -Headers @{Authorization="Bearer $t"} `
-  "<project endpoint>/agents/bi-triage-controller?api-version=v1").instance_identity
+.\.venv\Scripts\python.exe scripts\register_command_center.py `
+  --subscription "<subscription-name-or-id>" --tenant-id "<tenant-id>" `
+  --display-name "Example Triage Command Center" `
+  --webapp-origin "https://<app-name>.azurewebsites.net" --dry-run
 ```
 
-Grant to `instance_identity.principal_id` — that is what the container presents:
+Remove `--dry-run` only for an authorized registration operation.
+For an existing application, supply `--application-id "<application-client-id>"`.
+The script preserves role/scope IDs, rejects ambiguous or unmarked same-name
+applications unless explicitly identified, and refuses registrations with
+existing passwords/certificates rather than deleting them. It configures
+single-tenant authorization code + PKCE, disables implicit grants and enforces
+`appRoleAssignmentRequired=true` on the enterprise application.
 
-| Scope | Role | Why |
-|---|---|---|
-| Fabric workspace | `Contributor`, principal type `ServicePrincipal` | See the SQL database item |
-| Fabric SQL Database | Database user + `db_datareader`, `db_datawriter`, `db_ddladmin` | Persist state and create the tables |
-| Foundry account | `Foundry Agent Consumer` | Invoke the two prompt agents it reasons through |
-| Application Insights | `Monitoring Metrics Publisher` | Emit traces; without it the log floods with 403s |
-| Power BI workspace | Admin, principal type `App` | Read refresh history, trigger a retry |
+Optional flags are distinct choices:
 
-The first two are section 3. The Foundry grant is easy to miss: with
-`TRIAGE_PROVIDER_MODE=foundry` the controller calls `bi-triage` and
-`bi-data-quality` over the responses API, so without it every run fails at the
-first model call.
+| Flag | Effect |
+|---|---|
+| `--localhost-redirect-uri` | Adds an explicit loopback development redirect |
+| `--admin-current-user` or `--admin-user-object-id` | Adds a direct Admin assignment as an optional bootstrap |
+| `--authorize-azure-cli` | Preauthorizes Microsoft's CLI client for this API's scope only |
+| `--grant-admin-consent` | Grants `access_as_user` for the selected administrator, for the SPA and opted-in CLI client; not `AllPrincipals` |
+| `--grant-profile-consent` | Grants delegated Graph `User.Read` for only that selected user and SPA; not a Graph application permission |
 
-**Do not grant it `Mail.Read`.** Exchange rejects Entra agent identities for
-app-only mailbox access — verified as a 401 against the same token Graph's
-directory endpoint accepted with a 200. Mail goes through the app registration
-from section 2, which is why that one secret still exists.
+Consent flags require a selected administrator and separately authorized
+directory/consent privileges. The selection flags also assign that user's
+direct Admin bootstrap role; do not use them for routine end-user onboarding.
+Assignment-required apps need administrator consent; selected-user grants do
+not consent future group members. IT must arrange their approved consent
+process. Remove evaluation CLI access when no longer needed.
 
-### Verify
+### Provision the four groups
 
 ```powershell
-azd ai agent invoke bi-triage-controller "sweep"      # reads the mailbox
-azd ai agent monitor bi-triage-controller --tail 300  # shows what it ignored, and why
-.\.venv\Scripts\bi-triage.exe incidents               # written by the container, read from here
+.\.venv\Scripts\python.exe scripts\configure_command_center_groups.py `
+  --subscription "<subscription-name-or-id>" --tenant-id "<tenant-id>" `
+  --app-id "<application-client-id>" --group-prefix "Example Triage" `
+  --admin-current-user
 ```
 
-The last one is the real proof: an incident written by the container in Azure,
-read back on another machine, means the container authenticated to Fabric SQL as
-itself with no secret in the deployment.
+This defaults to an **offline plan**, unlike registration without `--dry-run`.
+Add `--apply` only for privileged operator provisioning. It checks the enabled
+single-tenant enterprise application, role definitions, administrator and
+active P1/P2 plan. It creates or reconciles four ordinary security groups,
+rejects name/ownership-marker collisions and role-assignable groups, assigns
+the roles, and reads back owners, the administrator's direct Admin-group
+membership and every app-role assignment.
 
-Raise `--tail` when diagnosing. The default is 50 lines and the OpenTelemetry
-metric dump fills that easily, hiding the line you need; 300 is the maximum.
+The selected administrator owns each group and is added as a member of the
+Administrators group. Ownership alone is not app access. The script does
+**not** remove existing direct assignments, delete groups or change operational
+SQL data. A delayed/ambiguous directory write must be reconciled before retrying.
 
-### Governance notes
+Entra ID P1/P2 is required for group-based assignment. Nested group membership
+does not cascade. IT manages app assignments; group owners manage membership
+externally. The application has no roster or membership editor and needs no
+`AppRoleAssignment.ReadWrite.All` or `Group.ReadWrite.All` on its UAMI. See
+[Entra group assignment](https://learn.microsoft.com/entra/identity/enterprise-apps/assign-user-or-group-access-portal).
 
-Expect tenant policy to act on this deployment within minutes of creating it,
-and design around it rather than fighting it:
+### Existing-deployment cutover
 
-- **Fabric SQL needs no exemption**, which is part of why state moved there. It
-  accepts Entra tokens only, so there is no local-authentication setting to be
-  switched off and no shared key to be disabled underneath you.
-- **A degraded store must not be permanent.** Policy disabled public network
-  access on the storage account this accelerator used to depend on, minutes
-  after it was created. The container started while it was unreachable and then
-  reported healthy triage outcomes while persisting none of them — and kept
-  doing so after connectivity returned, because nothing retried. The store layer
-  now re-checks and reloads on use. If you write another store, do the same.
+Do not treat the removal of the SQL ACL implementation as a data migration or
+silently disable an active old authority during provisioning.
 
-### Restarting the container
+1. Inventory the exact existing app, role IDs, direct assignments, group
+   assignments, old flag and operational tables. Preserve existing records and
+   an operator-controlled copy of any legacy access evidence.
+2. Establish the Entra app roles, administrator group, direct group membership
+   and group role assignment. Before disabling the old flag, prove a freshly
+   issued, cryptographically validated API token contains Entra Admin for the
+   correct tenant/audience/scope. An old SQL-authorized Admin display is not
+   this proof. Retain a reviewed bootstrap path until cutover is confirmed.
+3. Explicitly set the old live app's
+   `COMMAND_CENTER_ACCESS_MANAGEMENT_ENABLED` to false after that proof.
+   The deployment helper refuses both a requested true value and an existing
+   true value; it does not perform the authority switch for you. New code
+   rejects `access_management_enabled=true` at startup.
+4. Deploy the Entra-only code. Verify `/api/access` reports
+   `source=entra_app_roles`, Admin operations work for the intended actor and
+   lower-role operations remain refused. Preserve all operational state.
+5. Only after successful group setup/readback, remove the specifically reviewed
+   direct bootstrap assignment. Obtain another fresh API token and prove Admin
+   through the group-based path. Do not remove every direct assignment or
+   assume the group script already removed them.
+6. Only after fresh-token group access and operational continuity are confirmed,
+   retire the separately identified legacy permission table under the approved
+   retention process. Do not drop, recreate or clear the standalone database
+   or any incident, approval, command, history or collaboration table.
 
-`azd deploy` with no code change completes in seconds and does **not** restart
-the container, so its in-memory incident cache survives. To force a genuine
-restart, change something in the service definition (an environment variable is
-enough) and redeploy.
+The old SQL access service/store and its initialization script have been
+removed. There is no dual SQL/Entra authority to re-enable.
+
+### Access display and human closure
+
+Access & permissions calls `/api/access`: it reports the presented token's
+effective roles, tenant/application and issue/expiry dates. It does not read
+SQL membership, query Graph directory membership or identify the supplying
+group. Refresh permissions forces a new API-token request, then reloads
+access and the command-center snapshot. If interaction is required, sign in
+explicitly; the refresh does not silently open consent.
+
+Changes depend on Entra propagation and token renewal. Refreshing one session
+does not revoke anyone else's already-issued token. The optional browser
+profile-photo request uses a separate delegated Graph `User.Read` token.
+
+Human closure is append-only tracking, not verified remediation. It binds to
+the original SQL NVARCHAR payload hash (SHA-256 over UTF-16 LE), plus the
+tracking version. New evidence invalidates the closure without resetting
+controller incidents, budgets, notifications, approvals or claims. This is why
+the web UAMI inserts into `triage_incident_activity` but cannot update
+`triage_incidents`.
+
+## 11. App Service infrastructure and code releases
+
+`infra\command-center.bicep` provisions only the independent web host and its
+network/identity resources. The existing resource group, Foundry services and
+Fabric SQL Database are separate prerequisites.
+
+### Infrastructure helper
+
+Inspect the real command help and validate before provisioning:
+
+```powershell
+Get-Help .\scripts\deploy_command_center.ps1 -Detailed
+
+.\scripts\deploy_command_center.ps1 `
+  -Subscription "<subscription-name-or-id>" -ResourceGroup "<resource-group>" `
+  -Location "<region>" -AppName "<app-name>" `
+  -TenantId "<tenant-id>" -ApplicationClientId "<application-client-id>" `
+  -CostCenter "<cost-center>" -Owner "<owner>" -Environment "evaluation" `
+  -DataClassification "synthetic" `
+  -ApplicationSettingsFile "<operator-owned-settings.json>" -ValidateOnly
+```
+
+Without `-Deploy`, the helper runs ARM validation and resource-ID-only what-if,
+not provisioning. The settings file is a JSON object of string values, not an
+`.env` file. It requires `FABRIC_SQL_SERVER`, `FABRIC_SQL_DATABASE` and
+`FOUNDRY_PROJECT_ENDPOINT`; credentials and managed-setting overrides are
+rejected. Do not commit it.
+
+For new infrastructure, use `-Deploy -ProvisionOnly` to create the UAMI/host,
+then grant its external permissions and install SQL schema separately.
+`-Deploy` without `-ProvisionOnly` also builds and uploads code. This helper
+does not request quota, register agents, grant directory/RBAC permissions or
+prove private backend connectivity.
+
+Verify the selected App Service SKU's regional quota **and admission**, Python
+3.13 availability, Foundry hosting/model capacity and Fabric capacity.
+Supported helper SKUs include B1/B2/B3, S1/S2/S3, P0v3/P1v3; do not assume the
+default B1 can be provisioned merely because the region lists it.
+
+### Network and governance invariants
+
+The template sets `publicNetworkAccess=Disabled` by default, with app/SCM
+private DNS, separate inbound-private-endpoint and outbound-integration
+subnets, `defaultOutboundAccess=false` and an explicit NAT Gateway. The NAT
+public IP is for outbound SNAT, not an inbound listener.
+
+Read back `properties.outboundVnetRouting.allTraffic=true` from the deployed
+site. The earlier inline `vnetRouteAllEnabled` setting returned false after
+provisioning; a declared flag is not runtime evidence. Preserve governance
+NSG bindings on both subnets; the helper reads existing bindings before
+redeployment. See
+[App Service routing](https://learn.microsoft.com/azure/app-service/configure-vnet-integration-routing).
+
+Private web ingress does not provide private routes/DNS to Foundry or Fabric.
+Configure those separately, including Foundry managed network isolation and
+the supported Fabric Private Link scope. Tenant-level Fabric Private Link
+supports SQL TDS; review current workspace-level limitations instead of
+assuming every item is covered. Fabric-to-source egress is a separate control.
+See [Fabric Private Link](https://learn.microsoft.com/fabric/security/security-private-links-overview).
+
+SCM/FTP basic publishing remain disabled. Use Entra-authenticated CLI
+(Azure CLI 2.48.1 or later) or Kudu REST, never publishing passwords/profiles.
+`/api/health` proves only that the web process answers in live mode. Verify
+authenticated API, SQL, observer and command/scheduler paths independently.
+
+The helper's `-TemporaryPublicAccess` requires explicit client `/32` or `/128`
+CIDRs, defaults other traffic to Deny and restores `publicNetworkAccess=Disabled`
+in `finally`, including after failure. It is not a persistent user-access mode.
+
+An explicitly requested persistent client/Global Secure Access exception must
+use verified single-host egress addresses on the **main endpoint** plus Entra
+authentication. Keep **SCM independent and deny-all** outside a deployment
+window. Do not infer SCM trust from an approved main-site allowlist.
+
+All taggable resources and the resource group need `CostCenter`, `Owner`,
+`Environment` and `DataClassification`. NAT, Private Link, the App Service plan,
+Fabric capacity and hosted/model use incur separate costs. For a finite
+approved evaluation, `-Evaluation` enables admin-only isolated validation;
+`-EvaluationCostExemption` adds `CostControl=Ignore` and requires a future
+`-EvaluationExpiresOn`. Those tags do not shut anything down. Disable validation
+and remove the exemption by the recorded review date.
+
+### Code-only update to an existing app
+
+**Do not run a default full infrastructure deployment for a code-only change.**
+It can reset an approved persistent main-site access policy and reintroduce
+shared SCM restrictions. Preserve the existing app, UAMI, database, runtime
+settings, NSGs, private endpoints and approved ingress.
+
+Build a new artifact outside the repository; do not restore dependencies unless
+needed:
+
+```powershell
+$package = Join-Path $env:TEMP "triage-command-center-release.zip"
+.\scripts\package_command_center.ps1 -OutputPath $package
+```
+
+The packager type-checks/builds the UI and includes source, scenarios, mock
+inputs and `command-center\dist`, with generated `requirements.txt` containing
+`.[web,azure]`. It excludes environment files, credentials, caches and
+publishing material and runs the repository credential gate. Use a new output
+name or explicit `-Force`; it will not overwrite an existing artifact silently.
+
+Before any ZIP POST, confirm private app **and SCM** DNS/routing from the
+deployment host. If a separate temporary SCM window is authorized, capture the
+exact current access configuration and restore it in a PowerShell `finally`
+block. Preserve approved persistent main-site access; do not replace it with
+an unrelated default.
+
+Require repeated successful **Entra-authenticated, read-only** SCM probes,
+such as `GET /api/deployments`, before uploading. Restriction propagation can
+differ between SCM frontends; one 200 response or an ARM update result is not
+stable readiness. If different resolved frontends are used, establish
+consistent results with the correct hostname/TLS SNI before the write.
+The current deployment helper has a post-upload health probe, not this
+pre-upload stability gate; the operator must establish it first.
+
+Once readiness and identity are confirmed:
+
+```powershell
+az account set --subscription $subscription
+az webapp deploy --subscription $subscription -g <resource-group> -n <app-name> `
+  --src-path $package --type zip --clean true --restart true `
+  --async false --track-status false --timeout 1800000
+```
+
+Control-plane startup tracking previously stalled after Kudu completed and the
+API served requests, so inspect Kudu deployment status and the actual
+application, not just the CLI wait. An accepted POST, timeout or lost response
+can leave a deployment running: inspect its existing deployment ID/status and
+reconcile before another upload. Do not blindly retry ambiguous writes.
+
+Restore temporary SCM/network changes in `finally` and verify the readback even
+when packaging, upload or readiness fails. Then prove authenticated Entra
+roles, operational data continuity and the specific deployed feature. A
+successful ZIP upload is not proof of SQL authorization or private backends.
+
+See [deployment without basic authentication](https://learn.microsoft.com/azure/app-service/configure-basic-auth-disable)
+and [App Service private endpoints](https://learn.microsoft.com/azure/app-service/overview-private-endpoint).

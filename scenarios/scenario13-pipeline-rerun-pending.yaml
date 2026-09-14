@@ -1,0 +1,37 @@
+name: scenario13-pipeline-rerun-pending
+title: Approved pipeline rerun still in progress
+description: Fabric accepts an approved rerun but has not completed it. The controller must not report resolution.
+approval:
+  mode: auto_approve
+pipeline:
+  target:
+    name: Orders ingestion pending replay
+    workspace_id: "10000000-0000-0000-0000-000000000001"
+    pipeline_id: "20000000-0000-0000-0000-000000000013"
+    rerun_safe: true
+    rerun_parameters: {}
+  runs:
+    - id: "30000000-0000-0000-0000-000000000003"
+      item_id: "20000000-0000-0000-0000-000000000013"
+      job_type: Pipeline
+      invoke_type: Scheduled
+      status: Failed
+      start_time: "2026-09-11T06:00:00Z"
+      end_time: "2026-09-11T06:01:00Z"
+      error_code: ADLSGen2OperationFailed
+      failure_reason: "The storage operation failed. Inner error: InternalServerError."
+  activities:
+    - name: CopyOrders
+      activity_type: Copy
+      status: Failed
+      error_code: ADLSGen2OperationFailed
+      message: "The storage operation failed. Inner error: InternalServerError."
+  rerun_status: InProgress
+expect:
+  outcome: needs_human
+  remediation_applied: true
+  approval_requested: true
+  approval_granted: true
+  flags_written: 0
+  pipeline_reruns: 1
+  incident_source: fabric_pipeline_failure

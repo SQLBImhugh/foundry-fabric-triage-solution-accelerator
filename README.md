@@ -2,19 +2,36 @@
 
 The BI Triage Solution Accelerator is a multi-agent operations loop for business
 intelligence failures. When a Power BI refresh fails, it gathers evidence,
-consults a specialist agent, decides what it is allowed to do, and either
-remediates within policy or escalates to a human with the evidence attached. It
-also finds the failures that never raise an alert at all, which is the class of
-problem no inbox will ever tell you about.
+consults a specialist agent, and either remediates within controller-enforced
+policy or escalates with the evidence attached. Deterministic probes also detect
+configured freshness, row-count and schema regressions when no failure alert
+arrives.
+
+Scheduled Fabric Data Factory pipeline failures can also enter the same triage
+loop through an explicit job monitor. Pipeline reruns require reviewed replay
+safety and human approval; accepted jobs are not reported as resolved until
+their execution and activity evidence have been checked. Notebook activity
+failures are evidence within a monitored pipeline; standalone notebook
+monitoring is not implemented. See
+[Scheduled Fabric pipeline triage](./docs/PipelineTriage.md).
+
+An optional [Azure-hosted command center](./docs/CommandCenter.md) adds a queue
+and inspector, authenticated approvals, queued investigations, full run history
+and separate incident records. Incident records support append-only notes,
+persisted read-only discussion and **Resolved by user** tracking decisions.
+Human closure is not a verified repair and does not reset the controller's
+remediation budget. Teams is not required for these workflows. Operational state
+remains in the standalone Fabric SQL database.
 
 **Key use cases and customization:**
 
 - **Power BI operations use case**: A semantic model refresh fails at 06:00. The
-  accelerator triages the cause, applies a permitted fix or requests approval for
-  one that is not permitted, deduplicates repeat occurrences, and records a
-  terminal outcome for every incident.
+  accelerator triages the cause, applies an allowlisted fix or requests approval
+  for an allowlisted gated action, deduplicates repeat occurrences, and records
+  a terminal outcome for every run. Approval never permits an off-allowlist action.
 - **Reusability and customization**: The policy ledger, action allowlists,
-  approval gate and evidence model are domain-independent. See
+  approval gate and typed evidence provide patterns for other domains; tools and
+  evidence checks remain workload-specific. See
   [How to customize](#how-to-customize).
 
 <br/>
@@ -28,17 +45,17 @@ problem no inbox will ever tell you about.
 
 <h2 id="solution-overview">Solution overview</h2>
 
-This solution accelerator is built on Azure AI Foundry, Power BI and Microsoft
-Graph. A controller agent orchestrates the loop, a data quality agent
-investigates data-shaped failures, and every action the system can take is on an
-allowlist enforced in code.
+This solution accelerator uses Azure AI Foundry, Power BI, Microsoft Fabric and
+optional Microsoft Graph mailbox ingestion. A controller orchestrates the loop,
+a data quality agent investigates data-shaped failures, and every action the
+system can take is on an allowlist enforced in code.
 
 It runs **fully offline** with mock providers and mock tools, so you can read it,
 run it and evaluate its behaviour before it touches a tenant. That is also how
 the test suite runs: no credentials, no network.
 
 **Bring your own Foundry project and Fabric workspace.** This repository deploys
-the agents and the supporting Logic App *into* an Azure AI Foundry project and a
+the agents and supporting Logic Apps for an Azure AI Foundry project and a
 Microsoft Fabric workspace you already have; it does not provision the project,
 the Fabric SQL Database or Application Insights for you.
 [`docs/DeploymentGuide.md`](./docs/DeploymentGuide.md) lists every
@@ -57,8 +74,8 @@ description, see the [architecture description](./docs/TechnicalArchitecture.md)
 **Preview notice:** Some platform capabilities used in this solution are
 currently in preview, including Foundry hosted agents, Entra agent identity and
 Foundry routines. These features are provided "as-is" and may change without
-notice. One of them does not currently work as documented, and the accelerator
-ships around it rather than pretending otherwise — see
+notice. Foundry routines did not fire in the recorded tenant verification, so
+the supported scheduler is a Logic App — see
 [Scheduling](#scheduling-what-does-and-does-not-work) below.
 
 ### How to customize
@@ -84,7 +101,7 @@ ships around it rather than pretending otherwise — see
 ## Features
 
 <details>
-  <summary>Click to learn more about the key features this solution enables</summary>
+  <summary>Feature details</summary>
 
 - **Triage controller** <br/>Orchestrates the loop: parses the alert, gathers
   evidence, calls the specialist agent, decides an action, and persists a
@@ -116,16 +133,28 @@ ships around it rather than pretending otherwise — see
   the agent tools, because a model asked whether a 60% row drop is acceptable
   will sometimes say yes.
 
+- **Scheduled pipeline triage** <br/>Reads failed scheduled Fabric pipeline jobs
+  and activity diagnostics, deduplicates run IDs, and separates pipeline tools
+  from dataset tools. A durable submission journal prevents repeating an
+  approved rerun after an ambiguous response.
+
 - **Evidence and redaction** <br/>Deterministic evidence outranks model output,
   and disagreements are logged. Redaction happens inside the store boundary, so a
   call site cannot forget it.
 
-- **Monitoring cockpit** <br/>A read-only Fabric App (`cockpit/`) over the
+- **Agent command center** <br/>An Azure-hosted operator interface
+  (`command-center/`) for authenticated approvals, queued investigations,
+  full run history, incident notes and read-only questions. Four Entra app roles
+  control access; IT and group owners manage the mapped security groups in
+  Entra. The **Access & permissions** page displays effective token roles, not
+  a membership roster, and cannot edit access. See
+  [setup and operation](./docs/CommandCenter.md).
+
+- **Read-only monitoring cockpit** <br/>An optional Fabric App (`cockpit/`) over the
   controller's own state: incidents, approvals, deferred retries, semantic-health
   baselines, and the claims and leases that stop two invocations acting on the
   same alert. It reads a Direct Lake semantic model over the state database, so
-  it adds no writer and no second copy of the truth — nothing in it can change
-  the system it watches.
+  it introduces no writer or app-owned operational store.
 
 </details>
 
@@ -175,21 +204,23 @@ The table below lists the major Microsoft products used.
 | [Power BI](https://learn.microsoft.com/power-bi/) | The estate being monitored. The accelerator reads refresh history, triggers refreshes, manages refresh schedules and queries semantic models. | [Pricing](https://www.microsoft.com/power-platform/products/power-bi/pricing) |
 | [Microsoft Fabric](https://learn.microsoft.com/fabric/) | Provides the capacity that Power BI semantic models run on, where capacity throttling originates, and the Fabric SQL Database holding durable state: incidents, processed messages, approvals, deferred retries, sweep leases and semantic health baselines. | [Pricing](https://azure.microsoft.com/pricing/details/microsoft-fabric/) |
 | [Azure Logic Apps](https://learn.microsoft.com/azure/logic-apps/) | The scheduled trigger. Consumption tier, managed identity, no keys. | [Pricing](https://azure.microsoft.com/pricing/details/logic-apps/) |
+| [Azure App Service](https://learn.microsoft.com/azure/app-service/) | Optional command-center web host. Its private endpoint and NAT gateway are billed separately. | [Pricing](https://azure.microsoft.com/pricing/details/app-service/linux/) |
 | [Application Insights](https://learn.microsoft.com/azure/azure-monitor/app/app-insights-overview) | Optional. Traces every run as spans carrying metadata only. | [Pricing](https://azure.microsoft.com/pricing/details/monitor/) |
 | [Microsoft 365 / Exchange Online](https://learn.microsoft.com/exchange/exchange-online) | Supplies the monitored mailbox that Power BI failure alerts arrive in. | [Pricing](https://www.microsoft.com/microsoft-365/business/compare-all-microsoft-365-business-products) |
 | [Microsoft Teams](https://learn.microsoft.com/microsoftteams/) | Optional. Receives notification and approval cards. | [Pricing](https://www.microsoft.com/microsoft-teams/compare-microsoft-teams-business-options) |
 
 <br/>
 
-> ⚠️ **Important:** To avoid unnecessary costs, remember to take down your
-> deployment when it is no longer in use, either by deleting the resource group
-> in the Portal or running `azd down`.
+> ⚠️ **Important:** Remove resources created for an evaluation when it ends.
+> Review the scope of `azd down` or a resource-group deletion first: the Foundry
+> project, Fabric workspace and state database may predate this deployment.
+> The optional command center is deployed separately and needs separate cleanup.
 
 <h3 id="scheduling-what-does-and-does-not-work">Scheduling: what does and does not work</h3>
 
-Foundry routines are the native scheduled trigger, and they **do not fire**.
-Verified six days after registration: the routine reported itself enabled with
-its cron, accepted dispatches, produced no runs, and telemetry showed agent
+Foundry routines are the native scheduled trigger. In verification on
+2026-09-02, six days after registration, the routine reported itself enabled
+with its cron, accepted dispatches, produced no runs, and telemetry showed agent
 activity in two of twenty-four hours — both of them hours when a person invoked
 it by hand. `azd deploy` does not manage routines at all.
 
@@ -198,41 +229,39 @@ the evidence in the file. The scheduled trigger the accelerator actually support
 is [`infra/scheduled-sweep.json`](./infra/scheduled-sweep.json), a Consumption
 Logic App with a managed identity, verified end to end.
 
-An accelerator whose subject is failures that never announce themselves must not
-ship a scheduler that silently does nothing. Re-test routines in your own tenant
-before enabling them — this may be regional, or already fixed.
+Re-test routines in your own tenant before enabling them; the observed behavior
+may be regional or fixed in a later preview release. An enabled declaration is
+not evidence that a schedule has executed.
 
 <br /><br />
 
 <h2 id="business-use-case">Business use case</h2>
 
-A scheduled refresh fails at 06:02. An email lands in a shared mailbox that
-already receives dozens a week. Nobody is on shift. The report is wrong when the
-business opens, and the first anyone hears of it is a question from a user.
-
-This accelerator closes that gap. It reacts to the alert within minutes, works
-out what actually happened from refresh history rather than from the subject
-line, and either fixes it within a policy an operations team wrote, or asks a
-named human for permission with the evidence already gathered.
+A scheduled refresh fails at 06:02 and sends an email to the monitored mailbox.
+The next configured sweep reads the alert, checks refresh history and
+deterministic data evidence, and proposes an action. The controller either
+permits it within policy, requests approval for a gated action, or records an
+escalation. Detection time depends on the configured schedule and service
+availability; it is not a response-time guarantee.
 
 **Key use cases by role:**
 
 | Role | Capabilities |
 |---|---|
 | **BI / data platform operations** | Triage and first-line remediation of refresh failures without a human in the loop for routine cases; an auditable terminal outcome for every incident. |
-| **On-call engineer** | Receives an approval request with evidence attached rather than a bare alert, and approves or denies from Teams or the CLI. |
+| **On-call engineer** | Reviews evidence and approves or denies in the command center, or through the configured Teams/CLI channel. |
 | **Data steward** | Learns about silent data-quality regressions — stale models, collapsed row counts, dropped columns — that no alert would ever have reported. |
 
 > ⚠️ **Note:** The sample data in this repository is synthetic and intended for
 > evaluation only.
 
-### Business value
+### Operational behavior
 
 <details>
-  <summary>Click to learn more about what value this solution provides</summary>
+  <summary>Operational behavior details</summary>
 
-- **Time to first action** <br/>The loop starts within minutes of the alert
-  rather than at the start of the next working day.
+- **Scheduled processing** <br/>The loop can start unattended at the next
+  successful sweep, rather than waiting for an engineer to read the mailbox.
 
 - **Alert fatigue reduction** <br/>Repeat occurrences of one incident are
   announced once, not once per occurrence. Deduplication that stops the
@@ -241,11 +270,10 @@ named human for permission with the evidence already gathered.
 
 - **Bounded autonomy** <br/>The agent's authority is a short, readable list.
   Anything outside it is refused before dispatch and escalated with evidence, so
-  adopting it is a policy decision rather than an act of faith.
+  changes to available actions require a code and policy review.
 
-- **Failures nobody reports** <br/>The silent-failure detector covers the gap
-  between "the refresh succeeded" and "the data is right", which is where the
-  most damaging BI incidents live.
+- **Silent-failure coverage** <br/>Configured probes check whether a successful
+  refresh also meets expected freshness, row-count and schema conditions.
 
 </details>
 
@@ -255,11 +283,13 @@ named human for permission with the evidence already gathered.
 
 | Document | What it covers |
 |---|---|
-| [Technical architecture](./docs/TechnicalArchitecture.md) | The flow, the agent boundary, outcome validation, signatures and suppression, approvals, providers, observability. |
+| [Technical architecture](./docs/TechnicalArchitecture.md) | Controller and agent boundaries, state, approvals, command-center authorization, incident collaboration and network scope. |
 | [Deployment guide](./docs/DeploymentGuide.md) | Everything that must exist in a tenant, ordered by lead time. |
 | [Azure account setup](./docs/AzureAccountSetUp.md) | Subscription, permissions and quota prerequisites. |
 | [Operations guide](./docs/OperationsGuide.md) | What runs on a schedule, off switches, budgets, inspecting state, telemetry, cost control. |
 | [Customization guide](./docs/CustomizationGuide.md) | Adding a tool, an approval gate, a playbook, a detector or an agent. |
+| [Scheduled Fabric pipeline triage](./docs/PipelineTriage.md) | Configured pipeline monitoring, replay safety, approval and execution verification. |
+| [Command center](./docs/CommandCenter.md) | Web deployment, Entra groups and app roles, incident workflows, run history and isolated scenario validation. |
 | [Foundry component](./docs/foundry/README.md) | What runs where, which identity does it, and the platform behaviours this repo has already paid for. |
 | [FAQs](./docs/FAQs.md) | Common questions. |
 
@@ -270,19 +300,38 @@ named human for permission with the evidence already gathered.
 This accelerator authenticates with [Managed Identity](https://learn.microsoft.com/entra/identity/managed-identities-azure-resources/overview)
 and Entra agent identity wherever the platform allows it. The controller reaches
 Power BI and its Fabric SQL Database as itself, with no key and no secret —
-Fabric SQL accepts Entra tokens only, so there is no connection string to leak
-and no local-authentication fallback to switch off.
+Fabric SQL accepts Entra tokens only, with no stored SQL password or
+local-authentication fallback.
 
-Two bearer credentials remain, and each is a deliberate exception:
+The command center is a secretless SPA/API. The backend validates the delegated
+API token and its `CommandCenter.Reader`, `CommandCenter.Operator`,
+`CommandCenter.Approver` or `CommandCenter.Admin` roles on every request.
+Ordinary Entra security groups supply these roles; there is no SQL ACL or
+editable in-app access manager. App roles grant no Azure, Fabric or directory
+permissions to the user, controller or reasoning agents.
+
+**Refresh permissions** requests a fresh token for this API and reloads access
+details and the command-center snapshot. It does not revoke already-issued
+tokens in other sessions: roles can remain valid until token expiry or renewal,
+with the backend's 30-second validation leeway. Authorization needs no runtime
+Graph directory permission. The optional profile photo uses a separate delegated
+Graph `User.Read` token.
+
+The optional legacy mailbox and Teams integrations still accept these
+credential-bearing inputs:
 
 | Credential | Why it exists | Scope |
 |---|---|---|
-| App registration client secret | Exchange does not yet accept an Entra agent identity for app-only mailbox reads. | One mailbox, enforced by an Exchange `ApplicationAccessPolicy`. |
+| Mailbox app registration client secret | The tested hosted Entra agent identity was rejected by Exchange for app-only mailbox reads. This is separate from command-center sign-in. | One mailbox, enforced by an Exchange `ApplicationAccessPolicy`. |
 | Teams Workflows webhook URL | The URL *is* the credential; there is no identity on an incoming webhook. | One channel. |
 
-Both live in the azd environment, which is gitignored, and never in the
-repository. Only the first expires, and its expiry will stop mail ingestion
-silently, so track it.
+If used, keep them in the gitignored deployment environment, never in the
+repository. Track mailbox credential expiry and ingestion failures. A
+secret-based mailbox path is unsuitable for a tenant that removes app secrets
+on a 30-day schedule: use a supported, verified workload-identity path or the
+command-center/pipeline entry points instead. Legacy Teams approval links are
+not Entra-authenticated decisions; web proposals require the command-center
+decision path.
 
 Design rules worth keeping if you adapt this:
 

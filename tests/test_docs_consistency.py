@@ -282,7 +282,7 @@ def test_routine_inputs_reach_a_command_the_agent_handles() -> None:
             continue
         for target in node.targets:
             name = getattr(target, "id", None)
-            if name in ("_SWEEP_COMMANDS", "_SILENT_COMMANDS"):
+            if name in ("_SWEEP_COMMANDS", "_SILENT_COMMANDS", "_PIPELINE_COMMANDS", "_WEB_COMMANDS"):
                 # Both are frozenset({...}) rather than bare literals, so unwrap
                 # the call before evaluating its argument.
                 value = node.value
@@ -293,13 +293,13 @@ def test_routine_inputs_reach_a_command_the_agent_handles() -> None:
                     value = value.args[0]
                 commands[name] = set(ast.literal_eval(value))
 
-    assert set(commands) == {"_SWEEP_COMMANDS", "_SILENT_COMMANDS"}, (
+    assert set(commands) == {"_SWEEP_COMMANDS", "_SILENT_COMMANDS", "_PIPELINE_COMMANDS", "_WEB_COMMANDS"}, (
         f"could not read the command sets out of src/app.py, found {sorted(commands)}. "
         "If they were renamed or built dynamically, update this test rather than "
         "letting it pass without checking anything."
     )
 
-    handled = {c.lower() for c in commands["_SWEEP_COMMANDS"] | commands["_SILENT_COMMANDS"]}
+    handled = {c.lower() for values in commands.values() for c in values}
     inputs = re.findall(r'^\s+input:\s*"([^"]*)"', (REPO_ROOT / "azure.yaml").read_text(
         encoding="utf-8"), re.M)
     assert inputs, "no routine inputs found in azure.yaml"
@@ -414,6 +414,9 @@ def test_env_example_and_settings_agree_exactly() -> None:
         re.findall(r"^([A-Z][A-Z0-9_]*)=", _read(REPO_ROOT / ".env.example"), re.M)
     )
     supported = {name.upper() for name in Settings.model_fields}
+    from triage.command_center.models import WebSettings
+
+    supported |= {f"COMMAND_CENTER_{name.upper()}" for name in WebSettings.model_fields}
 
     assert not advertised - supported, (
         f"advertised in .env.example but no Settings field reads them: "
@@ -653,9 +656,65 @@ def test_the_scheduler_waits_longer_than_the_approval_window() -> None:
     hours, minutes, seconds = (int(part or 0) for part in match.groups())
     budget = hours * 3600 + minutes * 60 + seconds
 
-    approval = Settings().approval_timeout_seconds
+    settings = Settings()
+    approval = settings.approval_timeout_seconds
     assert budget > approval, (
         f"the scheduler gives up after {budget}s but an approval may take "
         f"{approval}s. Raise the Logic App timeout, or lower "
         "APPROVAL_TIMEOUT_SECONDS -- they have to move together."
     )
+    command_budget = settings.triage_timeout_seconds + approval + 30
+    assert budget > command_budget, (
+        f"The scheduler timeout {budget}s must outlast the combined command-worker "
+        f"execution deadline of {command_budget}s, including time awaiting approval."
+    )
+    failure_card = json.dumps(
+        template["resources"][0]["properties"]["definition"]["actions"]["Did_it_fail"]
+    )
+    assert "may have executed" in failure_card
+    assert "Nothing was triaged" not in failure_card
+
+
+def test_command_center_routes_outbound_traffic_explicitly() -> None:
+    import re
+
+    template = (REPO_ROOT / "infra" / "command-center.bicep").read_text(encoding="utf-8")
+    assert re.search(r"outboundVnetRouting:\s*\{\s*allTraffic:\s*true\s*\}", template)
+    assert "defaultOutboundAccess: false" in template
+    assert "publicNetworkAccess: enablePublicAccess ? 'Enabled' : 'Disabled'" in template
+    helper = (REPO_ROOT / "scripts" / "deploy_command_center.ps1").read_text(encoding="utf-8")
+    for name in ("integrationSubnetNsgId", "privateEndpointSubnetNsgId"):
+        assert name in template and name in helper
+    rules = template.split("var temporaryAccessRules =", 1)[1].split("\n}]", 1)[0]
+    description = re.search(r"description: '([^']*)'", rules)
+    assert description is not None
+    assert len(description.group(1)) <= 64
+
+
+def test_scheduler_rejects_failed_responses_even_when_http_succeeds() -> None:
+    template = json.loads(
+        (REPO_ROOT / "infra" / "scheduled-sweep.json").read_text(encoding="utf-8")
+    )
+    actions = template["resources"][0]["properties"]["definition"]["actions"]
+    assert actions["Invoke_the_agent"]["inputs"]["body"] == {
+        "input": "@{parameters('command')}",
+    }
+    check = actions["Validate_agent_response"]
+    assert check["type"] == "ParseJson"
+    assert check["runAfter"] == {"Invoke_the_agent": ["Succeeded"]}
+    assert check["inputs"]["content"] == (
+        "@if(contains(body('Invoke_the_agent'), '$content'), "
+        "json(base64ToString(body('Invoke_the_agent')['$content'])), "
+        "body('Invoke_the_agent'))"
+    )
+    schema = check["inputs"]["schema"]
+    assert "status" in schema["required"]
+    assert schema["properties"]["status"]["enum"] == ["completed"]
+    assert schema["properties"]["error"]["type"] == "null"
+    after = actions["Did_it_fail"]["runAfter"]
+    assert set(after["Invoke_the_agent"]) == {"Succeeded", "Failed", "TimedOut"}
+    assert set(after["Validate_agent_response"]) == {"Failed", "TimedOut", "Skipped"}
+    assert actions["Fail_the_run"]["inputs"]["runStatus"] == "Failed"
+    assert set(actions["Fail_the_run"]["runAfter"]["Did_it_fail"]) == {
+        "Succeeded", "Failed", "TimedOut",
+    }

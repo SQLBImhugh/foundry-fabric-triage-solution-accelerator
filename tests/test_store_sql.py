@@ -23,6 +23,7 @@ from triage.store.approvals import FabricSqlApprovalChannel
 from triage.store.claims import FabricSqlClaimStore, build_claim_store
 from triage.store.fabric_sql import (
     DEFAULT_TABLES,
+    FabricSqlDatabase,
     SqlUnavailable,
     ensure_schema,
     quote_identifier,
@@ -86,6 +87,99 @@ class FakeSql:
         return FakeIntegrityError
 
 
+def test_sql_cursors_are_closed_before_reusing_a_connection(monkeypatch) -> None:
+    """A procedure's remaining result handles must not block the next query."""
+    class Connection:
+        busy = False
+        closed = 0
+
+        def cursor(self):
+            connection = self
+
+            class Cursor:
+                rowcount = 1
+
+                def execute(self, *_args):
+                    if connection.busy:
+                        raise RuntimeError("Connection is busy with results for another command")
+                    connection.busy = True
+
+                def fetchall(self):
+                    return [(1,)]
+
+                def close(self):
+                    connection.busy = False
+                    connection.closed += 1
+
+            return Cursor()
+
+    connection = Connection()
+    database = FabricSqlDatabase(server="unused", database="unused")
+    monkeypatch.setattr(database, "_ensure", lambda: connection)
+    assert database.query("EXEC fixture") == [(1,)]
+    assert database.query("SELECT 1") == [(1,)]
+    assert database.execute("UPDATE fixture SET value=1") == 1
+    assert connection.closed == 3
+
+
+def test_sql_failure_preserves_a_redacted_cause_and_clears_it_on_recovery(monkeypatch) -> None:
+    from triage.store.command_center import FabricSqlCommandCenterStore
+
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    database = FabricSqlDatabase(server="unused", database="unused", cooldown_seconds=0)
+
+    def unavailable():
+        raise RuntimeError(f"Connection rejected with {secret}")
+
+    monkeypatch.setattr(database, "_connect", unavailable)
+    with pytest.raises(SqlUnavailable) as error:
+        FabricSqlCommandCenterStore(database).commands()
+    assert "RuntimeError" in str(error.value)
+    assert "Connection rejected" in str(error.value)
+    assert secret not in str(error.value)
+    assert secret not in database.connection_error
+    monkeypatch.setattr(database, "_connect", object)
+    assert database.is_available
+    assert database.connection_error == ""
+
+
+def test_sql_attempts_its_first_connection_in_a_fresh_sandbox(monkeypatch) -> None:
+    monkeypatch.setattr("triage.store.fabric_sql.time.monotonic", lambda: 1.0)
+    database = FabricSqlDatabase(server="unused", database="unused")
+    calls = []
+
+    def connect():
+        calls.append(True)
+        return object()
+
+    monkeypatch.setattr(database, "_connect", connect)
+    assert database.is_available
+    assert calls == [True]
+
+
+def test_sql_failure_at_monotonic_zero_still_observes_recovery_cooldown(monkeypatch) -> None:
+    now = [0.0]
+    monkeypatch.setattr("triage.store.fabric_sql.time.monotonic", lambda: now[0])
+    database = FabricSqlDatabase(server="unused", database="unused")
+    calls = []
+
+    def connect():
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("Synthetic connection failure")
+        return object()
+
+    monkeypatch.setattr(database, "_connect", connect)
+    assert not database.is_available
+    now[0] = 1.0
+    assert not database.is_available
+    assert len(calls) == 1
+    now[0] = 31.0
+    assert database.is_available
+    assert len(calls) == 2
+    assert database.connection_error == ""
+
+
 def _result(**overrides) -> TriageResult:
     base = {
         "outcome": "needs_human",
@@ -137,6 +231,21 @@ def test_schema_covers_every_store() -> None:
     sql = " ".join(schema_statements(DEFAULT_TABLES))
     for table in DEFAULT_TABLES.values():
         assert table in sql, f"{table} has no CREATE statement"
+
+
+def test_retiring_permission_storage_preserves_every_operational_table(runner, test_settings) -> None:
+    operational = {
+        "incidents", "processed", "approvals", "retries", "semantic_health", "leases",
+        "claims", "inbox_audit", "pipeline_reruns", "agent_runs", "agent_events",
+        "agent_commands", "incident_activity",
+    }
+    assert set(DEFAULT_TABLES) == set(runner._sql_tables()) == operational
+    assert "command_center_access_table_name" not in type(test_settings).model_fields
+    sql = " ".join(schema_statements(runner._sql_tables()))
+    assert "triage_command_center_access" not in sql
+    for table in runner._sql_tables().values():
+        assert table in sql
+    assert all(statement not in sql.upper() for statement in ("DROP TABLE", "TRUNCATE TABLE", "DELETE FROM"))
 
 
 def test_schema_creation_reports_failure_rather_than_raising() -> None:

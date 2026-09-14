@@ -1,7 +1,7 @@
 # Operations
 
-Running it in production: what runs on a schedule, how to turn each
-part off, and what to look at when it behaves unexpectedly.
+Operating the deployed accelerator: schedules, off switches, stored state and
+failure investigation. This is sample code, not a supported service.
 
 For first-time setup see [`DeploymentGuide.md`](DeploymentGuide.md).
 
@@ -9,19 +9,32 @@ For first-time setup see [`DeploymentGuide.md`](DeploymentGuide.md).
 
 | Trigger | What it does | Off switch |
 |---|---|---|
-| `bi-triage-mailbox-sweep` Logic App, every 5 min | Filters new mail, triages, acts or escalates | Disable the Logic App, or unset `GRAPH_MAILBOX` |
-| `bi-triage-silent-sweep` Logic App, hourly | Drains due retries, runs the silent-failure scan | Disable the Logic App, or `SILENT_SWEEP_ENABLED=false` |
-| Approval reply | Applies or abandons a proposed Tier 2 action | Unset `APPROVAL_CALLBACK_URL` — with no gate configured, every gated action is refused |
+| `bi-triage-mailbox-sweep` Logic App, every 5 min | Drains due retries, filters new mail, triages, acts or escalates | Disable the Logic App, or unset `GRAPH_MAILBOX` to stop mailbox ingestion |
+| `bi-triage-silent-sweep` Logic App, hourly | Runs the silent-failure scan; does not drain retries | Disable the Logic App, or `SILENT_SWEEP_ENABLED=false` |
+| Pipeline sweep, when deployed | Triages failed scheduled pipeline jobs and verifies approved reruns | Disable its scheduler, or `PIPELINE_SWEEP_ENABLED=false` |
+| Command sweep, when deployed | Drains authenticated operator investigations from the SQL queue | Disable its scheduler; queued requests are not executed by the web app |
+| Legacy Teams approval reply | Applies or abandons a proposed Tier 2 action | Unset `APPROVAL_CALLBACK_URL`; this does not disable the separate web channel |
+| Web approval reply | Conditionally records an authenticated, fingerprint-bound decision | No action without an explicit valid approval; disabling the UI does not revoke a decision already recorded |
 
-Neither Logic App exists until you deploy it, and nothing runs on a timer until
-you do.
+No scheduler exists until you deploy it, and nothing runs on a timer until you do.
 
-**Foundry routines do not fire.** The routines declared in `azure.yaml` **ship
-disabled**: a routine reports `enabled`, accepts dispatches, and never invokes
-the agent. Verified 2026-09-02, six days after registration, by three
-independent checks; see [`foundry/README.md`](foundry/README.md).
-Re-test in your own tenant before enabling — this may be regional, or already
-fixed.
+The optional `pipeline sweep` command uses the same scheduler template.
+[PipelineTriage.md](PipelineTriage.md) documents its explicit target allowlist,
+approval-gated reruns, submission journal and required permissions.
+
+The [agent command center](CommandCenter.md) provides pending requests, run
+history, read-only questions and explicit reconciliation of interrupted
+commands. Set `APPROVAL_DELIVERY_MODE=web`, `NOTIFICATION_CHANNEL=web` and
+`RUN_HISTORY_ENABLED=true` on the controller to use it without Teams. Deploy a
+separate scheduler with `command="command sweep"`; a healthy web process alone
+does not drain the queue.
+
+**Foundry routines did not fire in the recorded evaluation.** The routines
+declared in `azure.yaml` **ship disabled**: the evaluated routine reported
+`enabled` and accepted dispatches but never invoked the agent. Verified
+2026-09-02, six days after registration, by three independent checks; see
+[`foundry/README.md`](foundry/README.md). Re-test in your own tenant before
+enabling; this may be regional or already fixed.
 
 The trigger the accelerator actually supports is a Logic App:
 [`infra/scheduled-sweep.json`](../infra/scheduled-sweep.json). It authenticates
@@ -29,18 +42,19 @@ with a system-assigned managed identity, so there is no key anywhere, and it
 keeps its own run history, so a sweep that fails is visible afterwards rather
 than being a thing that quietly stopped.
 
-Deploy it once per cadence. The two sweeps answer different questions:
+Deploy it once per cadence. The mailbox and silent-failure sweeps are separate:
 
 ```powershell
+az account set --subscription "<subscription>"
 $ep = (azd env get-values | Select-String AZURE_AI_PROJECT_ENDPOINT) -replace '.*="(.*)"','$1'
 
 # hourly: find models that failed without telling anyone
-az deployment group create -g <rg> --template-file infra/scheduled-sweep.json `
+az deployment group create -g <rg> --template-file infra\scheduled-sweep.json `
   --parameters name=bi-triage-silent-sweep projectEndpoint=$ep `
                command="silent sweep" frequency=Hour interval=1 owner=<you>
 
 # every 5 min: drain the mailbox, perform due retries
-az deployment group create -g <rg> --template-file infra/scheduled-sweep.json `
+az deployment group create -g <rg> --template-file infra\scheduled-sweep.json `
   --parameters name=bi-triage-mailbox-sweep projectEndpoint=$ep `
                command="sweep" frequency=Minute interval=5 owner=<you>
 ```
@@ -59,11 +73,11 @@ question that changes once a day, and `executeQueries` is capped at 120/minute
 per user across every dataset, so polling hard makes the detector load on the
 capacity it is watching.
 
-The `command` parameter is constrained to the two values the controller
-recognises. That constraint matters: the agent routes anything it does not
-recognise to "triage this text as an alert", so a typo would not fail — it would
-quietly triage the word `sweeep` as though it were a Power BI failure report,
-every five minutes, and look like it was working.
+The `command` parameter is constrained to `sweep`, `silent sweep`,
+`pipeline sweep` and `command sweep`, which the controller recognises.
+Unrecognised text is routed to alert triage, so an unconstrained typo such as
+`sweeep` would become a Power BI failure report every five minutes rather than
+failing as an unknown command.
 
 The HTTP call does not retry. A sweep that times out is picked up by the next
 scheduled run instead, because a retry overlapping an in-flight triage can post
@@ -107,9 +121,10 @@ azd ai routine disable bi-triage-schedule
 azd ai routine show bi-triage-schedule -o json        # confirm; the deploy will not do it for you
 ```
 
-**The silent-sweep off switch is configuration, not routine state**, for the same
-reason. A deploy resets routine state; it does not reset an environment variable
-you set deliberately.
+**The silent-sweep off switch is configuration, not routine state.** Set
+`SILENT_SWEEP_ENABLED=false` to stop scanning independently of the trigger.
+`azd deploy` does not manage routine enabled-state, so disabling a routine is
+not a substitute for configuring the controller.
 
 ## Budgets
 
@@ -141,12 +156,57 @@ bi-triage health --probes      # what is watched, and how
 bi-triage health --baselines   # what healthy looked like last time
 bi-triage health --preflight   # configuration that would silently detect nothing
 bi-triage health --accept all  # accept a planned change as the new normal
+bi-triage pipelines --targets  # configured Fabric pipelines and reviewed replay policy
+bi-triage pipelines --preflight # configuration only, without network
+bi-triage pipelines            # one bounded scheduled-pipeline sweep
 bi-triage flags                # data quality findings, reported not fixed
 bi-triage preflight            # configured vs missing, printing no secret values
 ```
 
 Everything printed is already redacted: redaction happens inside the store
 boundary, so a display path cannot forget it.
+
+## Command-center access and incident work
+
+The command-center queue and inspector link to a separate **Incidents** page.
+Open **See full incident details** for evidence, execution history, append-only
+notes, the durable read-only discussion and human tracking decisions. Closed
+records remain searchable. **Needs investigation** includes the wire status
+`needs_review`; selecting a summary tile clears search and workload filters
+because its count is not scoped to them.
+
+Operator or Admin permission is required to add notes or record **Resolved by
+user**. Enter a reason, review the current evidence and confirm the tracking
+decision. The API checks both the tracking version and the source revision.
+If it returns `409`, refresh the case and review again. A user resolution does
+not verify a repair, reset the remediation budget, approve a proposal or remove
+a command/rerun uncertainty block. New controller evidence invalidates the older
+closure. The decision remains in history.
+
+**Access & permissions** is visible to Reader and higher app roles. It reports
+roles and issued/expiry timestamps from the validated API token, not current
+group membership. Group owners manage membership in the four ordinary Entra
+security groups; authorized IT administrators manage their app-role assignments.
+There is no in-app Add/Edit user, invite or SQL-grant workflow. Operator and
+Approver remain separate roles; Admin has all app capabilities but no directory
+administration. See the [role catalog and setup](CommandCenter.md#authentication-and-roles).
+
+After an Entra change, select **Refresh permissions**. It requests a fresh API
+token and reloads access information and the snapshot. Stale actions remain
+locked until that reload succeeds. Use the explicit sign-in control if renewal
+requires interaction. Refresh does not revoke other sessions' already-issued
+tokens or prove that Entra membership changes have finished propagating.
+The old `?view=admin` route now opens this read-only page, and authenticated
+requests to retired permission-editor APIs return `410 managed_in_entra`.
+Do not restore a SQL permission table or clear incident data to repair access.
+
+**Scenario validation** is Admin-only and checks the 15 canonical cases using
+synthetic tools and isolated state. Mock mode checks deployed controller code;
+Foundry mode also makes model calls. Neither repairs production resources.
+Read the recorded assertions and run timeline rather than treating every pass
+as an incident resolution. **Stop queue** only stops new requests; accepted
+requests can finish. The [command-center guide](CommandCenter.md#validation-and-evidence)
+documents validation and the separate live checks.
 
 ## When it behaves unexpectedly
 
@@ -172,6 +232,25 @@ is announced once, not once per occurrence.
 **A refresh was not attempted during a capacity incident.** Deliberate. A
 throttled retry is postponed with exponential backoff, capped at three attempts,
 rather than retried immediately and made worse. `bi-triage retries` shows when.
+
+**A new investigation stays queued.** A web response confirms durable receipt,
+not execution. Check the separate `command sweep` scheduler and its invocation
+permission. The web process does not drain production commands.
+
+**A command is interrupted or uncertain.** Inspect external job history and
+target state before an Admin records **Human reconciliation** with a reason.
+That decision clears the command-worker uncertainty block without executing
+or retrying the command. It does not clear a pipeline rerun reservation or prove
+that the underlying repair succeeded. See
+[Interrupted commands and reconciliation](CommandCenter.md#interrupted-commands-and-reconciliation).
+
+**An incident question is pending or failed.** Its question may already be
+durable even when the response was lost. Refresh the saved discussion and
+inspect its run history; no success or automatic retry is inferred.
+
+**The UI shows records but locks actions.** The last snapshot or renewed
+permissions could not be confirmed. Check the explicit API error and refresh
+access/records. Cached records are not evidence of current permission.
 
 **The hosted agent starts and immediately fails.** Check the environment
 variables it was deployed with. pydantic-settings JSON-decodes complex field
@@ -199,6 +278,17 @@ azd ai agent monitor bi-triage-controller
 A deploy that finishes in ~25 seconds instead of the usual minute and a half
 detected no source change and shipped nothing. Exit code 0 is not proof; invoke
 it and read the result.
+
+Inspect the Responses body's `status` and `error`, not just HTTP status or the
+CLI exit code. A deployed controller returned HTTP 200 with `status=failed`
+while the CLI exited 0 and printed no failure text. The scheduler now validates
+that `status` is `completed` and any `error` is null. A failed, incomplete or
+malformed response fails the Logic App run even if its HTTP request succeeded.
+Failure notification is optional; failed run status is not.
+Logic Apps can represent a successful JSON response as a base64 `$content`
+envelope when the endpoint sends `Content-Encoding: identity`. The scheduler
+decodes that wrapper before applying the same status/error checks; it does not
+treat the wrapper itself as the agent's result.
 
 ## Telemetry
 

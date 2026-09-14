@@ -1,36 +1,34 @@
 # Customization
 
-Adapting this to your failures, your tools and your risk tolerance.
-
-The structure generalises past Power BI. What makes it work is the separation:
-reasoning agents hold prompts and no permissions, the controller holds every
-limit and every credential, and deterministic detectors produce the evidence.
-Keep that split and most of this document is mechanical.
+Adapt the failure types, tools and policy while preserving the separation of
+responsibilities: reasoning agents interpret evidence without service
+permissions, the controller enforces action limits, and deterministic detectors
+produce measurements. Live components authenticate with their own Entra
+identities; a command-center user's app role is not a controller service grant.
 
 ## Decide the tier before writing any code
 
-Every action belongs in one of three classes, and the class decides where the
-code goes. The first column is the value the model actually carries in
-`TriageResult.tier` — there is no `tier_3`, because "never automate" is not a
-tier of automation:
+Classify the proposed action before exposing it. The first column is a value
+of `TriageClassification.tier`, available through `TriageResult.classification`
+when a classification was recorded. There is no `TriageResult.tier` field or
+`tier_3` value. Classification does not itself authorize a tool:
 
 | `tier` value | Meaning | Where it lands |
 |---|---|---|
 | `tier_1` | Transient and idempotent. Safe unattended. | `REMEDIATION_ACTIONS` |
 | `tier_2` | Deterministic fix, real blast radius. Human approves first. | `REMEDIATION_ACTIONS` + an approval gate |
-| `needs_human` | Never automate. Report with evidence. | `REPORTING_ACTIONS` |
+| `needs_human` | No suitable permitted automation. Escalate with evidence. | Reporting tools only; do not add the unsafe action to an allowlist |
 
 An approval gate decides *whether a permitted action runs*. It never authorises
 an action that is off the allowlist: approval-gated actions are a subset of
 `REMEDIATION_ACTIONS`, so there is no path by which saying yes widens what the
 agent can do.
 
-Getting this wrong is the expensive mistake. The test: if this action ran at
-03:00 with nobody watching and the diagnosis was wrong, what is the damage? If
-the answer is "we retry it", Tier 1. If it is "we restore from backup", Tier 3.
-
-Duplicate rows are Tier 3 here for that reason. Deleting the wrong duplicate is
-unrecoverable, and the agent cannot know which row is authoritative.
+Evaluate the consequence of a wrong diagnosis before classifying an action as
+safe unattended. Retrying a confirmed transient failure differs from deleting
+data that might require restoration from backup. Duplicate deletion is outside
+the allowlist here: the agent cannot know which row is authoritative. It can
+report and flag duplicate evidence, not repair the underlying records.
 
 ## Add a remediation tool
 
@@ -51,6 +49,12 @@ Five steps, all required:
 
 Give the tool its own mock. The offline path is the evaluation path; a tool that
 only works live cannot be demonstrated or tested.
+
+Pipeline requests use `PIPELINE_ACTIONS` as well as the action taxonomy. Add an
+action to that workload's set only after reviewing its effect on pipelines;
+do not make dataset tools available to pipeline requests. The existing monitor
+handles explicitly configured scheduled pipeline jobs. Notebook failures
+inside their activity evidence do not imply standalone notebook monitoring.
 
 ## Add a preconditioned action
 
@@ -75,14 +79,28 @@ a rubber stamp, and the person clicking it is accountable for the result.
 A denial must not consume the remediation budget, or one "no" disarms the agent
 for the rest of the incident.
 
+The current gated remediations are `rebind_dataset_gateway`,
+`reenable_refresh_schedule` and `rerun_fabric_pipeline`. Schedule re-enablement
+also requires successful refresh evidence. A pipeline rerun requires a reviewed
+target and complete replay-parameter set, rechecked prerequisites after approval,
+and a durable reservation before submission. Its correlated job and activity
+evidence must confirm success; HTTP acceptance is not a resolution.
+
+For web decisions, use the authenticated command-center API and its exact,
+fingerprint-bound decision method. Do not accept a responder identity from a
+request body or adapt the legacy bearer-link callback into an authentication
+mechanism. App Approver or Admin permission controls who may answer, while the
+controller still decides whether the approved action may execute.
+
 ## Add a playbook
 
 Entries live in `knowledge/playbooks.py`: triggers, a `retry_useful` verdict, and
 a public Microsoft Learn source.
 
-`retry_useful` is the field that changes the decision. "Credentials expired" and
-"capacity throttled" both surface as "refresh failed", but retrying fixes one and
-wastes capacity on the other.
+`retry_useful` distinguishes retry candidates from failures needing a different
+response. A transient timeout, expired credentials and capacity throttling can
+all surface as "refresh failed": credentials need correction, throttling needs
+backoff, and only a permitted transient failure justifies an immediate retry.
 
 Retrieval is capped at three. If a new entry matters more than an existing one,
 raise its trigger specificity rather than the cap — a larger prompt is not
@@ -113,27 +131,80 @@ gets turned off, and then it is not detecting anything. Design accordingly:
 
 ## Add an agent
 
-Mirror `DataQualityAgent`: its own provider, prompt and tools, returning a typed
-Pydantic model, exposed to the orchestrator as a single tool.
+Mirror `DataQualityAgent`'s boundary: a separate provider and prompt, a typed
+Pydantic result, and one tool exposed to the orchestrator. Its current
+implementation scans every registered table deterministically, then makes one
+tool-free model call to interpret the selected evidence. A specialist does not
+need a model-driven tool loop merely to qualify as an agent.
 
 It **reports**; the orchestrator decides. Do not give a reasoning agent the
 ability to act — permissions belong to the component that acts, not the one that
-reasons. Each agent gets its own identity, so each needs its own grant. If a new
-reasoning agent seems to need a permission, the design is wrong.
+reasons. A separate identity does not imply a service grant. If a new reasoning
+agent seems to need a permission, reconsider that boundary.
 
-New agents share the same `PolicyLedger`. Budgets are per incident, not per
-agent, so a second agent does not double the ceiling.
+Specialists called by triage share its `PolicyLedger`, so a second agent does
+not double the run's ceiling. Incident suppression and durable claims govern
+repeat work across invocations; a new agent must not bypass them.
+
+The command-center observer is separate from actionable triage. It answers from
+authorized records, has no tools, and cannot approve, queue or execute work.
+Keep human notes and prior answers in its untrusted evidence context, not in
+system instructions. Persist discussion through the incident activity store.
+
+## Extend the command center
+
+Keep the React/Vite interface behind `triage.command_center.api`. New actions
+need typed HTTP contracts, backend permission checks, durable command or
+activity records and offline frontend/backend tests. A disabled button is not
+an authorization boundary.
+
+Reader can inspect records and ask questions. Operator adds investigations,
+notes and user resolutions; Approver can answer approval requests. Operator and
+Approver do not imply one another. Admin includes all app operations, scenario
+validation and reconciliation, but no directory administration.
+
+Access is managed through four ordinary Entra security groups mapped to the
+existing `CommandCenter.*` app roles. Use
+`scripts/register_command_center.py` and
+`scripts/configure_command_center_groups.py` for registration and group setup,
+with an authorized operator; neither grants directory authority to the app.
+The Access & permissions page reports validated token roles, not memberships.
+There is no SQL ACL to customize. The retired
+`COMMAND_CENTER_ACCESS_MANAGEMENT_ENABLED=true` setting is rejected.
+
+After **Refresh permissions**, keep actions disabled until a snapshot loaded
+under the new token-refresh generation succeeds. A token's role claims are not
+a continuous directory check, and group changes do not revoke existing tokens
+immediately. Profile-photo consent uses a separate delegated Graph `User.Read`
+token; it must not become a requirement for app authorization.
+
+Human **Resolved by user** decisions append tracking activity bound to the
+original SQL NVARCHAR payload's SHA-256 hash over UTF-16 LE bytes. Do not hash a
+re-serialized model: defaults or whitespace can change the revision. New
+controller evidence invalidates the closure, and neither closure nor notes may
+reset incidents, approvals, claims, notification counts or remediation budgets.
+Use the same tracking projection for the queue, counts and full incident record.
+
+Preserve the shared safe Markdown renderer for explanations and answers:
+no raw HTML, images or unsafe links. Presentation tokens live in
+`command-center/src/styles.css`; the current design uses self-hosted DejaVu
+Serif Condensed, Onyx dark/light colors and Ink-style geometry and shadows.
+Keep the supplied PNG logo and packaged font assets unless a deliberate branding
+change updates the asset checks too. The separate Rayfin cockpit remains
+read-only and is not an alternative command writer.
 
 ## Change the model
 
-`FOUNDRY_AGENT_MODEL` for the Foundry path, `AZURE_OPENAI_DEPLOYMENT` for the
-direct path. See [`FAQs.md`](FAQs.md) for what the choice
-affects and what to do when a deployment is unavailable.
+Use `FOUNDRY_AGENT_MODEL` when registering Foundry agents and
+`AZURE_OPENAI_DEPLOYMENT` for the direct path. Changing a local Foundry model
+setting does not update an already registered agent. See [`FAQs.md`](FAQs.md)
+for deployment availability and [`CommandCenter.md`](CommandCenter.md) for the
+optional observer.
 
 After any prompt or tool-schema change, re-register:
 
 ```powershell
-python scripts\register_foundry_agents.py
+.\.venv\Scripts\python.exe scripts\register_foundry_agents.py
 ```
 
 A Foundry-registered agent does not pick up local changes. Without this the run
@@ -141,9 +212,11 @@ looks unaltered, which is worse than an error.
 
 ## Change the trigger
 
-The mailbox is one entry point, not the design. `runner.py` exposes triage as a
-function; anything that can call it can be a trigger — a webhook, a queue, a
-Fabric event, a schedule.
+The mailbox is one entry point. `TriageRunner.run_request` is also used by
+interactive and queued requests; `pipeline_sweep` handles configured scheduled
+pipeline failures. A webhook, queue or Fabric event would need an adapter with
+equivalent authentication, target validation, filtering, claims and persistence.
+These are extension points, not preconfigured triggers.
 
 Whatever the trigger, keep an equivalent of the inbox filter. It fails closed,
 including when its own pattern is invalid, and counts what it ignored rather
@@ -152,13 +225,13 @@ steer the agent.
 
 ## Move to a different domain
 
-The reusable parts are `policy.py`, `approvals.py`, `signature.py`,
-`redaction.py`, the incident store and outcome validation. None of them know
-anything about Power BI.
+Reuse the mechanisms in `policy.py`, `approvals.py`, `signature.py`,
+`redaction.py`, the incident store and outcome validation. Their current action
+names, signatures and evidence checks contain workload-specific choices;
+review those rather than assuming they are domain-free.
 
 What you replace: the tools, the playbooks, the detectors and the prompts.
 
-What you should not replace: the rule that the controller owns every limit. A
-limit that exists only as prompt wording is not a limit, and the first thing a
-capable model does with an ambiguous instruction is find the reading that lets
-it proceed.
+Retain controller-owned limits, fail-closed approvals, durable concurrency
+controls and deterministic outcome validation. Prompt wording cannot enforce
+any of these boundaries.

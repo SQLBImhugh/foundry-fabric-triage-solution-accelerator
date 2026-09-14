@@ -1,15 +1,12 @@
-"""The Data Quality agent — a genuinely separate agent, not a tool.
+"""A separate Data Quality agent exposed through one typed consultation tool.
 
-It has its own provider, its own system prompt, its own tool, and its own
-small controller loop. The Triage agent reaches it only through the
-``consult_data_quality_agent`` tool, and receives a typed
-:class:`DataQualityFinding` back.
+A deterministic scan runs before a single tool-free provider interpretation.
+The Triage agent calls ``consult_data_quality_agent`` and receives a typed
+:class:`DataQualityFinding`; the model does not own the scan or a tool loop.
 
 The important property: **deterministic evidence overrides the model.** The
 scan produces the numbers; the model produces the sentence. If the model
-contradicts the scan, the scan wins and the disagreement is logged. An agent
-that can talk itself out of its own evidence is not one you can put in front
-of an operations team.
+contradicts the scan, the scan wins and the disagreement is logged.
 """
 
 from __future__ import annotations

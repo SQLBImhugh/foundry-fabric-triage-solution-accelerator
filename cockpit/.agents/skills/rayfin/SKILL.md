@@ -57,7 +57,7 @@ search_docs(query: 'known limitations', module: 'guide')
 
 ### Security
 
-- Every entity must have an explicit permission decorator (`@role`, `@anonymous`, `@authenticated`) — entities without one are inaccessible.
+- Every entity must have an explicit permission decorator (`@role`, `@anonymous`, `@authenticated`). The installed `@microsoft/rayfin-core@1.33.2` reference (`assets/docs/permissions.md`) documents explicit grants, not the behavior of an entity with no permission decorator. That default needs version-specific verification; do not assume either denial or authenticated full CRUD.
 - Add `policy: (claims, item) => claims.sub.eq(item.user_id)` for row-level filtering on user-scoped data.
 - Use `exclude` in role options to hide sensitive fields (e.g., `exclude: ['secret']`).
 - Publishable keys (`pk-*`) are safe for client-side code — never expose service secrets or connection strings.
@@ -73,7 +73,7 @@ search_docs(query: 'known limitations', module: 'guide')
 - `@text()` length option is `max` (not `maxLength`) — e.g., `@text({ max: 200 })`.
 - Use `@one(() => Target)` with lazy arrow functions for relationships — Rayfin auto-generates FK columns named `{property}_id`.
 - Use `import` (not `import type`) for entity classes referenced in `@one()`/`@many()` arrow functions — decorators need the runtime class value.
-- FK columns referencing another entity (`{property}_id`) must use `@uuid()` to match the PK type. Auth-based fields like `user_id` from `claims.sub` use `@text()`.
+- FK columns referencing another entity (`{property}_id`) must use `@uuid()` to match the PK type. Auth-based fields like `user_id` from `claims.sub` use bounded `@text({ max: N })` on MSSQL.
 - Many-to-many requires an explicit join entity with two `@one()` fields.
 - Use `@many(() => Target)` for the inverse side of relationships.
 
@@ -103,9 +103,9 @@ search_docs(query: 'known limitations', module: 'guide')
 ## Anti-Patterns
 
 - Never use raw `fetch()` or hand-built GraphQL for data operations — always use `client.data.<Entity>` (provides type-safe queries and automatic auth).
-- Never omit permission decorators on entities — always add an explicit `@permissions(...)`. Forgetting silently applies `authenticated: *` (full CRUD for any signed-in user), which is usually too permissive for production data.
-- Never use `@text()` without `max` on MSSQL — always set `@text({ max: N })` (e.g. `max: 200` for typical strings). `NVARCHAR(MAX)` breaks GraphQL schema generation and cannot be uniquely indexed.
-- Never use `@text()` for FK columns that reference another entity's `@uuid()` PK — use `@uuid()` to match types. (`user_id` from `claims.sub` is `@text()`, not a FK.)
+- Never omit permission decorators on entities — use the documented `@role('authenticated', actions)` or `@authenticated(actions)` with deliberately chosen actions, rather than relying on an unspecified default.
+- Never use `@text()` without `max` on MSSQL — always set `@text({ max: N })` (e.g. `max: 200` for typical strings). The installed `@microsoft/rayfin-guide@1.33.2` (`assets/docs/known-limitations.md`) warns that `NVARCHAR(MAX)` can prevent GraphQL schema generation. It does not establish unique-index behavior; verify index limits for the target database/version.
+- Never use `@text()` for FK columns that reference another entity's `@uuid()` PK — use `@uuid()` to match types. (`user_id` from `claims.sub` is bounded text on MSSQL, not an entity FK.)
 - Never skip `search_docs('known limitations')` before implementing entities — always run it first to surface platform constraints (text length caps, supported scalar types, MSSQL-specific gotchas) that affect entity design.
 
 ## CLI Quick Reference

@@ -1,123 +1,109 @@
-# Universal App — agent guide
+# Read-only Fabric cockpit contributor guide
 
-> **You're an agent** working in a **lean, universal Rayfin app** (a Microsoft
-> Fabric Backend-as-a-Service app). It ships as a tiny "hello world" and is
-> designed to **grow into whatever the user asks for** — a CRUD app, a charts
-> dashboard, a Power BI analytics dashboard, or any mix. Your job is to grow it
-> **on demand**, pulling in only the capabilities the request actually needs.
+The [repository contributor contract](../AGENTS.md) applies here. This directory
+contains the existing React/Vite monitoring cockpit, not an unconfigured
+Universal App starter. Read [README.md](README.md) for its deployment and command
+reference.
 
-**Before you write any code, do three things:**
+## Scope and safety boundaries
 
-1. **Route first.** Read the **`capability-router` skill**
-   (`.agents/skills/capability-router/SKILL.md`). It maps a plain-English request
-   to a set of **capability packs**, and for each one tells you exactly what to
-   turn on: which Fabric **service** to enable, which npm **modules** to install,
-   which **code** to scaffold, and which **skill** to read for the patterns.
-2. **Stay lean.** Don't enable services, install modules, or copy in kit code the
-   request doesn't need. The whole point of this template is that it starts small
-   and only grows where the user is going.
-3. **Never answer Rayfin APIs from memory.** The router decides *what capabilities
-   to add*; the version-locked skill at `.agents/skills/rayfin/SKILL.md` stays
-   authoritative for *how Rayfin's APIs are actually called*. See
-   [Rayfin docs](#rayfin-docs).
+- Keep this app read-only. It queries controller state through a semantic model;
+  it has no remediation, approval, reset or incident-resolution controls.
+  Operator workflows belong to the separate
+  [Azure-hosted command center](../docs/CommandCenter.md).
+- Keep the standalone Fabric SQL state database independent of both apps.
+  Rayfin `data.enabled` is `false`. Do not enable an app-owned data service,
+  migrate the controller's tables through Rayfin or delete the database as an
+  app deployment step.
+- Preserve Fabric-hosted authentication. `src/lib/fabric-client.ts` uses the
+  Fabric embed proxy; no app `AuthProvider` is needed for that path. A local
+  Vite server does not provide the Fabric host or authorize model access.
+- Keep the default test path offline. Never make a test depend on tenant access
+  or a live semantic model. Use synthetic fixtures for automated checks.
+- Do not add credentials, live environment IDs, personal data or customer data
+  to source, screenshots or documentation.
 
----
+## Current implementation
 
-## What ships in the base
+`src/main.tsx` renders `App`, which mounts the theme, sketch, selection and filter
+providers around `src/pages/CockpitPage.tsx`. The page reads the `triageState`
+alias through `useSemanticModelQuery`. DAX and state-schema assumptions live in
+`src/queries/triage.ts`; cards use the dashboard kit's `toChartData` and `toTable`
+mapping helpers.
 
-A minimal React 19 + Vite app, Fabric-ready but deliberately bare:
+Queries run on load; the page does not periodically refresh itself. Preserve
+loading, empty and error states, and do not describe cached or mirrored data as
+instantaneous SQL state. A blank approval decision must never be presented as
+approval.
 
-- A no-auth `HomePage` (`src/pages/HomePage.tsx`) rendered by `src/App.tsx` — so
-  it previews with **no backend** (`npm run preview`).
-- **Fabric auth scaffolding, wired OFF** under `src/services/` +
-  `src/hooks/AuthContext.tsx` — the base is a static, public page, so it needs no
-  auth. **Wire auth in as soon as the app uses data** (see the rule in Rules).
-- **Graphein** wired in for charts: `src/components/Chart.tsx` (+ `useChart.ts`)
-  renders a declarative `<Chart spec={…} />`. The `graphein-visuals` pack covers
-  authoring specs.
-- An **empty data schema** (`rayfin/data/schema.ts`) and `rayfin/rayfin.yml` with
-  `auth` + `data` (mssql) + `staticHosting` enabled. The analytics stack is
-  **absent** until the analytics pack turns it on.
+The cockpit has a canonical dark theme in `src/global.css`, system fonts
+(Segoe UI and Cascadia Mono) and no theme-toggle control. Preserve that design
+unless a redesign is explicitly requested. The command center has a separate
+theme; its DejaVu Serif Condensed/Onyx styling does not redefine this app.
+Check both `src/main.tsx` and `index.html` before making a claim about font
+downloads.
 
-## The capability packs
+## Bundled skills
 
-Each pack is a skill under `.agents/skills/`, trigger-gated so it only fires when
-relevant. The router picks packs; the pack skill has the details.
+`.agents/skills/` retains reusable template and platform reference material.
+Statements there about a hello-world page, enabled Rayfin data, starter fonts,
+auth wiring or demo slicers describe template variants, not the deployed
+cockpit. Use the current source and this guide for app-specific decisions;
+resolve platform API questions against the installed package documentation.
 
-| Pack (skill) | Turn it on when the user wants… |
+| Work | References |
 |---|---|
-| `authentication` | Sign-in, accounts, login, protected pages, per-user data |
-| `data-modeling` | Records, CRUD, a database, entities, row-level security |
-| `graphein-visuals` | Charts, graphs, KPIs, tables, a simple dashboard |
-| `analytics` | Power BI / semantic-model dashboards, DAX, BI reporting |
+| Model aliases and query transport | [fabric-data](.agents/skills/fabric-data/SKILL.md) |
+| DAX grain, filtering and result shapes | [dax](.agents/skills/dax/SKILL.md) |
+| Dashboard cards, tables and charts | [visuals](.agents/skills/visuals/SKILL.md) |
+| Headless spec rendering | [headless-preview](.agents/skills/headless-preview/SKILL.md) |
+| Layout and visual tokens | [app-design](.agents/skills/app-design/SKILL.md), adapted to the existing dark theme |
+| Rayfin API and deployment details | [rayfin](.agents/skills/rayfin/SKILL.md) |
 
-The `analytics` pack also brings its own supporting skills (`build-workflow`,
-`visuals`, `dax`, `fabric-data`, `app-design`, `headless-preview`) — read those
-only when you're on the analytics path.
+The analytics pack is already installed. Do not run `npm run pack:add` to begin
+a routine cockpit change: it re-copies kit-owned files and can overwrite local
+customizations even when seed protection preserves `App.tsx` and `main.tsx`.
+Use the [capability router](.agents/skills/capability-router/SKILL.md) and
+[pack manifest reference](.agents/skills/capability-router/pack-manifest.md) only
+for an explicitly requested scaffolding or capability change, with the copy
+plan reviewed first.
 
-> **Fast path — one command.** A pack that ships a `pack.json` manifest turns on
-> with a single idempotent command instead of dozens of manual steps:
->
-> ```sh
-> npm run pack:add -- <pack>      # e.g. analytics
-> ```
->
-> It enables the service, installs the pinned modules, copies the kit, wires the
-> scripts, and seeds a runnable demo. **`analytics`** ships a manifest today;
-> more capabilities/connectors will adopt the same mechanism.
-> See `.agents/skills/capability-router/pack-manifest.md`.
+Do not rewrite versioned vendor guidance merely to match this app. Keep
+copyright and license notices intact, and report conflicting platform guidance
+rather than guessing which API behavior is correct.
 
----
+## Rayfin documentation
 
-## Rules
+Never answer Rayfin APIs from memory. Use the version-matched `rayfin` MCP server
+configured in `.mcp.json`, when available, or run the installed CLI from
+`cockpit` so it resolves this project's packages:
 
-- **Make the requested code changes only**, and keep the project building —
-  prefer small, correct increments.
-- **Deploy to Fabric with `npm run rayfin:up`** (i.e. `rayfin up`) when you want
-  to see the app running. `npm run preview` serves the base app locally with no
-  backend for a quick look; `npm run dev` runs it against your deployment. A real
-  deploy is needed once the app requires auth or data.
-- **Only use what Rayfin natively provides** (auth, data, static hosting) — don't
-  add external services like payment processors or email senders. Prefer
-  **stable, Fabric-supported** features unless the user asks for an experimental
-  one.
-- **Installing npm modules is expected** — install what a pack needs; don't
-  pre-install everything.
-- **Auth follows data.** Rayfin data is always accessed as an authenticated user
-  (no anonymous access on Fabric), so **wire authentication whenever the app uses
-  or connects to data** — `data-modeling`, per-user rows, row-level security. A
-  **static page over public data** needs no auth. (Analytics reads its Power BI
-  model through the Fabric embed proxy, which Fabric authenticates.)
+```powershell
+npx --no-install rayfin docs search "<topic>" --module guide
+npx --no-install rayfin docs get --symbol "<symbol>"
+```
 
-When you finish a capability, build and deploy (`npm run rayfin:up`) to see it on
-Fabric.
+Use `discover_packages` or `rayfin docs discover <topic>` when installed
+documentation does not cover the task. Install dependencies only for a required
+manifest change or a confirmed missing dependency.
 
-## Rayfin docs
+## Verification and deployment
 
-Start with the in-project skill at `.agents/skills/rayfin/SKILL.md`. It ships with
-the packages installed here, so it is version-matched to this project, and it owns
-every Rayfin specific: schema and decorators, the typed data API and client queries,
-auth, storage, and deployment. Prefer it over remembered APIs, which are routinely
-wrong across versions.
+For cockpit code changes, run the relevant Vitest tests, ESLint and the
+type-check/build from this directory:
 
-Rayfin docs are version-locked to the packages installed in this project.
-Prefer the `rayfin` MCP server in `.mcp.json` and its tools `search_docs`,
-`get_doc`, `list_docs`, and `discover_packages` for examples, API details, and
-troubleshooting. If MCP is unavailable, run `rayfin docs ...` from the project
-root so the CLI reads this project's `node_modules`. If `rayfin` is not on
-`PATH`, use `npx -y @microsoft/rayfin-cli docs ...` from the project root.
+```powershell
+npm test
+npm run lint
+npm run build:fabric
+```
 
-Use `discover_packages` or `rayfin docs discover <topic>` when installed docs do
-not cover the task.
+`npm run preview -- --spec <file>` renders a PNG and report; it does not serve a
+home page. Inline-data specs can run offline. `--query` uses a live model and
+is not part of the default offline suite. The preview's bundled Inter setup
+does not establish font parity with the system-font cockpit.
 
-## If you're asked to…
-
-| Task | Start here |
-|---|---|
-| Build "an app" / anything, from scratch | **`capability-router`** — classify the request, then pull in packs |
-| Add sign-in / accounts / per-user data | `authentication` |
-| Store records / build CRUD / add a table | `data-modeling` |
-| Restrict rows to their owner | `data-modeling` → row-level security |
-| Add a chart / KPI / small dashboard | `graphein-visuals` |
-| Build a Power BI / semantic-model dashboard | run **`npm run pack:add -- analytics`**, then `analytics` (then its sub-skills) |
-| Make it look polished / themed | the relevant pack's styling notes + Tailwind theme in `src/main.css` |
+`npm run dev` and `npm run rayfin:up` perform deployment work. Use them only when
+a deployment is part of the task, after checking the target tenant and
+workspace. Verify the deployed app inside Fabric, where the embed proxy is
+available. Local Vite rendering alone cannot verify authenticated model reads.

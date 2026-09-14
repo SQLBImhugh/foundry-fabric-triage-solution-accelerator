@@ -30,13 +30,14 @@ REMEDIATION_ACTIONS: frozenset[str] = frozenset(
         "refresh_powerbi_dataset",
         "rebind_dataset_gateway",
         "reenable_refresh_schedule",
+        "rerun_fabric_pipeline",
     }
 )
 
 # Remediations a human must authorise before dispatch, however confident the
-# agent is. These are actions whose blast radius extends beyond the thing being
-# fixed: rebinding a gateway affects every dataset bound to it, so the decision
-# belongs to someone who knows what else is on it.
+# agent is. Rebinding changes the selected dataset's persistent gateway binding,
+# not every dataset on that gateway. It changes future routing and can add load
+# to a shared gateway, so a person must review the target and impact.
 #
 # Membership here is a code change and a review. That is the point — it is the
 # difference between "the agent was told to ask" and "the agent cannot proceed
@@ -50,6 +51,7 @@ APPROVAL_REQUIRED_ACTIONS: frozenset[str] = frozenset(
         # recent refresh succeeded, so the human is being asked to authorise a
         # restoration, not to guess whether the cause was fixed.
         "reenable_refresh_schedule",
+        "rerun_fabric_pipeline",
     }
 )
 
@@ -80,6 +82,22 @@ DIAGNOSTIC_ACTIONS: frozenset[str] = frozenset(
         "check_duplicates",
         "get_known_incidents",
         "consult_data_quality_agent",
+        "get_pipeline_run_evidence",
+        "get_pipeline_rerun_status",
+    }
+)
+
+# A pipeline failure must never reach a semantic-model refresh or its deferred
+# retry queue, even if the model proposes one from the registered tool catalog.
+PIPELINE_ACTIONS: frozenset[str] = frozenset(
+    {
+        "get_request_context",
+        "get_known_incidents",
+        "get_pipeline_run_evidence",
+        "get_pipeline_rerun_status",
+        "rerun_fabric_pipeline",
+        "notify_teams",
+        "report_resolution",
     }
 )
 

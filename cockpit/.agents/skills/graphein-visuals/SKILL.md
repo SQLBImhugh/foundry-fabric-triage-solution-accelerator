@@ -18,7 +18,7 @@ description: >
 
 **One chart is one JSON object.** You don't hand-write SVG or wire a charting
 library. You (1) shape your data into plain rows, (2) author a single Graphein
-[`ChartSpec`](https://github.com/spatney/graphein/blob/main/docs/spec-reference.md)
+[`ChartSpec`](../visuals/references/graphein-spec-reference.md)
 — a `type`, a tidy `data` array, and an `encoding` that names the columns — and
 (3) render it with the bundled `<Chart>` component. Graphein owns axes, scales,
 ticks, color, the legend, tooltips, number/date formatting, responsive sizing,

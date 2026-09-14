@@ -1,0 +1,24 @@
+.markdown-text { color: var(--ink); font-size: 15px; line-height: 1.7; max-width: 76ch; min-width: 0; overflow-wrap: anywhere; }
+.markdown-text > :first-child { margin-top: 0; }
+.markdown-text > :last-child { margin-bottom: 0; }
+.markdown-text p { margin: 0 0 1em; white-space: pre-line; }
+.markdown-text h4, .markdown-text h5, .markdown-text h6 { font-size: 1.05em; line-height: 1.45; margin: 1.35em 0 .55em; color: var(--ink); }
+.markdown-text strong { color: var(--ink); }
+.markdown-text ul, .markdown-text ol { margin: .65em 0 1em; padding-left: 1.5em; }
+.markdown-text ul { list-style: disc; }
+.markdown-text ol { list-style: decimal; }
+.markdown-text li { padding-left: .2em; margin: .35em 0; }
+.markdown-text li > p { margin-bottom: .4em; }
+.markdown-text li > ul, .markdown-text li > ol { margin-top: .4em; }
+.markdown-text code, .markdown-preview code { font: inherit; font-size: .93em; color: var(--ink); background: var(--panel2); border: 1px solid var(--line); padding: .05em .3em; border-radius: var(--radius); }
+.markdown-text pre { font-size: .9em; margin: 1em 0; padding: 14px 16px; white-space: pre-wrap; line-height: 1.65; }
+.markdown-text pre code { padding: 0; border: 0; background: var(--transparent); }
+.markdown-text a { color: var(--accent-text); text-decoration: underline; text-underline-offset: 3px; }
+.markdown-text blockquote { margin: 1em 0; padding: .3em 0 .3em 1em; border-left: 3px solid var(--line-strong); color: var(--muted); }
+.markdown-text hr { margin: 1.2em 0; border: 0; border-top: 1px solid var(--line); }
+.markdown-table { max-width: 100%; overflow-x: auto; margin: 1em 0; }
+.markdown-table table { width: 100%; border-collapse: collapse; font-size: .93em; }
+.markdown-table th, .markdown-table td { padding: 9px 11px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+.markdown-table th { background: var(--panel2); color: var(--ink); }
+.markdown-preview { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; overflow-wrap: anywhere; margin: 9px 0 13px; font-size: 13px; line-height: 1.7; color: var(--muted); }
+.answer-panel > .markdown-text, .inspector-heading > .markdown-text { margin-top: 16px; }

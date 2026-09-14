@@ -44,18 +44,28 @@ npm install @microsoft/rayfin-data
 
 Create one file per entity under `rayfin/data/`, e.g. `rayfin/data/Note.ts`:
 
+For MSSQL, the installed `@microsoft/rayfin-guide@1.33.2`
+(`assets/docs/known-limitations.md`) recommends a `max` on every text field to
+avoid GraphQL schema-generation failures. The bounds below are example
+application limits, not platform defaults.
+
 ```ts
 import { entity, role, text, boolean, date, uuid } from '@microsoft/rayfin-core';
 
 @entity()
+@role('authenticated', '*')
 export class Note {
   @uuid() id!: string;
   @text({ min: 1, max: 200 }) title!: string;
-  @text() body!: string;
+  @text({ max: 2000 }) body!: string;
   @boolean() pinned!: boolean;
   @date() createdAt!: Date;
 }
 ```
+
+This shared-note example explicitly grants authenticated CRUD using the
+documented `@role` decorator; it does not rely on omitted-permission defaults.
+Use the owner-only policy below when notes must be private to each user.
 
 Common field decorators: `@uuid()`, `@text({ min, max })`, `@boolean()`,
 `@date()`, plus number/relation decorators. If you're unsure of a decorator or
@@ -116,10 +126,10 @@ import { entity, role, text, boolean, date, uuid } from '@microsoft/rayfin-core'
 export class Note {
   @uuid() id!: string;
   @text({ min: 1, max: 200 }) title!: string;
-  @text() body!: string;
+  @text({ max: 2000 }) body!: string;
   @boolean() pinned!: boolean;
   @date() createdAt!: Date;
-  @text() user_id!: string;
+  @text({ max: 200 }) user_id!: string;
 }
 ```
 

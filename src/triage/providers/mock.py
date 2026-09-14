@@ -147,6 +147,9 @@ class ScriptedProvider:
             )
 
         # Data quality gate — always before remediation.
+        if results.get("get_request_context", {}).get("workload") == "fabric_pipeline":
+            return self._pipeline_step(results, counts)
+
         if "consult_data_quality_agent" not in called:
             return (
                 "consult_data_quality_agent",
@@ -501,6 +504,89 @@ class ScriptedProvider:
                 "reasoning": ["Remediation unavailable or unsuccessful.", "Escalating rather than retrying."],
             },
             "Escalating.",
+        )
+
+    def _pipeline_step(
+        self, results: dict[str, Any], counts: dict[str, int]
+    ) -> tuple[str, dict[str, Any], str]:
+        if "get_pipeline_run_evidence" not in counts:
+            return "get_pipeline_run_evidence", {}, "Reading the failed scheduled job."
+
+        evidence = results.get("get_pipeline_run_evidence", {})
+        if self.rogue_unknown_action and "delete_pipeline" not in counts:
+            return "delete_pipeline", {}, "Attempting an action outside the allowlist."
+
+        if evidence.get("may_propose_rerun") and "rerun_fabric_pipeline" not in counts:
+            return (
+                "rerun_fabric_pipeline",
+                {"justification": (
+                    "The run has a retry-candidate failure and the operator reviewed "
+                    "replay safety and parameters. Request approval for one new run."
+                )},
+                "Requesting approval for the configured pipeline.",
+            )
+
+        rerun = results.get("rerun_fabric_pipeline", {})
+        if rerun.get("status") == "Submitted" and "get_pipeline_rerun_status" not in counts:
+            return "get_pipeline_rerun_status", {}, "Checking execution, not HTTP acceptance."
+        if (
+            self.rogue_second_refresh
+            and rerun.get("status") == "Submitted"
+            and counts.get("rerun_fabric_pipeline") == 1
+        ):
+            return (
+                "rerun_fabric_pipeline", {"justification": "Try a second time."},
+                "Attempting a second pipeline rerun.",
+            )
+
+        verified = results.get("get_pipeline_rerun_status", {})
+        outcome = "needs_human"
+        detail = evidence.get("rerun_refusal") or (
+            "Inspect the failed activities and sink state before any replay."
+        )
+        if rerun.get("status") == "not_approved":
+            outcome = "approval_denied"
+            detail = "Pipeline rerun was not approved. No pipeline was started."
+        elif rerun.get("status") == "Submitted":
+            if verified.get("succeeded"):
+                outcome = "resolved"
+                detail = "The approved pipeline rerun completed successfully."
+            else:
+                detail = (
+                    "The approved pipeline rerun was submitted but has not been "
+                    "verified successful. The pipeline sweep will check the new run."
+                )
+        elif rerun:
+            detail = str(rerun.get("reason") or rerun.get("detail") or rerun.get("error") or detail)
+
+        root = str(evidence.get("failure_summary") or "Pipeline failure needs investigation.")
+        if "notify_teams" not in counts:
+            return (
+                "notify_teams",
+                {
+                    "title": "Scheduled Fabric pipeline failure",
+                    "outcome": outcome,
+                    "action_taken": "rerun_fabric_pipeline" if rerun.get("status") == "Submitted" else "none",
+                    "detail": f"{root}\n{detail}",
+                },
+                "Reporting the pipeline evidence and outcome.",
+            )
+        return (
+            "report_resolution",
+            {
+                "outcome": outcome,
+                "tier": "tier_2" if rerun else "needs_human",
+                "category": "app",
+                "severity": "medium",
+                "root_cause": root,
+                "summary": detail,
+                "reasoning": [
+                    "Fabric job evidence identifies a failed scheduled pipeline run.",
+                    "Only the configured replay can be proposed; a human authorises it.",
+                    "Submission is not resolution.",
+                ],
+            },
+            "Recording pipeline triage.",
         )
 
     async def close(self) -> None:

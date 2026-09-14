@@ -161,6 +161,12 @@ def build_definitions(model: str) -> dict[str, dict[str, Any]]:
             # not from something the model can talk itself out of.
             "tools": [],
         },
+        "observer": {
+            "kind": "prompt",
+            "model": model,
+            "instructions": load_prompt("observer_system.md"),
+            "tools": [],
+        },
     }
 
 
@@ -301,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--triage-name", default=_settings.foundry_triage_agent_name)
     parser.add_argument("--dq-name", default=_settings.foundry_dq_agent_name)
+    parser.add_argument("--observer-name", default=_settings.foundry_observer_agent_name)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--print-definitions", action="store_true")
     parser.add_argument("--with-guardrail", action="store_true",
@@ -340,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
         # a future a2a wiring the reference must resolve.
         print(sync_agent(client, endpoint, args.dq_name, definitions["data_quality"], dry_run=args.dry_run))
         print(sync_agent(client, endpoint, args.triage_name, definitions["triage"], dry_run=args.dry_run))
+        print(sync_agent(client, endpoint, args.observer_name, definitions["observer"], dry_run=args.dry_run))
 
     if args.with_guardrail:
         print("\nguardrail:")

@@ -7,7 +7,7 @@ from typing import Literal
 from triage.providers.base import BaseProvider, LLMResponse, ToolCall
 from triage.providers.mock import ScriptedDataQualityProvider, ScriptedProvider
 
-Role = Literal["triage", "data_quality"]
+Role = Literal["triage", "data_quality", "observer"]
 
 __all__ = [
     "BaseProvider",
@@ -28,6 +28,8 @@ def get_provider(role: Role, settings, **overrides) -> BaseProvider:
     mode = overrides.pop("mode", None) or settings.triage_provider_mode
 
     if mode == "mock":
+        if role == "observer":
+            raise ValueError("The records-only observer does not need a model provider")
         if role == "data_quality":
             return ScriptedDataQualityProvider()
         return ScriptedProvider(**overrides)
@@ -44,7 +46,7 @@ def get_provider(role: Role, settings, **overrides) -> BaseProvider:
     if mode == "foundry":
         from triage.providers.foundry import FoundryAgentProvider
 
-        agent_name = (
+        agent_name = settings.foundry_observer_agent_name if role == "observer" else (
             settings.foundry_dq_agent_name
             if role == "data_quality"
             else settings.foundry_triage_agent_name

@@ -44,6 +44,8 @@ services:
               value: bi-triage
             - name: FOUNDRY_DQ_AGENT_NAME
               value: bi-data-quality
+            - name: FOUNDRY_OBSERVER_AGENT_NAME
+              value: bi-triage-observer
             - name: FOUNDRY_AGENT_MODEL
               value: ${FOUNDRY_AGENT_MODEL}
             - name: FOUNDRY_HANDOFF_MODE
@@ -82,6 +84,38 @@ services:
               value: ${FABRIC_SQL_SERVER}
             - name: FABRIC_SQL_DATABASE
               value: ${FABRIC_SQL_DATABASE}
+            - name: FABRIC_TENANT_ID
+              value: ${AZURE_TENANT_ID}
+            - name: FABRIC_CLIENT_ID
+              value: ${FABRIC_CLIENT_ID}
+            - name: FABRIC_PIPELINE_TARGETS
+              value: ${FABRIC_PIPELINE_TARGETS}
+            # Unset is disabled. Enabling this does not create a schedule;
+            # deploy scheduled-sweep.json with command="pipeline sweep".
+            - name: PIPELINE_SWEEP_ENABLED
+              value: ${PIPELINE_SWEEP_ENABLED}
+            - name: PIPELINE_RERUN_TABLE_NAME
+              value: ${PIPELINE_RERUN_TABLE_NAME}
+            - name: PIPELINE_LOOKBACK_HOURS
+              value: ${PIPELINE_LOOKBACK_HOURS}
+            - name: PIPELINE_MAX_PAGES
+              value: ${PIPELINE_MAX_PAGES}
+            - name: PIPELINE_MAX_RUNS_PER_SWEEP
+              value: ${PIPELINE_MAX_RUNS_PER_SWEEP}
+            - name: RUN_HISTORY_ENABLED
+              value: ${RUN_HISTORY_ENABLED}
+            - name: AGENT_RUN_TABLE_NAME
+              value: ${AGENT_RUN_TABLE_NAME}
+            - name: AGENT_EVENT_TABLE_NAME
+              value: ${AGENT_EVENT_TABLE_NAME}
+            - name: AGENT_COMMAND_TABLE_NAME
+              value: ${AGENT_COMMAND_TABLE_NAME}
+            - name: APPROVAL_DELIVERY_MODE
+              value: ${APPROVAL_DELIVERY_MODE}
+            - name: NOTIFICATION_CHANNEL
+              value: ${NOTIFICATION_CHANNEL}
+            - name: COMMAND_CENTER_URL
+              value: ${COMMAND_CENTER_URL}
             - name: INCIDENT_TABLE_NAME
               value: triage_incidents
             # Traces. Without this the container emits nothing, and the first

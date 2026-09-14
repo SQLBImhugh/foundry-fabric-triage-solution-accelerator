@@ -1,0 +1,36 @@
+name: scenario14-pipeline-write-timeout
+title: Pipeline write timeout with unresolved commit state
+description: An earlier activity succeeded and a SQL batch write timed out. Missing commit evidence must not be interpreted as rollback.
+pipeline:
+  target:
+    name: Orders ingestion
+    workspace_id: "10000000-0000-0000-0000-000000000001"
+    pipeline_id: "20000000-0000-0000-0000-000000000002"
+    rerun_safe: true
+    rerun_parameters: {}
+  runs:
+    - id: "30000000-0000-0000-0000-000000000003"
+      item_id: "20000000-0000-0000-0000-000000000002"
+      job_type: Pipeline
+      invoke_type: Scheduled
+      status: Failed
+      start_time: "2026-09-11T06:00:00Z"
+      end_time: "2026-09-11T06:05:00Z"
+      error_code: SqlBatchWriteTimeout
+      failure_reason: The SQL batch write timed out before its acknowledgement arrived.
+  activities:
+    - name: PrepareStaging
+      activity_type: Script
+      status: Succeeded
+    - name: WriteOrders
+      activity_type: Copy
+      status: Failed
+      error_code: SqlBatchWriteTimeout
+      message: The SQL batch write timed out before its acknowledgement arrived.
+expect:
+  outcome: needs_human
+  remediation_applied: false
+  approval_requested: false
+  flags_written: 0
+  pipeline_reruns: 0
+  incident_source: fabric_pipeline_failure

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ProviderMode = Literal["mock", "direct", "foundry"]
@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     foundry_project_endpoint: str = ""
     foundry_triage_agent_name: str = "bi-triage"
     foundry_dq_agent_name: str = "bi-data-quality"
+    foundry_observer_agent_name: str = "bi-triage-observer"
     foundry_agent_model: str = "gpt-5.6-luna"
     # Which agent-to-agent handoff shape the runtime uses.
     # 'responses'  = invoke the other agent over /openai/v1/responses. Our code
@@ -128,6 +129,46 @@ class Settings(BaseSettings):
     #: per user across all datasets, so a detector that fires them back to back
     #: becomes load on the capacity it is watching.
     silent_probe_pace_seconds: float = 1.0
+    # Parsed at command time so a malformed optional monitor cannot prevent
+    # the existing mailbox controller starting.
+    fabric_pipeline_targets: str = ""
+    pipeline_sweep_enabled: bool = False
+    fabric_tenant_id: str = ""
+    fabric_client_id: str = ""
+    pipeline_lookback_hours: int = Field(default=24, ge=1, le=168)
+    pipeline_max_pages: int = Field(default=10, ge=1, le=100)
+    pipeline_max_runs_per_sweep: int = Field(default=1, ge=1, le=100)
+    pipeline_rerun_table_name: str = "triage_pipeline_reruns"
+    run_history_enabled: bool = False
+    agent_run_table_name: str = "triage_agent_runs"
+    agent_event_table_name: str = "triage_agent_events"
+    agent_command_table_name: str = "triage_agent_commands"
+    incident_activity_table_name: str = "triage_incident_activity"
+    approval_delivery_mode: Literal["teams", "web"] = "teams"
+    notification_channel: Literal["teams", "web"] = "teams"
+    command_center_url: str = ""
+
+    @field_validator("pipeline_sweep_enabled", "run_history_enabled", mode="before")
+    @classmethod
+    def unset_pipeline_switch(cls, value):
+        # azd substitutes an unset optional environment value with "".
+        return False if value == "" else value
+
+    @field_validator(
+        "pipeline_lookback_hours", "pipeline_max_pages",
+        "pipeline_max_runs_per_sweep", "pipeline_rerun_table_name",
+        "agent_run_table_name", "agent_event_table_name", "agent_command_table_name",
+        "incident_activity_table_name",
+        "approval_delivery_mode", "notification_channel",
+        mode="before",
+    )
+    @classmethod
+    def unset_pipeline_default(cls, value, info: ValidationInfo):
+        if value == "":
+            assert info.field_name is not None
+            return cls.model_fields[info.field_name].default
+        return value
+
     # The URL behind the card's Approve/Decline buttons. An incoming webhook
     # has no bot behind it, so Action.Submit does nothing; the buttons have to
     # be links to something that records the decision. Empty means the card

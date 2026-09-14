@@ -44,11 +44,62 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from triage.redaction import redact_text
+
 logger = logging.getLogger("triage.store.approvals")
 
 
 def _utcnow() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _redacted(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, dict):
+        return {key: _redacted(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redacted(item) for item in value]
+    return value
+
+
+def _request_row(request: Any) -> dict[str, Any]:
+    return {
+        "request_id": request.request_id,
+        "action": request.action,
+        "fingerprint": request.fingerprint,
+        "report_name": redact_text(request.report_name),
+        "justification": redact_text(request.justification),
+        "impact": redact_text(request.impact),
+        "signature": getattr(request, "signature", ""),
+        "run_id": getattr(request, "run_id", ""),
+        "arguments": _redacted(request.arguments),
+        "requested_at": request.requested_at.isoformat(timespec="seconds"),
+        "expires_at": request.expires_at.isoformat(timespec="seconds"),
+        "decision": "", "responder": "", "reason": "", "decided_at": "",
+        "consumed_at": "",
+    }
+
+
+def _assert_open(row: dict[str, Any], fingerprint: str) -> None:
+    if not fingerprint or row.get("fingerprint") != fingerprint:
+        raise ValueError("This proposal changed; refresh it before deciding.")
+    if row.get("decision") or row.get("consumed_at"):
+        raise ValueError("This proposal has already been answered or consumed.")
+    try:
+        expires = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+        if expires.tzinfo is None or expires <= datetime.now(UTC):
+            raise ValueError("This proposal has expired.")
+    except (KeyError, TypeError) as exc:
+        raise ValueError("This proposal has no valid expiry.") from exc
+
+
+def _pending_priority(row: dict[str, Any]) -> bool:
+    try:
+        _assert_open(row, str(row.get("fingerprint") or ""))
+        return True
+    except ValueError:
+        return False
 
 
 class ApprovalChannel(Protocol):
@@ -68,24 +119,74 @@ class InMemoryApprovalChannel:
         self._items: dict[str, dict[str, Any]] = {}
 
     def open(self, request: Any) -> None:
-        row = {
-            "request_id": request.request_id,
-            "action": request.action,
-            "fingerprint": request.fingerprint,
-            "report_name": request.report_name,
-            "justification": request.justification,
-            "impact": request.impact,
-            "requested_at": request.requested_at.isoformat(timespec="seconds"),
-            "expires_at": request.expires_at.isoformat(timespec="seconds"),
-            "decision": "",
-            "responder": "",
-            "reason": "",
-            "decided_at": "",
-        }
+        row = _request_row(request)
         with self._lock:
             self._items[request.request_id] = row
             self._persist(row)
         logger.info("Approval %s opened for %s", request.request_id, request.action)
+
+    def open_exact(self, request: Any) -> None:
+        row = _request_row(request)
+        row["delivery_channel"] = "web"
+        with self._lock:
+            prior = self._items.get(request.request_id)
+            if prior is not None:
+                _assert_open(prior, request.fingerprint)
+                return
+            self._items[request.request_id] = row
+            try:
+                self._persist(row)
+            except Exception:
+                self._items.pop(request.request_id, None)
+                raise
+
+    def decide_exact(
+        self, request_id: str, *, decision: str, fingerprint: str,
+        responder: str, reason: str = "",
+    ) -> dict[str, Any]:
+        if decision not in {"approve", "decline"} or not responder:
+            raise ValueError("A valid decision and authenticated responder are required.")
+        with self._lock:
+            row = self._items.get(request_id)
+            if row is None:
+                raise KeyError(request_id)
+            _assert_open(row, fingerprint)
+            before = dict(row)
+            row.update(decision=decision, responder=responder, reason=redact_text(reason), decided_at=_utcnow())
+            try:
+                self._persist(row)
+            except Exception:
+                self._items[request_id] = before
+                raise
+            return dict(row)
+
+    def consume_exact(self, request_id: str, fingerprint: str) -> bool:
+        with self._lock:
+            row = self._items.get(request_id)
+            if row is None or row.get("decision") != "approve" or row.get("consumed_at"):
+                return False
+            check = dict(row, decision="")
+            try:
+                _assert_open(check, fingerprint)
+            except ValueError:
+                return False
+            before = dict(row)
+            row["consumed_at"] = _utcnow()
+            try:
+                self._persist(row)
+            except Exception:
+                self._items[request_id] = before
+                raise
+            return True
+
+    def list_requests(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = sorted(
+                self._items.values(),
+                key=lambda row: (_pending_priority(row), row["requested_at"], row["request_id"]),
+                reverse=True,
+            )
+            return [dict(row) for row in rows[:max(1, min(limit, 500))]]
 
     async def poll(self, request_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -196,6 +297,26 @@ class JsonFileApprovalChannel(InMemoryApprovalChannel):
         with self._lock:
             self._reload()
         return super().get(request_id)
+
+    def open_exact(self, request: Any) -> None:
+        with self._lock:
+            self._reload()
+        super().open_exact(request)
+
+    def decide_exact(self, request_id: str, **kwargs) -> dict[str, Any]:
+        with self._lock:
+            self._reload()
+        return super().decide_exact(request_id, **kwargs)
+
+    def consume_exact(self, request_id: str, fingerprint: str) -> bool:
+        with self._lock:
+            self._reload()
+        return super().consume_exact(request_id, fingerprint)
+
+    def list_requests(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self._lock:
+            self._reload()
+        return super().list_requests(limit)
 
     def _persist(self, row: dict[str, Any]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -340,6 +461,75 @@ class FabricSqlApprovalChannel(InMemoryApprovalChannel):
 
     def get(self, request_id: str) -> dict[str, Any] | None:
         return self._fetch(request_id)
+
+    def get_exact(self, request_id: str) -> dict[str, Any] | None:
+        rows = self._db.query(f"SELECT payload FROM {self._table} WHERE request_id = ?", request_id)
+        return json.loads(rows[0][0]) if rows else None
+
+    def list_requests(self, limit: int = 200) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        return [
+            json.loads(row[0]) for row in self._db.query(
+                f"SELECT TOP ({limit}) payload FROM {self._table} "
+                "ORDER BY CASE WHEN (decision IS NULL OR decision = '') "
+                "AND COALESCE(JSON_VALUE(payload, '$.consumed_at'), '') = '' "
+                "AND TRY_CAST(JSON_VALUE(payload, '$.expires_at') AS DATETIMEOFFSET) > SYSDATETIMEOFFSET() "
+                "THEN 0 ELSE 1 END, "
+                "TRY_CAST(JSON_VALUE(payload, '$.requested_at') AS DATETIMEOFFSET) DESC, request_id DESC"
+            )
+        ]
+
+    def open_exact(self, request: Any) -> None:
+        row = _request_row(request)
+        row["delivery_channel"] = "web"
+        try:
+            self._db.execute(
+                f"INSERT INTO {self._table} (request_id, decision, responder, decided_at, payload) "
+                "VALUES (?, NULL, NULL, NULL, ?)",
+                request.request_id, json.dumps(row),
+            )
+        except self._db.integrity_error():
+            prior = self.get_exact(request.request_id)
+            if prior is None:
+                raise RuntimeError("The existing approval could not be read") from None
+            _assert_open(prior, request.fingerprint)
+
+    def decide_exact(
+        self, request_id: str, *, decision: str, fingerprint: str,
+        responder: str, reason: str = "",
+    ) -> dict[str, Any]:
+        if decision not in {"approve", "decline"} or not responder or not fingerprint:
+            raise ValueError("A decision, proposal fingerprint and authenticated responder are required.")
+        row = self.get_exact(request_id)
+        if row is None:
+            raise KeyError(request_id)
+        _assert_open(row, fingerprint)
+        decided = _utcnow()
+        won = self._db.execute(
+            f"UPDATE {self._table} SET decision = ?, responder = ?, decided_at = ?, "
+            "payload = JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(payload, "
+            "'$.decision', ?), '$.responder', ?), '$.reason', ?), '$.decided_at', ?) "
+            "WHERE request_id = ? AND (decision IS NULL OR decision = '') "
+            "AND JSON_VALUE(payload, '$.fingerprint') = ? "
+            "AND COALESCE(JSON_VALUE(payload, '$.consumed_at'), '') = '' "
+            "AND TRY_CAST(JSON_VALUE(payload, '$.expires_at') AS DATETIMEOFFSET) > SYSDATETIMEOFFSET()",
+            decision, responder, decided, decision, responder, redact_text(reason), decided,
+            request_id, fingerprint,
+        )
+        if won != 1:
+            raise ValueError("The proposal expired, changed or was answered by another operator.")
+        row.update(decision=decision, responder=responder, reason=redact_text(reason), decided_at=decided)
+        return row
+
+    def consume_exact(self, request_id: str, fingerprint: str) -> bool:
+        return self._db.execute(
+            f"UPDATE {self._table} SET payload = JSON_MODIFY(payload, '$.consumed_at', ?) "
+            "WHERE request_id = ? AND decision = 'approve' "
+            "AND JSON_VALUE(payload, '$.fingerprint') = ? "
+            "AND COALESCE(JSON_VALUE(payload, '$.consumed_at'), '') = '' "
+            "AND TRY_CAST(JSON_VALUE(payload, '$.expires_at') AS DATETIMEOFFSET) > SYSDATETIMEOFFSET()",
+            _utcnow(), request_id, fingerprint,
+        ) == 1
 
     def _persist(self, row: dict[str, Any]) -> None:
         self._write(row["request_id"], row)

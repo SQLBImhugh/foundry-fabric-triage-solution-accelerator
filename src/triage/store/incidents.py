@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Protocol
 
 from triage.models import Incident, TriageResult
+from triage.pipeline_models import PipelineFailure, PipelineRun
 from triage.redaction import redact
 from triage.signature import incident_id
 
@@ -34,6 +35,7 @@ logger = logging.getLogger("triage.store")
 # than a crash or a policy block.
 _ACTION_TYPES: dict[str, str] = {
     "refresh_powerbi_dataset": "nondeterministic_retry",
+    "rerun_fabric_pipeline": "nondeterministic_retry",
     "rebind_dataset_gateway": "known_workaround",
     # Restoring a schedule the platform disabled. Deterministic: the state it
     # produces is known exactly, unlike a retry, which may or may not work.
@@ -88,10 +90,45 @@ def _needs_investigation(result: TriageResult) -> bool:
     )
 
 
+def _redacted_pipeline(failure: PipelineFailure | None) -> PipelineFailure | None:
+    if failure is None:
+        return None
+
+    def clean_run(run: PipelineRun) -> PipelineRun:
+        return run.model_copy(update={
+            "error_code": redact(run.error_code)[0],
+            "failure_reason": redact(run.failure_reason)[0],
+        })
+
+    return failure.model_copy(update={
+        "target": failure.target.model_copy(update={
+            "name": redact(failure.target.name)[0],
+            # Replay parameters stay in operator configuration, not incident
+            # exports. The rerun journal retains their approval fingerprint.
+            "rerun_parameters": None,
+        }),
+        "run": clean_run(failure.run),
+        "recent_runs": [clean_run(run) for run in failure.recent_runs],
+        "activities": [
+            activity.model_copy(update={
+                "name": redact(activity.name)[0],
+                "activity_type": redact(activity.activity_type)[0],
+                "status": redact(activity.status)[0],
+                "message": redact(activity.message)[0],
+                "error_code": redact(activity.error_code)[0],
+            })
+            for activity in failure.activities
+        ],
+        "diagnostics_error": redact(failure.diagnostics_error)[0],
+    })
+
+
 class IncidentStore(Protocol):
     def find_open(self, signature: str) -> Incident | None: ...
     def record(self, result: TriageResult, **provenance) -> Incident: ...
     def list_all(self) -> list[Incident]: ...
+    def get(self, incident_id_: str) -> Incident | None: ...
+    def note_pipeline_occurrence(self, incident_id_: str, failure: PipelineFailure) -> Incident | None: ...
     def reset(self) -> None: ...
 
 
@@ -150,9 +187,11 @@ class InMemoryIncidentStore:
         app_version: str = "",
         source: str = "powerbi_refresh_failure",
         notified: bool = False,
+        pipeline_failure: PipelineFailure | None = None,
     ) -> Incident:
         """Upsert an incident for this result. Increments on repeat."""
         now = _utcnow()
+        clean_pipeline = _redacted_pipeline(pipeline_failure)
 
         # A suppressed duplicate must increment the incident it duplicated.
         # Writing a parallel row would defeat the entire point of dedup: you
@@ -164,6 +203,8 @@ class InMemoryIncidentStore:
                 if parent is not None:
                     parent.occurrence_count += 1
                     parent.last_seen_at = now
+                    if clean_pipeline is not None:
+                        parent.pipeline_failure = clean_pipeline
                     if notified:
                         parent.notified_count += 1
                         parent.last_notified_at = now
@@ -189,7 +230,12 @@ class InMemoryIncidentStore:
         red_error, kinds_a = redact(original_error)
         red_cause, kinds_b = redact(result.root_cause)
         red_action, kinds_c = redact(result.action_taken)
-        fired = sorted(set(kinds_a) | set(kinds_b) | set(kinds_c))
+        pipeline_kinds = (
+            redact(pipeline_failure.model_dump_json(
+                exclude={"target": {"rerun_parameters"}},
+            ))[1] if pipeline_failure is not None else []
+        )
+        fired = sorted(set(kinds_a) | set(kinds_b) | set(kinds_c) | set(pipeline_kinds))
 
         with self._lock:
             existing = self._items.get(iid)
@@ -197,6 +243,8 @@ class InMemoryIncidentStore:
                 existing.occurrence_count += 1
                 existing.last_seen_at = now
                 existing.outcome = result.outcome
+                if clean_pipeline is not None:
+                    existing.pipeline_failure = clean_pipeline
                 if notified:
                     existing.notified_count += 1
                     existing.last_notified_at = now
@@ -222,6 +270,7 @@ class InMemoryIncidentStore:
                 request_id=result.request_id,
                 report_name=report_name,
                 source=source,
+                pipeline_failure=clean_pipeline,
                 occurrence_count=1,
                 first_seen_at=now,
                 last_seen_at=now,
@@ -255,6 +304,23 @@ class InMemoryIncidentStore:
                 inc.triage_notes = redact(notes)[0]
             self._persist(inc)
             return inc.model_copy(deep=True)
+
+    def note_pipeline_occurrence(
+        self, incident_id_: str, failure: PipelineFailure,
+    ) -> Incident | None:
+        """Count late historical evidence without reopening a resolved cause."""
+        with self._lock:
+            incident = self._items.get(incident_id_)
+            if incident is None or incident.pipeline_failure is None:
+                return None
+            latest = incident.pipeline_failure.run
+            if latest.end_time is None or failure.run.end_time is None or failure.run.end_time > latest.end_time:
+                return None
+            if failure.run.id != latest.id:
+                incident.occurrence_count += 1
+                incident.last_seen_at = _utcnow()
+                self._persist(incident)
+            return incident.model_copy(deep=True)
 
     def reset(self) -> None:
         """Clear the store — used between demo rehearsals and in tests.
@@ -303,7 +369,7 @@ class JsonFileIncidentStore(InMemoryIncidentStore):
         # Caller already holds the lock.
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "incidents": [i.model_dump() for i in self._items.values()],
+            "incidents": [i.model_dump(mode="json") for i in self._items.values()],
             "updated_at": _utcnow(),
         }
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")

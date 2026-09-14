@@ -21,7 +21,7 @@ def test_every_scenario_file_parses(repo_root) -> None:
     for scenario in scenarios:
         assert scenario.name
         assert scenario.title
-        assert scenario.email
+        assert scenario.email or scenario.pipeline
         assert scenario.expect.outcome
 
 
@@ -39,6 +39,12 @@ def test_every_scenario_file_parses(repo_root) -> None:
         "scenario6-approval-denied",
         "scenario7-schedule-reenable",
         "scenario8-capacity-backoff",
+        "scenario9-pipeline-authentication",
+        "scenario10-pipeline-rerun-approved",
+        "scenario11-pipeline-rerun-denied",
+        "scenario12-pipeline-schema-mismatch",
+        "scenario13-pipeline-rerun-pending",
+        "scenario14-pipeline-write-timeout",
     ],
 )
 async def test_scenario_meets_its_expectations(

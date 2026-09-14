@@ -8,7 +8,7 @@ scale axes and tables sort.
 
 | Surface | How to format |
 |---|---|
-| Graphein chart spec | a `format` hint on the `FieldDef` (axis/label/tooltip) — the [mini-language](#format-mini-language) |
+| Graphein chart spec | a `format` hint on the `FieldDef` (axis/label/tooltip) — the [mini-language](#format-mini-language-chart-specs) |
 | `KpiCard` | the `valueFormat` prop |
 | `DataTableCard` table/matrix spec | column/value `format` plus `conditionalFormat` |
 | Anywhere in JSX | call a formatter from `@/components/dashboard` directly |

@@ -91,6 +91,7 @@ class ApprovalRequest:
     impact: str = ""
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     requested_at: datetime = field(default_factory=_utcnow)
+    run_id: str = ""
 
     @property
     def fingerprint(self) -> str:
@@ -450,6 +451,80 @@ class TeamsCardApprovalGate(_BaseGate):
                 detail=request.impact,
             )
         )
+
+
+class WebApprovalGate(TeamsCardApprovalGate):
+    """Wait on durable decisions; Teams delivery is optional, not a prerequisite."""
+
+    def __init__(
+        self, decision_source: Any, notifier: Any = None, *,
+        poll_seconds: float = 2.0, command_center_url: str = "",
+    ):
+        super().__init__(notifier, decision_source, poll_seconds=poll_seconds, callback_url=command_center_url)
+        self._requests: dict[str, ApprovalRequest] = {}
+
+    def _actions(self, request: ApprovalRequest) -> list[dict[str, Any]]:
+        if not self._callback_url:
+            return []
+        return [{
+            "type": "Action.OpenUrl", "title": "Review in command center",
+            "url": f"{self._callback_url.rstrip('/')}/?approval={quote(request.request_id, safe='')}",
+        }]
+
+    async def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
+        import asyncio
+
+        try:
+            self._decision_source.open_exact(request)
+        except Exception as exc:
+            logger.error("Could not register web approval (%s)", type(exc).__name__)
+            return ApprovalDecision(
+                granted=False, fingerprint=request.fingerprint, outcome="error",
+                reason="The approval request could not be persisted.",
+            )
+        async def notify():
+            try:
+                await asyncio.wait_for(self._post(request), timeout=10)
+            except Exception as exc:
+                logger.warning("Optional Teams approval delivery failed (%s); web inbox remains available", type(exc).__name__)
+
+        notification = asyncio.create_task(notify()) if self._notifier is not None else None
+        try:
+            while _utcnow() < request.expires_at:
+                try:
+                    raw = await self._decision_source.poll(request.request_id)
+                except Exception as exc:
+                    logger.warning("Web approval poll failed (%s)", type(exc).__name__)
+                    raw = None
+                if raw:
+                    if raw.get("fingerprint") != request.fingerprint or not raw.get("responder"):
+                        return ApprovalDecision(
+                            granted=False, fingerprint=request.fingerprint, outcome="error",
+                            reason="The decision has no matching proposal or responder.",
+                        )
+                    decision = _decision_from_payload(raw, request)
+                    self._requests[decision.decision_id] = request
+                    return decision
+                await asyncio.sleep(self._poll_seconds)
+            return ApprovalDecision(
+                granted=False, fingerprint=request.fingerprint, outcome="timed_out",
+                reason=f"No response within {request.timeout_seconds}s.",
+            )
+        finally:
+            if notification is not None:
+                if not notification.done():
+                    notification.cancel()
+                await asyncio.gather(notification, return_exceptions=True)
+
+    def consume(self, decision: ApprovalDecision) -> bool:
+        request = self._requests.pop(decision.decision_id, None)
+        if request is None or not decision.is_valid_for(request)[0]:
+            return False
+        try:
+            return self._decision_source.consume_exact(request.request_id, request.fingerprint)
+        except Exception as exc:
+            logger.error("Could not consume web approval (%s); action refused", type(exc).__name__)
+            return False
 
 
 def _decision_from_payload(raw: dict[str, Any], request: ApprovalRequest) -> ApprovalDecision:
