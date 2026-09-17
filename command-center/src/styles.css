@@ -16,7 +16,7 @@
 
 :root {
   color-scheme: dark;
-  --font: "DejaVu Serif Condensed", "DejaVu Serif", serif;
+  --font: Georgia, "DejaVu Serif", "DejaVu Serif Condensed", serif;
   --bg: #000000;
   --panel: #0b0f16;
   --panel2: #111821;
