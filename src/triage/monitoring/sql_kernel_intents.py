@@ -41,6 +41,7 @@ def handoff_sql(
     if producer not in {"worker", "web"}:
         raise ValueError("Only fixed producer handoffs are supported")
     # No caller work payload: SQL constructs a clean initial reconciliation row.
+    # Native FOR JSON can return NULL for an empty set; typed evidence is an array.
     request_kind = f"{producer}_reconcile_request"
     return f"""DECLARE @reconcile_id nvarchar(36)=LOWER(CONVERT(nvarchar(36),NEWID()));
 {raise_frontier_sql(names, producer=producer, operation=operation, topic=topic, reference=reference, target=target, collection_id=collection_id, requires_window=requires_window, collection_complete=collection_complete, window_start=window_start, window_end=window_end)}
@@ -51,14 +52,14 @@ DECLARE @handoff_payload nvarchar(max)=(
            JSON_QUERY(@frontier_target) AS target,JSON_QUERY(@frontier_window) AS [window],
            @frontier_key AS frontier_key,@frontier_revision AS frontier_revision,
            JSON_QUERY(@binding_json) AS request_payload,
-           JSON_QUERY((SELECT JSON_VALUE(payload,'$.fact_kind') AS kind,
+           JSON_QUERY(COALESCE((SELECT JSON_VALUE(payload,'$.fact_kind') AS kind,
                JSON_VALUE(payload,'$.fact_key') AS [key],
                TRY_CONVERT(bigint,JSON_VALUE(payload,'$.fact_revision')) AS revision,
                LOWER(JSON_VALUE(payload,'$.payload_hash')) AS payload_hash
                FROM {names.table('monitoring_records')}
                WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='accepted_fact'
                  AND JSON_VALUE(payload,'$.batch_id')=@request_id
-               ORDER BY full_key COLLATE Latin1_General_100_BIN2 FOR JSON PATH)) AS evidence,
+               ORDER BY full_key COLLATE Latin1_General_100_BIN2 FOR JSON PATH),N'[]')) AS evidence,
            CONVERT(nvarchar(40),@now,127)+N'Z' AS created_at
     FOR JSON PATH, INCLUDE_NULL_VALUES, WITHOUT_ARRAY_WRAPPER);
 {record_insert(names, request_kind, '@request_id', '@handoff_payload', status="N'pending'", target_key='@frontier_target_key', parent_key='@frontier_key', sequence='@frontier_revision')}

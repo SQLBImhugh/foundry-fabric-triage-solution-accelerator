@@ -306,3 +306,48 @@ def test_no_correlation_guard_compares_against_a_bare_handoff_value(kernel):
         assert "<>JSON_VALUE(@handoff," not in obj.ddl, (
             f"{obj.logical_name} compares a proof value against a bare handoff value"
         )
+
+
+def test_producer_handoff_emits_an_empty_evidence_array_not_json_null(kernel):
+    producers = [obj for obj in kernel.objects if "AS evidence," in obj.ddl]
+    assert producers
+    for obj in producers:
+        assert "FOR JSON PATH),N'[]')) AS evidence," in obj.ddl, obj.logical_name
+
+
+def _proof_rejected(db, kernel, proof, handoff):
+    sql = _sql(kernel, "controller.resolve_frontier")
+    predicate = re.search(
+        r"IF (@proof IS NULL OR COALESCE\(@decision,.*?)(?=\n    THROW 51072, 'Controller proof)",
+        sql, re.S,
+    )[1]
+    return bool(db.execute(
+        f"SELECT CASE WHEN {predicate} THEN 1 ELSE 0 END FROM (SELECT 'bigint' AS bigint)",
+        {
+            "proof": json.dumps(proof), "handoff": json.dumps(handoff),
+            "decision": "published", "work_id": "work", "owner_id": "owner",
+            "fence": 7, "work_revision": 3, "current_revision": 0,
+            "frontier_key": "frontier", "accepted": 1, "producer_request_id": "request",
+        },
+    ).fetchone()[0])
+
+
+@pytest.mark.parametrize("field", ["producer_fingerprint", "evidence_digest"])
+@pytest.mark.parametrize("side", ["proof", "handoff", "both"])
+@pytest.mark.parametrize("value", ["missing", None, ""])
+def test_missing_correlation_fields_cannot_match_through_empty_sentinels(
+    decision_db, kernel, field, side, value,
+):
+    handoff = {"producer_fingerprint": "a" * 64, "evidence_digest": "b" * 64}
+    proof = {
+        **handoff, "decision": "published", "work_id": "work", "lease_owner_id": "owner", "lease_fence": 7,
+        "expected_work_revision": 3, "policy_revision": 0, "frontier_key": "frontier",
+        "through_revision": 1, "producer_request_id": "request", "detail": "Validated original intent.",
+    }
+    assert not _proof_rejected(decision_db, kernel, proof, handoff)
+    for document in ([proof, handoff] if side == "both" else [proof if side == "proof" else handoff]):
+        if value == "missing":
+            document.pop(field)
+        else:
+            document[field] = value
+    assert _proof_rejected(decision_db, kernel, proof, handoff)

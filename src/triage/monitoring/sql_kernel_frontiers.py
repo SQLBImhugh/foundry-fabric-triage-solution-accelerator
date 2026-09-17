@@ -386,7 +386,10 @@ WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='frontier_validation
   AND full_key=@validation_id AND key_hash={key_hash('@validation_id')}
   AND {payload_hash('payload')}=@validation_hash;
 SET @decision=JSON_VALUE(@proof,'$.decision');
+-- Equal empty sentinels cannot establish that a required handoff hash exists.
 IF @proof IS NULL OR COALESCE(@decision,'') NOT IN ('published','rejected')
+   OR NULLIF(JSON_VALUE(@handoff,'$.producer_fingerprint'),'') IS NULL
+   OR NULLIF(JSON_VALUE(@handoff,'$.evidence_digest'),'') IS NULL
    OR COALESCE(JSON_VALUE(@proof,'$.work_id'),'')<>@work_id
    OR COALESCE(JSON_VALUE(@proof,'$.lease_owner_id'),'')<>@owner_id
    OR COALESCE(TRY_CONVERT(bigint,JSON_VALUE(@proof,'$.lease_fence')),-1)<>@fence

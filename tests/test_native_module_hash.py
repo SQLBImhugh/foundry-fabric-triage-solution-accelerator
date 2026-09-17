@@ -128,10 +128,12 @@ def test_utf8_sql_catalogue_and_complete_kernel_abi_remain_unchanged() -> None:
         if obj.kind != "role":
             native_module_hash(obj.ddl)
     assert kernel.statements == before
+    # These pin the reviewed frontier null/empty-set fixes; native header
+    # projection must not rewrite their UTF-8 source or API contract.
     assert kernel_contract_hash(tables) == (
-        "48d8c86a19be50b67fc3e27ffd10fa8eae5d33b31440ee206dff71de33aacb96"
+        "06a093a919ee25896891202f04c3939226fb09f385398744b0733dff3eeacce3"
     )
     assert fingerprint(kernel_abi(tables)) == kernel_contract_hash(tables)
     assert fingerprint(list(kernel.catalogue())) == (
-        "2480bdbec3db9961d5a91eed400878ef6246ecf9a560debed71167e767898bf9"
+        "66b27e7dc0b7ec0bfde833b84dd6a4d3eeac6bad4e2dbb86808238804e07f4f8"
     )
