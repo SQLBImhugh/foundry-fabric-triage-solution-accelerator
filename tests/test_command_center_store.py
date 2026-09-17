@@ -13,16 +13,16 @@ import pytest
 from pydantic import ValidationError
 
 from triage.models import TriageAction, TriageClassification, TriageResult
+from triage.store.azure_sql import SqlUnavailable
 from triage.store.command_center import (
+    AzureSqlCommandCenterStore,
     CommandRecord,
-    FabricSqlCommandCenterStore,
     InMemoryCommandCenterStore,
     JsonFileCommandCenterStore,
     RunEvent,
     RunRecord,
     schema_statements,
 )
-from triage.store.fabric_sql import SqlUnavailable
 
 NOW = datetime(2026, 9, 11, 18, 0, 0, tzinfo=UTC)
 RUN_ID = "10000000-0000-0000-0000-000000000001"
@@ -149,7 +149,7 @@ def store(request, tmp_path):
         return InMemoryCommandCenterStore()
     if request.param == "json":
         return JsonFileCommandCenterStore(tmp_path / "command-center.json")
-    return FabricSqlCommandCenterStore(_Sql(tmp_path / "command-center.db"))
+    return AzureSqlCommandCenterStore(_Sql(tmp_path / "command-center.db"))
 
 
 def test_run_history_retains_full_result_and_derived_counters(store) -> None:
@@ -433,7 +433,7 @@ def test_expired_worker_cannot_finish_before_expiration_sweep(store, monkeypatch
     store.claim_command("command-1", "worker-1", lease_seconds=1)
     future = NOW + timedelta(seconds=1)
     monkeypatch.setattr("triage.store.command_center._utcnow", lambda: future.isoformat())
-    if isinstance(store, FabricSqlCommandCenterStore):
+    if isinstance(store, AzureSqlCommandCenterStore):
         store._db.now = future
     with pytest.raises(ValueError, match="lease"):
         store.finish_command("command-1", "worker-1", "completed", "Too late")
@@ -475,7 +475,7 @@ def test_owner_can_interrupt_after_lease_expiry_without_rewriting_existing_audit
     store.claim_command(queued.id, "worker-1", lease_seconds=1)
     future = NOW + timedelta(seconds=2)
     monkeypatch.setattr("triage.store.command_center._utcnow", lambda: future.isoformat())
-    if isinstance(store, FabricSqlCommandCenterStore):
+    if isinstance(store, AzureSqlCommandCenterStore):
         store._db.now = future
     assert store.target_blocked(queued.target_id) is True
     interrupted = store.interrupt_command(
@@ -526,7 +526,7 @@ def test_operator_reconciliation_preserves_audit_and_clears_uncertainty_without_
     interrupted = store.interrupt_command(queued.id, "worker-1", "Final result was uncertain", RUN_ID)
     later = NOW + timedelta(minutes=5)
     monkeypatch.setattr("triage.store.command_center._utcnow", lambda: later.isoformat())
-    if isinstance(store, FabricSqlCommandCenterStore):
+    if isinstance(store, AzureSqlCommandCenterStore):
         store._db.now = later
     reason = "Verified the correlated platform job is stopped"
     reconciled = store.reconcile_command(queued.id, "admin-1", reason)
@@ -551,8 +551,8 @@ def test_operator_reconciliation_preserves_audit_and_clears_uncertainty_without_
         store.reconcile_command(queued.id, "admin-2", "Cannot replace the first review")
     if isinstance(store, JsonFileCommandCenterStore):
         restored = JsonFileCommandCenterStore(store.path)
-    elif isinstance(store, FabricSqlCommandCenterStore):
-        restored = FabricSqlCommandCenterStore(store._db)
+    elif isinstance(store, AzureSqlCommandCenterStore):
+        restored = AzureSqlCommandCenterStore(store._db)
     else:
         restored = store
     assert restored.get_command(queued.id) == reconciled
@@ -622,8 +622,8 @@ def test_concurrent_reconciliations_have_one_audit_winner(store) -> None:
     barrier = threading.Barrier(4)
 
     def reconcile(index):
-        caller = FabricSqlCommandCenterStore(store._db) if isinstance(
-            store, FabricSqlCommandCenterStore,
+        caller = AzureSqlCommandCenterStore(store._db) if isinstance(
+            store, AzureSqlCommandCenterStore,
         ) else store
         barrier.wait()
         try:
@@ -735,7 +735,7 @@ def test_active_reader_keeps_blocking_work_visible_behind_over_100_terminal_comm
     assert store.get_command("old-interrupted").summary == "Needs reconciliation"
     if isinstance(store, JsonFileCommandCenterStore):
         assert [row.id for row in JsonFileCommandCenterStore(store.path).active_commands()] == expected_ids
-    if isinstance(store, FabricSqlCommandCenterStore):
+    if isinstance(store, AzureSqlCommandCenterStore):
         assert any(
             "WHERE state IN ('queued', 'running', 'interrupted') "
             "ORDER BY created_at ASC, command_id ASC "
@@ -888,12 +888,12 @@ def test_json_failed_interruption_and_reconciliation_do_not_publish_audit(
 def test_exactly_one_concurrent_claim_winner(tmp_path, backend) -> None:
     db = _Sql(tmp_path / "concurrent.db") if backend == "sql" else None
     memory = InMemoryCommandCenterStore()
-    store = FabricSqlCommandCenterStore(db) if db is not None else memory
+    store = AzureSqlCommandCenterStore(db) if db is not None else memory
     store.enqueue(_command())
     barrier = threading.Barrier(8)
 
     def claim(index):
-        caller = FabricSqlCommandCenterStore(db) if db is not None else memory
+        caller = AzureSqlCommandCenterStore(db) if db is not None else memory
         barrier.wait()
         return caller.claim_command("command-1", f"worker-{index}")
 
@@ -906,8 +906,8 @@ def test_exactly_one_concurrent_claim_winner(tmp_path, backend) -> None:
 
 def test_sql_cas_promoted_columns_override_stale_json(tmp_path) -> None:
     db = _Sql(tmp_path / "promoted.db")
-    first = FabricSqlCommandCenterStore(db)
-    second = FabricSqlCommandCenterStore(db)
+    first = AzureSqlCommandCenterStore(db)
+    second = AzureSqlCommandCenterStore(db)
     first.enqueue(_command())
     db.operations.clear()
     first.claim_command("command-1", "worker-1")
@@ -928,12 +928,12 @@ def test_sql_cas_promoted_columns_override_stale_json(tmp_path) -> None:
 
 def test_sql_lost_claim_acknowledgement_cannot_execute_work_twice(tmp_path) -> None:
     db = _Sql(tmp_path / "ambiguous.db")
-    store = FabricSqlCommandCenterStore(db)
+    store = AzureSqlCommandCenterStore(db)
     store.enqueue(_command())
     db.lose_write_ack = True
     with pytest.raises(ConnectionError, match="acknowledgement"):
         store.claim_command("command-1", "worker-1")
-    assert FabricSqlCommandCenterStore(db).get_command("command-1").state == "running"
+    assert AzureSqlCommandCenterStore(db).get_command("command-1").state == "running"
     assert store.claim_command("command-1", "worker-1") is None
     assert store.expire_commands(NOW + timedelta(hours=1)) == 1
     assert store.claim_command("command-1", "worker-2") is None
@@ -941,7 +941,7 @@ def test_sql_lost_claim_acknowledgement_cannot_execute_work_twice(tmp_path) -> N
 
 def test_sql_runtime_reads_need_no_schema_privileges(tmp_path) -> None:
     db = _Sql(tmp_path / "schema.db")
-    store = FabricSqlCommandCenterStore(db)
+    store = AzureSqlCommandCenterStore(db)
     assert db.operations == [], "construction must not access the database"
     assert store.is_durable is True
     assert store.get_run(RUN_ID) is None
@@ -961,7 +961,7 @@ def test_sql_missing_deployment_schema_raises_without_runtime_migration(tmp_path
     db = _Sql(tmp_path / "unmigrated.db")
     with db._connection() as conn:
         conn.execute("DROP TABLE triage_agent_commands")
-    store = FabricSqlCommandCenterStore(db)
+    store = AzureSqlCommandCenterStore(db)
     with pytest.raises(sqlite3.OperationalError, match="no such table"):
         store.get_command("command-1")
     with pytest.raises(sqlite3.OperationalError, match="no such table"):
@@ -970,7 +970,7 @@ def test_sql_missing_deployment_schema_raises_without_runtime_migration(tmp_path
 
 def test_sql_outage_raises_for_history_and_queue_reads_and_writes(tmp_path) -> None:
     db = _Sql(tmp_path / "outage.db")
-    store = FabricSqlCommandCenterStore(db)
+    store = AzureSqlCommandCenterStore(db)
     store.start_run(_run())
     store.enqueue(_command())
     db.down = True
@@ -1002,7 +1002,7 @@ def test_sql_outage_raises_for_history_and_queue_reads_and_writes(tmp_path) -> N
 
 def test_sql_write_failure_does_not_report_a_successful_run_finish_or_claim(tmp_path) -> None:
     db = _Sql(tmp_path / "write-failure.db")
-    store = FabricSqlCommandCenterStore(db)
+    store = AzureSqlCommandCenterStore(db)
     store.start_run(_run())
     store.enqueue(_command())
     db.fail_writes = True
@@ -1017,12 +1017,12 @@ def test_sql_write_failure_does_not_report_a_successful_run_finish_or_claim(tmp_
 
 def test_sql_only_one_conflicting_terminal_result_is_accepted(tmp_path) -> None:
     db = _Sql(tmp_path / "finish-race.db")
-    store = FabricSqlCommandCenterStore(db)
+    store = AzureSqlCommandCenterStore(db)
     store.start_run(_run())
     barrier = threading.Barrier(4)
 
     def finish(index):
-        caller = FabricSqlCommandCenterStore(db)
+        caller = AzureSqlCommandCenterStore(db)
         barrier.wait()
         try:
             return caller.finish_run(RUN_ID, _result(summary=f"Outcome {index}"))
@@ -1037,7 +1037,7 @@ def test_sql_only_one_conflicting_terminal_result_is_accepted(tmp_path) -> None:
 
 def test_sql_interruption_and_reconciliation_are_fenced_and_keep_audit_in_payload(tmp_path) -> None:
     db = _Sql(tmp_path / "reconcile.db")
-    store = FabricSqlCommandCenterStore(db)
+    store = AzureSqlCommandCenterStore(db)
     queued = store.enqueue(_command())
     store.claim_command(queued.id, "worker-1")
     db.operations.clear()
@@ -1068,7 +1068,7 @@ def test_sql_interruption_and_reconciliation_are_fenced_and_keep_audit_in_payloa
 
 def test_sql_lost_interruption_acknowledgement_is_idempotent_without_replay(tmp_path) -> None:
     db = _Sql(tmp_path / "interruption-ack.db")
-    store = FabricSqlCommandCenterStore(db)
+    store = AzureSqlCommandCenterStore(db)
     store.enqueue(_command())
     store.claim_command("command-1", "worker-1")
     db.lose_write_ack = True
@@ -1084,7 +1084,7 @@ def test_sql_lost_interruption_acknowledgement_is_idempotent_without_replay(tmp_
 def test_sql_uses_validated_custom_tables_and_server_bounded_pages(tmp_path) -> None:
     names = ("test_runs", "test_events", "test_commands")
     db = _Sql(tmp_path / "custom.db", names)
-    store = FabricSqlCommandCenterStore(db, *names)
+    store = AzureSqlCommandCenterStore(db, *names)
     store.start_run(_run())
     store.enqueue(_command())
     store.append_event(RunEvent(run_id=RUN_ID, sequence=0, kind="status", label="test"))
@@ -1106,6 +1106,6 @@ def test_sql_uses_validated_custom_tables_and_server_bounded_pages(tmp_path) -> 
     with pytest.raises(ValueError):
         schema_statements(command_table="unsafe; DROP TABLE anything")
     with pytest.raises(ValueError):
-        FabricSqlCommandCenterStore(db, run_table="bad]")
+        AzureSqlCommandCenterStore(db, run_table="bad]")
     with pytest.raises(ValueError):
         schema_statements("same", "SAME", "different")

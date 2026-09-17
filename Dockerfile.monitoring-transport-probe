@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+# The operator may supply an approved digest of this Python 3.13 Debian base.
+ARG PYTHON_BASE_IMAGE=python:3.13-slim-trixie
+FROM ${PYTHON_BASE_IMAGE}
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 probe \
+    && useradd --uid 10001 --gid probe --create-home --shell /usr/sbin/nologin probe
+
+WORKDIR /probe
+COPY requirements.monitoring-transport-probe.txt ./
+RUN python -m pip install --isolated --no-cache-dir --no-input \
+        --index-url https://pypi.org/simple --only-binary=:all: \
+        -r requirements.monitoring-transport-probe.txt \
+    && python -m pip check \
+    && python -c "import aiohttp; from azure.identity.aio import ManagedIdentityCredential; from azure.eventhub.aio import EventHubConsumerClient"
+
+# No repository install, src tree, SQL driver, private journal or environment file.
+COPY scripts/hybrid_platform_probe.py scripts/monitoring_transport_probe.py scripts/monitoring_readiness_probe.py ./scripts/
+USER 10001:10001
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["python", "-m", "scripts.monitoring_transport_probe"]

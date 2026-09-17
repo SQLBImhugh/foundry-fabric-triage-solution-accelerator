@@ -4,6 +4,7 @@ import { initializeAuth } from './auth'
 import { PROFILE_SCOPE } from './profile'
 import { approvalFromSearch, approvalFromSignInState, approvalSignInState } from '../approvalLinks'
 import { applicationSignInState, incidentFromSignInState } from '../incidentLinks'
+import { workspaceFromSearch, workspaceFromSignInState, workspaceSignInState } from '../workspaceNavigation'
 import type { AppConfig } from './types'
 
 const sdk = vi.hoisted(() => ({
@@ -66,6 +67,33 @@ const account = {
 }
 
 afterEach(() => window.history.replaceState({}, '', '/'))
+
+describe('MSAL monitoring workspace integration', () => {
+  it('round-trips the monitoring deep link with the existing registered redirect URI', async () => {
+    window.history.replaceState({}, '', '/?view=monitoring')
+    const session = await initializeAuth(config)
+    await session.signIn()
+    const state = sdk.login.mock.calls[0]![0].state
+    expect(workspaceFromSignInState(state)).toBe('monitoring')
+    expect(sdk.construct).toHaveBeenCalledWith(expect.objectContaining({
+      auth: expect.objectContaining({ redirectUri: `${window.location.origin}/`, navigateToLoginRequestUrl: false }),
+    }))
+    window.history.replaceState({}, '', '/?existing=kept')
+    sdk.redirect.mockResolvedValue({ state, account })
+    await initializeAuth(config)
+    expect(workspaceFromSearch(window.location.search).section).toBe('monitoring')
+    expect(new URLSearchParams(window.location.search).get('existing')).toBe('kept')
+  })
+  it('keeps an incident link ahead of a workspace restore and ignores unknown destinations', async () => {
+    sdk.redirect.mockResolvedValue({ state: workspaceSignInState('?view=monitoring&incident=case%2B1'), account })
+    await initializeAuth(config)
+    expect(workspaceFromSearch(window.location.search)).toEqual({ section: 'incidents', incidentId: 'case+1' })
+    window.history.replaceState({}, '', '/')
+    sdk.redirect.mockResolvedValue({ state: 'command_center_workspace=https%3A%2F%2Funsafe.example', account })
+    await initializeAuth(config)
+    expect(window.location.search).toBe('')
+  })
+})
 
 describe('MSAL approval-link integration', () => {
   it('carries approval context without changing the registered redirect URI', async () => {

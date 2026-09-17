@@ -81,7 +81,11 @@ def detect_duplicates(
 
 def render_table(path: str | Path, limit: int = 20) -> str:
     """Render a CSV for on-screen display — used for the before/after beat."""
-    rows = read_rows(path)
+    return render_rows(read_rows(path), limit)
+
+
+def render_rows(rows: list[dict[str, str]], limit: int = 20) -> str:
+    """Render table rows without requiring a local file."""
     if not rows:
         return "(empty)"
 

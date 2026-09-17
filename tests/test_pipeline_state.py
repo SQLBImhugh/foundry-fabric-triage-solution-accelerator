@@ -9,7 +9,7 @@ import pytest
 
 from triage.pipeline_models import PipelineRerunRecord, PipelineTarget, load_pipeline_targets
 from triage.store.pipeline_reruns import (
-    FabricSqlPipelineRerunStore,
+    AzureSqlPipelineRerunStore,
     InMemoryPipelineRerunStore,
     JsonFilePipelineRerunStore,
 )
@@ -63,7 +63,7 @@ def reruns(request, tmp_path):
         return InMemoryPipelineRerunStore()
     if request.param == "file":
         return JsonFilePipelineRerunStore(tmp_path / "reruns.json")
-    return FabricSqlPipelineRerunStore(db=_Sql(tmp_path / "reruns.db"))
+    return AzureSqlPipelineRerunStore(db=_Sql(tmp_path / "reruns.db"))
 
 
 def test_reserved_run_cannot_be_submitted_again(reruns) -> None:
@@ -126,19 +126,19 @@ def test_sql_reservation_has_exactly_one_winner_across_store_instances(tmp_path)
     barrier = threading.Barrier(8)
 
     def reserve(_index):
-        store = FabricSqlPipelineRerunStore(db=db)
+        store = AzureSqlPipelineRerunStore(db=db)
         barrier.wait()
         return store.reserve(_record())
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         winners = list(pool.map(reserve, range(8)))
     assert winners.count(True) == 1
-    assert not FabricSqlPipelineRerunStore(db=db).reserve(_record())
+    assert not AzureSqlPipelineRerunStore(db=db).reserve(_record())
 
 
 def test_sql_outage_refuses_instead_of_creating_an_in_memory_reservation(tmp_path) -> None:
     db = _Sql(tmp_path / "reruns.db")
-    store = FabricSqlPipelineRerunStore(db=db)
+    store = AzureSqlPipelineRerunStore(db=db)
     db.down = True
     with pytest.raises(ConnectionError):
         store.reserve(_record())

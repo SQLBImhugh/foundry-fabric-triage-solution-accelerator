@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # --- Execution mode ----------------------------------------------------
     triage_provider_mode: ProviderMode = "mock"
     triage_tool_mode: ToolMode = "mock"
+    monitoring_mode: Literal["fixture", "live"] = "fixture"
+    monitoring_tenant_id: str = ""
+    azure_client_id: str = ""
 
     # --- Foundry -----------------------------------------------------------
     foundry_project_endpoint: str = ""
@@ -76,18 +79,15 @@ class Settings(BaseSettings):
     graph_sender_allowlist: str = "no-reply-powerbi@microsoft.com,no-reply@powerbi.com"
     graph_subject_pattern: str = r"(?i)\b(power\s*bi|fabric|refresh|semantic model|dataset)\b"
 
-    # Durable state lives in a Fabric SQL Database. Empty = JSON files next to
-    # the repo, which is the right choice on a laptop and the wrong one in a
-    # container: the filesystem goes away on recycle and takes the open
-    # incidents with it, which would let the agent remediate the same failure
-    # twice after a restart.
+    # Fixture mode uses explicit offline stores. Live mode requires both SQL
+    # settings and deployment-owned schema; missing state never selects JSON.
     #
-    # A Fabric SQL Database accepts Microsoft Entra tokens and nothing else, so
-    # there is no connection string to leak and no local-auth setting for
-    # governance to keep switching off. Read both values from the item's
-    # connection properties (Fabric portal, or the sqlDatabases REST API).
-    fabric_sql_server: str = ""
-    fabric_sql_database: str = ""
+    # Deployment configures an Entra-only Azure SQL logical server. Supply its
+    # DNS hostname and database name, never a password or connection string.
+    # One database keeps controller, worker and web state transactional.
+    azure_sql_server: str = ""
+    azure_sql_database: str = ""
+    data_quality_flag_table_name: str = "triage_data_quality_flags"
     # Table names, so one database can host more than one deployment.
     incident_table_name: str = "triage_incidents"
     # Which alert mail has already been triaged. Shares the database because it
@@ -129,11 +129,8 @@ class Settings(BaseSettings):
     #: per user across all datasets, so a detector that fires them back to back
     #: becomes load on the capacity it is watching.
     silent_probe_pace_seconds: float = 1.0
-    # Parsed at command time so a malformed optional monitor cannot prevent
-    # the existing mailbox controller starting.
-    fabric_pipeline_targets: str = ""
+    # Standalone fixture sweeps only. Live enablement belongs to registry policy.
     pipeline_sweep_enabled: bool = False
-    fabric_tenant_id: str = ""
     fabric_client_id: str = ""
     pipeline_lookback_hours: int = Field(default=24, ge=1, le=168)
     pipeline_max_pages: int = Field(default=10, ge=1, le=100)
@@ -158,7 +155,7 @@ class Settings(BaseSettings):
         "pipeline_lookback_hours", "pipeline_max_pages",
         "pipeline_max_runs_per_sweep", "pipeline_rerun_table_name",
         "agent_run_table_name", "agent_event_table_name", "agent_command_table_name",
-        "incident_activity_table_name",
+        "incident_activity_table_name", "data_quality_flag_table_name",
         "approval_delivery_mode", "notification_channel",
         mode="before",
     )
@@ -178,11 +175,7 @@ class Settings(BaseSettings):
     approval_timeout_seconds: int = 300
 
     # --- Power BI ----------------------------------------------------------
-    powerbi_tenant_id: str = ""
     powerbi_client_id: str = ""
-    powerbi_client_secret: str = Field(default="", repr=False)
-    powerbi_workspace_id: str = ""
-    powerbi_dataset_id: str = ""
 
     # --- Teams -------------------------------------------------------------
     teams_webhook_url: str = Field(default="", repr=False)

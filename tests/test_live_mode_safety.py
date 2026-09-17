@@ -36,11 +36,10 @@ _BLANK: dict[str, object] = {
     "powerbi_tenant_id": "",
     "powerbi_client_id": "",
     "powerbi_client_secret": "",
-    "powerbi_workspace_id": "",
-    "powerbi_dataset_id": "",
+    "monitoring_tenant_id": "",
     "teams_webhook_url": "",
-    "fabric_sql_server": "",
-    "fabric_sql_database": "",
+    "azure_sql_server": "",
+    "azure_sql_database": "",
     "approval_callback_url": "",
 }
 
@@ -48,6 +47,8 @@ _BLANK: dict[str, object] = {
 def _live(**overrides: object) -> Settings:
     """Settings that ask for live tools, with nothing configured by default."""
     return Settings(
+        _env_file=None,
+        monitoring_mode="live",
         triage_tool_mode="live",
         triage_provider_mode="mock",
         **{**_BLANK, **overrides},
@@ -55,6 +56,13 @@ def _live(**overrides: object) -> Settings:
 
 
 def _runner(settings: Settings) -> TriageRunner:
+    if settings.triage_tool_mode == "live":
+        # Isolate client-builder contracts from deployed-store bootstrap.
+        # The core monitoring tests exercise complete runner construction.
+        runner = TriageRunner.__new__(TriageRunner)
+        runner.settings = settings
+        runner._teams = None
+        return runner
     return TriageRunner(settings=settings, base_dir=REPO_ROOT)
 
 
@@ -70,7 +78,7 @@ def test_live_power_bi_without_a_tenant_refuses_to_build() -> None:
     with pytest.raises(ValueError) as error:
         runner.build_powerbi()
 
-    assert "POWERBI_TENANT_ID" in str(error.value)
+    assert "MONITORING_TENANT_ID" in str(error.value)
     assert "report success for work that never happened" in str(error.value)
 
 
@@ -98,7 +106,7 @@ def test_live_health_client_without_a_tenant_refuses_to_build() -> None:
     with pytest.raises(ValueError) as error:
         runner.build_health_client()
 
-    assert "POWERBI_TENANT_ID" in str(error.value)
+    assert "MONITORING_TENANT_ID" in str(error.value)
 
 
 def test_mock_mode_still_builds_everything_without_configuration() -> None:
@@ -192,52 +200,52 @@ def test_scope_check_allows_mail_only_when_scoping_is_proven() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_configured_ids_outrank_ids_supplied_by_the_alert() -> None:
-    """The alert is an email, and the sender of an email is trivially forged.
-
-    An attacker who gets one message past the inbox filter could otherwise name
-    any workspace or dataset and have the agent act on it, bounded only by what
-    the controller's identity happens to reach.
-    """
-    resolved = TriageRunner._resolve_id(
-        "",                                          # no scenario
-        "configured-workspace",                      # configuration
-        "workspace-from-the-email",                  # the alert
-        untrusted="workspace-from-the-email",
-        label="workspace",
-    )
-
-    assert resolved == "configured-workspace"
+def test_static_live_target_settings_and_precedence_loader_are_removed() -> None:
+    assert not {"powerbi_workspace_id", "powerbi_dataset_id", "fabric_pipeline_targets"} & Settings.model_fields.keys()
+    assert not hasattr(TriageRunner, "_resolve_id")
 
 
-def test_the_alert_is_still_used_when_nothing_is_configured() -> None:
-    """A deployment watching many models leaves the ids unset.
-
-    That case is steerable by construction, so it must keep working rather than
-    break, and the disagreement is logged instead of hidden.
-    """
-    resolved = TriageRunner._resolve_id(
-        "",
-        "",
-        "workspace-from-the-email",
-        untrusted="workspace-from-the-email",
-        label="workspace",
-    )
-
-    assert resolved == "workspace-from-the-email"
+def test_state_settings_read_azure_sql_without_a_fabric_setting_fallback(monkeypatch) -> None:
+    monkeypatch.delenv("AZURE_SQL_SERVER", raising=False)
+    monkeypatch.delenv("AZURE_SQL_DATABASE", raising=False)
+    monkeypatch.setenv("FABRIC_SQL_SERVER", "retired.database.fabric.microsoft.com")
+    monkeypatch.setenv("FABRIC_SQL_DATABASE", "retired_state")
+    unconfigured = Settings(_env_file=None)
+    assert unconfigured.azure_sql_server == unconfigured.azure_sql_database == ""
+    assert not {"fabric_sql_server", "fabric_sql_database"} & Settings.model_fields.keys()
+    monkeypatch.setenv("AZURE_SQL_SERVER", "state.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DATABASE", "triage_state")
+    configured = Settings(_env_file=None)
+    assert configured.azure_sql_server == "state.database.windows.net"
+    assert configured.azure_sql_database == "triage_state"
 
 
-def test_a_scenario_still_outranks_configuration() -> None:
-    """Scenario files are local and trusted; they pin the whole run."""
-    resolved = TriageRunner._resolve_id(
-        "scenario-workspace",
-        "configured-workspace",
-        "workspace-from-the-email",
-        untrusted="workspace-from-the-email",
-        label="workspace",
-    )
+def test_the_sql_adapter_has_no_retired_import_alias() -> None:
+    from importlib.util import find_spec
 
-    assert resolved == "scenario-workspace"
+    from triage.store.azure_sql import AzureSqlDatabase
+
+    assert AzureSqlDatabase.__module__ == "triage.store.azure_sql"
+    assert find_spec("triage.store.fabric_sql") is None
+
+
+def test_untrusted_non_native_ids_cannot_be_live_target_identities() -> None:
+    from triage.monitoring.models import TargetIdentity
+
+    with pytest.raises(ValueError):
+        TargetIdentity(
+            tenant_id="11111111-1111-1111-1111-111111111111",
+            epoch="22222222-2222-2222-2222-222222222222",
+            workload="powerbi", workspace_id="workspace-from-email", item_id="dataset-from-email",
+        )
+
+
+def test_synthetic_identity_mapping_is_explicit_and_deterministic() -> None:
+    from triage.monitoring.runtime import fixture_target
+
+    identity = fixture_target("powerbi", "scenario-workspace", "scenario-dataset")
+    assert fixture_target("powerbi", "scenario-workspace", "scenario-dataset") == identity
+    assert fixture_target("powerbi", "other-workspace", "scenario-dataset").key != identity.key
 
 
 def test_preflight_does_not_connect_unless_asked(monkeypatch) -> None:
@@ -248,10 +256,10 @@ def test_preflight_does_not_connect_unless_asked(monkeypatch) -> None:
 
     calls: list[str] = []
     monkeypatch.setattr(
-        cli, "_probe_fabric_sql", lambda: calls.append("connected") or ("", "", "")
+        cli, "_probe_azure_sql", lambda *_args: calls.append("connected") or ("", "", "")
     )
-    monkeypatch.setattr(cli.settings, "fabric_sql_server", "srv")
-    monkeypatch.setattr(cli.settings, "fabric_sql_database", "db")
+    monkeypatch.setattr(cli.settings, "azure_sql_server", "srv")
+    monkeypatch.setattr(cli.settings, "azure_sql_database", "db")
 
     args = cli.build_parser().parse_args(["preflight"])
     assert cli.cmd_preflight(args) == 0
@@ -268,13 +276,13 @@ def test_check_sql_opts_into_a_real_connection(monkeypatch) -> None:
 
     calls: list[str] = []
 
-    def fake_probe() -> tuple[str, str, str]:
+    def fake_probe(*_args) -> tuple[str, str, str]:
         calls.append("connected")
         return ("  probe", "SELECT 1 succeeded", "ok")
 
-    monkeypatch.setattr(cli, "_probe_fabric_sql", fake_probe)
-    monkeypatch.setattr(cli.settings, "fabric_sql_server", "srv")
-    monkeypatch.setattr(cli.settings, "fabric_sql_database", "db")
+    monkeypatch.setattr(cli, "_probe_azure_sql", fake_probe)
+    monkeypatch.setattr(cli.settings, "azure_sql_server", "srv")
+    monkeypatch.setattr(cli.settings, "azure_sql_database", "db")
 
     args = cli.build_parser().parse_args(["preflight", "--check-sql"])
     assert cli.cmd_preflight(args) == 0
@@ -284,23 +292,24 @@ def test_check_sql_opts_into_a_real_connection(monkeypatch) -> None:
 def test_the_sql_probe_reports_failure_rather_than_raising(monkeypatch) -> None:
     """A diagnostic that aborts the table is worse than one that prints red."""
     import triage.cli as cli
-    from triage.store import fabric_sql
+    from triage.store import azure_sql
 
     def boom(**_kwargs):
         raise RuntimeError("no route to host")
 
-    monkeypatch.setattr(fabric_sql, "FabricSqlDatabase", boom)
-    monkeypatch.setattr(cli.settings, "fabric_sql_server", "srv")
-    monkeypatch.setattr(cli.settings, "fabric_sql_database", "db")
+    monkeypatch.setattr(azure_sql, "AzureSqlDatabase", boom)
+    monkeypatch.setattr(cli, "_operator_credential", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(cli.settings, "azure_sql_server", "srv")
+    monkeypatch.setattr(cli.settings, "azure_sql_database", "db")
 
-    name, detail, status = cli._probe_fabric_sql()
+    name, detail, status = cli._probe_azure_sql()
     assert "failed" in status
     assert "RuntimeError" in detail
 
 
 def test_a_scenario_will_not_silently_wipe_a_durable_incident_store(monkeypatch, capsys) -> None:
     """`run` clears incidents so a scenario is reproducible. That is right for a
-    JSON file under runs/ and wrong for Fabric SQL, where the same table is the
+    JSON file under runs/ and wrong for Azure SQL, where the same table is the
     hosted controller's live state.
 
     Found by doing it: one `bi-triage run scenario1-transient` against the live

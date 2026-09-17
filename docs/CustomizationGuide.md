@@ -5,6 +5,22 @@ responsibilities: reasoning agents interpret evidence without service
 permissions, the controller enforces action limits, and deterministic detectors
 produce measurements. Live components authenticate with their own Entra
 identities; a command-center user's app role is not a controller service grant.
+All live application state belongs in one shared Azure SQL Database, while
+Power BI and Fabric remain the monitored workload/event platforms.
+
+The current SQL ownership contract is independently reviewed offline; final
+component-store, controller and connector acceptance remains separate.
+Isolated MI event transport has been demonstrated across manual and
+scheduled failure, success and cancellation; SQL durable handling and normal
+worker readiness have not. The shipped infrastructure now uses public networking
+with Entra authentication and no PE/VNet/NAT/private-DNS prerequisites.
+Scoped evaluation SQL/registry public access is verified, but the original SQL
+proof receipt is under recovery and bootstrap/runtime acceptance remains gated.
+Earlier private-network proofs and the private Foundry preflight error are
+historical, not blockers for the retained public Foundry path.
+The live app/controller remain the prior release; normal-worker rollout,
+history migration/wipe and hybrid cutover are not complete. Keep those gates distinct; see
+[DeploymentGuide.md](DeploymentGuide.md#release-gates).
 
 ## Decide the tier before writing any code
 
@@ -15,7 +31,7 @@ when a classification was recorded. There is no `TriageResult.tier` field or
 
 | `tier` value | Meaning | Where it lands |
 |---|---|---|
-| `tier_1` | Transient and idempotent. Safe unattended. | `REMEDIATION_ACTIONS` |
+| `tier_1` | Transient/idempotent candidate, subject to current admission, review and controller policy | `REMEDIATION_ACTIONS` |
 | `tier_2` | Deterministic fix, real blast radius. Human approves first. | `REMEDIATION_ACTIONS` + an approval gate |
 | `needs_human` | No suitable permitted automation. Escalate with evidence. | Reporting tools only; do not add the unsafe action to an allowlist |
 
@@ -32,7 +48,7 @@ report and flag duplicate evidence, not repair the underlying records.
 
 ## Add a remediation tool
 
-Five steps, all required:
+Required changes:
 
 1. **Schema** in `TRIAGE_TOOLS` (`tools/registry.py`). Describe what it does and
    what it affects — the model sees only this.
@@ -46,14 +62,24 @@ Five steps, all required:
 4. **Scenario** in `scenarios/`, with an `expect` block.
 5. **Test**, including a negative control: a test that fails if the guard is
    removed.
+6. **Shared action contract** for a live mutation: typed action/review/argument
+   fingerprints, source-head and active-job prerequisites, atomic reservation,
+   submission state and exact verification. Do not add a second pre-POST path
+   outside the common monitoring store/controller.
+7. **Recovery and finalization**: preserve an uncertain effect's fence and prove
+   terminal incident, processed-source disposition and work completion are
+   durable. A local result or an unrelated new job is not completion.
 
 Give the tool its own mock. The offline path is the evaluation path; a tool that
 only works live cannot be demonstrated or tested.
 
+Targets default to observation-only; classification or adding a tool schema
+does not enable an action in the registry.
+
 Pipeline requests use `PIPELINE_ACTIONS` as well as the action taxonomy. Add an
 action to that workload's set only after reviewing its effect on pipelines;
 do not make dataset tools available to pipeline requests. The existing monitor
-handles explicitly configured scheduled pipeline jobs. Notebook failures
+handles registry-admitted scheduled pipeline jobs. Notebook failures
 inside their activity evidence do not imply standalone notebook monitoring.
 
 ## Add a preconditioned action
@@ -66,6 +92,11 @@ Add the name to `_PRECONDITIONED_ACTIONS` and implement `_precondition_failure()
 The budget is charged **after** the precondition passes, not before. Charging
 first means a refusal still spends the write budget, which silently disarms the
 agent for the rest of the incident — the same bug the approval path already had.
+
+The in-run ledger is not the cross-invocation action boundary. A live action
+must also pass the store's atomic current-epoch, admission, review, source-head,
+approval and owner/fence checks. Do not split those into a successful read and
+an independent reservation write.
 
 ## Add an approval gate
 
@@ -83,8 +114,18 @@ The current gated remediations are `rebind_dataset_gateway`,
 `reenable_refresh_schedule` and `rerun_fabric_pipeline`. Schedule re-enablement
 also requires successful refresh evidence. A pipeline rerun requires a reviewed
 target and complete replay-parameter set, rechecked prerequisites after approval,
-and a durable reservation before submission. Its correlated job and activity
-evidence must confirm success; HTTP acceptance is not a resolution.
+and a durable reservation before submission. Its exact submitted job and activity
+evidence must confirm success; HTTP acceptance is not a resolution. Power BI
+refresh also needs exact own-submission correlation. Gateway/schedule actions
+need the intended configuration read back through their typed verification path.
+Keep the full tool arguments and approval fingerprint. Do not strip arguments
+to fit an older RPC shape or replace an original hash with a smaller technical
+subset. Empty `{}` and absent/null reviewed parameters are not interchangeable.
+
+Never globally refund an incident budget or reuse a consumed approval because
+a response proves no effect. Preserve the reserved incident slot. Any allowed
+retry must use the store's bound, single-use path after durable parent
+finalization and fresh scope/source/review checks.
 
 For web decisions, use the authenticated command-center API and its exact,
 fingerprint-bound decision method. Do not accept a responder identity from a
@@ -110,6 +151,161 @@ retrieval.
 detailed, but they are written for engineers debugging the service and carry
 owner and incident-management references. Use them to decide what matters; write
 the entry from public docs. A test enforces this.
+
+## Extend monitoring discovery or intake
+
+Use the typed models and synchronous `MonitoringStore` contract under
+`triage.monitoring`. `MONITORING_MODE=live` selects durable SQL and the pinned
+`MONITORING_TENANT_ID`; `MONITORING_MODE=fixture` selects explicit offline state.
+No missing setting, unavailable backend or partial response may select a
+fixture or restore `FABRIC_PIPELINE_TARGETS`. Static live targets and
+compatibility loaders are retired.
+
+Discovery work uses `discovery_selector`; API-triggered discovery delegates
+revision/idempotency handling to `request_discovery(expected, selector,
+request_id=...)`. Do not add an alias or perform an API preflight that rejects
+the original request after an idempotent mutation has already committed.
+Scopes, metadata generations and display names are not execution authority.
+An accepted web intent remains pending/configuring until deterministic controller
+publication. Workers own observations, not source heads or resolved admission.
+Use `controller.publish_source` for current-fenced source publication and
+`controller.disposition_source` for a no-effect disposition with its processed
+marker; no raw source/head/disposition write alternative is part of the contract.
+
+Keep these contracts when adding an inventory provider or workload:
+
+- Enumerate valid pages within durable budgets. Persist continuation and gaps;
+  failed or incomplete enumeration must not delete known inventory.
+- Store named workspaces/domains separately from workload items. Reconcile
+  ancestors/descendants and moves, with exclusions winning. Unknown domain
+  membership must not bypass a policy exclusion.
+- Label caller-visible versus authorized tenant-admin inventory. Domain
+  metadata grants nothing; Admin Items preview must be explicitly selected.
+  Power BI scanning is inventory, not operational refresh telemetry.
+- Perform source/capability probes with the deployed collection/execution
+  identity. Reading history cannot establish event, write or exact-correlation
+  capability. No access grants are made by a collector.
+- Use canonical tenant/epoch/workload/workspace/item identity and authoritative
+  execution IDs. Resolve Power BI ID aliases from source evidence, never from
+  timestamps or display-name similarity.
+- Accept/disposition every source observation before advancing a REST page or
+  contiguous stream checkpoint. Preserve original transport source/ID and
+  connector provenance separately from execution deduplication.
+
+Target identity, source-execution identity and incident identity are distinct.
+`target_signature` supplies the immutable target key to the existing
+`compute_signature` normalization/digest logic; it is not a new canonical-ID
+wire format. Do not confuse that failure signature with the SHA-256 source
+revision used for human tracking. Power BI numeric history IDs
+(`powerbi_refresh`) and request IDs (`powerbi_request`) remain separate
+namespaces; only authoritative REST evidence can establish their alias.
+
+Collectors remain evidence-only. Unsupported item types stay visible with
+reasons; standalone notebooks do not become pipelines. A failed-job stream
+cannot detect a job that never existed. Missing expected starts need explicit
+schedule/timezone/grace contracts, and broad data-quality monitoring needs
+business expectations and source data access.
+
+The current Eventstream path uses public outbound Custom Endpoint transport
+with Entra. Do not call the key-returning connection API, introduce a SAS/blob
+checkpoint fallback or claim automatic endpoint discovery. Initial nonsecret
+metadata comes from the Entra tab and must be bound to the owned topology.
+Reconciliation may alter only app-owned monitoring definitions. It cannot
+adopt an unrecorded user-owned Eventstream or authorize a workload remediation.
+
+### Connector proposals, observations and retirement
+
+Additions use a typed logical `ConnectorSourceProposal`: `proposal_id`,
+`node_name`, target and event types, with `source_id=null`. An unresolved
+proposal, including one already stored, cannot supply an invented physical ID.
+The worker records the original complete owned definition; controller
+`publish_connector` passes its `observation_receipt_id` to let SQL validate and
+bind only actual returned component IDs. Do not query worker-private receipt
+views from controller caller code.
+
+`SourceRemovalIntent` carries `removal_id`, `source_id`, `proposal_id` and
+`detail`. Both selector keys are required and exactly one must be nonnull.
+Desired removal fences intake but retains ownership and existing IDs while
+remote absence is pending. Only a complete original current receipt proving
+absence of the selected node, physical ID and stream routing may retire the
+source and append its immutable tombstone. An uncertain or inherited snapshot,
+or a null SQL-derived `observed_definition_hash`, cannot establish absence.
+
+Preserve `pending_removals`, `retired_sources` and `observation_receipt_id` in
+the typed publication result. Do not infer retirement from an empty latest list,
+reuse earlier readiness for a changed source set, or turn worker observations
+into published authority.
+
+## Extend shared state
+
+State crossing invocations belongs in a durable store, not a worker/controller
+instance field. All live stores share the Azure SQL application catalog so
+cross-store acceptance, finalization and receipts can be atomic. The live store
+must fail closed when SQL is unavailable and recover from current shared records.
+A recovered empty cache can incorrectly
+license another remediation.
+
+Live construction must select the component explicitly:
+`build_monitoring_store(settings, db=db, component="controller")`, or the
+corresponding `worker`/`web` component. `AzureSqlMonitoringStore(db=db,
+component=...)` has no permissive live default. Fixture component views are
+explicit offline objects, not evidence that a deployed identity has SQL access.
+The component argument selects routing; actual SQL roles enforce authorization.
+
+Seed offline state inside a narrow `fixture_setup(store)` context, passing its
+yielded fixture to the seeding helpers. Close that context before awaiting or
+running the controller. Use `fixture_component` to share fixture state through
+separate restricted worker, web and controller views. SQL protocol doubles live
+in tests, not production adapters or live fallback paths.
+
+Use `triage.monitoring.sql_permissions` for the checked-view, static-RPC and
+deployer-grant contract. Bind every named argument, including required nulls,
+with `RpcContract.bind`, execute through `db.query`, and use
+`decode_rpc_result`. Read the returned `status`, `affected_rows` and typed
+`result`; never treat EXEC rowcount as success. Preserve original receipts
+after uncertain commits rather than reconstructing a success-shaped result.
+`runtime_table_permissions()` is retired and raises; do not replace missing
+component routes with broad base-table DML.
+
+Use `AzureSqlDatabase.transaction` for multi-record atomic work. It is
+synchronous and thread-bound: no awaits, no nested transaction, and no claim
+that several autocommit calls form one transaction. Async collectors offload
+blocking persistence. Use database time, conditional ownership and fences,
+shared service/API budgets and fair workspace shares across replicas.
+
+Use `AZURE_SQL_SERVER` and `AZURE_SQL_DATABASE`, with the hostname and catalog
+from the Azure deployment. The public SQL endpoint requires Entra-only
+authentication, TLS, auditing/TDE and explicit firewall admission. The default
+`allowAzureServices=true` is SQL's special start/end `0.0.0.0` rule for
+Azure-hosted callers, including other subscriptions, not an Internet-wide rule
+or an identity grant. Optional client rules specify exact IPv4 ranges.
+Do not introduce a SQL login, credential string, Fabric SQL adapter or legacy
+configuration alias. A temporary proof database may share the logical server;
+the shipped template has one application database and no elastic pool.
+
+Keep normal public networking as the shipped baseline. Optional resource
+exception maps must not become baked-in customer defaults. For MCAPS testing,
+the SQL server's approved `SecurityControl=Ignore` plus reason/review tags has
+one 14-day period; re-adding the tag does not renew it. Longer tests need an
+approved exclusion. Do not introduce a VNet, NAT or private-endpoint dependency
+as a workaround for an identity/permission failure.
+
+Creation/bootstrap/reset belong to explicit deployment tooling. Runtime stores
+must not acquire DDL, upgrade schema, import old state or delete an uncertain
+action journal. Preserve original operation IDs after a timeout and reconcile
+their receipts. The deployment-only prototype reset is not a recovery fallback.
+
+Add deterministic fake transport/clock/transaction cases for denial, malformed
+or partial evidence, retention exhaustion, duplicate source aliases, stale
+scope/review, lease loss, ambiguous commit, restart and cross-workspace fairness.
+Keep them offline even when the operator's environment contains live settings.
+Deployment proof is a separate authorized procedure.
+Keep unfinished adapters or `kernel_incomplete` failures explicit until all
+required live routes are functional and independently proved. Native permission
+proof requires real Entra identities on an approved isolated Azure SQL target.
+Azure SQL supports `WITHOUT LOGIN` and `EXECUTE AS USER` for database-scoped
+tests; these and offline fixtures do not prove MI sign-in, firewall admission,
+reconnect or end-to-end persistence.
 
 ## Add a detector
 
@@ -190,8 +386,10 @@ no raw HTML, images or unsafe links. Presentation tokens live in
 `command-center/src/styles.css`; the current design uses self-hosted DejaVu
 Serif Condensed, Onyx dark/light colors and Ink-style geometry and shadows.
 Keep the supplied PNG logo and packaged font assets unless a deliberate branding
-change updates the asset checks too. The separate Rayfin cockpit remains
-read-only and is not an alternative command writer.
+change updates the asset checks too. The Command Center is the operational UI.
+The separate Rayfin cockpit remains a read-only sample, not an alternative
+command writer or a deployment/state dependency. Its earlier model binding
+is not a verified Azure SQL integration.
 
 ## Change the model
 
@@ -212,11 +410,17 @@ looks unaltered, which is worse than an error.
 
 ## Change the trigger
 
-The mailbox is one entry point. `TriageRunner.run_request` is also used by
-interactive and queued requests; `pipeline_sweep` handles configured scheduled
-pipeline failures. A webhook, queue or Fabric event would need an adapter with
-equivalent authentication, target validation, filtering, claims and persistence.
-These are extension points, not preconfigured triggers.
+The mailbox is one entry point. Interactive, queued, polled, event and deferred
+retry observations must converge on current registry admission and exact source
+identity. In live mode, `pipeline_sweep` queues observations for admitted targets;
+the collector reads them and the controller heartbeat drains durable work.
+Do not turn a new trigger into a direct tool dispatcher.
+
+The Eventstream worker and disabled-by-default one-minute heartbeat are the
+hybrid mechanisms. A new webhook or queue adapter still needs equivalent
+authentication, provenance, scope/cutoff validation, idempotent intake and
+receipt-before-checkpoint ordering. Its successful transport response is not
+controller completion.
 
 Whatever the trigger, keep an equivalent of the inbox filter. It fails closed,
 including when its own pattern is invalid, and counts what it ignored rather

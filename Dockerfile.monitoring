@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1
+# Use an approved digest of this supported Python 3.13 / Debian base for releases.
+ARG PYTHON_BASE_IMAGE=python:3.13-slim-trixie
+FROM ${PYTHON_BASE_IMAGE}
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# The mssql-python wheel bundles its driver, but not these Linux libraries:
+# https://learn.microsoft.com/sql/connect/python/mssql-python/container-local-development
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates libltdl7 libkrb5-3 libgssapi-krb5-2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 triage \
+    && useradd --uid 10001 --gid triage --create-home --shell /usr/sbin/nologin triage
+
+WORKDIR /app
+# An explicit copy boundary keeps .env, credential caches, state and UI builds out.
+COPY pyproject.toml README.md LICENSE ./
+COPY src/triage ./src/triage
+COPY scripts/hybrid_platform_probe.py ./scripts/hybrid_platform_probe.py
+
+# pip only warns about an unknown extra; fail instead of building an incomplete worker.
+RUN python -c "import tomllib; assert 'monitoring' in tomllib.load(open('pyproject.toml', 'rb'))['project']['optional-dependencies'], 'The monitoring extra is required'" \
+    && python -m pip install --no-cache-dir ".[azure,monitoring]" \
+    && python -m pip check \
+    && python -c "import importlib.util; import mssql_python; import azure.eventhub; import scripts.hybrid_platform_probe; assert importlib.util.find_spec('triage.monitoring.worker') is not None, 'The monitoring worker entry point is required'"
+
+USER 10001:10001
+STOPSIGNAL SIGTERM
+# Health evidence comes from durable worker heartbeats, not an HTTP listener.
+ENTRYPOINT ["python", "-m", "triage.monitoring.worker"]

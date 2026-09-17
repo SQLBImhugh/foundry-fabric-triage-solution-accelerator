@@ -1,9 +1,9 @@
 targetScope = 'resourceGroup'
 
-// Independent of the Foundry deployment and the existing Fabric SQL database.
-// Inbound Private Link and outbound VNet integration use different subnets:
-// https://learn.microsoft.com/azure/app-service/overview-private-endpoint
-// https://learn.microsoft.com/azure/app-service/overview-vnet-integration
+// Independent of the Foundry deployment and the existing Azure SQL database.
+// Public HTTPS networking; Entra app roles protect the API and Azure RBAC
+// protects deployment. No VNet, NAT gateway or private DNS is required.
+// https://learn.microsoft.com/azure/app-service/overview-access-restrictions
 
 type GovernanceTags = {
   CostCenter: string
@@ -20,7 +20,7 @@ param appName string
 param location string = resourceGroup().location
 param tags GovernanceTags
 
-@description('Choose a SKU with available regional quota. Basic supports Linux VNet integration and private endpoints. NAT and Private Link are billed separately.')
+@description('Choose an App Service SKU with available regional quota. No additional network resources are provisioned.')
 @allowed([
   'B1'
   'B2'
@@ -37,20 +37,9 @@ param planSku string = 'B1'
 param tenantId string
 param applicationClientId string
 
-@description('Additional non-secret application settings, including FABRIC_SQL_SERVER, FABRIC_SQL_DATABASE and Foundry configuration. Managed settings below take precedence.')
+@description('Additional non-secret application settings, including AZURE_SQL_SERVER, AZURE_SQL_DATABASE and Foundry configuration. Managed settings below take precedence.')
 @secure()
 param applicationSettings object = {}
-
-param vnetAddressPrefix string = '10.74.0.0/16'
-param integrationSubnetPrefix string = '10.74.0.0/26'
-param privateEndpointSubnetPrefix string = '10.74.1.0/27'
-
-@description('Preserve an existing subnet NSG, including one attached by governance. The deployment helper reads this binding before redeploying.')
-param integrationSubnetNsgId string = ''
-param privateEndpointSubnetNsgId string = ''
-
-@description('Optional custom DNS servers. The deployment operator must arrange DNS/peering to existing private Foundry and Fabric endpoints.')
-param dnsServers array = []
 
 @description('Optional existing Application Insights resource ID for the portal link. This template neither provisions telemetry nor grants monitoring permissions.')
 param applicationInsightsResourceId string = ''
@@ -58,17 +47,17 @@ param applicationInsightsResourceId string = ''
 @description('Enable admin-only isolated synthetic scenario validation for an evaluation, never normal production operation.')
 param enableEvaluation bool = false
 
-@description('Opt-in evaluation cost-control exemption. Requires an expiry review; the tag does not expire automatically.')
+@description('Opt-in evaluation cost-control exemption. Review tenant limits: MCAPS tag exemptions have a single limited period and reapplying them does not extend it.')
 param evaluationCostExemption bool = false
 
 @description('Evaluation review date, YYYY-MM-DD. EvaluationExpiresOn is informational: remove CostControl=Ignore and disable validation before this date.')
 param evaluationExpiresOn string = ''
 
-@description('Temporary deployment/verification only. Default is private. The caller must restore Disabled; deploy_command_center.ps1 does so in finally.')
-param enablePublicAccess bool = false
-
-@description('Explicit temporary client /32 or /128 CIDRs. Public and SCM access otherwise deny by default, including when this list is empty.')
+@description('Optional main-site client CIDRs. Empty means public network reachability, not anonymous API authorization.')
 param publicAccessClientCidrs array = []
+
+@description('Optional separate deployment-endpoint client CIDRs. Empty permits public SCM networking; Entra deployment authentication remains required.')
+param scmAccessClientCidrs array = []
 
 var baseTags = union(tags, enableEvaluation ? { EvaluationExpiresOn: evaluationExpiresOn } : {})
 var costTags = union(baseTags, evaluationCostExemption ? { CostControl: 'Ignore' } : {})
@@ -76,107 +65,25 @@ var appTags = union(costTags, empty(applicationInsightsResourceId) ? {} : {
   'hidden-link:${applicationInsightsResourceId}': 'Resource'
 })
 var planTier = startsWith(planSku, 'B') ? 'Basic' : (startsWith(planSku, 'S') ? 'Standard' : 'PremiumV3')
-var integrationSubnetName = 'app-integration'
-var endpointSubnetName = 'private-endpoints'
-var integrationSubnetId = resourceId('Microsoft.Network/virtualNetworks/subnets', network.name, integrationSubnetName)
-var endpointSubnetId = resourceId('Microsoft.Network/virtualNetworks/subnets', network.name, endpointSubnetName)
-var temporaryAccessRules = [for (cidr, i) in publicAccessClientCidrs: {
-  name: 'temporary-client-${i}'
+var clientAccessRules = [for (cidr, i) in publicAccessClientCidrs: {
+  name: 'client-${i}'
   action: 'Allow'
   priority: 100 + i
   ipAddress: cidr
-  description: 'Temporary single-host deployment or evaluation access.'
+  description: 'Main-site network admission; application roles still apply.'
+}]
+var scmAccessRules = [for (cidr, i) in scmAccessClientCidrs: {
+  name: 'deployment-client-${i}'
+  action: 'Allow'
+  priority: 100 + i
+  ipAddress: cidr
+  description: 'Deployment admission; Entra authentication still applies.'
 }]
 
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${appName}-identity'
   location: location
   tags: costTags
-}
-
-// This IP provides outbound SNAT only, not a public listener. Entra, package
-// repositories, and public control-plane endpoints need explicit egress because
-// defaultOutboundAccess is disabled. Private destinations still need DNS/routes.
-resource outboundIp 'Microsoft.Network/publicIPAddresses@2024-05-01' = {
-  name: '${appName}-egress'
-  location: location
-  tags: costTags
-  sku: {
-    name: 'Standard'
-  }
-  properties: {
-    publicIPAllocationMethod: 'Static'
-    publicIPAddressVersion: 'IPv4'
-  }
-}
-
-resource nat 'Microsoft.Network/natGateways@2024-05-01' = {
-  name: '${appName}-nat'
-  location: location
-  tags: costTags
-  sku: {
-    name: 'Standard'
-  }
-  properties: {
-    idleTimeoutInMinutes: 10
-    publicIpAddresses: [
-      {
-        id: outboundIp.id
-      }
-    ]
-  }
-}
-
-resource network 'Microsoft.Network/virtualNetworks@2024-05-01' = {
-  name: '${appName}-vnet'
-  location: location
-  tags: costTags
-  properties: {
-    addressSpace: {
-      addressPrefixes: [
-        vnetAddressPrefix
-      ]
-    }
-    dhcpOptions: {
-      dnsServers: dnsServers
-    }
-    subnets: [
-      {
-        name: integrationSubnetName
-        properties: union({
-          addressPrefix: integrationSubnetPrefix
-          defaultOutboundAccess: false
-          natGateway: {
-            id: nat.id
-          }
-          delegations: [
-            {
-              name: 'app-service'
-              properties: {
-                serviceName: 'Microsoft.Web/serverFarms'
-              }
-            }
-          ]
-        }, empty(integrationSubnetNsgId) ? {} : {
-          networkSecurityGroup: {
-            id: integrationSubnetNsgId
-          }
-        })
-      }
-      {
-        name: endpointSubnetName
-        properties: union({
-          addressPrefix: privateEndpointSubnetPrefix
-          defaultOutboundAccess: false
-          privateEndpointNetworkPolicies: 'Disabled'
-        }, empty(privateEndpointSubnetNsgId) ? {} : {
-          networkSecurityGroup: {
-            id: privateEndpointSubnetNsgId
-          }
-        })
-      }
-    ]
-  }
 }
 
 resource plan 'Microsoft.Web/serverfarms@2024-11-01' = {
@@ -232,14 +139,8 @@ resource webApp 'Microsoft.Web/sites@2024-11-01' = {
   properties: {
     serverFarmId: plan.id
     httpsOnly: true
-    publicNetworkAccess: enablePublicAccess ? 'Enabled' : 'Disabled'
+    publicNetworkAccess: 'Enabled'
     clientAffinityEnabled: false
-    virtualNetworkSubnetId: integrationSubnetId
-    // The legacy inline siteConfig flag returned false after provisioning.
-    // Use the current site-level setting and verify it in ARM after deployment.
-    outboundVnetRouting: {
-      allTraffic: true
-    }
     siteConfig: {
       // Verified with az webapp list-runtimes --os linux (2026-09-12).
       linuxFxVersion: 'PYTHON|3.13'
@@ -250,10 +151,11 @@ resource webApp 'Microsoft.Web/sites@2024-11-01' = {
       minTlsVersion: '1.2'
       scmMinTlsVersion: '1.2'
       http20Enabled: true
-      ipSecurityRestrictions: temporaryAccessRules
-      ipSecurityRestrictionsDefaultAction: 'Deny'
-      scmIpSecurityRestrictionsUseMain: true
-      scmIpSecurityRestrictionsDefaultAction: 'Deny'
+      ipSecurityRestrictions: clientAccessRules
+      ipSecurityRestrictionsDefaultAction: empty(publicAccessClientCidrs) ? 'Allow' : 'Deny'
+      scmIpSecurityRestrictions: scmAccessRules
+      scmIpSecurityRestrictionsUseMain: false
+      scmIpSecurityRestrictionsDefaultAction: empty(scmAccessClientCidrs) ? 'Allow' : 'Deny'
       appSettings: map(items(effectiveSettings), setting => {
         name: setting.key
         value: string(setting.value)
@@ -281,63 +183,6 @@ resource ftpPublishing 'Microsoft.Web/sites/basicPublishingCredentialsPolicies@2
   }
 }
 
-resource privateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = {
-  name: '${appName}-endpoint'
-  location: location
-  tags: costTags
-  properties: {
-    subnet: {
-      id: endpointSubnetId
-    }
-    privateLinkServiceConnections: [
-      {
-        name: '${appName}-site'
-        properties: {
-          privateLinkServiceId: webApp.id
-          groupIds: [
-            'sites'
-          ]
-        }
-      }
-    ]
-  }
-}
-
-resource privateDns 'Microsoft.Network/privateDnsZones@2024-06-01' = {
-  name: 'privatelink.azurewebsites.net'
-  location: 'global'
-  tags: costTags
-}
-
-resource privateDnsLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = {
-  parent: privateDns
-  name: '${appName}-link'
-  location: 'global'
-  tags: costTags
-  properties: {
-    registrationEnabled: false
-    virtualNetwork: {
-      id: network.id
-    }
-  }
-}
-
-// The zone group creates both app and SCM records.
-resource privateDnsGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-05-01' = {
-  parent: privateEndpoint
-  name: 'websites'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'websites'
-        properties: {
-          privateDnsZoneId: privateDns.id
-        }
-      }
-    ]
-  }
-}
-
 output webAppName string = webApp.name
 output webAppId string = webApp.id
 output webAppUrl string = 'https://${webApp.properties.defaultHostName}'
@@ -345,10 +190,3 @@ output scmUrl string = 'https://${replace(webApp.properties.defaultHostName, '.a
 output managedIdentityId string = identity.id
 output managedIdentityPrincipalId string = identity.properties.principalId
 output managedIdentityClientId string = identity.properties.clientId
-output virtualNetworkId string = network.id
-output integrationSubnetResourceId string = integrationSubnetId
-output privateEndpointSubnetResourceId string = endpointSubnetId
-output privateEndpointId string = privateEndpoint.id
-output privateDnsZoneId string = privateDns.id
-output natGatewayId string = nat.id
-output outboundPublicIp string = outboundIp.properties.ipAddress

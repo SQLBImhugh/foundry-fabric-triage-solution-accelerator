@@ -24,13 +24,18 @@ azure = [
     "openai>=1.40",
     "azure-monitor-opentelemetry>=1.6",
     "msal>=1.28",
-    # Durable state lives in a Fabric SQL Database. Microsoft's own driver is
+    # Durable state lives in an Azure SQL Database. Microsoft's own driver is
     # used rather than pyodbc because it ships the ODBC driver inside the wheel
     # (as mssql-python-odbc), so it installs with pip alone. pyodbc needs the
     # msodbcsql18 *system* package, which cannot be installed in the Foundry
     # hosted agent image -- that container is built by pip from
     # src/requirements.txt and nothing else.
     "mssql-python>=1.14",
+]
+monitoring = [
+    "azure-eventhub>=5.15,<6",
+    # The async identity and WebSocket transport need this optional HTTP client.
+    "aiohttp>=3.14.3,<4",
 ]
 # Only needed to run the controller AS a Foundry hosted agent. Kept separate so
 # the offline path never pulls in the hosting stack.

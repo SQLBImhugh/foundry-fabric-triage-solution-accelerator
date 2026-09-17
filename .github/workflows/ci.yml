@@ -33,14 +33,10 @@ jobs:
       - name: Test
         run: python -m pytest -q
 
-      # Belt and braces on the invariant above: fail if a test file has started
-      # importing a live client or a credential provider.
+      # Inspect code rather than matching mocked module names or source fixtures.
+      # Runtime offline tests remain the primary behavior check.
       - name: No network in the test path
-        run: |
-          if grep -rnE "azure\.identity|httpx\.(get|post)\(|requests\.(get|post)\(" tests/; then
-            echo "::error::A test appears to reach the network. Tests must run offline."
-            exit 1
-          fi
+        run: python scripts/check_offline_tests.py
 
   command-center:
     name: Command-center tests and build

@@ -6,11 +6,12 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from triage.knowledge.playbooks import pipeline_retry_is_allowed
 from triage.pipeline_models import (
     PIPELINE_TERMINAL_STATUSES,
+    PipelineActivity,
     PipelineFailure,
     PipelineRerunOutcome,
     PipelineRerunRecord,
@@ -21,17 +22,22 @@ from triage.redaction import redact_text
 from triage.store.pipeline_reruns import PipelineRerunStore
 from triage.tools.fabric_pipeline import FabricPipelineClient, PipelineApiError
 
+if TYPE_CHECKING:
+    from triage.monitoring.controller import MonitoringExecution
+
 logger = logging.getLogger("triage.tools.pipeline_actions")
 
 
 async def verify_rerun(
     client: FabricPipelineClient, target: PipelineTarget, run: PipelineRun,
+    *, activities: list[PipelineActivity] | None = None,
 ) -> PipelineRerunOutcome:
     """A handled activity failure can coexist with a Completed pipeline job."""
     detail = run.failure_reason
     status = run.status
     if status == "Completed":
-        activities = await client.activity_runs(target, run)
+        if activities is None:
+            activities = await client.activity_runs(target, run)
         if not activities:
             raise PipelineApiError("Completed pipeline has no activity evidence to verify")
         failed = [activity for activity in activities if activity.status == "Failed"]
@@ -55,15 +61,18 @@ class PipelineToolContext:
     outcome: PipelineRerunOutcome | None = None
     approval_parameter_hash: str = ""
     approved_target: PipelineTarget | None = None
+    monitoring: MonitoringExecution | None = None
 
     async def refusal(self) -> str | None:
         target = self.failure.target
+        if self.approval_parameter_hash and target.parameter_hash != self.approval_parameter_hash:
+            return "Replay parameters changed after approval was requested."
         if self.failure.run.job_type != "Pipeline":
             return "This job uses a different pipeline execution API. Only Core Pipeline reruns are enabled."
         if not target.permits_rerun:
             return "Replay safety and the complete parameter set have not both been approved in configuration."
-        if self.live and not self.reruns.is_durable:
-            return "A live pipeline rerun requires a reachable shared Fabric SQL journal."
+        if self.live and self.monitoring is None:
+            return "A live pipeline rerun requires a shared monitoring work lease and atomic action reservation."
         if self.failure.diagnostics_error:
             return "Activity diagnostics are incomplete. Review the failure and sink state before replay."
         if any(
@@ -76,7 +85,7 @@ class PipelineToolContext:
             for activity in self.failure.activities
         ):
             return "Nested pipeline executions require child-run and side-effect reconciliation before parent replay."
-        if self.reruns.get(self.failure.key) is not None:
+        if self.monitoring is None and self.reruns.get(self.failure.key) is not None:
             return "A rerun has already been reserved or submitted for this failed run. Reconcile it; do not submit again."
         if (
             not pipeline_retry_is_allowed(self.failure.error_text())
@@ -118,6 +127,8 @@ class PipelineToolContext:
         }
 
     def reserve(self) -> bool:
+        if self.live:
+            raise ValueError("Live pipeline reservations belong to the common monitoring admission boundary.")
         target = self.failure.target
         if target.parameter_hash != self.approval_parameter_hash:
             raise ValueError("Replay parameters changed after approval was requested")
@@ -143,6 +154,14 @@ class PipelineToolContext:
         }
 
     async def submit(self) -> dict[str, Any]:
+        if self.monitoring is not None:
+            if self.approved_target is None or self.failure.target.parameter_hash != self.approval_parameter_hash:
+                raise ValueError("The reviewed pipeline parameters changed after approval.")
+            self.outcome = await self.monitoring.submit_pipeline(self.client, self.approved_target)
+            return {
+                "status": self.outcome.status, "run_id": self.outcome.run_id,
+                "succeeded": False, "detail": self.outcome.detail,
+            }
         record = self.reservation
         if record is None:
             raise RuntimeError("Pipeline rerun has no durable submission reservation")
@@ -188,6 +207,12 @@ class PipelineToolContext:
         return {"status": "Submitted", "run_id": submission.run_id, "succeeded": False, "detail": self.outcome.detail}
 
     async def check_rerun(self) -> dict[str, Any]:
+        if self.monitoring is not None:
+            self.outcome = await self.monitoring.verify_pipeline(self.client, self.failure.target)
+            return {
+                "status": self.outcome.status, "run_id": self.outcome.run_id,
+                "succeeded": self.outcome.succeeded, "detail": self.outcome.detail,
+            }
         record = self.reruns.get(self.failure.key)
         if record is None or not record.rerun_id:
             raise ValueError("There is no correlated rerun to inspect")

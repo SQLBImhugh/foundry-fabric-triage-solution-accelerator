@@ -38,7 +38,7 @@ from triage.prompts import load_prompt, prompt_version_hash
 from triage.providers.base import BaseProvider
 from triage.redaction import redact_text
 from triage.tools.dataset import DatasetSource
-from triage.tools.flags import DataQualityFlagTable
+from triage.tools.flags import FlagStore
 from triage.tools.pipeline_actions import PipelineToolContext
 from triage.tools.powerbi import PowerBIClient
 from triage.tools.registry import TRIAGE_TOOLS, ToolContext, ToolDispatcher
@@ -67,7 +67,7 @@ class TriageDeps:
 
     powerbi: PowerBIClient | None
     teams: TeamsNotifier
-    flag_table: DataQualityFlagTable
+    flag_table: FlagStore
     datasets: dict[str, DatasetSource] = field(default_factory=dict)
     workspace_id: str = ""
     dataset_id: str = ""

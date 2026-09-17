@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, m
 
 from triage.models import TriageResult
 from triage.redaction import redact_text
-from triage.store.fabric_sql import SqlUnavailable, quote_identifier
+from triage.store.azure_sql import SqlUnavailable, quote_identifier
 
 RunState = Literal["running", "completed", "failed"]
 CommandState = Literal["queued", "running", "completed", "failed", "interrupted"]
@@ -697,7 +697,7 @@ class _Database(Protocol):
     def integrity_error(self) -> type[Exception]: ...
 
 
-class FabricSqlCommandCenterStore:
+class AzureSqlCommandCenterStore:
     """Read-through history and conditional command transitions, without fallback.
 
     Deployment installs the schema. Runtime identities need data privileges,

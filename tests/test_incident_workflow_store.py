@@ -14,9 +14,9 @@ import pytest
 from pydantic import ValidationError
 
 from triage.models import Incident
-from triage.store.fabric_sql import SqlUnavailable
+from triage.store.azure_sql import SqlUnavailable
 from triage.store.incident_workflow import (
-    FabricSqlIncidentWorkflowStore,
+    AzureSqlIncidentWorkflowStore,
     IncidentQuery,
     InMemoryIncidentWorkflowStore,
     WorkflowConflict,
@@ -153,7 +153,7 @@ class Harness:
         self.core = InMemoryIncidentStore()
         self.db = WorkflowSql(path) if mode == "sql" else None
         self.store = (
-            FabricSqlIncidentWorkflowStore(self.db) if self.db else InMemoryIncidentWorkflowStore(self.core)
+            AzureSqlIncidentWorkflowStore(self.db) if self.db else InMemoryIncidentWorkflowStore(self.core)
         )
         self.put(incident())
 
@@ -203,7 +203,7 @@ def test_mutation_activity_ids_are_receipts_even_after_redaction(harness) -> Non
     store.add_note("incident-1", f"Note {secret}", idempotency_key=note_key, **ACTOR)
     store.reserve_question("incident-1", f"Question {secret}", idempotency_key=question_key, **ACTOR)
     harness.resolve(key=resolution_key)
-    reloaded = FabricSqlIncidentWorkflowStore(harness.db) if harness.db else store
+    reloaded = AzureSqlIncidentWorkflowStore(harness.db) if harness.db else store
     entries = {entry.id: entry for entry in reloaded.state("incident-1").activity}
     assert set(entries) == {note_key, question_key, resolution_key}
     for key, kind in ((note_key, "note"), (question_key, "question"), (resolution_key, "resolution")):
@@ -347,7 +347,7 @@ def test_concurrent_resolutions_have_one_winner(harness) -> None:
     barrier = threading.Barrier(2)
 
     def resolve():
-        store = FabricSqlIncidentWorkflowStore(harness.db) if harness.db else harness.store
+        store = AzureSqlIncidentWorkflowStore(harness.db) if harness.db else harness.store
         barrier.wait()
         try:
             store.resolve(
@@ -370,7 +370,7 @@ def test_concurrent_question_reservations_acquire_once(harness) -> None:
     barrier = threading.Barrier(2)
 
     def reserve():
-        store = FabricSqlIncidentWorkflowStore(harness.db) if harness.db else harness.store
+        store = AzureSqlIncidentWorkflowStore(harness.db) if harness.db else harness.store
         barrier.wait()
         return store.reserve_question("incident-1", "What happened?", idempotency_key=key, **ACTOR).acquired
 
@@ -465,7 +465,7 @@ def test_sql_restart_readback_preserves_notes_closure_and_pending_questions(tmp_
     harness.store.reserve_question("incident-1", "Pending question", idempotency_key=key, **ACTOR)
     harness.resolve()
     before = harness.store.state("incident-1")
-    restarted = FabricSqlIncidentWorkflowStore(WorkflowSql(harness.db.path))
+    restarted = AzureSqlIncidentWorkflowStore(WorkflowSql(harness.db.path))
     assert restarted.state("incident-1") == before
     assert not restarted.reserve_question(
         "incident-1", "Pending question", idempotency_key=key, **ACTOR,
@@ -479,7 +479,7 @@ def test_sql_preserves_actual_payload_revision_not_reserialized_defaults(tmp_pat
     value = incident()
     raw = json.dumps(value.model_dump(mode="json"), indent=2)
     db.seed(value, raw)
-    store = FabricSqlIncidentWorkflowStore(db)
+    store = AzureSqlIncidentWorkflowStore(db)
     state = store.state(value.id)
     assert state.source.revision == hashlib.sha256(raw.encode("utf-16-le")).hexdigest()
     assert state.source.revision != source_revision(value)
@@ -570,7 +570,7 @@ def test_sql_outage_and_lost_acknowledgement_never_report_local_success(tmp_path
     with pytest.raises(SqlUnavailable, match="not confirmed"):
         store.reserve_question("incident-1", "Uncertain", idempotency_key=key, **ACTOR)
     assert len([op for op in db.operations if op[0] == "execute"]) == before + 1
-    restarted = FabricSqlIncidentWorkflowStore(db)
+    restarted = AzureSqlIncidentWorkflowStore(db)
     reservation = restarted.reserve_question("incident-1", "Uncertain", idempotency_key=key, **ACTOR)
     assert not reservation.acquired
     assert restarted.state("incident-1").activity[0].status == "pending"
@@ -593,13 +593,13 @@ def test_sql_writes_are_append_only_and_never_target_automated_state(tmp_path) -
 def test_schema_and_stores_support_configured_names_and_reject_unsafe_tables(tmp_path) -> None:
     db = WorkflowSql(tmp_path / "custom.db", activity_table="case_activity", incident_table="core_incidents")
     db.seed(incident())
-    store = FabricSqlIncidentWorkflowStore(db, activity_table="case_activity", incident_table="core_incidents")
+    store = AzureSqlIncidentWorkflowStore(db, activity_table="case_activity", incident_table="core_incidents")
     store.add_note("incident-1", "Configured table", idempotency_key=str(uuid4()), **ACTOR)
     assert len(store.state("incident-1").activity) == 1
     with pytest.raises(ValueError):
         schema_statements("unsafe]; DROP TABLE incidents")
     with pytest.raises(ValueError, match="distinct"):
-        FabricSqlIncidentWorkflowStore(db, activity_table="triage_incidents")
+        AzureSqlIncidentWorkflowStore(db, activity_table="triage_incidents")
 
 
 @pytest.mark.parametrize("fields", [

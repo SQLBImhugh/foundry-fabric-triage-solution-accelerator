@@ -35,6 +35,7 @@ from triage.command_center.models import (
     ReconcileInput,
     WebSettings,
 )
+from triage.command_center.monitoring import create_monitoring_router
 from triage.command_center.service import CommandCenterService, run_summary
 from triage.settings import settings as core_settings
 
@@ -75,6 +76,8 @@ def create_app(
     if web.mode == "demo" and any(os.getenv(name) for name in ("WEBSITE_SITE_NAME", "WEBSITE_INSTANCE_ID", "CONTAINER_APP_NAME")):
         raise RuntimeError("Demo mode cannot be enabled on an Azure-hosted command center")
     runtime = service or CommandCenterService(core_settings, web)
+    if isinstance(runtime, CommandCenterService):
+        runtime.validate_web_settings(web)
     verifier = token_verifier if token_verifier is not None else (
         EntraTokenVerifier(web) if web.mode == "live" else None
     )
@@ -281,6 +284,11 @@ def create_app(
         from triage.command_center.validation import validate_scenario
 
         return await validate_scenario(runtime, ROOT, name, value.provider, user)
+
+    app.include_router(create_monitoring_router(
+        authenticated_actor,
+        bootstrap_reader=runtime.monitoring_bootstrap if isinstance(runtime, CommandCenterService) else None,
+    ))
 
     static_dir = Path(web.static_dir) if web.static_dir else ROOT / "command-center" / "dist"
     if static_dir.is_dir():

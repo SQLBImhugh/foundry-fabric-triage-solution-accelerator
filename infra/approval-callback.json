@@ -25,8 +25,8 @@
       "and every one of those issues GET. GET reaches a workflow with nothing to",
       "change. An approval a link preview can grant is not an approval.",
       "",
-      "State lives in a Fabric SQL Database, which speaks TDS and has no REST",
-      "data plane, so the write uses the SQL managed connector authenticating as",
+      "State lives in an Azure SQL Database. The write uses the TDS-backed SQL",
+      "managed connector authenticating as",
       "the recording workflow's own system-assigned identity. No key and no",
       "connection string appears anywhere in this deployment.",
       "",
@@ -57,13 +57,13 @@
     "sqlServer": {
       "type": "string",
       "metadata": {
-        "description": "Fabric SQL server FQDN, without the port. From the SQL database item's connection properties."
+        "description": "Azure SQL server FQDN, without the port. From the SQL database item's connection properties."
       }
     },
     "sqlDatabase": {
       "type": "string",
       "metadata": {
-        "description": "Fabric SQL database name, including the item GUID."
+        "description": "Azure SQL database name, including the item GUID."
       }
     },
     "owner": {
@@ -285,4 +285,3 @@
     }
   }
 }
-

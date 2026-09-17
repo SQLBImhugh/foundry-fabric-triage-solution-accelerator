@@ -16,25 +16,26 @@ database-user and Foundry permissions. Grant those separately, then invoke
 Fabric tenant settings, registers Foundry agents, or grants directory/RBAC roles.
 
 ApplicationSettingsFile is an operator-owned JSON object of string values, NOT
-an .env file. It must contain FABRIC_SQL_SERVER (hostname), FABRIC_SQL_DATABASE
+an .env file. It must contain AZURE_SQL_SERVER (hostname), AZURE_SQL_DATABASE
 (catalog), and FOUNDRY_PROJECT_ENDPOINT. It may include model/agent names, table
 names and the other backend settings. Credentials and overrides of managed
 authentication/build settings are rejected. Do not commit this input file.
 
-The deployment host must reach the private app and SCM DNS names. For a
-preauthorized temporary deployment from outside the VNet, explicitly supply
--TemporaryPublicAccess and -PublicAccessClientCidr with client /32 or /128
-addresses. Access defaults to deny, and publicNetworkAccess is restored to
-Disabled in finally, even on failure. No basic publishing credentials are used.
+The app and SCM use public HTTPS networking. Entra app roles protect the API;
+Entra/Azure RBAC protects deployment. Optional -PublicAccessClientCidr and
+-ScmAccessClientCidr restrict their respective network endpoints. Empty lists
+leave public reachability enabled. No basic publishing credentials are used
+and the helper never switches the application back to private networking.
 
 -Evaluation enables admin-only isolated synthetic validation. The optional
 -EvaluationCostExemption applies CostControl=Ignore only to this deployment's
-resources. EvaluationExpiresOn is a review tag, NOT an automatic expiry:
-disable validation and remove the exemption before that date.
+resources. EvaluationExpiresOn is a review tag, not an enforcement mechanism.
+Tenant exemptions can expire independently; MCAPS has a single 14-day tag
+period that reapplying the tag does not extend.
 
 Existing App Insights is optional; its resource ID links the portal view only.
-Managed-identity telemetry authorization and endpoint configuration, private
-routes/DNS to Foundry/Fabric, role grants, and post-deployment scenario evidence
+Managed-identity telemetry authorization and endpoint configuration,
+access to Foundry/Fabric, role grants, and post-deployment scenario evidence
 remain separate operator tasks. The web app health endpoint is not proof of
 database or Foundry connectivity.
 #>
@@ -72,16 +73,12 @@ param(
     [string]$ApplicationSettingsFile,
     [ValidateSet('B1', 'B2', 'B3', 'S1', 'S2', 'S3', 'P0v3', 'P1v3')]
     [string]$PlanSku = 'B1',
-    [string]$VnetAddressPrefix = '10.74.0.0/16',
-    [string]$IntegrationSubnetPrefix = '10.74.0.0/26',
-    [string]$PrivateEndpointSubnetPrefix = '10.74.1.0/27',
-    [string[]]$DnsServers = @(),
     [string]$ApplicationInsightsResourceId = '',
     [switch]$Evaluation,
     [switch]$EvaluationCostExemption,
     [string]$EvaluationExpiresOn = '',
-    [switch]$TemporaryPublicAccess,
     [string[]]$PublicAccessClientCidr = @(),
+    [string[]]$ScmAccessClientCidr = @(),
     [string]$PackageOutputPath,
     [string]$Python,
     [switch]$RestoreDependencies,
@@ -114,26 +111,16 @@ if ($Evaluation) {
         throw 'Evaluation requires a future EvaluationExpiresOn date in YYYY-MM-DD form.'
     }
 }
-if ($TemporaryPublicAccess -and $PublicAccessClientCidr.Count -eq 0) {
-    throw 'Temporary public access requires explicit client /32 or /128 addresses.'
-}
-if (-not $TemporaryPublicAccess -and $PublicAccessClientCidr.Count -gt 0) {
-    throw 'Client CIDRs are only accepted with -TemporaryPublicAccess.'
-}
-foreach ($cidr in $PublicAccessClientCidr) {
+foreach ($cidr in @($PublicAccessClientCidr) + @($ScmAccessClientCidr)) {
     $parts = $cidr.Split('/')
     $address = [Net.IPAddress]::None
     if ($parts.Count -ne 2 -or -not [Net.IPAddress]::TryParse($parts[0], [ref]$address)) {
-        throw 'Each temporary client CIDR must be one explicit IP address.'
+        throw 'Each client CIDR must be one explicit IP address.'
     }
     $prefix = if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { '32' } else { '128' }
     if ($parts[1] -cne $prefix) {
-        throw 'Temporary public access accepts only single-host /32 or /128 CIDRs, never a network or wildcard.'
+        throw 'Client restrictions accept only single-host /32 or /128 CIDRs, never a wildcard.'
     }
-}
-foreach ($dns in $DnsServers) {
-    $address = [Net.IPAddress]::None
-    if (-not [Net.IPAddress]::TryParse($dns, [ref]$address)) { throw 'DNS servers must be IP addresses.' }
 }
 if ($ApplicationInsightsResourceId -and $ApplicationInsightsResourceId -notmatch '^/subscriptions/[0-9a-f-]{36}/resourceGroups/[^/]+/providers/Microsoft\.Insights/components/[^/]+$') {
     throw 'ApplicationInsightsResourceId must identify an existing Microsoft.Insights/components resource.'
@@ -170,16 +157,16 @@ foreach ($key in $inputSettings.Keys) {
     }
     $appSettings[$name] = $value
 }
-foreach ($required in @('FABRIC_SQL_SERVER', 'FABRIC_SQL_DATABASE', 'FOUNDRY_PROJECT_ENDPOINT')) {
+foreach ($required in @('AZURE_SQL_SERVER', 'AZURE_SQL_DATABASE', 'FOUNDRY_PROJECT_ENDPOINT')) {
     if (-not $appSettings.ContainsKey($required) -or [string]::IsNullOrWhiteSpace($appSettings[$required])) {
         throw "The settings file must provide $required for the live application."
     }
 }
-if ($appSettings.FABRIC_SQL_SERVER -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]+$') {
-    throw 'FABRIC_SQL_SERVER must be a hostname without a protocol, port, or connection-string fields.'
+if ($appSettings.AZURE_SQL_SERVER -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]+$') {
+    throw 'AZURE_SQL_SERVER must be a hostname without a protocol, port, or connection-string fields.'
 }
-if ($appSettings.FABRIC_SQL_DATABASE -match '[;=\r\n]') {
-    throw 'FABRIC_SQL_DATABASE must be a catalog name, not connection-string fields.'
+if ($appSettings.AZURE_SQL_DATABASE -match '[;=\r\n]') {
+    throw 'AZURE_SQL_DATABASE must be a catalog name, not connection-string fields.'
 }
 $foundryUri = $null
 if (-not [uri]::TryCreate($appSettings.FOUNDRY_PROJECT_ENDPOINT, [UriKind]::Absolute, [ref]$foundryUri) -or
@@ -236,7 +223,7 @@ function Confirm-WebProcess {
             return
         }
         if ($response.StatusCode -notin @(404, 500, 502, 503, 504)) {
-            throw "Web startup probe returned HTTP $($response.StatusCode). Check private routing or the explicit client allowlist."
+            throw "Web startup probe returned HTTP $($response.StatusCode). Check endpoint access or the explicit client allowlist."
         }
         Write-Output "Waiting for the web process: HTTP $($response.StatusCode)."
         Start-Sleep -Seconds 5
@@ -248,9 +235,7 @@ $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $template = Join-Path $repo 'infra\command-center.bicep'
 $stage = Join-Path ([IO.Path]::GetTempPath()) ('triage-command-center-deploy-' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $stage
-$restorePublicAccess = $false
 $failure = $null
-$restoreFailure = $null
 $appResourceId = ''
 try {
     $version = Invoke-AzJson @('version')
@@ -282,21 +267,6 @@ try {
         Assert-ManagedAccessContinuity $currentSettings $appSettings
     }
 
-    # Governance can attach an NSG after provisioning. An inline subnet
-    # redeployment must retain that binding rather than silently detaching it.
-    $existingSubnetNsgs = @{}
-    $networks = @(Invoke-AzJson @(
-        'network', 'vnet', 'list', '--resource-group', $ResourceGroup, '--subscription', $Subscription
-    ))
-    foreach ($network in $networks) {
-        if ($network.name -ine "$AppName-vnet") { continue }
-        foreach ($subnet in $network.subnets) {
-            if ($subnet.ContainsKey('networkSecurityGroup') -and $subnet.networkSecurityGroup) {
-                $existingSubnetNsgs[$subnet.name] = $subnet.networkSecurityGroup.id
-            }
-        }
-    }
-
     $tags = @{
         CostCenter = $CostCenter
         Owner = $Owner
@@ -311,22 +281,12 @@ try {
         tenantId = $TenantId.ToString()
         applicationClientId = $ApplicationClientId.ToString()
         applicationSettings = $appSettings
-        vnetAddressPrefix = $VnetAddressPrefix
-        integrationSubnetPrefix = $IntegrationSubnetPrefix
-        privateEndpointSubnetPrefix = $PrivateEndpointSubnetPrefix
-        integrationSubnetNsgId = if ($existingSubnetNsgs.ContainsKey('app-integration')) {
-            $existingSubnetNsgs['app-integration']
-        } else { '' }
-        privateEndpointSubnetNsgId = if ($existingSubnetNsgs.ContainsKey('private-endpoints')) {
-            $existingSubnetNsgs['private-endpoints']
-        } else { '' }
-        dnsServers = @($DnsServers)
         applicationInsightsResourceId = $ApplicationInsightsResourceId
         enableEvaluation = [bool]$Evaluation
         evaluationCostExemption = [bool]$EvaluationCostExemption
         evaluationExpiresOn = $EvaluationExpiresOn
-        enablePublicAccess = [bool]$TemporaryPublicAccess
         publicAccessClientCidrs = @($PublicAccessClientCidr)
+        scmAccessClientCidrs = @($ScmAccessClientCidr)
     }
     $parameters = @{}
     foreach ($key in $values.Keys) { $parameters[$key] = @{ value = $values[$key] } }
@@ -365,8 +325,14 @@ try {
     foreach ($key in $tags.Keys) { $tagArgs += "$key=$($tags[$key])" }
     $null = Invoke-AzJson $tagArgs
     $null = Confirm-AzureContext
-    $restorePublicAccess = [bool]$TemporaryPublicAccess
     $outputs = Invoke-AzJson (@('deployment', 'group', 'create') + $deploymentArgs + @('--query', 'properties.outputs'))
+    $publicAccess = Invoke-AzJson @(
+        'resource', 'show', '--subscription', $Subscription, '--ids', $appResourceId,
+        '--query', 'properties.publicNetworkAccess'
+    )
+    if ($publicAccess -cne 'Enabled') {
+        throw 'The deployed app did not retain public networking. Check the tenant network policy and any explicitly approved test exception.'
+    }
     Write-Output ($outputs | ConvertTo-Json -Depth 10)
     if ($ProvisionOnly) {
         Write-Output 'Infrastructure provisioned only. Grant the UAMI access to the existing services before deploying code.'
@@ -381,27 +347,12 @@ try {
         # Control-plane startup tracking stalled after Kudu completed and the
         # real API served requests. Check the process directly instead.
         Confirm-WebProcess "https://$AppName.azurewebsites.net"
-        Write-Output 'ZIP/Oryx deployment finished. Validate authenticated APIs, private connectivity, and scenarios separately.'
+        Write-Output 'ZIP/Oryx deployment finished. Validate authenticated APIs, SQL/Foundry access, and scenarios separately.'
     }
 } catch {
     $failure = $_
 } finally {
-    if ($restorePublicAccess) {
-        try {
-            $null = Confirm-AzureContext
-            $restored = Invoke-AzJson @(
-                'resource', 'update', '--subscription', $Subscription, '--ids', $appResourceId,
-                '--set', 'properties.publicNetworkAccess=Disabled', '--query', 'properties.publicNetworkAccess'
-            )
-            if ($restored -cne 'Disabled') { throw 'The response did not confirm Disabled.' }
-            Write-Output 'Temporary public access reverted to Disabled.'
-        } catch {
-            $restoreFailure = $_
-            Write-Warning "Public-access restoration was not confirmed for $appResourceId. Revert it immediately."
-        }
-    }
     # Only this invocation's explicitly-created GUID directory is removed.
     Remove-Item -LiteralPath $stage -Recurse -Force
 }
 if ($failure) { throw $failure }
-if ($restoreFailure) { throw $restoreFailure }

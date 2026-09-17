@@ -26,6 +26,12 @@
       "                                            pipelines and verifies reruns",
       "  command='command sweep' every minute     drains authenticated operator",
       "                                            investigations from SQL",
+      "  command='heartbeat'    every minute     fairly drains durable monitoring",
+      "                                            and human-command work",
+      "",
+      "The monitoring collector owns discovery/polling/event intake. Deploy one",
+      "heartbeat for the controller rather than another polling timer per target.",
+      "Create disabled, verify the identity and schema, then explicitly enable.",
       "",
       "Why a Logic App and not a Function or a VM cron: it authenticates with a",
       "system-assigned managed identity, so there is no key anywhere, which the",
@@ -69,12 +75,13 @@
     },
     "command": {
       "type": "string",
-      "defaultValue": "sweep",
+      "defaultValue": "heartbeat",
       "allowedValues": [
         "sweep",
         "silent sweep",
         "pipeline sweep",
-        "command sweep"
+        "command sweep",
+        "heartbeat"
       ],
       "metadata": {
         "description": "Constrained on purpose. The controller routes anything it does not recognise to 'triage this text as an alert', so a typo here would not fail - it would quietly triage the word as if it were a Power BI alert."
@@ -91,7 +98,22 @@
     },
     "interval": {
       "type": "int",
-      "defaultValue": 5
+      "defaultValue": 1,
+      "minValue": 1
+    },
+    "enabled": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Enable only after the controller, durable schema and invocation identity are verified."
+      }
+    },
+    "dataClassification": {
+      "type": "string",
+      "defaultValue": "Internal",
+      "metadata": {
+        "description": "Classification of the actual operational metadata; do not label real incidents synthetic."
+      }
     },
     "alertWebhookUrl": {
       "type": "securestring",
@@ -139,10 +161,10 @@
         "CostCenter": "[parameters('costCenter')]",
         "Owner": "[parameters('owner')]",
         "Environment": "[parameters('environment')]",
-        "DataClassification": "synthetic"
+        "DataClassification": "[parameters('dataClassification')]"
       },
       "properties": {
-        "state": "Enabled",
+        "state": "[if(parameters('enabled'), 'Enabled', 'Disabled')]",
         "definition": {
           "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
           "contentVersion": "1.0.0.0",

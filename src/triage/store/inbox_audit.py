@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from triage.redaction import redact
+from triage.store.azure_sql import SqlUnavailable, quote_identifier
 
 logger = logging.getLogger("triage.store.inbox_audit")
 
@@ -183,13 +184,8 @@ class JsonFileInboxAudit(InMemoryInboxAudit):
             self.path.unlink()
 
 
-class FabricSqlInboxAudit(InMemoryInboxAudit):
-    """The deployed path.
-
-    Degrades to in-memory and keeps retrying, like the other stores. Losing this
-    one costs evidence rather than correctness -- the filter still refuses the
-    message either way -- so it never blocks ingestion.
-    """
+class AzureSqlInboxAudit(InMemoryInboxAudit):
+    """Durable filter evidence. An unrecorded refusal cannot complete ingestion."""
 
     def __init__(
         self,
@@ -198,8 +194,6 @@ class FabricSqlInboxAudit(InMemoryInboxAudit):
         table: str = "triage_inbox_audit",
         max_rows: int = DEFAULT_MAX_ROWS,
     ) -> None:
-        from triage.store.fabric_sql import quote_identifier
-
         super().__init__(max_rows=max_rows)
         self._db = db
         self._table = quote_identifier(table)
@@ -211,73 +205,100 @@ class FabricSqlInboxAudit(InMemoryInboxAudit):
     def is_durable(self) -> bool:
         return self._loaded and self._db.is_available
 
-    def _ensure_loaded(self) -> bool:
+    def _ensure_loaded(self) -> None:
         with self._lock:
-            if self._loaded:
-                return True
+            self._loaded = False
+            self._items.clear()
             try:
-                self._db.ensure_schema_once()
                 rows = self._db.query(
                     f"SELECT fingerprint, sender, subject, reason, ignored_at "
                     f"FROM {self._table}"
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.error(
-                    "Inbox audit degraded to in-memory: cannot read %s (%s). "
-                    "Ignored messages will not be visible after a restart.",
-                    self._table_name,
-                    type(exc).__name__,
+                    "Cannot read deployed inbox audit in %s (%s); ingestion stopped",
+                    self._table_name, type(exc).__name__,
                 )
-                return False
-            self._items = {
-                str(r[0]): {
-                    "fingerprint": str(r[0]),
-                    "sender": r[1],
-                    "subject": r[2],
-                    "reason": r[3],
-                    "ignored_at": r[4],
-                }
-                for r in rows
-            }
+                raise
+            loaded: dict[str, dict[str, Any]] = {}
+            try:
+                for key, sender, subject, reason, ignored_at in rows:
+                    if (
+                        not isinstance(key, str) or len(key) != 48 or key in loaded
+                        or any(value is not None and not isinstance(value, str) for value in (sender, subject, reason))
+                        or not isinstance(ignored_at, str)
+                        or datetime.fromisoformat(ignored_at).tzinfo is None
+                    ):
+                        raise ValueError("Invalid inbox-audit row")
+                    loaded[key] = {
+                        "fingerprint": key, "sender": sender, "subject": subject,
+                        "reason": reason, "ignored_at": ignored_at,
+                    }
+            except (TypeError, ValueError) as exc:
+                logger.error("Unreadable inbox audit in %s; ingestion stopped", self._table_name)
+                raise SqlUnavailable(
+                    f"Unreadable inbox audit in {self._table_name}; repair deployed state."
+                ) from exc
+            self._items = loaded
             self._loaded = True
-            return True
+
+    def record(self, *, message_id: str, sender: str, subject: str, reason: str) -> None:
+        with self._lock:
+            self._ensure_loaded()
+            super().record(message_id=message_id, sender=sender, subject=subject, reason=reason)
 
     def recent(self, limit: int = 50) -> list[dict[str, Any]]:
-        self._ensure_loaded()
-        return super().recent(limit)
+        with self._lock:
+            self._ensure_loaded()
+            return super().recent(limit)
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            self._ensure_loaded()
+            return super().count
 
     def _persist(self, row: dict[str, Any]) -> None:
         try:
-            self._db.execute(
+            inserted = self._db.execute(
                 f"INSERT INTO {self._table} "
                 f"(fingerprint, sender, subject, reason, ignored_at) "
-                f"VALUES (?, ?, ?, ?, ?)",
+                f"SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {self._table} "
+                "WITH (UPDLOCK, HOLDLOCK) WHERE fingerprint = ?)",
                 row["fingerprint"], row["sender"], row["subject"],
-                row["reason"], row["ignored_at"],
+                row["reason"], row["ignored_at"], row["fingerprint"],
             )
-        except Exception as exc:  # noqa: BLE001
-            # A duplicate means another invocation already audited this message,
-            # which is the correct outcome and not an error.
-            try:
-                if isinstance(exc, self._db.integrity_error()):
-                    return
-            except Exception:  # pragma: no cover - driver missing
-                pass
+            if inserted not in (0, 1):
+                raise SqlUnavailable("Inbox-audit insert returned no reliable row count.")
+            if inserted == 0:
+                self._ensure_loaded()
+        except Exception as exc:
             self._loaded = False
-            logger.warning(
-                "Could not record an ignored message (%s)", type(exc).__name__
+            self._items.clear()
+            logger.error(
+                "Inbox-audit write unconfirmed (%s); ingestion stopped", type(exc).__name__,
             )
+            raise
 
     def _on_prune(self, fingerprint: str) -> None:
         try:
-            self._db.execute(
+            removed = self._db.execute(
                 f"DELETE FROM {self._table} WHERE fingerprint = ?", fingerprint
             )
-        except Exception:  # noqa: BLE001 - pruning is best effort
-            logger.debug("Could not prune inbox audit row")
+            if removed not in (0, 1):
+                raise SqlUnavailable("Inbox-audit pruning returned no reliable row count.")
+        except Exception as exc:
+            self._loaded = False
+            self._items.clear()
+            logger.error("Inbox-audit pruning unconfirmed (%s)", type(exc).__name__)
+            raise
 
     def _on_reset(self) -> None:
+        self._loaded = False
         try:
-            self._db.execute(f"DELETE FROM {self._table}")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not clear %s (%s)", self._table_name, type(exc).__name__)
+            if self._db.execute(f"DELETE FROM {self._table}") < 0:
+                raise SqlUnavailable("Inbox-audit reset returned no reliable row count.")
+        except Exception as exc:
+            logger.error("Could not clear %s (%s)", self._table_name, type(exc).__name__)
+            raise
+        self._loaded = True

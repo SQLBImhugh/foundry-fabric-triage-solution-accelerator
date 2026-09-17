@@ -22,12 +22,15 @@ patient way of doing nothing.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
+
+from triage.store.azure_sql import SqlUnavailable, quote_identifier
 
 logger = logging.getLogger("triage.store.retries")
 
@@ -50,6 +53,7 @@ def backoff_seconds(attempt: int, *, base: int = DEFAULT_BACKOFF_SECONDS) -> int
 
 class RetryStore(Protocol):
     def defer(self, **fields: Any) -> dict[str, Any]: ...
+    def record_linked_retry(self, **fields: Any) -> dict[str, Any]: ...
     def due(self, *, now: datetime | None = None) -> list[dict[str, Any]]: ...
     def pending(self) -> list[dict[str, Any]]: ...
     def complete(self, signature: str, *, outcome: str) -> None: ...
@@ -74,6 +78,8 @@ class InMemoryRetryStore:
         report_name: str = "",
         reason: str = "",
         retry_after_seconds: int = 0,
+        source_execution: dict[str, Any] | None = None,
+        policy_revision: int | None = None,
     ) -> dict[str, Any]:
         """Postpone this dataset's retry. One row per signature, not per alert.
 
@@ -123,12 +129,51 @@ class InMemoryRetryStore:
                 "updated_at": now.isoformat(timespec="seconds"),
                 "status": "pending",
             }
+            if source_execution is not None:
+                fresh["source_execution"] = source_execution
+                fresh["policy_revision"] = policy_revision
+            elif row and "source_execution" in row:
+                fresh["source_execution"] = row["source_execution"]
+                fresh["policy_revision"] = row["policy_revision"]
             self._items[signature] = fresh
             self._persist(fresh)
             logger.info(
                 "Deferred retry for %s: attempt %d, due in %ds", signature, attempts, wait
             )
             return dict(fresh)
+
+    def record_linked_retry(
+        self, *, signature: str, work_id: str, retry_of: str, attempt: int,
+        due_at: datetime, created_at: datetime, source_execution: dict[str, Any],
+        policy_revision: int, report_name: str = "",
+    ) -> dict[str, Any]:
+        """Project an already-durable successor; this row grants no retry authority."""
+        if type(attempt) is not int or not 1 <= attempt <= self._max_attempts:
+            raise ValueError("Linked retries must retain the existing bounded attempt count.")
+        if due_at.tzinfo is None or created_at.tzinfo is None:
+            raise ValueError("Linked retry timestamps require a timezone.")
+        with self._lock:
+            prior = self._items.get(signature)
+            if prior and (
+                prior.get("monitoring_work_id") == work_id or int(prior["attempts"]) > attempt
+            ):
+                logger.info("Retaining the existing or newer linked retry projection for %s", signature)
+                return dict(prior)
+            target = source_execution["target"]
+            row = {
+                "signature": signature, "request_id": source_execution["run_id"],
+                "workspace_id": target["workspace_id"], "dataset_id": target["item_id"],
+                "report_name": report_name or (prior or {}).get("report_name", ""),
+                "reason": "The service confirmed no effect; a bounded linked successor is scheduled.",
+                "attempts": attempt, "wait_seconds": max(0, int((due_at - created_at).total_seconds())),
+                "due_at": due_at.isoformat(), "created_at": created_at.isoformat(),
+                "updated_at": _utcnow().isoformat(), "status": "pending",
+                "source_execution": source_execution, "policy_revision": policy_revision,
+                "monitoring_work_id": work_id, "retry_of": retry_of,
+            }
+            self._items[signature] = row
+            self._persist(row)
+            return dict(row)
 
     def get(self, signature: str) -> dict[str, Any] | None:
         with self._lock:
@@ -249,15 +294,8 @@ class JsonFileRetryStore(InMemoryRetryStore):
             self._path.unlink()
 
 
-class FabricSqlRetryStore(InMemoryRetryStore):
-    """The deployed path. Degrades to in-memory, loudly, and keeps retrying.
-
-    In the degraded state a deferred retry is scheduled into a store that will
-    not exist on the next invocation, so the work is silently dropped. That is
-    worse than not deferring at all, hence the error rather than a warning --
-    and it is why this reconnects instead of giving up for the life of the
-    process.
-    """
+class AzureSqlRetryStore(InMemoryRetryStore):
+    """Shared retry state. Missing or uncertain durable work stops the caller."""
 
     def __init__(
         self,
@@ -266,106 +304,155 @@ class FabricSqlRetryStore(InMemoryRetryStore):
         table: str = "triage_deferred_retries",
         max_attempts: int = MAX_ATTEMPTS,
     ) -> None:
-        from triage.store.fabric_sql import quote_identifier
-
         super().__init__(max_attempts=max_attempts)
+        self._lock = threading.RLock()
         self._db = db
         self._table = quote_identifier(table)
         self._table_name = table
         self._loaded = False
+        self._revisions: dict[str, bytes] = {}
         self._ensure_loaded()
 
     @property
     def is_durable(self) -> bool:
         return self._loaded and self._db.is_available
 
-    def _ensure_loaded(self) -> bool:
-        if self._loaded:
-            return True
+    def _ensure_loaded(self, signature: str | None = None) -> None:
+        self._loaded = False
+        self._items.clear()
+        self._revisions.clear()
         try:
-            self._load()
-        except Exception as exc:  # noqa: BLE001
+            self._load(signature)
+        except Exception as exc:
             logger.error(
-                "Retry store degraded to in-memory: cannot read %s (%s). "
-                "Deferred retries will be dropped rather than performed.",
-                self._table_name,
-                type(exc).__name__,
+                "Cannot read deployed retry state in %s (%s); deferred work stopped",
+                self._table_name, type(exc).__name__,
             )
-            return False
+            raise
         self._loaded = True
-        logger.info(
-            "Loaded %d deferred retry row(s) from %s", len(self._items), self._table_name
-        )
-        return True
 
-    def _load(self) -> None:
-        rows = self._db.query(f"SELECT signature, payload FROM {self._table}")
+    def _load(self, signature: str | None = None) -> None:
+        where = " WHERE signature = ?" if signature is not None else ""
+        params = (signature,) if signature is not None else ()
+        rows = self._db.query(f"SELECT signature, payload FROM {self._table}{where}", *params)
         loaded: dict[str, dict[str, Any]] = {}
-        for signature, raw in rows:
-            if not raw:
-                continue
-            try:
+        revisions: dict[str, bytes] = {}
+        try:
+            for key, raw in rows:
                 row = json.loads(raw)
-            except Exception:  # noqa: BLE001
-                logger.warning("Skipping unreadable retry row %s", signature)
-                continue
-            loaded[str(row.get("signature", signature))] = row
+                if not isinstance(row, dict) or row["signature"] != key or not key or key in loaded:
+                    raise ValueError("Invalid retry identity")
+                for name in (
+                    "signature", "request_id", "workspace_id", "dataset_id",
+                    "report_name", "reason", "status", "created_at", "updated_at", "due_at",
+                ):
+                    if not isinstance(row[name], str):
+                        raise ValueError("Invalid retry field")
+                if row["status"] not in {"pending", "done", "exhausted"}:
+                    raise ValueError("Invalid retry status")
+                if type(row["attempts"]) is not int or row["attempts"] < 1:
+                    raise ValueError("Invalid retry attempt count")
+                if type(row["wait_seconds"]) is not int or row["wait_seconds"] < 0:
+                    raise ValueError("Invalid retry wait")
+                for name in ("due_at", "created_at", "updated_at"):
+                    if datetime.fromisoformat(row[name]).tzinfo is None:
+                        raise ValueError("Retry timestamp has no timezone")
+                loaded[key] = row
+                revisions[key] = hashlib.sha256(raw.encode("utf-16-le")).digest()
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise SqlUnavailable(
+                f"Unreadable retry state in {self._table_name}; repair deployed state."
+            ) from exc
         self._items = loaded
+        self._revisions = revisions
+
+    def get(self, signature: str) -> dict[str, Any] | None:
+        with self._lock:
+            self._ensure_loaded(signature)
+            return super().get(signature)
 
     def due(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
-        # Guarded: the sweep that performs deferred work reads this, and an
-        # empty cache silently drops every retry that was scheduled.
-        self._ensure_loaded()
-        return super().due(now=now)
+        with self._lock:
+            self._ensure_loaded()
+            return super().due(now=now)
 
     def pending(self) -> list[dict[str, Any]]:
-        self._ensure_loaded()
-        return super().pending()
+        with self._lock:
+            self._ensure_loaded()
+            return super().pending()
+
+    def defer(
+        self, *, signature: str, request_id: str = "", workspace_id: str = "",
+        dataset_id: str = "", report_name: str = "", reason: str = "",
+        retry_after_seconds: int = 0,
+        source_execution: dict[str, Any] | None = None,
+        policy_revision: int | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._ensure_loaded(signature)
+            return super().defer(
+                signature=signature, request_id=request_id, workspace_id=workspace_id,
+                dataset_id=dataset_id, report_name=report_name, reason=reason,
+                retry_after_seconds=retry_after_seconds,
+                source_execution=source_execution, policy_revision=policy_revision,
+            )
+
+    def complete(self, signature: str, *, outcome: str) -> None:
+        with self._lock:
+            self._ensure_loaded(signature)
+            super().complete(signature, outcome=outcome)
+
+    def record_linked_retry(self, *, signature: str, **fields: Any) -> dict[str, Any]:
+        with self._lock:
+            self._ensure_loaded(signature)
+            return super().record_linked_retry(signature=signature, **fields)
 
     def _persist(self, row: dict[str, Any]) -> None:
-        signature = str(row["signature"])
+        signature = row["signature"]
         payload = json.dumps(row)
         args = (
-            row.get("status", ""),
-            row.get("due_at", ""),
-            int(row.get("attempts", 0)),
+            row["status"],
+            row["due_at"],
+            row["attempts"],
             payload,
             signature,
         )
         try:
-            updated = self._db.execute(
-                f"UPDATE {self._table} SET status = ?, due_at = ?, attempts = ?, "
-                f"payload = ? WHERE signature = ?",
-                *args,
-            )
-            if not updated:
-                try:
-                    self._db.execute(
-                        f"INSERT INTO {self._table} "
-                        f"(signature, status, due_at, attempts, payload) "
-                        f"VALUES (?, ?, ?, ?, ?)",
-                        signature,
-                        row.get("status", ""),
-                        row.get("due_at", ""),
-                        int(row.get("attempts", 0)),
-                        payload,
-                    )
-                except self._db.integrity_error():
-                    self._db.execute(
-                        f"UPDATE {self._table} SET status = ?, due_at = ?, "
-                        f"attempts = ?, payload = ? WHERE signature = ?",
-                        *args,
-                    )
-        except Exception as exc:  # noqa: BLE001
+            revision = self._revisions.get(signature)
+            if revision is None:
+                changed = self._db.execute(
+                    f"INSERT INTO {self._table} "
+                    f"(signature, status, due_at, attempts, payload) VALUES (?, ?, ?, ?, ?)",
+                    signature, *args[:4],
+                )
+            else:
+                changed = self._db.execute(
+                    f"UPDATE {self._table} SET status = ?, due_at = ?, attempts = ?, "
+                    "payload = ? WHERE signature = ? AND HASHBYTES('SHA2_256', payload) = ?",
+                    *args, revision,
+                )
+            if changed != 1:
+                raise SqlUnavailable(
+                    "Retry write was not confirmed or its shared revision changed; reload before continuing."
+                )
+        except Exception as exc:
             self._loaded = False
+            self._items.clear()
+            self._revisions.clear()
             logger.error(
-                "Could not persist deferred retry %s (%s); it will not run",
-                signature,
-                type(exc).__name__,
+                "Deferred retry %s write unconfirmed (%s); not retried",
+                signature, type(exc).__name__,
             )
+            raise
+        self._revisions[signature] = hashlib.sha256(payload.encode("utf-16-le")).digest()
 
     def _on_reset(self) -> None:
+        self._loaded = False
+        self._revisions.clear()
         try:
-            self._db.execute(f"DELETE FROM {self._table}")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not clear %s (%s)", self._table_name, type(exc).__name__)
+            if self._db.execute(f"DELETE FROM {self._table}") < 0:
+                raise SqlUnavailable("Retry reset returned no reliable affected-row count.")
+        except Exception as exc:
+            logger.error("Could not clear %s (%s)", self._table_name, type(exc).__name__)
+            raise
+        self._loaded = True

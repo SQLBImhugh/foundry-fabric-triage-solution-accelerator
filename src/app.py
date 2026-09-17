@@ -19,6 +19,7 @@ that all operations use one identity.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from collections.abc import AsyncIterator, Sequence
@@ -34,6 +35,7 @@ from agent_framework import (
 from agent_framework._agents import ResponseStream
 from agent_framework_foundry_hosting import ResponsesHostServer
 
+from triage.monitoring.controller import controller_heartbeat
 from triage.observability import configure_telemetry
 from triage.runner import TriageRunner
 from triage.settings import settings
@@ -60,6 +62,7 @@ _SWEEP_COMMANDS = frozenset({"sweep", "scheduled sweep", "run", "check mail", ""
 _SILENT_COMMANDS = frozenset({"silent sweep", "silent-sweep", "health sweep", "scan"})
 _PIPELINE_COMMANDS = frozenset({"pipeline sweep", "pipeline-sweep"})
 _WEB_COMMANDS = frozenset({"command sweep", "command-sweep"})
+_HEARTBEAT_COMMANDS = frozenset({"heartbeat", "monitoring sweep", "monitoring-sweep"})
 
 
 def _latest_text(messages: Any) -> str:
@@ -128,7 +131,7 @@ class TriageControllerAgent(BaseAgent):
         # this does not even span two requests to the same replica.
         self._lock = asyncio.Lock()
         # The one that actually prevents duplicate remediation. Durable when a
-        # Fabric SQL database is configured; in-process, and therefore honest
+        # Azure SQL database is configured; in-process, and therefore honest
         # about what it can guarantee, when it is not. It shares the runner's
         # connection rather than opening a second one.
         self._claims = build_claim_store(
@@ -137,8 +140,8 @@ class TriageControllerAgent(BaseAgent):
         )
         if not getattr(self._claims, "is_durable", False):
             logger.warning(
-                "Claim store is not durable: set FABRIC_SQL_SERVER and "
-                "FABRIC_SQL_DATABASE. Two concurrent invocations could triage "
+                "Claim store is not durable: set AZURE_SQL_SERVER and "
+                "AZURE_SQL_DATABASE. Two concurrent invocations could triage "
                 "the same alert twice."
             )
 
@@ -189,6 +192,10 @@ class TriageControllerAgent(BaseAgent):
         is_sweep = command in _SWEEP_COMMANDS
         is_silent = command in _SILENT_COMMANDS
         is_pipeline = command in _PIPELINE_COMMANDS
+        if command in _HEARTBEAT_COMMANDS:
+            async with self._lock:
+                summary = await self._heartbeat()
+                return AgentResponse(messages=[Message("assistant", [summary])])
         if command in _WEB_COMMANDS:
             from triage.command_center.worker import drain_commands
 
@@ -210,48 +217,28 @@ class TriageControllerAgent(BaseAgent):
         # store and could remediate the same failure twice -- the exact
         # duplicate-action problem the dedup logic exists to prevent.
         async with self._lock:
-            try:
-                if is_silent:
-                    summary = await self._silent_sweep()
-                elif is_sweep:
-                    summary = await self._drain_mailbox()
-                else:
-                    summary = await self._triage_text(text)
-            except Exception as exc:
-                logger.exception("Triage run failed")
-                summary = (
-                    f"Triage failed: {type(exc).__name__}: {exc}\n"
-                    "The incident store records every terminal outcome, including this one."
-                )
+            if is_silent:
+                summary = await self._silent_sweep()
+            elif is_sweep:
+                summary = await self._drain_mailbox()
+            else:
+                summary = await self._triage_text(text)
 
         return AgentResponse(messages=[Message("assistant", [summary])])
 
     # --- the two entry paths ----------------------------------------------
 
+    async def _heartbeat(self) -> str:
+        """Give automatic source work and human commands one slot per round."""
+        lines = await controller_heartbeat(self._runner)
+        return "\n".join(lines) if lines else "No due controller or human command work; monitoring coverage is reported separately."
+
     async def _triage_text(self, text: str) -> str:
-        """Triage an alert pasted straight into the Playground.
-
-        Unclaimed, unlike the mailbox and retry paths, and that is a known gap
-        rather than an oversight. There is no message id to key a claim on, and
-        the signature -- the thing that actually identifies the work -- is not
-        known until the request has been run. So a human pasting an alert while
-        a scheduled sweep is processing the same underlying failure can both
-        reach remediation.
-
-        What narrows it: `find_open` reads through to SQL on every check, so an
-        incident already opened by the sweep is visible here and suppresses.
-        What remains: both callers can pass that check before either persists.
-
-        Closing it properly means claiming on the signature inside the runner,
-        which would cover all three entry paths uniformly. That is a larger
-        change than it looks -- it moves claim ownership out of the hosted app
-        and into the runner, which the offline scenarios also drive -- so it is
-        recorded here rather than half-done.
-        """
+        """Unbound human text is diagnostic input, never native action authority."""
         subject, _, body = text.partition("\n")
         hints = parse_hints(subject, text)
         request = BIRequest(
-            request_id=f"interactive-{abs(hash(text)) % 10**10}",
+            request_id=f"interactive-{hashlib.sha256(text.encode()).hexdigest()[:24]}",
             received_at="",
             sender="playground",
             subject=subject.strip() or "Interactive alert",
@@ -349,7 +336,8 @@ class TriageControllerAgent(BaseAgent):
             # invoke overlapping a scheduled sweep, or two hosted replicas, would
             # both trigger the same refresh. The write-action budget does not
             # help: it is per run, and these are two runs.
-            claim_key = f"message:{request.request_id}"
+            context = self._runner.monitoring_context
+            claim_key = f"message:{context.tenant_id}:{context.epoch}:{request.request_id}"
             if not self._claims.claim(claim_key):
                 # Someone else has it. Skipping is right: they will mark it
                 # processed, and if they die their lease expires and the next

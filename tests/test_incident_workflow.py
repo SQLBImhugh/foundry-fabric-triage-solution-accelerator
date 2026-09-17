@@ -19,6 +19,7 @@ from triage.command_center.incident_models import (
 from triage.command_center.incident_workflow import IncidentWorkflowService
 from triage.command_center.models import Actor, ApiFailure, WebSettings
 from triage.command_center.service import CommandCenterService
+from triage.monitoring.runtime import FIXTURE_TENANT_ID, build_monitoring_store
 from triage.policy import PolicyLedger, TriagePolicy
 from triage.store.approvals import InMemoryApprovalChannel
 from triage.store.command_center import InMemoryCommandCenterStore
@@ -28,24 +29,76 @@ READER = Actor(id="reader-1", display_name="Test reader", roles=["reader"])
 OPERATOR = Actor(id="operator-1", display_name="Test operator", roles=["reader", "operator"])
 APPROVER = Actor(id="approver-1", display_name="Test approver", roles=["reader", "approver"])
 ADMIN = Actor(id="admin-1", display_name="Test admin", roles=["admin"])
+CLIENT_ID = "00000000-0000-0000-0000-000000000003"
+
+
+def make_bundle(backend, test_settings, tmp_path):
+    harness = Harness(backend, tmp_path / "service-workflow.db")
+    sql = harness.db is not None
+    monitoring = build_monitoring_store(test_settings, fixture=True)
+    settings = test_settings.model_copy(update={
+        "monitoring_mode": "live" if sql else "fixture",
+        "monitoring_tenant_id": FIXTURE_TENANT_ID,
+        "azure_sql_server": "offline.invalid" if sql else "",
+        "azure_sql_database": "offline" if sql else "",
+    })
+    runtime = CommandCenterService(
+        settings, WebSettings(
+            _env_file=None, mode="live" if sql else "demo",
+            tenant_id=FIXTURE_TENANT_ID, client_id=CLIENT_ID,
+            demo_worker=False, question_provider="records", access_management_enabled=False,
+        ),
+        incidents=harness.core, db=harness.db,
+        history=InMemoryCommandCenterStore(), approvals=InMemoryApprovalChannel(),
+        monitoring_store=monitoring,
+    )
+    workflow = IncidentWorkflowService(runtime, harness.store)
+    return SimpleNamespace(runtime=runtime, workflow=workflow, harness=harness, monitoring=monitoring)
 
 
 @pytest.fixture(params=["memory", "sql"])
 def bundle(request, test_settings, tmp_path):
-    harness = Harness(request.param, tmp_path / "service-workflow.db")
-    settings = test_settings.model_copy(update={
-        "fabric_sql_server": "offline.invalid" if harness.db else "",
-        "fabric_sql_database": "offline" if harness.db else "",
-    })
-    runtime = CommandCenterService(
-        settings, WebSettings(
-            mode="live" if harness.db else "demo", demo_worker=False, question_provider="records",
-        ),
-        incidents=harness.core, db=harness.db,
-        history=InMemoryCommandCenterStore(), approvals=InMemoryApprovalChannel(),
-    )
-    workflow = IncidentWorkflowService(runtime, harness.store)
-    return SimpleNamespace(runtime=runtime, workflow=workflow, harness=harness)
+    return make_bundle(request.param, test_settings, tmp_path)
+
+
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+def test_workflow_fixture_pins_monitoring_and_ignores_exported_live_configuration(
+    backend, test_settings, tmp_path, monkeypatch,
+):
+    for name, value in {
+        "MONITORING_MODE": "live",
+        "MONITORING_TENANT_ID": "10000000-0000-0000-0000-000000000001",
+        "TRIAGE_TOOL_MODE": "live",
+        "TRIAGE_PROVIDER_MODE": "direct",
+        "AZURE_CLIENT_ID": "20000000-0000-0000-0000-000000000002",
+        "AZURE_SQL_SERVER": "exported.database.invalid",
+        "AZURE_SQL_DATABASE": "exported_database",
+        "COMMAND_CENTER_MODE": "live",
+        "COMMAND_CENTER_TENANT_ID": "30000000-0000-0000-0000-000000000003",
+        "COMMAND_CENTER_CLIENT_ID": "40000000-0000-0000-0000-000000000004",
+        "COMMAND_CENTER_QUESTION_PROVIDER": "model",
+        "COMMAND_CENTER_ACCESS_MANAGEMENT_ENABLED": "true",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    def forbidden_factory(*_args, **_kwargs):
+        raise AssertionError("The workflow fixture must use its injected offline monitoring authority")
+
+    monkeypatch.setattr("triage.command_center.service.build_monitoring_store", forbidden_factory)
+    before = test_settings.model_dump()
+    value = make_bundle(backend, test_settings, tmp_path)
+    runtime = value.runtime
+    assert runtime.settings.monitoring_mode == ("live" if backend == "sql" else "fixture")
+    assert runtime.settings.monitoring_tenant_id == runtime.web.tenant_id == FIXTURE_TENANT_ID
+    assert runtime.web.client_id == CLIENT_ID
+    assert runtime.settings.triage_tool_mode == runtime.settings.triage_provider_mode == "mock"
+    assert runtime.web.question_provider == "records"
+    assert not runtime.web.access_management_enabled
+    assert runtime.monitoring.store is value.monitoring
+    assert runtime.monitoring.bootstrap(READER).status == "ready"
+    assert runtime.db is value.harness.db
+    assert value.workflow.case("incident-1", READER).detail["incident"]["id"] == "incident-1"
+    assert test_settings.model_dump() == before
 
 
 def note(body: str = "Operator note", **updates) -> IncidentNoteInput:

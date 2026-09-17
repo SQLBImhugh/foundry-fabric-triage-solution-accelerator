@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import tempfile
 from datetime import UTC, datetime, timedelta
@@ -11,7 +10,14 @@ from pathlib import Path
 from uuid import uuid4
 
 from triage.models import BIRequest, TriageAction, TriageResult
-from triage.pipeline_models import PipelineActivity, PipelineFailure, PipelineRun, PipelineTarget
+from triage.monitoring.runtime import (
+    FIXTURE_TENANT_ID,
+    ensure_fixture_target,
+    fixture_component,
+    fixture_setup,
+    fixture_target,
+)
+from triage.pipeline_models import PipelineActivity, PipelineFailure, PipelineRun
 from triage.runner import TriageRunner
 from triage.store.pipeline_reruns import InMemoryPipelineRerunStore
 from triage.store.processed import InMemoryProcessedLog
@@ -33,6 +39,7 @@ class DemoRunner(TriageRunner):
         super().__init__(
             service.settings, base_dir=folder, store=service.incidents,
             command_center_store=service.history,
+            monitoring_store=fixture_component(service.monitoring.store, "controller"), fixture=True,
         )
 
     def build_approval_channel(self):
@@ -59,25 +66,33 @@ class DemoRunner(TriageRunner):
 async def start_demo(service) -> None:
     from triage.store.command_center import RunEvent, RunRecord
 
-    target = PipelineTarget(
-        name="Orders daily ingestion", workspace_id=WORKSPACE, pipeline_id=PIPELINE,
-        rerun_safe=True, rerun_parameters={"businessDate": "2026-09-10"},
-    )
     service.settings = service.settings.model_copy(update={
-        "fabric_sql_server": "", "fabric_sql_database": "",
+        "azure_sql_server": "", "azure_sql_database": "",
         "triage_provider_mode": "mock", "triage_tool_mode": "mock",
-        "powerbi_workspace_id": WORKSPACE, "powerbi_dataset_id": DATASET,
-        "fabric_pipeline_targets": json.dumps([target.model_dump()]),
+        "monitoring_mode": "fixture", "monitoring_tenant_id": FIXTURE_TENANT_ID,
         "pipeline_sweep_enabled": True, "run_history_enabled": True,
         "approval_delivery_mode": "web", "notification_channel": "web",
         "teams_webhook_url": "", "applicationinsights_connection_string": "",
         "approval_timeout_seconds": 900,
     })
+    registry = service.monitoring.store
+    with fixture_setup(registry) as setup:
+        ensure_fixture_target(
+            setup, fixture_target("powerbi", WORKSPACE, DATASET), "Customer service performance",
+        )
+        ensure_fixture_target(
+            setup, fixture_target("fabric_pipeline", WORKSPACE, PIPELINE), "Orders daily ingestion",
+            action="pipeline_rerun", parameters={"businessDate": "2026-09-10"},
+        )
     # This temporary folder belongs only to this explicitly labelled demo;
     # no developer runs/ or Fabric state is opened.
     temporary = tempfile.TemporaryDirectory(prefix="triage-command-center-demo-")
     folder = Path(temporary.name)
     runner = DemoRunner(service, folder)
+    target = next(
+        item for item in runner.pipeline_targets()
+        if item.workspace_id == WORKSPACE and item.pipeline_id == PIPELINE
+    )
     service.demo_runner = runner
     service.demo_temporary = temporary
     now = datetime.now(UTC)

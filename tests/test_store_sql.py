@@ -1,4 +1,4 @@
-"""The Fabric SQL store layer, tested without a database.
+"""The Azure SQL store layer, tested without a database.
 
 Rule 1 of this repository is that tests never touch the network, so nothing
 here connects to anything. What is worth testing offline is the part that was
@@ -18,18 +18,19 @@ import json
 
 import pytest
 
+from triage.approvals import ApprovalRequest
 from triage.models import TriageResult
-from triage.store.approvals import FabricSqlApprovalChannel
-from triage.store.claims import FabricSqlClaimStore, build_claim_store
-from triage.store.fabric_sql import (
+from triage.store.approvals import AzureSqlApprovalChannel, InMemoryApprovalChannel
+from triage.store.azure_sql import (
     DEFAULT_TABLES,
-    FabricSqlDatabase,
+    AzureSqlDatabase,
     SqlUnavailable,
     ensure_schema,
     quote_identifier,
     schema_statements,
 )
-from triage.store.sql_incidents import FabricSqlIncidentStore
+from triage.store.claims import AzureSqlClaimStore, build_claim_store
+from triage.store.sql_incidents import AzureSqlIncidentStore
 
 
 class FakeIntegrityError(Exception):
@@ -114,7 +115,7 @@ def test_sql_cursors_are_closed_before_reusing_a_connection(monkeypatch) -> None
             return Cursor()
 
     connection = Connection()
-    database = FabricSqlDatabase(server="unused", database="unused")
+    database = AzureSqlDatabase(server="unused", database="unused")
     monkeypatch.setattr(database, "_ensure", lambda: connection)
     assert database.query("EXEC fixture") == [(1,)]
     assert database.query("SELECT 1") == [(1,)]
@@ -123,17 +124,17 @@ def test_sql_cursors_are_closed_before_reusing_a_connection(monkeypatch) -> None
 
 
 def test_sql_failure_preserves_a_redacted_cause_and_clears_it_on_recovery(monkeypatch) -> None:
-    from triage.store.command_center import FabricSqlCommandCenterStore
+    from triage.store.command_center import AzureSqlCommandCenterStore
 
     secret = "AKIAIOSFODNN7EXAMPLE"
-    database = FabricSqlDatabase(server="unused", database="unused", cooldown_seconds=0)
+    database = AzureSqlDatabase(server="unused", database="unused", cooldown_seconds=0)
 
     def unavailable():
         raise RuntimeError(f"Connection rejected with {secret}")
 
     monkeypatch.setattr(database, "_connect", unavailable)
     with pytest.raises(SqlUnavailable) as error:
-        FabricSqlCommandCenterStore(database).commands()
+        AzureSqlCommandCenterStore(database).commands()
     assert "RuntimeError" in str(error.value)
     assert "Connection rejected" in str(error.value)
     assert secret not in str(error.value)
@@ -144,8 +145,8 @@ def test_sql_failure_preserves_a_redacted_cause_and_clears_it_on_recovery(monkey
 
 
 def test_sql_attempts_its_first_connection_in_a_fresh_sandbox(monkeypatch) -> None:
-    monkeypatch.setattr("triage.store.fabric_sql.time.monotonic", lambda: 1.0)
-    database = FabricSqlDatabase(server="unused", database="unused")
+    monkeypatch.setattr("triage.store.azure_sql.time.monotonic", lambda: 1.0)
+    database = AzureSqlDatabase(server="unused", database="unused")
     calls = []
 
     def connect():
@@ -159,8 +160,8 @@ def test_sql_attempts_its_first_connection_in_a_fresh_sandbox(monkeypatch) -> No
 
 def test_sql_failure_at_monotonic_zero_still_observes_recovery_cooldown(monkeypatch) -> None:
     now = [0.0]
-    monkeypatch.setattr("triage.store.fabric_sql.time.monotonic", lambda: now[0])
-    database = FabricSqlDatabase(server="unused", database="unused")
+    monkeypatch.setattr("triage.store.azure_sql.time.monotonic", lambda: now[0])
+    database = AzureSqlDatabase(server="unused", database="unused")
     calls = []
 
     def connect():
@@ -237,7 +238,7 @@ def test_retiring_permission_storage_preserves_every_operational_table(runner, t
     operational = {
         "incidents", "processed", "approvals", "retries", "semantic_health", "leases",
         "claims", "inbox_audit", "pipeline_reruns", "agent_runs", "agent_events",
-        "agent_commands", "incident_activity",
+        "agent_commands", "incident_activity", "data_quality_flags",
     }
     assert set(DEFAULT_TABLES) == set(runner._sql_tables()) == operational
     assert "command_center_access_table_name" not in type(test_settings).model_fields
@@ -249,7 +250,7 @@ def test_retiring_permission_storage_preserves_every_operational_table(runner, t
 
 
 def test_schema_creation_reports_failure_rather_than_raising() -> None:
-    """An unreachable database must not stop the accelerator starting."""
+    """Deployment reports a failure; runtime stores do not call this helper."""
     assert ensure_schema(FakeSql(down=True)) is False
 
 
@@ -258,15 +259,16 @@ def test_schema_creation_reports_failure_rather_than_raising() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_a_store_that_starts_without_its_database_is_not_durable() -> None:
+def test_a_store_that_starts_without_its_database_refuses_to_start() -> None:
     db = FakeSql(down=True)
-    store = FabricSqlIncidentStore(db=db)
-
-    assert store.is_durable is False
+    with pytest.raises(SqlUnavailable):
+        AzureSqlIncidentStore(db=db)
+    assert db.schema_calls == 0
+    assert not db.executed
 
 
 def test_a_store_recovers_when_the_database_comes_back() -> None:
-    """The exact production failure: degraded at startup, degraded for ever.
+    """Recovery requires an authoritative reload, never a local fallback.
 
     Tenant policy disabled network access on the state store minutes after it
     was created. The container started while it was unreachable, fell back to
@@ -283,10 +285,12 @@ def test_a_store_recovers_when_the_database_comes_back() -> None:
         '"outcome": "needs_human", "summary": "s", "request_id": "r-0", '
         '"occurrence_count": 1}'
     )
-    db = FakeSql(rows=[(incident_json,)], down=True)
-    store = FabricSqlIncidentStore(db=db)
+    db = FakeSql(rows=[(incident_json,)])
+    store = AzureSqlIncidentStore(db=db)
 
-    assert store.find_open("sig-1") is None, "cannot see rows while down"
+    db.down = True
+    with pytest.raises(SqlUnavailable):
+        store.find_open("sig-1")
     assert store.is_durable is False
 
     db.down = False
@@ -300,24 +304,26 @@ def test_a_store_recovers_when_the_database_comes_back() -> None:
 def test_a_failed_write_marks_the_store_undurable_so_it_reloads() -> None:
     """A write that fails must not leave the store believing it is in sync."""
     db = FakeSql()
-    store = FabricSqlIncidentStore(db=db)
+    store = AzureSqlIncidentStore(db=db)
     assert store.is_durable is True
 
-    db.down = True
-    store.record(_result(), report_name="R")
+    db.fail_writes = True
+    with pytest.raises(SqlUnavailable):
+        store.record(_result(), report_name="R")
 
     assert store.is_durable is False
 
 
-def test_recording_still_works_while_the_database_is_down() -> None:
-    """Degraded means noisy, never fatal: triage must still reach an outcome."""
-    db = FakeSql(down=True)
-    store = FabricSqlIncidentStore(db=db)
-
-    incident = store.record(_result(), report_name="R")
-
-    assert incident.signature == "sig-1"
-    assert store.list_all()
+def test_recording_cannot_report_an_in_memory_outcome_while_sql_is_down() -> None:
+    db = FakeSql()
+    store = AzureSqlIncidentStore(db=db)
+    db.down = True
+    with pytest.raises(SqlUnavailable):
+        store.record(_result(), report_name="R")
+    assert not store._items
+    db.down = False
+    assert store.list_all() == []
+    assert not db.executed
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +333,7 @@ def test_recording_still_works_while_the_database_is_down() -> None:
 
 def test_an_unclaimed_key_is_granted() -> None:
     db = FakeSql()
-    claims = FabricSqlClaimStore(db=db)
+    claims = AzureSqlClaimStore(db=db)
 
     assert claims.claim("message:abc") is True
 
@@ -337,7 +343,7 @@ def test_a_key_someone_else_holds_is_refused() -> None:
     db = FakeSql()
     db.raise_duplicate = True
     db.affected = 0
-    claims = FabricSqlClaimStore(db=db)
+    claims = AzureSqlClaimStore(db=db)
 
     assert claims.claim("message:abc") is False
 
@@ -347,7 +353,7 @@ def test_an_expired_claim_is_stolen() -> None:
     db = FakeSql()
     db.raise_duplicate = True
     db.affected = 1
-    claims = FabricSqlClaimStore(db=db)
+    claims = AzureSqlClaimStore(db=db)
 
     assert claims.claim("message:abc") is True
 
@@ -361,7 +367,7 @@ def test_the_steal_is_conditional_on_expiry_in_sql() -> None:
     db = FakeSql()
     db.raise_duplicate = True
     db.affected = 1
-    FabricSqlClaimStore(db=db).claim("message:abc")
+    AzureSqlClaimStore(db=db).claim("message:abc")
 
     update = next(sql for sql, _ in db.executed if sql.strip().startswith("UPDATE"))
     assert "expires_at < SYSUTCDATETIME()" in update
@@ -370,18 +376,17 @@ def test_the_steal_is_conditional_on_expiry_in_sql() -> None:
 def test_an_unreachable_database_never_grants_a_claim() -> None:
     """Losing this store must stop work, not let it happen twice.
 
-    The incident and processed stores degrade to in-memory because losing them
-    makes the agent noisy. Losing this one makes it act twice, so it fails
-    closed instead.
+    Operational stores must fail closed too: a claim alone cannot compensate
+    for a terminal incident or processed disposition that was never persisted.
     """
-    claims = FabricSqlClaimStore(db=FakeSql(down=True))
+    claims = AzureSqlClaimStore(db=FakeSql(down=True))
 
     assert claims.claim("message:abc") is False
 
 
 def test_release_is_survivable_when_the_database_is_down() -> None:
     """Releasing early is an optimisation; the lease expires regardless."""
-    FabricSqlClaimStore(db=FakeSql(down=True)).release("message:abc")
+    AzureSqlClaimStore(db=FakeSql(down=True)).release("message:abc")
 
 
 def test_release_does_not_delete_a_claim_someone_else_now_holds() -> None:
@@ -392,7 +397,7 @@ def test_release_does_not_delete_a_claim_someone_else_now_holds() -> None:
     working. The delete has to prove ownership.
     """
     db = FakeSql()
-    claims = FabricSqlClaimStore(db=db)
+    claims = AzureSqlClaimStore(db=db)
     assert claims.claim("message:abc") is True
 
     db.executed.clear()
@@ -405,7 +410,7 @@ def test_release_does_not_delete_a_claim_someone_else_now_holds() -> None:
 def test_release_without_holding_the_claim_writes_nothing() -> None:
     """Releasing something this process never took must not touch the row."""
     db = FakeSql()
-    FabricSqlClaimStore(db=db).release("message:never-held")
+    AzureSqlClaimStore(db=db).release("message:never-held")
 
     assert not [sql for sql, _ in db.executed if sql.strip().startswith("DELETE")]
 
@@ -413,8 +418,8 @@ def test_release_without_holding_the_claim_writes_nothing() -> None:
 def test_two_claims_in_one_process_do_not_share_an_owner() -> None:
     """Host and pid are not unique: a hosted agent is rebuilt per request."""
     db = FakeSql()
-    first = FabricSqlClaimStore(db=db)
-    second = FabricSqlClaimStore(db=db)
+    first = AzureSqlClaimStore(db=db)
+    second = AzureSqlClaimStore(db=db)
     first.claim("a")
     second.claim("b")
 
@@ -427,9 +432,13 @@ def test_two_claims_in_one_process_do_not_share_an_owner() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _open_request(db: FakeSql, request_id: str = "req-1") -> FabricSqlApprovalChannel:
-    db.rows = [(json.dumps({"request_id": request_id, "action": "refresh"}),)]
-    return FabricSqlApprovalChannel(db=db)
+def _open_request(db: FakeSql, request_id: str = "req-1") -> AzureSqlApprovalChannel:
+    fixture = InMemoryApprovalChannel()
+    fixture.open(ApprovalRequest(
+        request_id=request_id, action="refresh", arguments={}, justification="Offline test",
+    ))
+    db.rows = [(json.dumps(fixture.get(request_id)),)]
+    return AzureSqlApprovalChannel(db=db)
 
 
 def test_a_decision_is_written_conditionally() -> None:
@@ -440,7 +449,7 @@ def test_a_decision_is_written_conditionally() -> None:
     """
     db = FakeSql()
     channel = _open_request(db)
-    channel.decide("req-1", decision="approved", responder="a")
+    channel.decide("req-1", decision="approve", responder="a")
 
     update = next(sql for sql, _ in db.executed if sql.strip().startswith("UPDATE"))
     assert "decision IS NULL OR decision = ''" in update, (
@@ -454,7 +463,7 @@ def test_losing_the_decision_race_is_refused_not_reported_as_success() -> None:
     db.affected = 0  # somebody answered between the read and the write
 
     with pytest.raises(ValueError):
-        channel.decide("req-1", decision="approved", responder="b")
+        channel.decide("req-1", decision="approve", responder="b")
 
 
 def test_a_failed_decision_write_is_raised_not_swallowed() -> None:
@@ -470,50 +479,38 @@ def test_a_failed_decision_write_is_raised_not_swallowed() -> None:
     db.fail_writes = True
 
     with pytest.raises(RuntimeError):
-        channel.decide("req-1", decision="approved", responder="a")
+        channel.decide("req-1", decision="approve", responder="a")
 
 
 # ---------------------------------------------------------------------------
-# Recovery must not discard what it could not save
+# Recovery must reconcile SQL without replaying uncertain local changes
 # ---------------------------------------------------------------------------
 
 
-def test_recovery_flushes_outcomes_recorded_while_the_database_was_down() -> None:
-    """Reloading must not throw away the writes the outage prevented.
+def test_recovery_does_not_flush_an_unconfirmed_local_outcome() -> None:
+    """The finalization owner reconciles failures; a read cannot replay writes."""
+    db = FakeSql()
+    store = AzureSqlIncidentStore(db=db)
+    db.fail_writes = True
+    with pytest.raises(SqlUnavailable):
+        store.record(_result(), report_name="R")
+    db.fail_writes = False
+    assert store.list_all() == []
+    assert not db.executed
 
-    Rule 8 says every terminal outcome is persisted. A store that reloads by
-    replacing its dictionary drops anything recorded during the outage at the
-    exact moment recovery made it savable, which is worse than staying
-    degraded: it looks like it recovered.
-    """
+
+def test_startup_and_recovery_never_attempt_runtime_schema_creation() -> None:
     db = FakeSql(down=True)
-    store = FabricSqlIncidentStore(db=db)
-    incident = store.record(_result(), report_name="R")
+    with pytest.raises(SqlUnavailable):
+        AzureSqlIncidentStore(db=db)
+    assert db.schema_calls == 0
 
     db.down = False
-    reloaded = store.list_all()
-
-    assert any(i.id == incident.id for i in reloaded), (
-        "the incident recorded during the outage was discarded on reload"
-    )
-    inserts = [sql for sql, _ in db.executed if "INSERT" in sql or "UPDATE" in sql]
-    assert inserts, "the recovered incident was never written to the database"
-
-
-def test_recovery_creates_the_schema_if_it_never_existed() -> None:
-    """If the database was down at startup, nothing created the tables.
-
-    Retrying only the SELECT would fail forever against a table that is never
-    going to appear.
-    """
-    db = FakeSql(down=True)
-    store = FabricSqlIncidentStore(db=db)
-    assert db.schema_calls >= 1
-
-    db.down = False
+    store = AzureSqlIncidentStore(db=db)
     store.list_all()
 
-    assert db.schema_calls >= 2, "recovery did not attempt to create the schema"
+    assert db.schema_calls == 0
+    assert not db.executed
 
 
 def test_build_claim_store_without_a_database_is_in_process() -> None:
@@ -542,7 +539,7 @@ def test_find_open_sees_an_incident_opened_by_another_instance() -> None:
     failure gets remediated twice.
     """
     db = FakeSql(rows=[])
-    store = FabricSqlIncidentStore(db=db)
+    store = AzureSqlIncidentStore(db=db)
     assert store.find_open("sig-1") is None
 
     # Another instance opens an incident for the same signature.
@@ -564,46 +561,37 @@ def test_find_open_drops_a_cached_incident_the_database_no_longer_has() -> None:
         '"outcome": "needs_human", "summary": "s", "request_id": "r-0", '
         '"occurrence_count": 1}',
     )])
-    store = FabricSqlIncidentStore(db=db)
+    store = AzureSqlIncidentStore(db=db)
     assert store.find_open("sig-1") is not None
 
     db.rows = []
     assert store.find_open("sig-1") is None
 
 
-def test_recovery_does_not_discard_a_change_made_while_the_database_was_down() -> None:
-    """A failed write is what triggers the reload, so the reload must not throw
-    away the change that failed.
-
-    Regression: recovery kept the local copy only for incident ids the database
-    had never seen. An incident that already existed was 'in' the reloaded set,
-    so the stale database row won and the local update vanished -- a regressed
-    occurrence_count or notified_count then licenses a second announcement.
-    """
+def test_recovery_keeps_authoritative_counts_not_the_unconfirmed_local_change() -> None:
+    """Replaying a dirty cached row can overwrite another worker's newer counts."""
     db = FakeSql(rows=[])
-    store = FabricSqlIncidentStore(db=db)
+    store = AzureSqlIncidentStore(db=db)
     first = store.record(_result(), report_name="R")
     stale = _last_payload(db)
     assert first.occurrence_count == 1
 
     # The database goes read-only: reads still work, writes fail.
+    db.rows = [(stale,)]
     db.fail_writes = True
-    second = store.record(_result(), report_name="R")
-    assert second.occurrence_count == 2, "the in-memory copy still advances"
+    with pytest.raises(SqlUnavailable):
+        store.record(_result(), report_name="R")
     assert store.is_durable is False
 
-    # It comes back, still holding the pre-outage row.
+    # Another worker has finalized newer evidence while this worker was failing.
     db.fail_writes = False
-    db.rows = [(stale,)]
+    shared = json.loads(stale)
+    shared.update(occurrence_count=5, notified_count=2)
+    db.rows = [(json.dumps(shared),)]
     db.executed.clear()
 
-    store.find_open("sig-1")
-
-    assert db.executed, (
-        "recovery wrote nothing: the local change was dropped in favour of the "
-        "stale database row"
-    )
-    flushed = _last_payload(db)
-    assert '"occurrence_count":2' in flushed.replace(" ", ""), (
-        "recovery overwrote the local change with the stale database row"
-    )
+    found = store.find_open("sig-1")
+    assert found is not None
+    assert found.occurrence_count == 5
+    assert found.notified_count == 2
+    assert not db.executed

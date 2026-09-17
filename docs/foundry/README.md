@@ -1,373 +1,401 @@
 # Hosted architecture and identity
 
-This describes the current deployment boundaries and the earlier runtime
-observations that explain them. Historical observations are not a guarantee
-that a preview limitation still applies in every tenant. Reverify platform
-behavior and permissions before changing the corresponding guard.
+The App Service command center, Foundry hosted controller and Container App
+monitoring worker are separate deployment boundaries. All application state
+shares one Azure SQL Database. The Command Center is the operational UI;
+the retained read-only Rayfin cockpit is not a deployment/state dependency or
+an alternative command writer.
 
-The App Service command center and Foundry hosted controller are separate
-deployments. The command center runs a Python 3.13 API and a Vite UI; the
-controller runs `src\app.py` in a Foundry-hosted Python 3.13 container. They
-share a standalone Fabric SQL Database. The read-only Rayfin cockpit remains
-a separate client and does not own the state database.
+This describes the independently reviewed SQL contract and in-progress hybrid
+source integration, not a completed deployment. An isolated MI transport
+canary received all four observed wire types across manual failure, scheduled
+failure, success and cancellation. SQL durable handling and normal-worker
+readiness remain unproved. All shipped infrastructure now uses public networking
+with Entra authentication and no PE/VNet/NAT/private-DNS prerequisites.
+Scoped evaluation SQL/registry public access has been enabled and read back;
+SQL remains Entra-only with TLS/auditing/TDE, and registry admin/anonymous
+access is disabled. The public Foundry controller path is retained with local
+authentication disabled.
+
+The original SQL `STARTED` proof receipt is under guarded recovery; completion,
+runtime users/memberships and permission/effect proof remain gates. Earlier
+private bootstrap/image/metadata checks and the private Foundry service
+preflight failure are historical. Microsoft tracing of that private attempt
+is not a prerequisite for this public path, nor does the error establish
+categorical lack of private-hosting support.
+The live app/controller remain the prior release, with no history migration/wipe,
+normal-worker rollout, hybrid application push or current-release UI screenshots.
+Earlier Fabric SQL checks remain historical.
+See the [release gates](../DeploymentGuide.md#release-gates).
 
 ## Components
 
 ```text
 Browser -- Entra authorization code + PKCE --> App Service command center
                                                 |
-                                                |-- validated API app-role claims
-                                                |-- Fabric SQL: history, queue,
-                                                |   approvals, incident activity
-                                                `-- optional tool-free observer
+                                                |-- validated app-role claims
+                                                |-- pending scope/review intents
+                                                |-- durable human commands
+                                                `-- notes/tracking/tool-free observer
 
-Logic App schedules -- managed identity --> Foundry hosted controller
-                                                |
-                                                |-- command sweep: durable queue
-                                                |-- pipeline sweep: explicit targets
-                                                |-- silent sweep: configured probes
-                                                |-- mailbox sweep: optional, scoped
-                                                |
-                                                |-- bi-triage: reasoning
-                                                |-- bi-data-quality: evidence report
-                                                |-- Power BI / Fabric tools
-                                                `-- Fabric SQL: durable state
+Fabric Job events --> owned Eventstream Custom Endpoint
+                              |
+                              | public outbound TLS, Entra
+                              v
+                   monitoring worker (no ingress)
+                              |
+                              |-- inventory and capability probes
+                              |-- due REST polling
+                              |-- owned connector reconciliation
+                              `-- raw SQL observations/receipts/work
 
-Foundry routines in azure.yaml: declared, disabled pending verified scheduling
-Rayfin cockpit: separate read-only view; no app/database ownership transfer
+Disabled-by-default scheduler -- MI --> Foundry controller "heartbeat"
+                                                |
+                                                |-- monitoring + human queues
+                                                |-- deterministic reconcile_state publication
+                                                |-- exact source re-read
+                                                |-- reasoning and policy
+                                                |-- atomic action reservation
+                                                `-- exact verification/finalization
+
+Azure SQL Database (one catalog): tenant/epoch/control, registry, receipts,
+            work, incidents, approvals, action fences, detector state,
+            commands/run history, collaboration and deployment registration
 ```
 
-The controller decides and executes remediation. Prompt agents propose or
-interpret; they have no workload permissions. The web API records authenticated
-operator intent and human collaboration, but does not turn a browser request
-or observer answer into a direct Power BI/Fabric action.
+The worker collects evidence and manages only owned monitoring topology. It
+does not run an agent or submit a business workload action. The controller is
+the action boundary. Prompt agents interpret supplied facts and propose tools
+without holding workload permissions. The browser records authorized intent;
+it cannot turn an answer or a button click into a direct Fabric/Power BI call.
 
-The optional `bi-triage-observer` receives authorized recorded evidence with
-no tools. A records-based explanation is also available and is the default.
-Its run journal is not proof that remediation occurred.
+The optional tool-free observer explains authorized recorded evidence. Neither
+its answer nor its run journal proves that a repair occurred.
+
+Worker observations and web intents are producers, not published authority.
+The tool-free `reconcile_state` controller path validates them before publishing
+registry/source/connector state. Only eligible source work proceeds to reasoning
+and action. An accepted/configuring response must not be displayed as completed
+publication or service readiness.
 
 ## Identity boundaries
 
-| Principal | Responsibility | Not granted for this responsibility |
+| Principal | Responsibility | Not implied |
 |---|---|---|
-| Deployment operator | Register the app, provision groups, install schema, assign external permissions and deploy code | These privileges do not transfer to an app role or runtime identity |
-| App Service UAMI | Read permitted SQL objects, persist queue/history/approval/collaboration operations, invoke an enabled observer | Directory administration, mailbox access, core-incident writes, runtime DDL |
-| Hosted controller identity | Invoke reasoning agents, execute permitted workload tools and maintain durable controller state | App/group provisioning authority |
-| Scheduler managed identity | Invoke the hosted controller at a reviewed Foundry scope | SQL, Power BI or directory administration |
-| Prompt agents | Reason about supplied evidence | Power BI/Fabric SQL/mailbox permissions |
-| Browser user | Present delegated API access with assigned `CommandCenter.*` roles | Workload service permissions merely by receiving an app role |
+| Deployment operator | Explicit DDL/bootstrap/reset, deployment and reviewed external grants | Runtime identities do not inherit deployment authority |
+| App Service UAMI | Required SQL configuration/history/command/approval/collaboration operations; optional observer invocation | Directory administration, workload remediation, runtime DDL |
+| Monitoring worker UAMI | Verified inventory/source reads, stream consumption, SQL intake/checkpoints and owned monitoring reconciliation | Controller action authority or universal tenant visibility |
+| Hosted controller identity | Invoke reasoning agents, execute permitted workload tools and persist shared outcomes | Automatic permission from a discovery result or human app role |
+| Scheduler MI | Invoke the reviewed controller scope | SQL, Fabric workload or directory administration |
+| Prompt agents | Reason about supplied evidence | Service grants to perform their proposed actions |
+| Browser user | Present delegated API access with assigned `CommandCenter.*` roles | Collector/controller service access |
 
-Fabric SQL access combines Fabric item authorization and SQL permissions; it
-is not an Azure RBAC role named "Fabric SQL". The web UAMI needs Read item
-access and the object-scoped grants in
-[DeploymentGuide.md](../DeploymentGuide.md#web-uami-object-permissions).
-Broad workspace or database roles can bypass that intended scope.
+Read-admin inventory, source item access, stream-workspace access, controller
+action access and human Entra roles are different permission planes. A domain
+is metadata, not a grant. Core workspace/item lists are caller-visible; Admin
+Items is preview and must be explicitly selected and authorized. Reading Power
+BI refresh history requires semantic-model Write permission, despite using GET.
+
+Azure SQL access requires an Entra-authenticated contained database user and
+reviewed SQL permissions. Azure management-plane RBAC and Fabric item/workspace
+access do not grant database DML. Configure the logical server's Entra
+administrator and Entra-only authentication separately; Azure SQL also supports
+SQL authentication, which this deployment must disable. A Command Center Admin
+is not the server's Entra administrator.
+
+Keep schema/reset DDL with a selected deployer. Runtime stores select an
+explicit `worker`, `web` or `controller` component and use its checked
+views/static RPCs. SQL roles, not the component argument, enforce that boundary.
+Broad database/schema roles or raw monitoring-table DML defeat it; missing
+adapters must fail rather than borrow another component's route.
 
 ### Command-center authorization
 
-The live API validates an RS256 Entra access token's signature, issuer,
-audience, tenant, identity and lifetime. It requires delegated `access_as_user`
-and recognized `CommandCenter.Reader`, `.Operator`, `.Approver` or `.Admin`
-claims. Operator and Approver are separate capabilities; both include Reader.
-Admin includes all app capabilities, not directory administration.
+The API validates the Entra access token's signature, issuer, audience, tenant,
+identity and lifetime. It requires delegated `access_as_user` and recognized
+`CommandCenter.Reader`, `.Operator`, `.Approver` or `.Admin` claims. Operator
+and Approver are separate. Admin includes app operations, not directory or
+controller administration.
 
-Four ordinary security groups normally supply those roles. The secretless
-registration script preserves role IDs and enforces
-`appRoleAssignmentRequired=true`. The group provisioning script plans offline
-unless explicitly run with `--apply` by an authorized operator. It checks
-licensing, ownership/name collisions, owners, administrator membership and
-assignment readback without deleting existing direct assignments.
+Four ordinary Entra security groups normally supply these roles. Group owners
+and IT manage memberships externally; group-based assignment requires the
+applicable Entra licensing and nested membership does not cascade. Assignment
+and delegated consent are separate prerequisites.
 
-Group owners and IT manage membership outside the app. Group-based application
-assignment requires Entra P1/P2; nested groups do not cascade. The selected
-administrator's license check is not an audit of every user's entitlement.
-Assignment and delegated consent are separate requirements.
+Access & permissions reports effective token roles, not current directory
+membership. Refresh permissions requests a new API token and keeps actions
+locked until a snapshot from that refresh generation succeeds. It cannot revoke
+already-issued tokens or prove directory propagation.
 
-Access & permissions is read-only. It reports the presented API token's
-effective roles and dates, not current directory membership or which group
-supplied a role. Refresh permissions forces a fresh API-token request and
-reloads the snapshot, but cannot revoke already-issued tokens. Entra
-propagation and token renewal still apply.
+No SQL ACL or Graph directory membership lookup authorizes app requests.
+Optional profile photos use separate delegated Graph `User.Read`. Never grant
+directory-write permissions to the web UAMI to implement this page. The retired
+`COMMAND_CENTER_ACCESS_MANAGEMENT_ENABLED=true` setting remains rejected.
 
-There are no runtime Graph directory membership calls/writes and no SQL
-permission-table authority. Entra signing-key discovery is not a directory
-membership lookup. The optional browser profile photo uses a separate
-delegated Graph `User.Read` token. Do not grant the web UAMI
-`AppRoleAssignment.ReadWrite.All` or `Group.ReadWrite.All`.
+### Workload and operator identity
 
-`COMMAND_CENTER_ACCESS_MANAGEMENT_ENABLED=true` is rejected. For an older
-deployment, follow the [ordered cutover](../DeploymentGuide.md#existing-deployment-cutover):
-prove Entra Admin before disabling the old flag, remove a reviewed direct
-bootstrap grant only after group setup, then prove fresh-token group access
-before retiring the legacy permission table. Preserve operational data.
+Inspect each actual deployed identity after creation/recreation. Foundry's
+`instance_identity` identifies the hosted agent; the explicit
+`bi-triage identity --check-scope` operator command performs directory inspection.
+Neither is a runtime human-authorization dependency.
 
-### Foundry agent identity observations
+A Foundry hosted agent may receive workload federation rather than IMDS managed
+identity. Do not replace its verified credential path with MI-only assumptions.
+The separate monitoring consumer deliberately uses its selected UAMI and checks
+tenant, client, principal/object and resource bindings; it cannot fall back to
+a developer or client secret.
 
-The evaluated Foundry agents had first-class Entra agent identities. Directory
-inspection used the subtype collection
-`GET /v1.0/servicePrincipals/microsoft.graph.agentIdentity`; the attempted
-top-level `/agentIdentities` path returned
-`Resource not found for the segment`.
+Operator SQL commands require explicit identity selection. `bi-triage` uses
+global `--sql-identity broker --operator-domain` or `--sql-identity managed`;
+managed mode requires `AZURE_CLIENT_ID`. The deployment reset tool separately
+supports explicit Azure CLI, Broker and MI selection, with tenant/principal
+checks. A reset does not require a separate signer or another person.
 
-Earlier identity inspection observed:
+For an Azure SQL Entra service-principal/UAMI user, the SID uses the **client
+ID** in little-endian GUID bytes; users/groups use object IDs. Azure RBAC uses
+the **principal object ID**, not that SQL client-ID encoding.
+`CREATE USER ... WITH SID` avoids directory name lookup but does not verify
+identity for the operator. Prove each runtime component's native stored SID
+and actual MI sign-in on Azure SQL. Bootstrap-MI login and authority are proved;
+runtime users, memberships and permission/effect proof remain gates. See
+[CREATE USER](https://learn.microsoft.com/sql/t-sql/statements/create-user-transact-sql#arguments).
 
-| Property | Observation, not a hardcoded guarantee |
-|---|---|
-| Blueprint credentials | `keyCredentials=0`, `passwordCredentials=0` |
-| Authentication | A federated credential named `fmi-fic`, audience `api://AzureADTokenExchange` |
-| Accountability | Foundry populated sponsors at creation |
-| Client ID and object ID | Equal for those agent identities; ordinary service principals differ |
+## Optional mailbox boundary
 
-`bi-triage identity --check-scope` is an explicit operator directory inspection,
-not a runtime web authorization dependency. If that Graph inspection is
-unavailable, the hosted definition's `instance_identity` identifies the
-controller without a directory query. Recheck after creation/recreation rather
-than assuming an earlier identity or sponsor is still current.
+Mailbox support requires separate identity and confinement proof. A Graph
+directory read does not establish Exchange-backed mail access; this difference
+caused earlier unattended mailbox failures. Leave mailbox ingestion disabled
+unless a supported secretless reader is verified. A client secret is not a
+workaround for an unsupported identity path.
 
-For Fabric SQL, a service principal/UAMI's SID is its **client ID**, converted
-to little-endian GUID bytes. Users/groups use their directory object IDs.
-`CREATE USER ... WITH SID ..., TYPE = E` avoids a directory name lookup but
-does not verify the identity for the operator. See
-[Fabric SQL authentication](https://learn.microsoft.com/fabric/database/sql/authentication).
+App-only mail access must be confined to the approved mailbox. The denied
+canary must return 403; a successful read, 401/404, missing canary or error does
+not prove isolation. The hosted reader also rejects a delegated `upn` token.
+Entra group membership for app roles is a different boundary.
 
-## Mailbox compatibility and scope
+Keep the sender/subject filter unchanged during tests. Invalid patterns fail
+closed, and ignored-message auditing must not widen intake when persistence
+fails. Send a matching synthetic alert rather than making arbitrary mail
+actionable. See [mailbox setup](../DeploymentGuide.md#2-optional-mailbox-ingestion)
+and [Exchange RBAC for Applications](https://learn.microsoft.com/exchange/permissions-exo/application-rbac).
 
-Mailbox ingestion is optional. Earlier hosted tests isolated a service
-compatibility difference: the same agent token returned 200 for a Graph
-directory read and 401 for Exchange-backed mail, with `Mail.Read` present,
-a real mailbox and an Application Access Policy. Power BI/Fabric and SQL
-accepted the configured controller identity, but that did not prove mail access.
+## Durable state and intake
 
-The source still retains a conventional mailbox client-secret fallback and
-`GRAPH_CLIENT_SECRET` environment wiring. This is a legacy integration, **not
-the current secretless command-center prerequisite**. Leave it unconfigured
-and the mailbox schedule off unless a supported secretless reader has been
-verified separately. Do not create a secret to work around the identity
-boundary or describe a Graph directory success as mailbox proof.
+`MONITORING_MODE=live` requires the shared Azure SQL baseline,
+`AZURE_SQL_SERVER=<server>.database.windows.net`, `AZURE_SQL_DATABASE` and pinned
+`MONITORING_TENANT_ID`. The hostname/catalog come from the Azure deployment,
+not a Fabric database item. Tenant, epoch, activation cutoff and maintenance are
+read from deployment control. `MONITORING_MODE=fixture` selects explicit
+offline implementations, never a fallback from unavailable SQL. There is no
+Fabric SQL compatibility layer, credential-string fallback or history import.
 
-App-only Entra `Mail.Read` is tenant-wide unless restricted. An earlier scope
-test showed that an integration intended for one mailbox could read an
-unrelated administrator mailbox. The scope control must therefore be proved,
-not inferred from configuration.
+Static `FABRIC_PIPELINE_TARGETS` and compatibility loaders are retired. Scopes,
+target admission, observation cadence and immutable safety reviews live in the
+registry. Default admission is observation-only. Future resources require review
+unless automatic detection-only enrolment was explicitly chosen.
 
-For the legacy Application Access Policy path, the scope is a mail-enabled
-security group containing the approved mailbox. A managed identity's app ID
-can also be used where that service path is supported. For new mail
-integrations, review
-[Exchange RBAC for Applications](https://learn.microsoft.com/exchange/permissions-exo/application-rbac);
-its scoped grants do not cancel separate unscoped Entra permissions.
+Canonical target keys include tenant, epoch, workload, workspace and item IDs.
+Source executions use authoritative workload-specific IDs; event transport uses
+its original source/ID separately. A rename or duplicate delivery cannot create
+another incident allowance.
 
-The controller's checks fail closed:
+REST pages and event receipts are accepted or explicitly quarantined before
+advancing checkpoints. Continuation is not completed coverage. Durable stream
+checkpoints advance through contiguous accepted/dispositioned positions, not
+through agent completions. Quarantine is not execution permission.
 
-- The actual reader must read the intended mailbox and be denied a distinct
-  canary mailbox. Only **403** proves the configured canary refusal; 200,
-  401/404, missing canary or a check error does not.
-- A token carrying `upn` is refused by the hosted mailbox path; an operator's
-  delegated identity is not unattended reader evidence.
-- The sender allowlist and subject filter must match. Invalid regexes also
-  fail closed. A sender address alone is not proof that the body is trusted.
+All application stores share the catalog. SQL transactions, current shared
+reads, uniqueness and conditional row-count winners enforce ownership. The
+database connection is thread-bound; do not await inside
+`AzureSqlDatabase.transaction()` or nest another transaction. Multiple
+autocommit statements do not form one atomic operation.
 
-Do not broaden the filter to make a test mail trigger. Earlier unfiltered
-ingestion treated unrelated directory-security digests as BI incidents; the
-filter is an injection boundary, not inbox housekeeping. Ignored-message
-counts and reasons make a misconfigured filter diagnosable.
+`RpcContract.bind` preserves the exact named arguments, and callers use
+`database.query` plus `decode_rpc_result`. The returned envelope's `status`,
+`affected_rows` and typed `result` establish the RPC outcome; EXEC rowcount
+does not. Current source publication and no-effect disposition use their
+dedicated controller RPCs, not raw source/head/disposition writes.
 
-## Durable state
+Every live operational store fails closed rather than retaining an in-memory
+substitute. Reconnection must read current state: an empty recovered cache
+could answer "no open incident" and license another action. After a lost
+acknowledgement, reconcile the original receipt/fence rather than replaying an
+uncertain write.
 
-State is authoritative across invocations, not process-local convenience.
-Open-incident lookup prevents a repeated alert from licensing another
-remediation. Keeping state only in a hosted object's fields or its filesystem
-does not survive reconstruction/recycling.
-
-Fabric SQL replaced the older key-value store for these reasons:
-
-- Claims/leases use one conditional statement, such as
-  `UPDATE ... WHERE expires_at < SYSUTCDATETIME()`, whose `rowcount` identifies
-  the winner. Expiry uses server time, not each container's clock. Earlier live
-  contention testing with eight threads produced exactly one winner.
-- SQL accepts Entra tokens, with no SQL-login/shared-key fallback.
-- `mssql-python` supplies the driver in its wheel, including the evaluated
-  Python 3.13 Linux build. The Foundry remote build installs Python
-  requirements; it does not provide an apt step for `pyodbc`'s separate
-  `msodbcsql18` dependency.
-
-The connection layer uses one connection per thread and autocommit for its
-single-statement operations. Serializing one connection across concurrent
-callers previously produced `OperationalError`, then `InterfaceError` after
-that connection was torn down.
-
-Recovery is part of the store contract. The older backend became unreachable
-after public access was disabled; its one-time startup fallback stayed
-in-memory after connectivity returned, losing three invocations before a
-redeploy. Stores now retry on use and reload after recovery. An empty recovered
-cache would still answer "no open incident" incorrectly.
-
-Different state has different failure handling. Some core stores degrade
-loudly; claims/approvals must fail closed rather than guess permission to act.
-The web command/history and incident collaboration stores require durable SQL
-and do not report an in-memory substitute as successful persistence. Schema
-installation is an operator task for the web path.
-
-Human resolution appends a tracking decision to `triage_incident_activity`.
-It binds to the original NVARCHAR payload's SHA-256 revision (UTF-16 LE bytes)
-and tracking version. A later evidence change invalidates the closure without
-resetting the automated incident, action budget, notification count, claims,
-approvals or retry history. It is not an agent-verified repair.
+Terminal incident/outcome, processed-source disposition and work completion
+must be durably finalized. In-memory success cannot mark work complete after
+SQL failure. Recovery resumes finalization or read-only verification.
 
 ## Execution and concurrency
 
-`src\app.py` routes on the latest inbound message, not the whole conversation:
+The controller routes the latest inbound message:
 
 | Input | Work |
 |---|---|
-| `sweep` or `scheduled sweep` | Drain mailbox and due retries |
-| `silent sweep` | Run configured semantic-health probes |
-| `pipeline sweep` | Inspect explicitly configured scheduled Fabric pipeline runs and verify submitted reruns |
-| `command sweep` | Drain authenticated operator work from the durable queue |
-| Other text | Interactive alert triage |
+| `heartbeat` | Bounded fair draining of monitoring work and human commands |
+| `pipeline sweep` | Queue reads for registry-admitted pipelines in live mode |
+| `command sweep` | Drain authenticated human commands |
+| `silent sweep` | Run explicit semantic-health probes |
+| `sweep` / `scheduled sweep` | Optional mailbox and due retry processing |
+| Other alert text | Resolve through current target/source admission before action |
 
-These are operational commands, not interchangeable health probes. An empty
-message is a mailbox sweep. Routing by message length was removed because
-Foundry supplies conversation history: a short sweep input could otherwise
-re-triage a previous alert.
+These are operational inputs, not interchangeable health checks. Empty input
+selects the mailbox path. Routing by the whole conversation or message length
+can re-triage a prior alert; the controller uses the current input instead.
 
-The command center does not monitor arbitrary pipelines or standalone
-notebook jobs. `PIPELINE_SWEEP_ENABLED`, explicit target configuration and a
-deployed schedule are all required for unattended pipeline monitoring.
-Full-pipeline reruns additionally require reviewed replay safety, approved
-parameters, an explicit human decision and durable reservation. Submission
-is not recovery; correlated job/activity evidence must confirm it.
+All live action paths must retain current scope, exact source evidence,
+authoritative source-head/active-job checks, immutable reviews and required
+explicit approvals. Recheck after waits. Reserve the target/action in the same
+atomic boundary that validates those prerequisites; a prior read cannot prevent
+a revocation race.
 
-The process-local lock does not protect concurrent hosted instances.
-Mailbox/retry paths use durable claims and silent sweeps use a durable lease.
-The **interactive Playground path remains unclaimed**: it lacks a stable
-mail message ID, and the signature is not known until the runner derives it.
-SQL open-incident reads suppress already-persisted work, but two callers can
-pass that read before either persists.
+Verify the controller's exact submitted job, including activity evidence for
+pipelines, or the intended configuration readback for non-job actions. A
+different concurrent refresh is not evidence of completion. Uncertain effects
+retain their fences.
 
-Avoid overlapping live interactive and scheduled remediation for the same
-failure. A complete fix would claim the signature inside the runner across
-all entry paths; this documentation does not imply that change has been made.
-Queued operator commands have their own durable arbitration and explicit
-reconciliation; do not automatically replay interrupted work.
+A confirmed no-effect rejection does not globally refund a budget or reuse an
+approval. Its restricted retry may reuse only its bound incident slot after
+durable parent finalization and fresh checks. Discovery, events and human
+tracking never reset this state.
 
-## Hosting and network constraints
+Human resolution appends tracking activity bound to the original SQL NVARCHAR
+payload hash over UTF-16 LE. New evidence invalidates that closure; it does not
+change automated budgets, approvals, claims or notification counts.
 
-The command-center Bicep is private by default, with separate inbound Private
-Link and outbound VNet integration, explicit NAT and private DNS for app/SCM.
-Read back the actual site property
-`outboundVnetRouting.allTraffic=true`; the old inline route-all setting did
-not persist as expected. Preserve governance-attached NSGs. SCM and FTP basic
-publishing credentials remain disabled.
+## Eventstream and network constraints
 
-This protects web ingress; it does not create private backend connectivity to
-Foundry or Fabric. Runtime DNS/routes, Foundry managed network isolation,
-supported Fabric Private Link scope and service permissions need separate
-proof. NAT's public IP provides outbound SNAT only.
+Azure SQL uses a public endpoint with Entra-only authentication, TLS 1.2 minimum,
+Proxy/TCP 1433, auditing and TDE. `allowAzureServices=true` defaults to SQL's
+special start/end `0.0.0.0` firewall rule. It admits Azure-hosted callers,
+including other subscriptions, not all Internet IPs; SQL identity permissions
+remain mandatory. Optional client rules specify exact IPv4 ranges.
 
-A code-only App Service update uses the existing host and an
-Entra-authenticated CLI/Kudu upload, not a default full infrastructure
-redeployment. Preserve explicitly approved persistent client ingress and keep
-SCM independently deny-all outside an authorized deployment window. Require
-stable read-only SCM readiness before ZIP upload, reconcile ambiguous accepted
-writes, and restore temporary changes in `finally`. The helper's post-upload
-health check is not a pre-upload SCM stability gate.
+The public [Foundry foundation](../../infra/foundry.bicep) disables local auth
+and has no managed-network injection, private endpoint or network-approver
+dependency. Its [capability-host template](../../infra/foundry-capabilities.bicep)
+is optional and inspect-first. The
+[monitoring prerequisites](../../infra/monitoring-prerequisites.bicep) create a
+dedicated UAMI and public Basic ACR with scoped `AcrPull`, admin/anonymous access
+disabled, Entra ARM authentication and `LegacyRegistryPermissions`.
+The public Consumption environment uses keyless Azure Monitor routing, not
+VNet/NAT prerequisites.
 
-Check SKU quota/admission, model availability and hosted container admission
-before deployment. An evaluation exemption such as `CostControl=Ignore` needs
-a finite review/removal date; tags do not automatically stop resources.
+The selected transport is an owned Eventstream Custom Endpoint over public
+outbound TLS with Entra authentication. It does not support tenant/workspace
+Private Link. The worker has no inbound HTTP/TCP endpoint;
+AMQP-over-WebSockets does not require a separate Azure Event Hubs namespace.
+Optional private hardening of SQL or a model would not make this transport private.
 
-### Runtime lessons
+Command Center uses public HTTPS with Entra API roles and Entra-authenticated
+SCM publishing. Separate optional app/SCM CIDR lists are persistent; empty
+lists leave the network public, not authorization anonymous. Basic publishing
+and FTPS remain disabled.
 
-- Foundry function tools use the flat Responses schema: `name` at the top
-  level, not nested under `function`. The latter returned
-  `Invalid payload: Required property 'name' is missing`.
-- Agent versions are created with `POST /agents/{name}/versions`; `PUT`
-  returned 405.
-- Some reasoning deployments reject `temperature` with
-  `Unsupported parameter: 'temperature' is not supported with this model`.
-  Registration can succeed before invocation exposes the problem. The
-  registered definitions omit it; deterministic checks enforce the facts.
-- Hosted `run()` is synchronous and returns an async iterable for streaming.
-  Making it `async def` returned a coroutine and failed with
-  `'coroutine' object has no attribute '__anext__'`.
-- A hosted agent can receive federated workload identity rather than IMDS
-  managed identity. `ManagedIdentityCredential` alone was insufficient.
-  Workload clients exclude human credentials so they cannot silently use an
-  operator's cached login. Local SQL operator commands deliberately allow
-  developer credentials, so their tenant context must be asserted separately.
-- Keep `agent-framework-foundry-hosting` pinned exactly. Date-stamped beta
-  releases have broken startup without a major-version warning.
-- Display tooling can render Authorization headers as asterisks. That is
-  display-side redaction, not evidence of a corrupt source header.
+Ordinary deployments contain no baked-in MCAPS exemption. Optional
+`sqlNetworkExceptionTags`, `registryExceptionTags` and `accountNetworkExceptionTags`
+are resource-scoped. The approved SQL `SecurityControl=Ignore` plus reason/review
+tags permits one 14-day period; removing/re-adding does not restart it.
+Longer tests need an approved exclusion. See
+[governed evaluation exceptions](../DeploymentGuide.md#governed-evaluation-exceptions).
 
-Telemetry is optional. The current helper consumes
-`APPLICATIONINSIGHTS_CONNECTION_STRING` without explicitly supplying an Entra
-exporter credential; the App Service template's Insights resource link is not
-telemetry configuration. Do not claim secretless telemetry or private ingestion
-from a portal link. Metadata-only spans, runtime logs, durable outcomes and
-scheduler history must be checked independently.
+Obtain only nonsecret destination metadata from the **Microsoft Entra ID** tab.
+The key-returning connection API must not be called. Supply namespace, entity,
+consumer group and exact owned item/destination IDs through the reviewed
+bootstrap/publication path; environment strings alone are not a connector
+record. Key-free endpoint automation remains unproved, and another application's
+Eventstream cannot be adopted as a fallback.
+
+Sources start as logical proposals with `source_id=null`. Only controller
+publication bound to the original complete worker observation may assign
+returned physical IDs. The caller supplies `observation_receipt_id`; SQL
+validates the worker receipt without giving the controller caller direct access
+to worker-private receipt views.
+
+Desired removal fences intake but retains ownership and IDs while pending.
+The original current receipt must prove exact node/ID/stream-route absence
+before an immutable retirement record is published. A null
+`observed_definition_hash`, an uncertain response or an inherited snapshot
+cannot prove absence or create readiness for a changed source set.
+
+Environment-only deployment requires no worker image, SQL or endpoint metadata.
+After that stage, use a finite UAMI canary to create/inspect the owned definition;
+then bind the nonsecret endpoint and perform separate reception/durable
+acceptance checks. A create/readback result is not managed-identity consumption.
+Normal worker startup requires ready shared control and compatible event
+persistence; no transport-only fallback is permitted.
+
+`--transport-probe` is a bounded, read-only worker mode with no SQL checkpoint
+or normal-health claim. `--reconcile-once` can update owned monitoring definitions
+through durable work and is not a read-only health probe. Never install the
+finite probe as an always-restarted consumer.
+
+Where tenant/workspace settings require an approved public exception, record
+its actual scope, owner and expiry/review operation. An Azure tag cannot change
+a Fabric network policy. Review dates do not enforce automatic shutdown.
+
+Public references:
+[Custom Endpoint destinations](https://learn.microsoft.com/fabric/real-time-intelligence/event-streams/add-destination-custom-app),
+[Entra consumption](https://learn.microsoft.com/fabric/real-time-intelligence/event-streams/custom-endpoint-entra-id-auth),
+[Private Link support](https://learn.microsoft.com/fabric/real-time-intelligence/event-streams/set-up-tenant-workspace-private-links),
+and [read-only admin APIs](https://learn.microsoft.com/fabric/admin/enable-service-principal-admin-apis).
 
 ## Foundry routine observations
 
-The native routines remain declared but disabled. Historical verification on
-2026-09-02, six days after registration, found:
+Native routines remain disabled by default. Earlier enabled-state and dispatch
+responses did not establish real invocations, and code deployment did not
+reliably apply routine enabled-state. Preserve that failure lesson without
+assuming the same behavior in every current tenant.
 
-| Check | Observation |
-|---|---|
-| `azd ai routine show` | Reported an enabled five-minute cron |
-| `azd ai routine list` | Returned `{"value": null}` |
-| `azd ai routine run list` | No runs |
-| Manual dispatch | Returned identifiers without a run or container activity |
-| Application Insights | Activity in two of twenty-four hours, both containing manual invocations |
+The separate `infra\scheduled-sweep.json` defaults to a disabled one-minute
+`heartbeat`. It uses MI, records run history, disables HTTP retries and checks
+the Responses body. Enable only after proving the current controller and
+durable execution path. Do not run overlapping old/new timers or treat an
+HTTP/deployment acknowledgement as schedule readiness.
 
-On 2026-09-02 and 2026-09-03, `azd deploy` also failed to apply routine
-`enabled` changes or create a newly declared routine. A successful controller
-deployment is therefore not evidence that a schedule exists or fires.
+## Hosting and deployment checks
 
-Read-only inspection:
+Keep `agent-framework-foundry-hosting` pinned exactly. Its date-stamped beta
+releases can break startup without a major-version warning. Other source
+constraints remain important:
 
-```powershell
-azd ai routine show bi-triage-schedule
-azd ai routine list
-azd ai routine run list bi-triage-schedule
-```
+- Foundry function tools use the flat Responses schema, not a nested
+  `function` object.
+- Registered prompt/tool changes require re-registration; local files do not
+  replace an existing agent version.
+- Some reasoning deployments reject `temperature`; successful registration
+  does not prove invocation compatibility.
+- Hosted `run()` returns an async iterable; making it a coroutine changes the
+  host contract.
+- Display-side Authorization redaction is not evidence of a corrupt token.
 
-If revalidating a supported native routine, manage it explicitly with
-`azd ai routine create <name> --file <routine-manifest.yaml>` and verify actual
-runs. Without `--file`, creation could not set the action's `input`, so a
-health routine sent empty input and drained the mailbox instead. Changing
-the trigger returned `UserError: Routine trigger cannot be changed after creation`;
-a changed cron/timezone required deliberate recreation.
+Preserve the App Service's approved ingress/SCM controls during code-only
+updates. Verify public backend DNS, firewall admission and identity independently
+from web liveness.
+Keep optional telemetry metadata-only; a portal Insights link is not an
+Entra-authenticated exporter or verified ingestion configuration.
 
-The supported separate scheduler is `infra\scheduled-sweep.json`. It invokes
-the same controller with a managed identity, keeps run history, disables
-HTTP retries and uses `PT15M` to exceed the default combined
-triage/approval/worker allowance of `300 + 300 + 30` seconds. It creates an
-enabled workflow, so deploy each job only after its prerequisites are ready.
-Transport completion still needs comparison with the durable business outcome.
+Deployment-only initialization/reset is separate from normal startup. Initial
+maintenance bootstrap initializes the new Azure SQL target; it does not copy
+history from the prior Fabric SQL store. Old-store disposal is separately
+scoped cleanup, not a function of the Azure SQL reset tool. The approved
+prototype reset requires an exact manifest/epoch, live writer/effect checks and
+atomic receipts; ordinary releases do not erase operational state. Retain the
+original operation after an ambiguous reply and never reset new-epoch rows.
+Protected deployment registration and its capture receipts remain separate
+from the resettable operational records and the kernel's physical-table map.
 
-## Deployment and verification
+Native permission/updatability proof must use actual Entra MIs on an approved
+isolated Azure SQL target. `WITHOUT LOGIN` and `EXECUTE AS USER` are supported
+database-scoped test tools, not substitutes for MI authentication, network
+admission or recovery proof. The provisioned temporary proof database shares
+the logical server with the application database. That evaluation topology is
+not a final sizing or pricing recommendation. The shipped SQL template uses
+one S1 application database and an optional Basic proof database without an
+elastic pool. Earlier bootstrap-MI proof
+does not establish runtime-component users, memberships or permissions.
 
-Follow [DeploymentGuide.md](../DeploymentGuide.md) for existing-environment
-updates, object grants, app registration/groups and the Entra cutover.
-The relevant offline/operator commands include:
-
-```powershell
-.\.venv\Scripts\bi-triage.exe preflight
-.\.venv\Scripts\bi-triage.exe pipelines --preflight
-.\.venv\Scripts\python.exe scripts\register_foundry_agents.py --dry-run
-```
-
-For a separately authorized live release, reassert the intended subscription
-and tenant before registering changed definitions or deploying
-`bi-triage-controller`. Use the existing azd environment and set both
-`AZURE_AI_PROJECT_ENDPOINT` and `FOUNDRY_PROJECT_ENDPOINT`. Deploy App Service
-code and schedules separately; never deploy a routine merely to imply that a
-timer works.
-
-`preflight --check-sql` proves a connection and `SELECT 1` as the operator, not
-the hosted identity's entire grant set. `/api/health` proves the web process,
-not SQL or Foundry. Verify runtime-written records through an independent
-authorized read, real token-role decisions, and the specific configured
-schedule. Keep private identifiers and tokens out of public evidence.
+Follow [DeploymentGuide.md](../DeploymentGuide.md) for concrete operator flags,
+worker preparation, endpoint binding and the controlled clean-start sequence.
+Enable the heartbeat only after actual MI receipt, durable acceptance,
+correlated controller behavior and restart recovery are proved for that release.

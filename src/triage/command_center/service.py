@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -19,14 +20,30 @@ from triage.command_center.models import (
     DecisionInput,
     WebSettings,
 )
+from triage.command_center.monitoring import (
+    BootstrapResponse,
+    MonitoringService,
+    _store_errors,
+    resolve_command_target,
+)
 from triage.knowledge.playbooks import PLAYBOOKS
 from triage.models import Incident, TriageResult
-from triage.pipeline_models import load_pipeline_targets
+from triage.monitoring.contracts import (
+    MonitoringComponentDenied,
+    MonitoringConflict,
+    MonitoringStore,
+)
+from triage.monitoring.runtime import (
+    FIXTURE_TENANT_ID,
+    build_monitoring_store,
+    fixture_approvals,
+)
+from triage.pipeline_models import canonical_id
 from triage.prompts import load_prompt
 from triage.providers import get_provider
 from triage.redaction import redact_text
-from triage.store.approvals import FabricSqlApprovalChannel, InMemoryApprovalChannel
-from triage.store.fabric_sql import FabricSqlDatabase, quote_identifier
+from triage.store.approvals import AzureSqlApprovalChannel
+from triage.store.azure_sql import AzureSqlDatabase, quote_identifier
 
 logger = logging.getLogger("triage.command_center.service")
 _LIMIT = 200
@@ -128,31 +145,15 @@ def run_summary(record) -> dict[str, Any]:
     }
 
 
-def target_views(settings) -> list[dict[str, str]]:
-    targets: list[dict[str, str]] = []
-    if settings.powerbi_workspace_id and settings.powerbi_dataset_id:
-        targets.append({
-            "id": f"powerbi:{settings.powerbi_workspace_id}:{settings.powerbi_dataset_id}",
-            "name": "Configured Power BI model", "kind": "powerbi_triage",
-            "description": "Submit an alert to the policy-controlled triage loop.",
-        })
-    for target in load_pipeline_targets(settings.fabric_pipeline_targets):
-        targets.append({
-            "id": f"pipeline:{target.key}", "name": target.name,
-            "kind": "pipeline_sweep",
-            "description": "Inspect failed scheduled runs; any permitted rerun still requires approval.",
-        })
-    return targets
-
-
 class CommandCenterService:
     def __init__(
         self, settings, web: WebSettings, *, history=None, incidents=None, approvals=None,
         db=None,
         incident_workflow: IncidentWorkflowService | None = None,
+        monitoring_store: MonitoringStore | None = None,
     ):
         from triage.store.command_center import (
-            FabricSqlCommandCenterStore,
+            AzureSqlCommandCenterStore,
             InMemoryCommandCenterStore,
         )
         from triage.store.incidents import InMemoryIncidentStore
@@ -160,17 +161,31 @@ class CommandCenterService:
         self.settings = settings
         self.web = web
         self.db = db
+        self._monitoring_fixture = web.mode == "demo"
+        self._monitoring_lock = threading.Lock()
+        if self._monitoring_fixture:
+            self._monitoring_tenant_id = FIXTURE_TENANT_ID
+        else:
+            if settings.monitoring_mode != "live":
+                raise ValueError("Live command center requires MONITORING_MODE=live.")
+            self._monitoring_tenant_id = canonical_id(web.tenant_id)
+            if canonical_id(settings.monitoring_tenant_id) != self._monitoring_tenant_id:
+                raise ValueError("The monitoring tenant must match the command-center Entra deployment tenant.")
+        self._monitoring_service = (
+            MonitoringService(monitoring_store, tenant_id=self._monitoring_tenant_id)
+            if monitoring_store is not None else None
+        )
         if web.mode == "live":
-            if not settings.fabric_sql_server or not settings.fabric_sql_database:
-                raise ValueError("Live command center requires Fabric SQL server and database settings")
-            self.db = db or FabricSqlDatabase(
-                server=settings.fabric_sql_server, database=settings.fabric_sql_database,
+            if not settings.azure_sql_server or not settings.azure_sql_database:
+                raise ValueError("Live command center requires Azure SQL server and database settings")
+            self.db = db or AzureSqlDatabase(
+                server=settings.azure_sql_server, database=settings.azure_sql_database,
             )
-            self.history = history or FabricSqlCommandCenterStore(
+            self.history = history or AzureSqlCommandCenterStore(
                 self.db, run_table=settings.agent_run_table_name,
                 event_table=settings.agent_event_table_name, command_table=settings.agent_command_table_name,
             )
-            self.approvals = approvals or FabricSqlApprovalChannel(
+            self.approvals = approvals or AzureSqlApprovalChannel(
                 db=self.db, table=settings.approval_table_name,
             )
             self.incidents = None
@@ -179,12 +194,65 @@ class CommandCenterService:
             # real connection settings left over from an operator deployment.
             self.history = history or InMemoryCommandCenterStore()
             self.incidents = incidents or InMemoryIncidentStore()
-            self.approvals = approvals or InMemoryApprovalChannel()
+            self.approvals = approvals if approvals is not None else fixture_approvals(self.monitoring.store)
         self.incident_workflow = incident_workflow or IncidentWorkflowService(
             self, activity_table=settings.incident_activity_table_name,
         )
         self.demo_runner = None
         self.demo_tasks: list[asyncio.Task] = []
+
+    @property
+    def monitoring(self) -> MonitoringService:
+        # One explicit fixture authority is shared with DemoRunner. Failed live
+        # construction is not cached, and never becomes a fixture on retry.
+        with self._monitoring_lock:
+            if self._monitoring_service is None:
+                try:
+                    store = build_monitoring_store(
+                        self.settings, db=self.db, fixture=self._monitoring_fixture, component="web",
+                    )
+                    if not self._monitoring_fixture and store.component != "web":
+                        raise MonitoringComponentDenied("The live API requires the web monitoring component.")
+                except MonitoringConflict as exc:
+                    raise ApiFailure(
+                        503, "monitoring_bootstrap_mismatch",
+                        "The monitoring factory could not validate the deployment context.",
+                    ) from exc
+                self._monitoring_service = MonitoringService(
+                    store, tenant_id=self._monitoring_tenant_id,
+                )
+            return self._monitoring_service
+
+    def validate_web_settings(self, web: WebSettings) -> None:
+        if self.web.mode == "live" and (
+            web.mode != "live" or canonical_id(web.tenant_id) != self._monitoring_tenant_id
+        ):
+            raise ValueError("Live API authentication must use the monitoring deployment's Entra tenant.")
+
+    def monitoring_bootstrap(self, actor: Actor) -> BootstrapResponse:
+        require(actor, "reader")
+        with _store_errors():
+            if self._monitoring_service is not None or self._monitoring_fixture:
+                return self.monitoring.bootstrap(actor)
+            from triage.monitoring.sql_store import AzureSqlMonitoringStore
+
+            # The normal factory requires valid bootstrap. Inspect the same SQL
+            # backend without caching this read-only handle as an admission store.
+            store = AzureSqlMonitoringStore(db=self.db, component="web")
+            return MonitoringService(store, tenant_id=self._monitoring_tenant_id).bootstrap(actor)
+
+    def target_views(self, actor: Actor) -> list[dict[str, str]]:
+        require(actor, "reader")
+        with _store_errors():
+            return [{
+                "id": target.identity.key, "name": target.name,
+                "kind": "powerbi_triage" if target.identity.workload == "powerbi" else "pipeline_sweep",
+                "description": (
+                    "Submit an alert for registry-scoped investigation; unbound reports are diagnostic-only."
+                    if target.identity.workload == "powerbi"
+                    else "Inspect failed scheduled runs; any permitted rerun still requires approval."
+                ),
+            } for target in self.monitoring.command_targets(actor)]
 
     def incident_rows(self) -> list[Incident]:
         if self.incidents is not None:
@@ -203,7 +271,7 @@ class CommandCenterService:
         return Incident.model_validate_json(rows[0][0]) if rows else None
 
     def approval(self, request_id: str) -> dict[str, Any] | None:
-        if isinstance(self.approvals, FabricSqlApprovalChannel):
+        if isinstance(self.approvals, AzureSqlApprovalChannel):
             return self.approvals.get_exact(request_id)
         return self.approvals.get(request_id)
 
@@ -261,7 +329,7 @@ class CommandCenterService:
         active_commands = self.history.active_commands(limit=100)
         command_history = self.history.commands(limit=50)
         commands = list({command.id: command for command in [*active_commands, *command_history]}.values())
-        targets = target_views(self.settings)
+        targets = self.target_views(actor)
         items = (
             [self.approval_item(row, actor, incidents) for row in proposals]
             + [self.incident_item(row) for row in incidents]
@@ -275,13 +343,13 @@ class CommandCenterService:
         elif self.demo_runner is not None:
             verification = sum(
                 len(self.demo_runner.reruns.pending(target.workspace_id, target.pipeline_id))
-                for target in load_pipeline_targets(self.settings.fabric_pipeline_targets)
+                for target in self.demo_runner.pipeline_targets(include_inactive=True)
             )
         else:
             verification = 0
         health = [{
             "name": "State", "status": "ok",
-            "detail": "Synthetic in-memory state; no Azure effects." if self.web.mode == "demo" else "Fabric SQL queries completed.",
+            "detail": "Synthetic in-memory state; no Azure effects." if self.web.mode == "demo" else "Azure SQL queries completed.",
         }, {
             "name": "Approvals", "status": "ok" if self.settings.approval_delivery_mode == "web" else "warning",
             "detail": "Web decisions are authoritative; Teams is optional." if self.settings.approval_delivery_mode == "web" else "Controller must use APPROVAL_DELIVERY_MODE=web for Teams-independent decisions.",
@@ -366,7 +434,7 @@ class CommandCenterService:
             command = self.history.get_command(source_id)
             if command is None:
                 raise ApiFailure(404, "not_found", "Command not found.")
-            item = self.command_item(command, target_views(self.settings))
+            item = self.command_item(command, self.target_views(actor))
             run = self.history.get_run(command.run_id) if command.run_id else None
             runs = [run] if run else []
             evidence = [
@@ -403,14 +471,18 @@ class CommandCenterService:
         from triage.store.command_center import CommandRecord
 
         require(actor, "operator")
-        target = next((target for target in target_views(self.settings) if target["id"] == value.target_id), None)
-        if target is None or target["kind"] != value.kind:
-            raise ApiFailure(422, "invalid_target", "Select a target configured on this controller.")
+        with _store_errors():
+            value = CommandInput.model_validate(value.model_dump())
+            registry = self.monitoring
+            target = resolve_command_target(
+                registry.store, tenant_id=registry.tenant_id,
+                target_id=value.target_id, kind=value.kind,
+            )
         if value.kind == "powerbi_triage" and not (value.subject.strip() or value.body.strip()):
             raise ApiFailure(422, "missing_alert", "Provide the alert to investigate.")
         try:
             command = self.history.enqueue(CommandRecord(
-                id=value.idempotency_key, kind=value.kind, target_id=value.target_id,
+                id=value.idempotency_key, kind=value.kind, target_id=target.identity.key,
                 subject=value.subject, body=value.body,
                 actor_id=actor.id, actor_name=actor.display_name,
             ))

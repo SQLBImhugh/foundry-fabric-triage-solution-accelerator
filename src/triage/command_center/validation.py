@@ -42,7 +42,7 @@ async def validate_scenario(service, root: Path, name: str, provider: str, actor
     started = time.monotonic()
     config = service.settings.model_copy(update={
         "triage_provider_mode": provider, "triage_tool_mode": "mock",
-        "fabric_sql_server": "", "fabric_sql_database": "",
+        "azure_sql_server": "", "azure_sql_database": "",
         "run_history_enabled": False, "notification_channel": "teams",
         "approval_delivery_mode": "teams", "teams_webhook_url": "",
         "applicationinsights_connection_string": "",

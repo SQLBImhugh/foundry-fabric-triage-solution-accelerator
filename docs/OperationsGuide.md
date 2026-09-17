@@ -1,315 +1,421 @@
 # Operations
 
-Operating the deployed accelerator: schedules, off switches, stored state and
-failure investigation. This is sample code, not a supported service.
+Operating the hybrid monitoring implementation: due work, coverage, off switches,
+stored state and failure investigation. This is sample code, not a supported
+service. All live application state uses one shared Azure SQL Database;
+Power BI and Fabric remain the monitored workload/event services. The Command
+Center is the operational UI, not the retained Rayfin sample. See
+[DeploymentGuide.md](DeploymentGuide.md) for setup.
 
-For first-time setup see [`DeploymentGuide.md`](DeploymentGuide.md).
+**Current readiness:** the SQL ownership contract is independently reviewed
+offline; final component-store, controller and connector acceptance remains
+separate. An isolated MI transport canary received the four observed wire
+event types across manual failure, scheduled failure, success and cancellation.
+It did not prove SQL durable handling or normal-worker readiness. The current
+network baseline is public with Entra authentication; scoped SQL/registry
+evaluation access is enabled and verified. The worker still has no ingress.
+The original SQL `STARTED` proof receipt is under guarded recovery; completion,
+full bootstrap commit and runtime permissions remain gates. Do not clear that
+receipt or start a new operation to bypass uncertainty.
+
+The public Foundry path is retained. The earlier private Foundry service error
+is historical and does not block this architecture. The live app/controller
+have not been cut over; no history migration/wipe, normal-worker rollout,
+hybrid application push or current-release UI screenshots are complete.
+Earlier private-network and Fabric SQL proof remains historical.
+Keep the normal worker and controller heartbeat gated; see
+[native proof status](DeploymentGuide.md#native-proof-and-bootstrap-status).
 
 ## What runs, and when
 
-| Trigger | What it does | Off switch |
+| Component/input | Work | Stop or limit |
 |---|---|---|
-| `bi-triage-mailbox-sweep` Logic App, every 5 min | Drains due retries, filters new mail, triages, acts or escalates | Disable the Logic App, or unset `GRAPH_MAILBOX` to stop mailbox ingestion |
-| `bi-triage-silent-sweep` Logic App, hourly | Runs the silent-failure scan; does not drain retries | Disable the Logic App, or `SILENT_SWEEP_ENABLED=false` |
-| Pipeline sweep, when deployed | Triages failed scheduled pipeline jobs and verifies approved reruns | Disable its scheduler, or `PIPELINE_SWEEP_ENABLED=false` |
-| Command sweep, when deployed | Drains authenticated operator investigations from the SQL queue | Disable its scheduler; queued requests are not executed by the web app |
-| Legacy Teams approval reply | Applies or abandons a proposed Tier 2 action | Unset `APPROVAL_CALLBACK_URL`; this does not disable the separate web channel |
-| Web approval reply | Conditionally records an authenticated, fingerprint-bound decision | No action without an explicit valid approval; disabling the UI does not revoke a decision already recorded |
+| Monitoring worker | Due inventory/capability/poll work, owned-connector reconciliation and Eventstream consumption | Stop its deployment; use reviewed scope changes for per-target admission |
+| Controller `reconcile_state` work | Deterministically validate worker observations/web intents and publish current authority; no agent or remediation | Current policy, work lease and original receipts govern publication |
+| Controller `heartbeat` | Bounded fair draining of monitoring work and authenticated human commands | Disable its scheduler; deployment maintenance blocks new intake/actions |
+| `pipeline sweep` / `bi-triage pipelines` in live mode | Queue observations for admitted registry pipelines | Disable/pause the scope; this is not a separate static target loader |
+| `command sweep` | Drain human commands only | Stop the command drain; the web request itself does not run remediation |
+| Optional `sweep` | Mailbox processing and due retries through current admission | Disable its timer; unset `GRAPH_MAILBOX` to stop mailbox intake |
+| Optional `silent sweep` | Explicit semantic-health probes | Disable its timer or set `SILENT_SWEEP_ENABLED=false` |
+| Web approval reply | Persist an authenticated, fingerprint-bound decision | No execution without current admission and valid approval; a recorded decision is not undone by closing the UI |
 
-No scheduler exists until you deploy it, and nothing runs on a timer until you do.
+`infra\scheduled-sweep.json` defaults to a **disabled one-minute heartbeat**:
+`command="heartbeat"`, `frequency=Minute`, `interval=1`, `enabled=false`.
+Enabling a monitor setting does not create or start a timer. Prepare the workflow
+disabled and grant its managed identity the reviewed Foundry invocation scope.
+Only after current-release proof, enable the same reviewed deployment and verify
+actual responses and durable work. Do not run overlapping old and new timers.
 
-The optional `pipeline sweep` command uses the same scheduler template.
-[PipelineTriage.md](PipelineTriage.md) documents its explicit target allowlist,
-approval-gated reruns, submission journal and required permissions.
+The heartbeat gives each queue bounded opportunities rather than allowing a busy
+workspace or human-command backlog to consume every slot. Target poll cadence
+belongs to the registry. The collector uses durable continuations, leases and
+service/API budgets across replicas; a local semaphore is not a shared limit.
 
-The [agent command center](CommandCenter.md) provides pending requests, run
-history, read-only questions and explicit reconciliation of interrupted
-commands. Set `APPROVAL_DELIVERY_MODE=web`, `NOTIFICATION_CHANNEL=web` and
-`RUN_HISTORY_ENABLED=true` on the controller to use it without Teams. Deploy a
-separate scheduler with `command="command sweep"`; a healthy web process alone
-does not drain the queue.
+The scheduler's `PT15M` caller timeout exceeds the default combined
+triage/approval/worker allowance (`300 + 300 + 30` seconds). A shorter timeout can
+abandon a caller while an approval remains valid. HTTP invocation retries are
+disabled: an ambiguous POST must not create overlapping work.
 
-**Foundry routines did not fire in the recorded evaluation.** The routines
-declared in `azure.yaml` **ship disabled**: the evaluated routine reported
-`enabled` and accepted dispatches but never invoked the agent. Verified
-2026-09-02, six days after registration, by three independent checks; see
-[`foundry/README.md`](foundry/README.md). Re-test in your own tenant before
-enabling; this may be regional or already fixed.
+The permitted scheduler commands are `heartbeat`, `sweep`, `silent sweep`,
+`pipeline sweep` and `command sweep`. Do not substitute free text; unrecognized
+controller text can be interpreted as an alert.
 
-The trigger the accelerator actually supports is a Logic App:
-[`infra/scheduled-sweep.json`](../infra/scheduled-sweep.json). It authenticates
-with a system-assigned managed identity, so there is no key anywhere, and it
-keeps its own run history, so a sweep that fails is visible afterwards rather
-than being a thing that quietly stopped.
+### Native routines and optional timers
 
-Deploy it once per cadence. The mailbox and silent-failure sweeps are separate:
+Foundry routines remain declared but disabled. Earlier routine state/dispatch
+acknowledgements did not establish actual invocations, and code deployment did
+not reliably apply enabled-state changes. Treat those as failure lessons, not
+a claim about every current tenant. Reverify native dispatch before choosing
+that trigger. A successful `azd deploy` is not timer readiness.
 
-```powershell
-az account set --subscription "<subscription>"
-$ep = (azd env get-values | Select-String AZURE_AI_PROJECT_ENDPOINT) -replace '.*="(.*)"','$1'
+Mailbox and silent-failure scans are separate optional jobs. The mailbox filter
+and mailbox confinement must be verified before enabling its timer. Silent
+probes require their own business expectations and source permissions; event
+silence is not a substitute for them. Avoid increasing probe cadence without
+accounting for Power BI execute-query budgets and capacity load.
 
-# hourly: find models that failed without telling anyone
-az deployment group create -g <rg> --template-file infra\scheduled-sweep.json `
-  --parameters name=bi-triage-silent-sweep projectEndpoint=$ep `
-               command="silent sweep" frequency=Hour interval=1 owner=<you>
+See [DeploymentGuide.md](DeploymentGuide.md#6c-scheduled-sweeps) for the reviewed
+disabled-template command and invocation-role boundary.
 
-# every 5 min: drain the mailbox, perform due retries
-az deployment group create -g <rg> --template-file infra\scheduled-sweep.json `
-  --parameters name=bi-triage-mailbox-sweep projectEndpoint=$ep `
-               command="sweep" frequency=Minute interval=5 owner=<you>
-```
+## Modes and startup
 
-Each deployment outputs a `principalId`, and that identity needs permission to
-invoke the agent before it will do anything — see
-[`DeploymentGuide.md`](DeploymentGuide.md). Until the grant lands, runs fail with 403,
-which is the correct behaviour and looks exactly like it should in run history.
+Use `MONITORING_MODE=fixture`, `TRIAGE_TOOL_MODE=mock` and
+`TRIAGE_PROVIDER_MODE=mock` for explicit offline fixtures. The runtime does not
+select fixtures because live SQL, a connector or a source permission failed.
 
-The mailbox sweep does **not** run the health scan — "what arrived" and "what is
-quietly wrong" are different questions, and only the first has an alert behind
-it. Deploy both or the detector never runs.
+Live API/controller settings use `MONITORING_MODE=live`, the pinned
+`MONITORING_TENANT_ID`, `AZURE_SQL_SERVER` and `AZURE_SQL_DATABASE`. Use the
+`<server>.database.windows.net` hostname and catalog from the Azure deployment,
+not Fabric item properties. Epoch, activation cutoff
+and maintenance come from shared deployment control. Missing or incompatible
+state fails closed. Static `FABRIC_PIPELINE_TARGETS` and compatibility loaders
+are retired; an empty registry admits no workload.
 
-Hourly is enough for the second: a freshness probe on a daily model answers a
-question that changes once a day, and `executeQueries` is capped at 120/minute
-per user across every dataset, so polling hard makes the detector load on the
-capacity it is watching.
+The worker's `MONITORING_INVENTORY_MODE` defaults to `caller_visible`.
+`tenant_admin_preview` explicitly selects the admin workspace/domain and preview
+Admin Items adapters; the deploy helper exposes the same choice as
+`-InventoryMode`. This is API selection, not a grant or proof of complete
+tenant-wide operational visibility.
 
-The `command` parameter is constrained to `sweep`, `silent sweep`,
-`pipeline sweep` and `command sweep`, which the controller recognises.
-Unrecognised text is routed to alert triage, so an unconstrained typo such as
-`sweeep` would become a Power BI failure report every five minutes rather than
-failing as an unknown command.
-
-The HTTP call does not retry. A sweep that times out is picked up by the next
-scheduled run instead, because a retry overlapping an in-flight triage can post
-twice before the first marks the message processed.
-
-Anything that can make an authenticated HTTPS call will do instead — Windows
-Task Scheduler, a cron job, a GitHub Actions schedule, an Azure Function timer.
-Prefer one that **reports its own failures**; a scheduler that stops silently
-reproduces the problem it was brought in to solve. The endpoint is in the azd
-environment:
+The MI consumer is a separate live-only process:
 
 ```powershell
-azd env get-values | Select-String AGENT_BI_TRIAGE_CONTROLLER_RESPONSES_ENDPOINT
+.\.venv\Scripts\python.exe -m triage.monitoring.worker
 ```
 
-The agent is unchanged either way: the scheduled path and the interactive path
-are the same code, so nothing needs rewriting when the platform catches up.
+It requires the explicit identity, owned connector, nonsecret endpoint and SQL
+environment listed in
+[DeploymentGuide.md](DeploymentGuide.md#worker-configuration-and-checks).
+It does not read `.env`, accept a developer/secret fallback or expose an inbound
+HTTP health endpoint. A blocked startup must remain visible, not silently become
+a transport probe.
 
-**Check that it is actually running.** Set `alertWebhookUrl` when deploying and
-a failed sweep posts a card to Teams; leave it empty and failures are visible in
-run history but nothing announces them. That gap is not hypothetical: an
-unpinned dependency crash-looped the container at startup, and because nothing
-watches, the agent answered nothing for hours until someone invoked it by hand.
-The cheapest independent check is the incident store's newest timestamp:
+### SQL component and publication boundaries
+
+Live `build_monitoring_store` and `AzureSqlMonitoringStore` construction must
+select `worker`, `web` or `controller` explicitly. That selection is routing,
+not a grant; the authenticated SQL principal must hold only its reviewed
+component role. Checked views and static RPCs separate raw observations, human
+intents and controller publication. Do not give a producer raw control,
+source-head, action or receipt-table write permissions.
+
+An accepted intent or intake receipt is durable pending work, not published
+authority. The controller validates the original evidence and current policy
+before publication. Missing/incompatible schema, `kernel_incomplete` or an
+unsupported adapter must remain visible failures, not select fixture state or
+another component's SQL route.
+
+RPCs return typed envelopes with `status`, `affected_rows` and `result`. The
+caller must decode the original result; an EXEC rowcount cannot establish
+success. Conditional rowcounts inside the SQL implementation remain guards,
+not the client RPC protocol.
+
+All operational stores use the same Azure SQL catalog and
+`AzureSqlDatabase.transaction()` for cross-store atomic work. Runtime identities
+never install or repair schema. Configure Entra-only server authentication,
+public firewall admission, TLS 1.2 minimum, Proxy/TCP 1433, auditing and TDE.
+The default Azure-services rule has start/end `0.0.0.0`; it admits Azure-hosted
+callers, including other subscriptions, not all Internet IPs. SQL permissions
+remain mandatory. Azure SQL supports other authentication modes, so a token
+login alone does not prove Entra-only policy.
+The server Entra administrator is separate from the Command Center Admin role.
+There is no SQL-password or Fabric SQL compatibility fallback.
+
+### Separate canary and reconciliation modes
 
 ```powershell
-bi-triage incidents        # nothing new since yesterday on a busy mailbox is a signal
+.\.venv\Scripts\python.exe -m triage.monitoring.worker --transport-probe `
+  --probe-workspace-id "<owned-source-workspace-uuid>" `
+  --probe-item-id "<owned-source-pipeline-uuid>" --probe-seconds 120
+
+.\.venv\Scripts\python.exe -m triage.monitoring.worker --reconcile-once
 ```
 
-**Routine enabled-state is not managed by `azd deploy`.** Measured
-2026-09-02, both directions: deploying with `enabled: false` in `azure.yaml` left
-an enabled routine enabled, and a full rebuild left a disabled one disabled. A
-newly declared routine is not created either — measured 2026-09-03. An earlier
-version of this document said a deploy would silently re-enable a disabled
-routine; that was observed once and no longer reproduces. Manage routines with
-the CLI, and check afterwards rather than assuming:
+The finite transport probe is read-only and omits SQL acceptance/checkpointing.
+Its source workspace can differ from the transport workspace. Receipt proves
+only the checked transport/envelope boundary, not source REST evidence, durable
+acceptance, controller execution or normal worker health. Never configure it as
+an always-restarted worker command.
 
-```powershell
-azd ai routine create <name> --file <manifest.yaml>   # --file is the only way to set `input`
-azd ai routine disable bi-triage-schedule
-azd ai routine show bi-triage-schedule -o json        # confirm; the deploy will not do it for you
-```
+`--reconcile-once` drains a bounded shared connector-work batch and can mutate
+an **owned monitoring** Eventstream definition. It cannot repair a business
+pipeline, refresh a model or grant a role. It is not a generic readiness probe.
+A pending or uncertain update keeps its original operation identity for
+readback; do not create another connector or repeat POST blindly.
 
-**The silent-sweep off switch is configuration, not routine state.** Set
-`SILENT_SWEEP_ENABLED=false` to stop scanning independently of the trigger.
-`azd deploy` does not manage routine enabled-state, so disabling a routine is
-not a substitute for configuring the controller.
+### Adding and removing Eventstream sources
 
-## Budgets
+Controller publication first records a logical source proposal with
+`source_id=null`; no unresolved proposal may invent a physical ID. The worker
+applies only the owned definition and records the actual observation. A later
+controller publication passes the original `observation_receipt_id` so SQL can
+validate that receipt and bind the returned component IDs. Controller code must
+not query a worker-private receipt view to bypass this boundary.
 
-Each run is bounded. These are charged by the controller before an action, so no
-prompt wording raises them.
+A desired removal immediately fences new intake but retains the source's
+ownership, node and ID bindings. It remains pending until an original, complete,
+current observation proves the exact node, physical ID and stream-route absence.
+Only then may controller publication retire it and record the immutable
+retirement evidence. A failed update, partial page, null
+`observed_definition_hash` or inherited snapshot cannot prove removal.
 
-| Setting | Default | What it bounds |
+Keep `pending_removals`, `retired_sources` and `observation_receipt_id` distinct
+when interpreting a publication result. Neither a saved removal request nor
+a worker-reported `ready` state is published readiness. Key-free endpoint
+automation remains unproved; retain the manual Entra-tab bootstrap.
+
+## Coverage and recovery
+
+Keep these observations distinct:
+
+| Evidence | What it does not prove |
+|---|---|
+| Admin inventory/read metadata | Source access, complete operational history or action permission |
+| Core workspace/item listing | Tenant-complete enumeration |
+| A domain selection | A resource grant |
+| A recent worker heartbeat | Event delivery, successful polling or complete coverage |
+| An accepted event/REST page | Controller publication, agent completion or remediation |
+| A complete returned history page | The requested lookback survived count-limited retention |
+| A submitted refresh/rerun | Completion of the controller's own exact job |
+| A human tracking closure | Verified repair, reset budget or released action fence |
+
+Fabric histories generally retain 100 completed jobs; Power BI refresh history
+uses the explicit 60-entry request window. Retention exhaustion, interrupted
+pagination, 401/403/429, malformed records and unknown state must remain coverage
+gaps. A failed page or incomplete domain inventory is not evidence of deletion.
+Honor shared `Retry-After`; release work to its due queue rather than sleeping
+past a lease.
+The worker reports retention through `worker.observe_retention`; it cannot use
+a complete-looking page to publish source-head or action authority.
+
+Event acceptance preserves connector provenance and original event source/ID.
+Source execution identity separately deduplicates poll/event/mail/operator
+overlap. Only after durable acceptance or quarantine may the contiguous
+checkpoint advance. A stream checkpoint is not an agent-completion marker.
+
+Live state cannot degrade to an empty process cache. SQL unavailability blocks
+admission, ownership, action reservation and completion. After recovery, read
+current shared state and the original receipt. Preserve existing action fences;
+resume verification/finalization rather than repeating an uncertain effect.
+
+## Budgets and action boundaries
+
+| Setting | Default | Bound |
 |---|---|---|
 | `TRIAGE_MAX_LLM_TURNS` | 14 | Reasoning turns per incident |
 | `TRIAGE_MAX_TOOL_CALLS` | 20 | Tool calls per incident |
 | `TRIAGE_MAX_WRITE_ACTIONS` | 1 | Remediations per incident |
-| `TRIAGE_MAX_TOKENS` | 80,000 | Tokens per incident, across every agent |
-| `TRIAGE_TIMEOUT_SECONDS` | 300 | Wall clock per incident |
+| `TRIAGE_MAX_TOKENS` | 80,000 | Tokens across agents in an incident |
+| `TRIAGE_TIMEOUT_SECONDS` | 300 | Incident reasoning/execution deadline |
 
-Raising `TRIAGE_MAX_WRITE_ACTIONS` above 1 removes the property that most of the
-safety argument rests on. If a scenario seems to need it, the action is probably
-mis-tiered — a Tier 2 action needing a second step should be a single tool that
-does both, so it is approved once with its real blast radius stated.
+These are controller limits, not prompt suggestions. Do not raise a policy
+limit to make a scenario pass. Distinct source executions sharing a failure
+signature do not automatically receive new incident allowances.
+
+Targets default to observation only. Action requires current scope, immutable
+review/fingerprints, authoritative source-head and active-job checks, any
+required explicit approval, and an atomic target/action reservation. Recheck
+after approval waits. Scope/review revocation prevents a new reservation; it
+cannot retract a request already committed to the external service.
+Existing reservations must retain their exact leased source-read,
+verification and finalization paths after a policy or maintenance change.
+
+An uncertain result retains its fence. A confirmed no-effect rejection is not
+a global budget refund or permission to reuse an approval. Only the
+store-authorized, single-use retry path can reuse its incident slot after
+durable parent finalization and fresh admission.
+
+Verify the exact submitted job and activity evidence, or the exact intended
+configuration readback for a non-job action. A newly seen external refresh is
+not proof that the controller's submission succeeded. Persist the terminal
+incident, processed-source disposition and work completion through the shared
+finalization boundary.
 
 ## Inspecting state
 
-```powershell
-bi-triage incidents            # what was seen, its signature, occurrence count
-bi-triage approvals            # actions awaiting a human decision
-bi-triage retries              # postponed retries and when they are due
-bi-triage retries --drain      # perform the ones whose window has passed
-bi-triage health               # scan for failures that raised no alert
-bi-triage health --probes      # what is watched, and how
-bi-triage health --baselines   # what healthy looked like last time
-bi-triage health --preflight   # configuration that would silently detect nothing
-bi-triage health --accept all  # accept a planned change as the new normal
-bi-triage pipelines --targets  # configured Fabric pipelines and reviewed replay policy
-bi-triage pipelines --preflight # configuration only, without network
-bi-triage pipelines            # one bounded scheduled-pipeline sweep
-bi-triage flags                # data quality findings, reported not fixed
-bi-triage preflight            # configured vs missing, printing no secret values
-```
-
-Everything printed is already redacted: redaction happens inside the store
-boundary, so a display path cannot forget it.
-
-## Command-center access and incident work
-
-The command-center queue and inspector link to a separate **Incidents** page.
-Open **See full incident details** for evidence, execution history, append-only
-notes, the durable read-only discussion and human tracking decisions. Closed
-records remain searchable. **Needs investigation** includes the wire status
-`needs_review`; selecting a summary tile clears search and workload filters
-because its count is not scoped to them.
-
-Operator or Admin permission is required to add notes or record **Resolved by
-user**. Enter a reason, review the current evidence and confirm the tracking
-decision. The API checks both the tracking version and the source revision.
-If it returns `409`, refresh the case and review again. A user resolution does
-not verify a repair, reset the remediation budget, approve a proposal or remove
-a command/rerun uncertainty block. New controller evidence invalidates the older
-closure. The decision remains in history.
-
-**Access & permissions** is visible to Reader and higher app roles. It reports
-roles and issued/expiry timestamps from the validated API token, not current
-group membership. Group owners manage membership in the four ordinary Entra
-security groups; authorized IT administrators manage their app-role assignments.
-There is no in-app Add/Edit user, invite or SQL-grant workflow. Operator and
-Approver remain separate roles; Admin has all app capabilities but no directory
-administration. See the [role catalog and setup](CommandCenter.md#authentication-and-roles).
-
-After an Entra change, select **Refresh permissions**. It requests a fresh API
-token and reloads access information and the snapshot. Stale actions remain
-locked until that reload succeeds. Use the explicit sign-in control if renewal
-requires interaction. Refresh does not revoke other sessions' already-issued
-tokens or prove that Entra membership changes have finished propagating.
-The old `?view=admin` route now opens this read-only page, and authenticated
-requests to retired permission-editor APIs return `410 managed_in_entra`.
-Do not restore a SQL permission table or clear incident data to repair access.
-
-**Scenario validation** is Admin-only and checks the 15 canonical cases using
-synthetic tools and isolated state. Mock mode checks deployed controller code;
-Foundry mode also makes model calls. Neither repairs production resources.
-Read the recorded assertions and run timeline rather than treating every pass
-as an incident resolution. **Stop queue** only stops new requests; accepted
-requests can finish. The [command-center guide](CommandCenter.md#validation-and-evidence)
-documents validation and the separate live checks.
-
-## When it behaves unexpectedly
-
-**It did nothing when mail arrived.** The inbox filter is a security control and
-fails closed. Check the sender against `GRAPH_SENDER_ALLOWLIST` and the subject
-against `GRAPH_SUBJECT_PATTERN`. The run reports what it ignored and why, rather
-than dropping it silently. Do not widen the filter to make it find something —
-send a message that matches. An agent that acts on every message is steerable by
-anyone who can email it.
-
-**It triaged, but took no action.** Expected for anything above Tier 1. Check
-`bi-triage approvals`: a Tier 2 action waits for an explicit human yes, and
-timeout, error, malformed reply and no-gate-configured all read as a decline.
-
-**It reported `needs_human` when it looked successful.** Outcome validation
-downgraded it: the agent claimed a result the evidence does not support. The
-incident records the claim and the contradiction.
-
-**The same alert produced no second action.** Signature suppression. The second
-occurrence increments a counter. Notification is deduplicated too — an incident
-is announced once, not once per occurrence.
-
-**A refresh was not attempted during a capacity incident.** Deliberate. A
-throttled retry is postponed with exponential backoff, capped at three attempts,
-rather than retried immediately and made worse. `bi-triage retries` shows when.
-
-**A new investigation stays queued.** A web response confirms durable receipt,
-not execution. Check the separate `command sweep` scheduler and its invocation
-permission. The web process does not drain production commands.
-
-**A command is interrupted or uncertain.** Inspect external job history and
-target state before an Admin records **Human reconciliation** with a reason.
-That decision clears the command-worker uncertainty block without executing
-or retrying the command. It does not clear a pipeline rerun reservation or prove
-that the underlying repair succeeded. See
-[Interrupted commands and reconciliation](CommandCenter.md#interrupted-commands-and-reconciliation).
-
-**An incident question is pending or failed.** Its question may already be
-durable even when the response was lost. Refresh the saved discussion and
-inspect its run history; no success or automatic retry is inferred.
-
-**The UI shows records but locks actions.** The last snapshot or renewed
-permissions could not be confirmed. Check the explicit API error and refresh
-access/records. Cached records are not evidence of current permission.
-
-**The hosted agent starts and immediately fails.** Check the environment
-variables it was deployed with. pydantic-settings JSON-decodes complex field
-types in the environment source *before* any validator runs, so a malformed
-value for such a field crashes the process at import — taking down mail triage,
-approvals and remediation over one optional feature. This is why
-`SILENT_HEALTH_PROBES` is typed `str` and parsed afterwards. Keep new
-configuration fields simple for the same reason.
-
-**A prompt or tool change had no effect.** Foundry-registered agents do not pick
-up local changes. Re-register:
+Configuration-only checks do not contact SQL or Fabric:
 
 ```powershell
-python scripts\register_foundry_agents.py
+.\.venv\Scripts\bi-triage.exe preflight
+.\.venv\Scripts\bi-triage.exe pipelines --preflight
+.\.venv\Scripts\bi-triage.exe health --preflight
 ```
 
-## Verifying a deployment actually deployed
+Select the live SQL identity before the subcommand:
 
 ```powershell
-azd deploy bi-triage-controller --no-prompt
-azd ai agent invoke bi-triage-controller "sweep"
-azd ai agent monitor bi-triage-controller
+$sqlIdentity = @("--sql-identity", "broker", "--operator-domain", "<operator-domain>")
+.\.venv\Scripts\bi-triage.exe @sqlIdentity incidents
+.\.venv\Scripts\bi-triage.exe @sqlIdentity approvals
+.\.venv\Scripts\bi-triage.exe @sqlIdentity retries
+.\.venv\Scripts\bi-triage.exe @sqlIdentity commands
+.\.venv\Scripts\bi-triage.exe @sqlIdentity pipelines --targets
+.\.venv\Scripts\bi-triage.exe @sqlIdentity preflight --check-sql
 ```
 
-A deploy that finishes in ~25 seconds instead of the usual minute and a half
-detected no source change and shipped nothing. Exit code 0 is not proof; invoke
-it and read the result.
+Managed-identity operator mode instead uses `--sql-identity managed` with an
+explicit `AZURE_CLIENT_ID`. `--check-sql` proves a connection/`SELECT 1`, not
+all object grants or the worker/controller identities.
 
-Inspect the Responses body's `status` and `error`, not just HTTP status or the
-CLI exit code. A deployed controller returned HTTP 200 with `status=failed`
-while the CLI exited 0 and printed no failure text. The scheduler now validates
-that `status` is `completed` and any `error` is null. A failed, incomplete or
-malformed response fails the Logic App run even if its HTTP request succeeded.
-Failure notification is optional; failed run status is not.
-Logic Apps can represent a successful JSON response as a base64 `$content`
-envelope when the endpoint sends `Content-Encoding: identity`. The scheduler
-decodes that wrapper before applying the same status/error checks; it does not
-treat the wrapper itself as the agent's result.
+Treat `retries --drain`, `commands --drain`, live `pipelines`, and `health --accept`
+as operational requests, not read-only diagnostics. The first two can execute
+eligible work, live pipelines queue observations, and accepting a health
+baseline changes what future scans consider normal.
 
-## Telemetry
+## Access and incident collaboration
 
-With `APPLICATIONINSIGHTS_CONNECTION_STRING` set, each run emits OpenTelemetry
-GenAI spans: the incident, each agent, each tool call, the policy decisions and
-the terminal outcome.
+The command-center Incidents page retains evidence, run history, append-only
+notes, tool-free discussion and human tracking decisions. **Needs investigation**
+includes wire status `needs_review`. Presentation labels do not rewrite stored
+status values.
 
-Spans carry **metadata only** — never prompt or completion content. Traces are
-retained and widely readable inside a tenant, and prompt content routinely
-contains customer data pasted into an alert.
+Operator or Admin can add notes or record **Resolved by user**. The decision
+binds to the original SQL NVARCHAR payload hash over UTF-16 LE and its tracking
+version. On a revision conflict, refresh and review the new evidence. A tracking
+closure does not verify repair, change approvals/budgets/notifications or remove
+an uncertain action fence. New evidence invalidates the prior closure.
 
-Without the connection string the instrumentation is a no-op, so nothing needs
-disabling to run offline.
+Access & permissions reports validated token roles, not current group membership.
+Ordinary Entra groups supply Reader, Operator, Approver and Admin; Operator and
+Approver are separate. Admin is an application role, not directory or controller
+service permission. There is no SQL membership authority or in-app directory
+writer.
 
-## Cost control
+After **Refresh permissions**, actions remain locked until a snapshot under the
+new token-refresh generation succeeds. Token renewal does not immediately revoke
+other issued tokens or prove directory propagation. Do not repair access by
+clearing incidents or restoring a retired SQL ACL.
 
-Model tokens dominate. The per-run token budget is the direct control: it bounds
-the cost of a single incident, and signature suppression bounds how many times
-the same failure can be paid for.
+Human reconciliation of an interrupted command is distinct from exact external
+effect verification. A pending question may already be durable after a lost
+reply; refresh its saved discussion instead of blindly repeating the mutation.
+Observer answers cannot approve or execute anything.
 
-If cost rises unexpectedly, look for a signature that is not matching — a
-failure whose error text varies on every occurrence defeats deduplication and
-gets triaged from scratch each time. `bi-triage incidents` shows occurrence
-counts; many near-identical incidents with a count of 1 is the symptom.
+## Controlled prototype reset
+
+Ordinary releases preserve state. The approved prototype clean start is a
+separate deployment operation: exact object manifest, expected epoch,
+explicit operator confirmation and fresh live ownership/quiescence/action
+evidence. No migration/import or old-target fallback is performed.
+
+Use `scripts\reset_monitoring_state.py` as documented in
+[DeploymentGuide.md](DeploymentGuide.md#3a-hybrid-registry-and-controlled-prototype-reset).
+Its default is read-only planning. On the new Azure SQL target, install the
+current application schema and initialize empty maintenance/control state.
+The tool targets Azure SQL only and neither imports nor clears a prior Fabric
+SQL database. Dispose of old prototype history through separately scoped cleanup.
+Any reset of an already initialized Azure SQL target is a later, separately
+confirmed step after **all** writers and uncertain effects are reconciled.
+
+The same pinned operator may prepare and execute; no new signing authority,
+certificate or second person is required. Caller booleans and saved observation
+documents are not live quiescence proof. Protected deployment registration joins
+actual SQL authority to independently observed writer resources; an operator's
+profile cannot define completeness. Unknown module/trigger/invoker paths must
+refuse. Reset receipts, registration/capture evidence and API rate budgets
+survive; unrelated objects, Entra groups, infrastructure, endpoint namespaces
+and business data do not belong to the wipe.
+
+Retain original manifests, operation IDs and receipts after a timeout. A repeat
+must reconcile the prior receipt, not wipe new-epoch rows. The tool leaves
+maintenance enabled and starts no services. `bi-triage reset` refuses live mode.
+
+## Failure investigation
+
+**No event arrived.** Distinguish quiet source, disabled/changed source
+configuration, denied consumer identity, endpoint mismatch, network failure and
+SQL rejection. A transport heartbeat is not delivery proof. Obtain only
+nonsecret Custom Endpoint metadata from the Entra tab; never call the
+key-returning connection API or substitute a SAS connection string.
+
+**A pipeline request remains queued.** Confirm current registry admission,
+worker collection, complete source evidence and the separate controller
+heartbeat. A web/CLI acknowledgement is durable intent, not execution.
+
+**A target is paused or incomplete.** Inspect capability and inventory-generation
+gaps. Verify the actual service identity. Domain membership/read-admin permissions
+do not imply history access, event consumption or controller action permission.
+
+**A prompt change had no effect.** Re-register the Foundry definitions before
+deploying the controller. Local files do not replace an existing registered
+version:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\register_foundry_agents.py
+```
+
+**A hosted response says success at HTTP level.** Inspect the Responses body
+`status` and `error`, then the durable operation/finalization record. HTTP 200,
+CLI exit status or an accepted deployment alone does not establish a completed
+business outcome. The scheduler validates the body, including supported
+base64 `$content` wrappers, rather than treating a wrapper as success.
+
+**Mail was ignored.** Check the approved sender/subject filter and denied canary
+scope. Invalid patterns fail closed. Send a matching synthetic alert; never
+widen the security filter to make something trigger.
+
+**A capacity incident deferred work.** Inspect the existing retry and action
+state. Respect service backoff and correlated no-effect/uncertain dispositions;
+do not add another immediate submission or clear its reservation.
+
+## Telemetry and cost
+
+Logs/spans carry metadata only, never prompts, completions or raw business
+payloads. Worker heartbeats, scheduler history, API health, source reads and SQL
+receipts are different signals. Configure alerting for stale workers, missing
+inventory deadlines, denied/throttled reads, checkpoint lag, backlog and failed
+finalization rather than relying on recent incidents alone.
+
+The existing telemetry helper consumes `APPLICATIONINSIGHTS_CONNECTION_STRING`
+without explicitly configuring an Entra exporter. A portal Insights link does
+not establish secretless telemetry. Use the separately reviewed exporter/network
+path; do not add a credential to make a dashboard appear healthy.
+
+Budget for continuously allocated worker compute, the hosted controller, model
+usage, Azure SQL compute/storage/backups/auditing, Fabric workload capacity,
+public Basic registry, data transfer and logging. No NAT/private-endpoint
+resources are required by the baseline. The application and temporary proof
+databases share one server; the shipped template has no elastic pool and is
+not a final sizing/pricing recommendation. Service
+request budgets and source deduplication complement the per-incident token limit.
+Investigate repeated near-identical incidents rather than raising limits.
+
+Where the public Custom Endpoint topology requires a tenant-specific exception,
+record the approved scope, owner and review/expiry operation. Tags and review
+dates do not enforce shutdown or override Fabric policy. Recheck actual outbound
+DNS/TLS and availability after governance changes; do not broaden unrelated
+resource access.
+
+In the approved MCAPS evaluation, the SQL server's resource-specific
+`SecurityControl=Ignore` plus reason/review tags permits one 14-day period.
+Removing/re-adding the tag does not restart it; a longer test requires an
+approved exclusion. Registry/account exception maps are separate and scoped,
+not defaults for ordinary customers. A public-access readback does not prove
+an exception will remain active. Monitor expiry and fail closed on lost SQL
+access rather than repeatedly flipping a governed setting.
+
+Optional Command Center app/SCM caller filters are persistent and independent.
+Empty lists mean public network reachability, not anonymous authorization.
+Preserve approved filters during code-only deployments; there is no automatic
+restore-to-private step. Retained private test infrastructure was not deleted
+by this network change and needs separate ownership/cost review.

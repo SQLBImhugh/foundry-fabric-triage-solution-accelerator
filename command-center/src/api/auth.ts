@@ -4,7 +4,8 @@ import type { TokenProvider } from './client'
 import { PROFILE_SCOPE } from './profile'
 import type { ProfileTokenProvider } from './profile'
 import { approvalFromSignInState } from '../approvalLinks'
-import { applicationSignInState, incidentFromSignInState } from '../incidentLinks'
+import { incidentFromSignInState } from '../incidentLinks'
+import { workspaceFromSignInState, workspaceSignInState } from '../workspaceNavigation'
 
 export interface AuthUser {
   id: string
@@ -55,9 +56,11 @@ export async function initializeAuth(config: AppConfig): Promise<AuthSession> {
   const redirect = await client.handleRedirectPromise()
   const approval = approvalFromSignInState(redirect?.state)
   const incident = incidentFromSignInState(redirect?.state)
-  if (approval || incident) {
+  const workspace = workspaceFromSignInState(redirect?.state)
+  if (approval || incident || workspace) {
     // Preserve deep links without requiring a distinct SPA redirect URI per request.
     const url = new URL(window.location.href)
+    if (workspace) url.searchParams.set('view', workspace)
     if (approval) url.searchParams.set('approval', approval)
     if (incident) {
       url.searchParams.set('incident', incident)
@@ -131,7 +134,7 @@ export async function initializeAuth(config: AppConfig): Promise<AuthSession> {
         throw new ApiError(0, 'profile_auth_error', 'Profile photo authorization was not completed. Try again; other commands remain available.')
       }
     } : undefined,
-    signIn: () => client.loginRedirect({ scopes, prompt: 'select_account', state: applicationSignInState(window.location.search) }),
+    signIn: () => client.loginRedirect({ scopes, prompt: 'select_account', state: workspaceSignInState(window.location.search) }),
     signOut: () => client.logoutRedirect({ account: client.getActiveAccount() }),
   }
 }

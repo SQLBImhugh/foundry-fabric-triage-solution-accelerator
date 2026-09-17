@@ -17,8 +17,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+from urllib.parse import urlsplit
+from uuid import UUID
+
+from triage.pipeline_models import canonical_id
 
 logger = logging.getLogger("triage.powerbi")
 
@@ -35,6 +40,8 @@ class RefreshOutcome:
     #: Seconds the service asked us to wait, from the 429 Retry-After header.
     #: Zero means it did not say, not "retry immediately".
     retry_after_seconds: int = 0
+    submission_state: Literal["not_submitted", "submitted", "uncertain", "rejected"] = "not_submitted"
+    configuration: dict[str, str | bool | list[str]] = field(default_factory=dict)
 
     @property
     def succeeded(self) -> bool:
@@ -47,17 +54,29 @@ class RefreshOutcome:
 
 class PowerBIClient(Protocol):
     async def refresh_dataset(self, workspace_id: str, dataset_id: str) -> RefreshOutcome: ...
+    async def submit_refresh(self, workspace_id: str, dataset_id: str) -> RefreshOutcome: ...
+    async def verify_refresh(
+        self, workspace_id: str, dataset_id: str, request_id: str,
+    ) -> RefreshOutcome: ...
     async def get_refresh_history(
         self, workspace_id: str, dataset_id: str, top: int = 5
     ) -> list[dict[str, Any]]: ...
     async def rebind_gateway(
-        self, workspace_id: str, dataset_id: str, gateway_id: str
+        self, workspace_id: str, dataset_id: str, gateway_id: str,
+        datasource_ids: list[str] | None = None,
+    ) -> RefreshOutcome: ...
+    async def verify_gateway_binding(
+        self, workspace_id: str, dataset_id: str, gateway_id: str,
+        datasource_ids: list[str] | None = None,
     ) -> RefreshOutcome: ...
     async def get_refresh_schedule(
         self, workspace_id: str, dataset_id: str
     ) -> dict[str, Any]: ...
     async def set_refresh_schedule_enabled(
         self, workspace_id: str, dataset_id: str, enabled: bool
+    ) -> RefreshOutcome: ...
+    async def verify_refresh_schedule(
+        self, workspace_id: str, dataset_id: str, enabled: bool,
     ) -> RefreshOutcome: ...
 
 
@@ -81,6 +100,8 @@ class MockPowerBIClient:
     #: What a throttled service asks for. Only used when refresh_result is
     #: "Throttled"; zero means the service did not say.
     retry_after_seconds: int = 0
+    gateway_id: str = ""
+    datasource_ids: list[str] = field(default_factory=list)
 
     async def refresh_dataset(self, workspace_id: str, dataset_id: str) -> RefreshOutcome:
         self.calls.append(
@@ -104,6 +125,7 @@ class MockPowerBIClient:
                     else f"Refresh ended with status {self.refresh_result}."
                 )
             ),
+            submission_state="rejected" if self.refresh_result == "Throttled" else "submitted",
         )
         # Reflect the refresh in history so a follow-up read is consistent.
         self.history.insert(
@@ -117,6 +139,20 @@ class MockPowerBIClient:
         )
         return outcome
 
+    async def submit_refresh(self, workspace_id: str, dataset_id: str) -> RefreshOutcome:
+        return await self.refresh_dataset(workspace_id, dataset_id)
+
+    async def verify_refresh(
+        self, workspace_id: str, dataset_id: str, request_id: str,
+    ) -> RefreshOutcome:
+        row = next((row for row in self.history if row.get("requestId") == request_id), None)
+        return RefreshOutcome(
+            status=str(row.get("status", "Unknown")) if row else "Unknown",
+            request_id=request_id,
+            submission_state="submitted",
+            detail="" if row else "The submitted refresh is absent from the mock history.",
+        )
+
     async def get_refresh_history(
         self, workspace_id: str, dataset_id: str, top: int = 5
     ) -> list[dict[str, Any]]:
@@ -124,15 +160,33 @@ class MockPowerBIClient:
         return self.history[:top]
 
     async def rebind_gateway(
-        self, workspace_id: str, dataset_id: str, gateway_id: str
+        self, workspace_id: str, dataset_id: str, gateway_id: str,
+        datasource_ids: list[str] | None = None,
     ) -> RefreshOutcome:
         self.calls.append(("rebind_gateway", {"gateway_id": gateway_id}))
         await asyncio.sleep(self.latency_ms / 1000)
+        self.gateway_id = gateway_id
+        self.datasource_ids = list(datasource_ids or self.datasource_ids)
         return RefreshOutcome(
             status="Completed",
             request_id=f"mock-rebind-{len(self.calls)}",
             duration_ms=self.latency_ms,
             detail=f"Dataset rebound to gateway {gateway_id}.",
+            submission_state="submitted",
+            configuration={"gateway_id": gateway_id, "datasource_ids": sorted(self.datasource_ids)},
+        )
+
+    async def verify_gateway_binding(
+        self, workspace_id: str, dataset_id: str, gateway_id: str,
+        datasource_ids: list[str] | None = None,
+    ) -> RefreshOutcome:
+        matches = self.gateway_id == gateway_id and (
+            datasource_ids is None or set(datasource_ids) == set(self.datasource_ids)
+        )
+        return RefreshOutcome(
+            status="Completed" if matches else "Unknown", submission_state="submitted",
+            configuration={"gateway_id": self.gateway_id, "datasource_ids": sorted(self.datasource_ids)},
+            detail="Mock gateway binding was checked.",
         )
 
     async def get_refresh_schedule(
@@ -157,6 +211,17 @@ class MockPowerBIClient:
             request_id=f"mock-schedule-{len(self.calls)}",
             duration_ms=self.latency_ms,
             detail=f"Refresh schedule {'enabled' if enabled else 'disabled'}.",
+            submission_state="submitted",
+            configuration={"enabled": enabled},
+        )
+
+    async def verify_refresh_schedule(
+        self, workspace_id: str, dataset_id: str, enabled: bool,
+    ) -> RefreshOutcome:
+        return RefreshOutcome(
+            status="Completed" if self.schedule_enabled is enabled else "Unknown",
+            submission_state="submitted", configuration={"enabled": self.schedule_enabled},
+            detail="Mock refresh schedule was checked.",
         )
 
 
@@ -183,8 +248,39 @@ def _require_ids(workspace_id: str, dataset_id: str) -> None:
         raise ValueError(
             "Cannot call Power BI without "
             + " and ".join(missing)
-            + ". Set POWERBI_WORKSPACE_ID / POWERBI_DATASET_ID, or include the ids in the alert."
+            + ". Select a monitored semantic model with verified workspace and item IDs."
         )
+    canonical_id(workspace_id)
+    canonical_id(dataset_id)
+
+
+def _submission_id(
+    headers: Mapping[str, str], workspace_id: str, dataset_id: str,
+) -> tuple[str, str]:
+    location = headers.get("Location", "")
+    value = headers.get("x-ms-request-id") or headers.get("RequestId", "")
+    if location:
+        try:
+            parsed = urlsplit(location)
+        except ValueError:
+            return "", "The refresh acknowledgement contains an invalid Location."
+        prefix = f"/v1.0/myorg/groups/{workspace_id}/datasets/{dataset_id}/refreshes/"
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc.casefold() not in {"api.powerbi.com", "api.powerbi.com:443"}
+            or parsed.query
+            or parsed.fragment
+            or not parsed.path.casefold().startswith(prefix.casefold())
+        ):
+            return "", "The refresh Location does not identify this Power BI target."
+        value = parsed.path[len(prefix):]
+    try:
+        parsed_id = UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return "", "The acknowledgement has no valid exact refresh identifier."
+    if not parsed_id.int:
+        return "", "The acknowledgement contains an empty refresh identifier."
+    return str(parsed_id), ""
 
 
 class LivePowerBIClient:
@@ -200,14 +296,16 @@ class LivePowerBIClient:
         tenant_id: str,
         client_id: str,
         client_secret: str,
-        poll_seconds: int = 5,
-        poll_timeout_seconds: int = 300,
+        poll_seconds: float = 5,
+        poll_timeout_seconds: float = 300,
+        credential: Any = None,
     ):
         self._tenant_id = tenant_id
         self._client_id = client_id
         self._client_secret = client_secret
         self._poll_seconds = poll_seconds
         self._poll_timeout = poll_timeout_seconds
+        self._credential = credential
         self._token: str = ""
         self._token_expires_at: float = 0.0
 
@@ -229,16 +327,18 @@ class LivePowerBIClient:
             # act as a person is a worse failure than one that cannot start.
             import asyncio
 
-            from azure.identity import DefaultAzureCredential
+            credential = self._credential
+            if credential is None:
+                from azure.identity import DefaultAzureCredential
 
-            credential = DefaultAzureCredential(
-                exclude_cli_credential=True,
-                exclude_developer_cli_credential=True,
-                exclude_interactive_browser_credential=True,
-                exclude_shared_token_cache_credential=True,
-                exclude_visual_studio_code_credential=True,
-                managed_identity_client_id=self._client_id or None,
-            )
+                credential = DefaultAzureCredential(
+                    exclude_cli_credential=True,
+                    exclude_developer_cli_credential=True,
+                    exclude_interactive_browser_credential=True,
+                    exclude_shared_token_cache_credential=True,
+                    exclude_visual_studio_code_credential=True,
+                    managed_identity_client_id=self._client_id or None,
+                )
             token = await asyncio.to_thread(credential.get_token, _SCOPE)
             self._token = token.token
             try:
@@ -266,26 +366,33 @@ class LivePowerBIClient:
         return self._token
 
     async def refresh_dataset(self, workspace_id: str, dataset_id: str) -> RefreshOutcome:
+        submission = await self.submit_refresh(workspace_id, dataset_id)
+        if submission.status != "Submitted":
+            return submission
+        return await self.verify_refresh(workspace_id, dataset_id, submission.request_id)
+
+    async def submit_refresh(self, workspace_id: str, dataset_id: str) -> RefreshOutcome:
+        """Submit once; the caller persists correlation before verifying completion."""
         _require_ids(workspace_id, dataset_id)
         import httpx
 
-        started = time.time()
+        started = time.monotonic()
         token = await self._get_token()
         headers = {"Authorization": f"Bearer {token}"}
         base = f"{_API}/groups/{workspace_id}/datasets/{dataset_id}/refreshes"
 
         async with httpx.AsyncClient(timeout=60) as client:
-            # Capture the newest existing refresh id BEFORE triggering, so a
-            # previously-completed run can never be mistaken for this one.
-            # Polling `$top=1` alone will happily return yesterday's success
-            # during the window before the new refresh appears.
-            prior_ids = {
-                r.get("requestId")
-                for r in (await self._history(client, base, headers, 5))
-                if r.get("requestId")
-            }
-
-            resp = await client.post(base, headers=headers, json={"notifyOption": "NoNotification"})
+            try:
+                resp = await client.post(
+                    base, headers=headers, json={"notifyOption": "NoNotification"},
+                )
+            except httpx.RequestError as exc:
+                logger.warning("Power BI refresh submission is uncertain (%s)", type(exc).__name__)
+                return RefreshOutcome(
+                    status="Unknown", submission_state="uncertain",
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    detail=f"Refresh submission acknowledgement was lost ({type(exc).__name__}). Do not resubmit.",
+                )
             if resp.status_code == 429:
                 # Throttling is not failure. Reporting it as failure would send
                 # the agent looking for a fault in a model that is fine, and
@@ -300,8 +407,9 @@ class LivePowerBIClient:
                 )
                 return RefreshOutcome(
                     status="Throttled",
-                    duration_ms=int((time.time() - started) * 1000),
-                    retry_after_seconds=retry_after,
+                    submission_state="rejected",
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    retry_after_seconds=max(0, retry_after),
                     detail=(
                         "The capacity rejected the refresh because it has exceeded its "
                         f"resource limits. {resp.text[:300]}"
@@ -309,27 +417,46 @@ class LivePowerBIClient:
                 )
             if resp.status_code not in (200, 202):
                 return RefreshOutcome(
-                    status="Failed",
-                    duration_ms=int((time.time() - started) * 1000),
+                    status="Unknown" if resp.status_code >= 500 else "Failed",
+                    submission_state="uncertain" if resp.status_code >= 500 else "rejected",
+                    duration_ms=int((time.monotonic() - started) * 1000),
                     detail=f"HTTP {resp.status_code}: {resp.text[:500]}",
                 )
 
-            # The 202 carries the new request id in a header on most tenants.
-            # Fall back to "the first id we have not seen before".
-            target_id = resp.headers.get("RequestId") or resp.headers.get("x-ms-request-id") or ""
+            target_id, error = _submission_id(resp.headers, workspace_id, dataset_id)
+            if error:
+                logger.warning("Power BI refresh accepted without usable correlation: %s", error)
+            return RefreshOutcome(
+                status="Submitted" if target_id else "Unknown",
+                request_id=target_id,
+                submission_state="submitted" if target_id else "uncertain",
+                duration_ms=int((time.monotonic() - started) * 1000),
+                detail=error or "Refresh accepted; exact completion has not yet been verified.",
+            )
 
-            deadline = time.time() + self._poll_timeout
-            while time.time() < deadline:
+    async def verify_refresh(
+        self, workspace_id: str, dataset_id: str, request_id: str,
+    ) -> RefreshOutcome:
+        """Read only the submitted refresh; another newly observed run proves nothing."""
+        _require_ids(workspace_id, dataset_id)
+        target_id = str(UUID(request_id))
+        if not UUID(target_id).int:
+            raise ValueError("An exact non-empty refresh identifier is required")
+        import httpx
+
+        started = time.monotonic()
+        token = await self._get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        base = f"{_API}/groups/{workspace_id}/datasets/{dataset_id}/refreshes"
+        async with httpx.AsyncClient(timeout=60) as client:
+            deadline = time.monotonic() + self._poll_timeout
+            while time.monotonic() < deadline:
                 await asyncio.sleep(self._poll_seconds)
-                rows = await self._history(client, base, headers, 10)
-
-                row = None
-                if target_id:
-                    row = next((r for r in rows if r.get("requestId") == target_id), None)
-                else:
-                    row = next(
-                        (r for r in rows if r.get("requestId") not in prior_ids), None
-                    )
+                rows = await self._history(client, base, headers, 60)
+                row = next(
+                    (r for r in rows if str(r.get("requestId", "")).casefold() == target_id),
+                    None,
+                )
                 if row is None:
                     continue
 
@@ -337,22 +464,36 @@ class LivePowerBIClient:
                 if status in ("Completed", "Failed", "Disabled"):
                     return RefreshOutcome(
                         status=status,
-                        request_id=row.get("requestId", ""),
-                        duration_ms=int((time.time() - started) * 1000),
+                        request_id=target_id,
+                        submission_state="submitted",
+                        duration_ms=int((time.monotonic() - started) * 1000),
                         detail=str(row.get("serviceExceptionJson", ""))[:500],
                     )
 
         return RefreshOutcome(
             status="Unknown",
-            duration_ms=int((time.time() - started) * 1000),
-            detail=f"Refresh did not reach a terminal state within {self._poll_timeout}s",
+            request_id=target_id,
+            submission_state="submitted",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            detail=f"The exact submitted refresh was not verified within {self._poll_timeout}s. Do not resubmit.",
         )
 
     @staticmethod
     async def _history(client, base: str, headers: dict, top: int) -> list[dict[str, Any]]:
         resp = await client.get(f"{base}?$top={top}", headers=headers)
         resp.raise_for_status()
-        return resp.json().get("value", [])
+        return LivePowerBIClient._history_rows(resp.json())
+
+    @staticmethod
+    def _history_rows(payload: Any, *, label: str = "refresh history") -> list[dict[str, Any]]:
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("value"), list)
+            or any(not isinstance(row, dict) for row in payload["value"])
+        ):
+            logger.error("Power BI returned malformed %s", label)
+            raise ValueError(f"Power BI {label} must contain a value array of records")
+        return payload["value"]
 
     async def get_refresh_history(
         self, workspace_id: str, dataset_id: str, top: int = 5
@@ -365,10 +506,11 @@ class LivePowerBIClient:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
-            return resp.json().get("value", [])
+            return self._history_rows(resp.json())
 
     async def rebind_gateway(
-        self, workspace_id: str, dataset_id: str, gateway_id: str
+        self, workspace_id: str, dataset_id: str, gateway_id: str,
+        datasource_ids: list[str] | None = None,
     ) -> RefreshOutcome:
         """Bind the dataset to a different gateway.
 
@@ -377,26 +519,116 @@ class LivePowerBIClient:
         no idea what it is authorising, which is the correct separation: the
         gate decides *whether*, the client decides *how*.
         """
+        _require_ids(workspace_id, dataset_id)
+        gateway_id = canonical_id(gateway_id)
+        if datasource_ids is not None:
+            if not datasource_ids:
+                raise ValueError("Reviewed datasource IDs must not be empty")
+            datasource_ids = sorted({canonical_id(value) for value in datasource_ids})
+        url = f"{_API}/groups/{workspace_id}/datasets/{dataset_id}/Default.BindToGateway"
+        body: dict[str, Any] = {"gatewayObjectId": gateway_id}
+        if datasource_ids is not None:
+            body["datasourceObjectIds"] = datasource_ids
+        submission = await self._submit_configuration("POST", url, body)
+        if submission.status != "Submitted":
+            return submission
+        return await self.verify_gateway_binding(
+            workspace_id, dataset_id, gateway_id, datasource_ids,
+        )
+
+    async def _submit_configuration(
+        self, method: str, url: str, body: dict[str, Any],
+    ) -> RefreshOutcome:
         import httpx
 
-        started = time.time()
+        started = time.monotonic()
         token = await self._get_token()
-        url = f"{_API}/groups/{workspace_id}/datasets/{dataset_id}/Default.BindToGateway"
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                json={"gatewayObjectId": gateway_id},
-            )
-            ok = resp.status_code in (200, 202)
+            try:
+                response = await client.request(
+                    method, url, headers={"Authorization": f"Bearer {token}"}, json=body,
+                )
+            except httpx.RequestError as exc:
+                logger.warning("Power BI configuration submission is uncertain (%s)", type(exc).__name__)
+                return RefreshOutcome(
+                    status="Unknown", submission_state="uncertain",
+                    detail="Configuration submission acknowledgement was lost. Do not repeat the write.",
+                )
+        if response.status_code in {200, 202}:
             return RefreshOutcome(
-                status="Completed" if ok else "Failed",
-                duration_ms=int((time.time() - started) * 1000),
+                status="Submitted", submission_state="submitted",
+                duration_ms=int((time.monotonic() - started) * 1000),
+                detail="Configuration request accepted; its resulting state must be verified.",
+            )
+        uncertain = response.status_code >= 500
+        retry_after = 0
+        if response.status_code == 429:
+            try:
+                retry_after = max(0, int(response.headers.get("Retry-After", "0")))
+            except (TypeError, ValueError):
+                retry_after = 0
+        return RefreshOutcome(
+            status="Unknown" if uncertain else (
+                "Throttled" if response.status_code == 429 else "Failed"
+            ),
+            submission_state="uncertain" if uncertain else "rejected",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            retry_after_seconds=retry_after,
+            detail=f"Configuration request returned HTTP {response.status_code}.",
+        )
+
+    async def verify_gateway_binding(
+        self, workspace_id: str, dataset_id: str, gateway_id: str,
+        datasource_ids: list[str] | None = None,
+    ) -> RefreshOutcome:
+        """Verify only the reviewed binding identities, without another mutation."""
+        _require_ids(workspace_id, dataset_id)
+        gateway_id = canonical_id(gateway_id)
+        if datasource_ids is not None and not datasource_ids:
+            raise ValueError("Reviewed datasource IDs must not be empty")
+        expected = sorted({canonical_id(value) for value in datasource_ids}) if datasource_ids else None
+        import httpx
+
+        token = await self._get_token()
+        url = f"{_API}/groups/{workspace_id}/datasets/{dataset_id}/datasources"
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+                response.raise_for_status()
+                rows = self._history_rows(response.json(), label="datasource bindings")
+            bindings: dict[str, str] = {}
+            incomplete = False
+            for row in rows:
+                source_id, bound_gateway = row.get("datasourceId"), row.get("gatewayId")
+                if not source_id or not bound_gateway:
+                    incomplete = True
+                    continue
+                if not isinstance(source_id, str) or not isinstance(bound_gateway, str):
+                    raise ValueError("Datasource binding identifiers must be strings")
+                source_id, bound_gateway = canonical_id(source_id), canonical_id(bound_gateway)
+                if source_id in bindings and bindings[source_id] != bound_gateway:
+                    raise ValueError("Datasource binding evidence contradicts itself")
+                bindings[source_id] = bound_gateway
+            selected = expected if expected is not None else sorted(bindings)
+            matches = bool(selected) and all(bindings.get(key) == gateway_id for key in selected)
+            if expected is None and incomplete:
+                matches = False
+            configuration: dict[str, str | bool | list[str]] = {}
+            if matches:
+                configuration = {"gateway_id": gateway_id, "datasource_ids": selected}
+            return RefreshOutcome(
+                status="Completed" if matches else "Unknown", submission_state="submitted",
+                configuration=configuration,
                 detail=(
-                    f"Dataset rebound to gateway {gateway_id}."
-                    if ok
-                    else f"HTTP {resp.status_code}: {resp.text[:400]}"
+                    "The exact reviewed datasource bindings match the requested gateway."
+                    if matches else "The requested gateway configuration has not been verified."
                 ),
+            )
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            logger.warning("Gateway binding verification is unavailable (%s)", type(exc).__name__)
+            return RefreshOutcome(
+                status="Unknown", submission_state="submitted",
+                detail="The binding request remains unverified; do not repeat the write.",
             )
 
     async def get_refresh_schedule(
@@ -416,16 +648,12 @@ class LivePowerBIClient:
         url = f"{_API}/groups/{workspace_id}/datasets/{dataset_id}/refreshSchedule"
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
-            if resp.status_code >= 400:
-                logger.warning(
-                    "Could not read refresh schedule: HTTP %s %s",
-                    resp.status_code,
-                    resp.text[:200],
-                )
-                # Unknown is not the same as enabled. Returning True here would
-                # let the controller conclude there is nothing to fix.
-                return {"enabled": None, "error": f"HTTP {resp.status_code}"}
-            return resp.json()
+            resp.raise_for_status()
+            value = resp.json()
+            if not isinstance(value, dict) or type(value.get("enabled")) is not bool:
+                logger.error("Power BI returned an invalid refresh schedule")
+                raise ValueError("Refresh schedule has no explicit boolean enabled state")
+            return value
 
     async def set_refresh_schedule_enabled(
         self, workspace_id: str, dataset_id: str, enabled: bool
@@ -438,24 +666,32 @@ class LivePowerBIClient:
         it again, having burned a remediation and told somebody it was handled.
         """
         _require_ids(workspace_id, dataset_id)
+        if type(enabled) is not bool:
+            raise ValueError("Schedule enabled must be an explicit boolean")
+        url = f"{_API}/groups/{workspace_id}/datasets/{dataset_id}/refreshSchedule"
+        submission = await self._submit_configuration("PATCH", url, {"value": {"enabled": enabled}})
+        if submission.status != "Submitted":
+            return submission
+        return await self.verify_refresh_schedule(workspace_id, dataset_id, enabled)
+
+    async def verify_refresh_schedule(
+        self, workspace_id: str, dataset_id: str, enabled: bool,
+    ) -> RefreshOutcome:
+        if type(enabled) is not bool:
+            raise ValueError("Schedule enabled must be an explicit boolean")
         import httpx
 
-        started = time.time()
-        token = await self._get_token()
-        url = f"{_API}/groups/{workspace_id}/datasets/{dataset_id}/refreshSchedule"
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.patch(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                json={"value": {"enabled": enabled}},
-            )
-            ok = resp.status_code in (200, 202)
+        try:
+            schedule = await self.get_refresh_schedule(workspace_id, dataset_id)
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Schedule verification is unavailable (%s)", type(exc).__name__)
             return RefreshOutcome(
-                status="Completed" if ok else "Failed",
-                duration_ms=int((time.time() - started) * 1000),
-                detail=(
-                    f"Refresh schedule {'enabled' if enabled else 'disabled'}."
-                    if ok
-                    else f"HTTP {resp.status_code}: {resp.text[:400]}"
-                ),
+                status="Unknown", submission_state="submitted",
+                detail="The schedule request remains unverified; do not repeat the write.",
             )
+        matches = schedule["enabled"] is enabled
+        return RefreshOutcome(
+            status="Completed" if matches else "Unknown", submission_state="submitted",
+            configuration={"enabled": schedule["enabled"]},
+            detail="The requested schedule state is verified." if matches else "The schedule state does not yet match the request.",
+        )

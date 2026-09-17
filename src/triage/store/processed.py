@@ -28,6 +28,8 @@ import threading
 from pathlib import Path
 from typing import Any, Protocol
 
+from triage.store.azure_sql import SqlUnavailable, quote_identifier
+
 logger = logging.getLogger("triage.store.processed")
 
 
@@ -113,18 +115,10 @@ class JsonFileProcessedLog(InMemoryProcessedLog):
             self._path.unlink()
 
 
-class FabricSqlProcessedLog(InMemoryProcessedLog):
-    """Survives a container restart, which is the case that actually matters.
-
-    Degrades to in-memory rather than failing to start, matching the other
-    stores -- but keeps retrying, because a permanent degradation here means
-    every sweep re-triages every message it has already handled and notifies
-    about all of them again.
-    """
+class AzureSqlProcessedLog(InMemoryProcessedLog):
+    """Read-through processed state; an unconfirmed mark cannot finish work."""
 
     def __init__(self, *, db: Any, table: str = "triage_processed_messages") -> None:
-        from triage.store.fabric_sql import quote_identifier
-
         super().__init__()
         self._db = db
         self._table = quote_identifier(table)
@@ -136,34 +130,54 @@ class FabricSqlProcessedLog(InMemoryProcessedLog):
     def is_durable(self) -> bool:
         return self._loaded and self._db.is_available
 
-    def _ensure_loaded(self) -> bool:
-        if self._loaded:
-            return True
+    def _ensure_loaded(self, fingerprint: str | None = None) -> None:
+        self._loaded = False
+        self._items.clear()
         try:
-            self._load()
-        except Exception as exc:  # noqa: BLE001
+            self._load(fingerprint)
+        except Exception as exc:
             logger.error(
-                "Processed-message log degraded to in-memory: cannot read %s (%s). "
-                "Repeat sweeps will re-triage the same mail.",
-                self._table_name,
-                type(exc).__name__,
+                "Cannot read deployed processed-message state in %s (%s); ingestion stopped",
+                self._table_name, type(exc).__name__,
             )
-            return False
+            raise
         self._loaded = True
-        logger.info(
-            "Loaded %d processed message(s) from %s", len(self._items), self._table_name
-        )
-        return True
 
-    def _load(self) -> None:
-        rows = self._db.query(f"SELECT fingerprint, received_at FROM {self._table}")
-        self._items = {str(k): str(v or "") for k, v in rows}
+    def _load(self, fingerprint: str | None = None) -> None:
+        where = " WHERE fingerprint = ?" if fingerprint is not None else ""
+        params = (fingerprint,) if fingerprint is not None else ()
+        rows = self._db.query(f"SELECT fingerprint, received_at FROM {self._table}{where}", *params)
+        loaded: dict[str, str] = {}
+        try:
+            for key, received in rows:
+                if (
+                    not isinstance(key, str) or len(key) != 64 or key in loaded
+                    or (received is not None and not isinstance(received, str))
+                ):
+                    raise ValueError("Invalid processed-message row")
+                loaded[key] = received or ""
+        except (TypeError, ValueError) as exc:
+            raise SqlUnavailable(
+                f"Unreadable processed-message state in {self._table_name}; repair deployed state."
+            ) from exc
+        self._items = loaded
 
     def seen(self, message_id: str) -> bool:
-        # Guarded: answering "not seen" from an empty cache is what causes the
-        # duplicate notification this log exists to prevent.
-        self._ensure_loaded()
-        return super().seen(message_id)
+        with self._lock:
+            fingerprint = _fingerprint(message_id)
+            self._ensure_loaded(fingerprint)
+            return fingerprint in self._items
+
+    def count(self) -> int:
+        with self._lock:
+            self._ensure_loaded()
+            return len(self._items)
+
+    def mark(self, message_id: str, *, received_at: str = "") -> None:
+        with self._lock:
+            self._persist(message_id, received_at)
+            self._items[_fingerprint(message_id)] = received_at
+            self._loaded = True
 
     def _persist(self, message_id: str, received_at: str) -> None:
         fingerprint = _fingerprint(message_id)
@@ -175,30 +189,32 @@ class FabricSqlProcessedLog(InMemoryProcessedLog):
                 (message_id or "")[:512],
                 fingerprint,
             )
-            if not updated:
-                try:
-                    self._db.execute(
-                        f"INSERT INTO {self._table} "
-                        f"(fingerprint, message_id, received_at) VALUES (?, ?, ?)",
-                        fingerprint,
-                        (message_id or "")[:512],
-                        received_at,
-                    )
-                except self._db.integrity_error():
-                    # Another invocation recorded it first. Nothing to do: the
-                    # message is marked processed either way.
-                    pass
-        except Exception as exc:  # noqa: BLE001
-            # Failing to write means this message gets triaged again on the
-            # next sweep. That is noisy but safe, so the run continues.
+            if updated not in (0, 1):
+                raise SqlUnavailable("Processed-message update returned no reliable row count.")
+            if updated == 0:
+                inserted = self._db.execute(
+                    f"INSERT INTO {self._table} (fingerprint, message_id, received_at) "
+                    f"SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM {self._table} "
+                    "WITH (UPDLOCK, HOLDLOCK) WHERE fingerprint = ?)",
+                    fingerprint, (message_id or "")[:512], received_at, fingerprint,
+                )
+                if inserted not in (0, 1):
+                    raise SqlUnavailable("Processed-message insert returned no reliable row count.")
+        except Exception as exc:
             self._loaded = False
+            self._items.clear()
             logger.error(
-                "Could not record processed message (%s); it will be re-triaged",
+                "Processed-message write unconfirmed (%s); work must remain unfinished",
                 type(exc).__name__,
             )
+            raise
 
     def _on_reset(self) -> None:
+        self._loaded = False
         try:
-            self._db.execute(f"DELETE FROM {self._table}")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not clear %s (%s)", self._table_name, type(exc).__name__)
+            if self._db.execute(f"DELETE FROM {self._table}") < 0:
+                raise SqlUnavailable("Processed-message reset returned no reliable row count.")
+        except Exception as exc:
+            logger.error("Could not clear %s (%s)", self._table_name, type(exc).__name__)
+            raise
+        self._loaded = True

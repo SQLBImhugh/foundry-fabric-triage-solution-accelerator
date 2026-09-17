@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from itertools import count
 
 import pytest
 
 from triage.approvals import AutoApproveGate, AutoDenyGate, TimeoutGate
 from triage.knowledge.playbooks import PLAYBOOKS, Playbook
+from triage.monitoring.contracts import MonitoringConflict, MonitoringUnavailable
+from triage.monitoring.models import WorkClaimRequest
 from triage.pipeline_models import PipelineActivity, PipelineFailure, PipelineRun, PipelineTarget
 from triage.runner import Scenario, TriageRunner
 from triage.store.incidents import InMemoryIncidentStore
@@ -17,6 +20,37 @@ WORKSPACE = "10000000-0000-0000-0000-000000000001"
 PIPELINE = "20000000-0000-0000-0000-000000000002"
 RUN = "30000000-0000-0000-0000-000000000003"
 OTHER = "40000000-0000-0000-0000-000000000004"
+
+
+def _reservation(runner, artifact):
+    work = runner.monitoring.get_work(runner.monitoring_context, artifact.monitoring_work_id)
+    return (
+        runner.monitoring.get_action_reservation(runner.monitoring_context, work.action_reservation_id)
+        if work.action_reservation_id else None
+    )
+
+
+async def _follow_registered_actions(runner, client, monkeypatch) -> list[str]:
+    future = datetime.now(UTC) + timedelta(minutes=5)
+    ticks = count()
+
+    def now():
+        return future + timedelta(microseconds=next(ticks))
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            instant = now()
+            return instant if tz else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr("triage.monitoring.memory.MemoryBackend.now", lambda _self: now())
+    monkeypatch.setattr("triage.monitoring.controller.datetime", Clock)
+    monkeypatch.setattr("triage.runner.datetime", Clock)
+    work = runner.monitoring.claim_work(WorkClaimRequest(
+        **runner.monitoring_context.model_dump(), owner_id=OTHER,
+        kinds=("verify_action",), limit=20, per_workspace_limit=20, lease_seconds=120,
+    ))
+    return [await runner.execute_monitoring_work(item, pipeline_client=client) for item in work]
 
 
 def _target(**overrides) -> PipelineTarget:
@@ -115,7 +149,7 @@ async def test_unapproved_rerun_never_spends_or_submits(
     assert result.outcome == expected
     assert result.write_actions == 0
     assert not any(name == "rerun" for name, _ in client.calls)
-    assert pipeline_runner.build_pipeline_rerun_store().get(f"{target.key}:{RUN}") is None
+    assert _reservation(pipeline_runner, report.artifacts[0]) is None
 
 
 async def test_approved_rerun_is_resolved_only_after_correlated_completion(
@@ -129,13 +163,13 @@ async def test_approved_rerun_is_resolved_only_after_correlated_completion(
     assert result.write_actions == 1
     assert result.approvals[0].granted
     assert sum(name == "rerun" for name, _ in client.calls) == 1
-    record = pipeline_runner.build_pipeline_rerun_store().get(f"{target.key}:{RUN}")
-    assert record.state == "completed"
-    assert record.rerun_id != RUN
+    record = _reservation(pipeline_runner, report.artifacts[0])
+    assert record.state == "verified_succeeded"
+    assert record.submitted_execution.run_id != RUN
 
 
 async def test_in_progress_rerun_is_followed_on_the_next_sweep(
-    pipeline_runner, retry_playbook,
+    pipeline_runner, retry_playbook, monkeypatch,
 ) -> None:
     target = _target(rerun_safe=True, rerun_parameters={})
     client = MockFabricPipelineClient([_run()], rerun_status="InProgress")
@@ -143,15 +177,14 @@ async def test_in_progress_rerun_is_followed_on_the_next_sweep(
     assert first.artifacts[0].result.outcome == "needs_human"
     assert pipeline_runner.store.list_all()[0].status == "open"
     client.runs[-1] = client.runs[-1].model_copy(update={"status": "Completed", "end_time": NOW})
-    second = await pipeline_runner.pipeline_sweep(now=NOW, client=client, targets=[target])
-    assert second.artifacts == []
-    assert "verified Completed" in second.summary()
+    lines = await _follow_registered_actions(pipeline_runner, client, monkeypatch)
+    assert lines and "verification finalized" in lines[0]
     assert pipeline_runner.store.list_all()[0].status == "resolved"
     assert sum(name == "rerun" for name, _ in client.calls) == 1
 
 
 async def test_historical_backlog_does_not_reopen_a_verified_rerun(
-    pipeline_runner, retry_playbook,
+    pipeline_runner, retry_playbook, monkeypatch,
 ) -> None:
     pipeline_runner.settings.pipeline_max_runs_per_sweep = 1
     target = _target(rerun_safe=True, rerun_parameters={})
@@ -162,6 +195,7 @@ async def test_historical_backlog_does_not_reopen_a_verified_rerun(
     first = await pipeline_runner.pipeline_sweep(now=NOW, client=client, targets=[target])
     assert first.artifacts[0].incident.pipeline_failure.run.id == RUN
     client.runs[-1] = client.runs[-1].model_copy(update={"status": "Completed", "end_time": NOW})
+    await _follow_registered_actions(pipeline_runner, client, monkeypatch)
     second = await pipeline_runner.pipeline_sweep(now=NOW, client=client, targets=[target])
     assert second.artifacts == []
     incident = pipeline_runner.store.list_all()[0]
@@ -184,8 +218,7 @@ async def test_completed_job_with_failed_activity_is_not_resolved(
     report = await pipeline_runner.pipeline_sweep(now=NOW, client=client, targets=[target])
     result = report.artifacts[0].result
     assert result.outcome == "needs_human"
-    journal = pipeline_runner.build_pipeline_rerun_store()
-    assert journal.get(f"{target.key}:{RUN}").state == "failed"
+    assert _reservation(pipeline_runner, report.artifacts[0]).state == "verified_failed"
 
 
 async def test_completed_job_without_activity_evidence_stays_unverified(
@@ -195,7 +228,7 @@ async def test_completed_job_without_activity_evidence_stays_unverified(
     client = MockFabricPipelineClient([_run()], rerun_activities=[])
     report = await pipeline_runner.pipeline_sweep(now=NOW, client=client, targets=[target])
     assert report.artifacts[0].result.outcome == "needs_human"
-    assert pipeline_runner.build_pipeline_rerun_store().get(f"{target.key}:{RUN}").state == "submitted"
+    assert _reservation(pipeline_runner, report.artifacts[0]).state == "submitted"
 
 
 async def test_ambiguous_submission_is_fenced_across_another_attempt(
@@ -211,37 +244,45 @@ async def test_ambiguous_submission_is_fenced_across_another_attempt(
     client = LostAcknowledgement([_run()])
     first = await pipeline_runner.pipeline_sweep(now=NOW, client=client, targets=[target])
     assert first.artifacts[0].result.outcome == "needs_human"
-    journal = pipeline_runner.build_pipeline_rerun_store()
-    assert journal.get(f"{target.key}:{RUN}").state == "unknown"
+    assert _reservation(pipeline_runner, first.artifacts[0]).state == "uncertain"
     # Even without source-event dedup or a known incident, the persisted fence
     # prevents another submission of this particular failed job.
     pipeline_runner.store = InMemoryIncidentStore()
-    artifact = await pipeline_runner._triage_pipeline(
-        PipelineFailure(target=target, run=_run()), client=client,
-        reruns=pipeline_runner.build_pipeline_rerun_store(),
-    )
-    assert artifact.result.write_actions == 0
+    with pytest.raises(MonitoringConflict, match="completed or owned"):
+        await pipeline_runner._triage_pipeline(
+            PipelineFailure(target=target, run=_run()), client=client,
+            reruns=pipeline_runner.build_pipeline_rerun_store(),
+        )
     assert sum(name == "rerun" for name, _ in client.calls) == 1
 
 
 async def test_lost_correlation_write_does_not_claim_no_rerun_occurred(
     pipeline_runner, retry_playbook, monkeypatch,
 ) -> None:
-    from triage.store.pipeline_reruns import InMemoryPipelineRerunStore
-
-    class FailingCorrelationStore(InMemoryPipelineRerunStore):
-        def update(self, record, *, expected):
-            raise ConnectionError("Correlation write unavailable")
-
-    journal = FailingCorrelationStore()
     target = _target(rerun_safe=True, rerun_parameters={})
     client = MockFabricPipelineClient([_run()])
-    monkeypatch.setattr(pipeline_runner, "build_pipeline_rerun_store", lambda: journal)
+    submitted = []
+
+    def fail_submission(request, *, commit):
+        assert commit.work_id == pipeline_runner.monitoring.get_action_reservation(
+            pipeline_runner.monitoring_context, request.reservation_id,
+        ).request.work_id
+        submitted.append(request)
+        raise MonitoringUnavailable("Correlation write unavailable")
+
+    monkeypatch.setattr(pipeline_runner.monitoring, "record_action_submission", fail_submission)
     report = await pipeline_runner.pipeline_sweep(now=NOW, client=client, targets=[target])
-    assert report.artifacts[0].result.outcome == "needs_human"
+    assert report.status == "incomplete"
+    assert report.artifacts == []
     assert sum(name == "rerun" for name, _ in client.calls) == 1
-    assert journal.get(f"{target.key}:{RUN}").state == "reserved"
-    assert client.runs[-1].id in pipeline_runner.build_teams().messages[-1].action_taken
+    record = pipeline_runner.monitoring.get_action_reservation(
+        pipeline_runner.monitoring_context, submitted[0].reservation_id,
+    )
+    assert record.state == "reserved"
+    work = pipeline_runner.monitoring.get_work(pipeline_runner.monitoring_context, record.request.work_id)
+    assert work.state == "leased"
+    assert submitted[0].submitted_execution.run_id == client.runs[-1].id
+    assert not any(message.action_taken == "No pipeline rerun was performed." for message in pipeline_runner.build_teams().messages)
 
 
 @pytest.mark.parametrize("status", ["InProgress", "NotStarted", "Completed"])
@@ -458,5 +499,7 @@ def test_pipeline_scenario_runs_through_the_real_cli_offline(
 
     restored = JsonFileIncidentStore(tmp_path / "runs" / "incidents.json").list_all()
     assert len(restored) == 1
-    assert restored[0].pipeline_failure.run.id == RUN
+    from triage.monitoring.runtime import stable_id
+
+    assert restored[0].pipeline_failure.run.id == stable_id(f"fixture:scenario10-pipeline-rerun-approved:pipeline-run:{RUN}")
     assert restored[0].pipeline_failure.run.end_time.tzinfo is not None

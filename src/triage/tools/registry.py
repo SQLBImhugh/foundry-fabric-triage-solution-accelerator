@@ -17,13 +17,27 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from triage.approvals import DEFAULT_TIMEOUT_SECONDS, ApprovalGate, ApprovalRequest
+from triage.approvals import (
+    DEFAULT_TIMEOUT_SECONDS,
+    ApprovalDecision,
+    ApprovalGate,
+    ApprovalRequest,
+    AutoApproveGate,
+    AutoDenyGate,
+    WebApprovalGate,
+)
 from triage.knowledge.refresh_history import assess_deactivation_risk
 from triage.models import ApprovalRecord, BIRequest, DataQualityFinding, TriageAction
+from triage.monitoring.contracts import (
+    MonitoringConflict,
+    MonitoringLeaseLost,
+    MonitoringStoreError,
+)
+from triage.monitoring.controller import MonitoringExecution, current_execution
 from triage.observability import tool_span
 from triage.policy import (
     REMEDIATION_ACTIONS,
@@ -32,25 +46,14 @@ from triage.policy import (
     is_remediation,
     requires_approval,
 )
+from triage.store.azure_sql import SqlUnavailable
 from triage.tools.dataset import DatasetSource
-from triage.tools.flags import DataQualityFlagTable, build_flag
+from triage.tools.flags import FlagStore, build_flag
 from triage.tools.pipeline_actions import PipelineToolContext
-from triage.tools.powerbi import PowerBIClient
+from triage.tools.powerbi import MockPowerBIClient, PowerBIClient
 from triage.tools.teams import ResolutionSummary, TeamsNotifier
 
 logger = logging.getLogger("triage.tools")
-
-# Actions whose dispatch is subject to a deterministic precondition. Their
-# remediation charge is deferred until the check passes, so being refused never
-# costs the run its one remediation.
-_PRECONDITIONED_ACTIONS: frozenset[str] = frozenset(
-    {
-        "refresh_powerbi_dataset",
-        "reenable_refresh_schedule",
-        "rerun_fabric_pipeline",
-    }
-)
-
 
 # ---------------------------------------------------------------------------
 # Function-calling schemas
@@ -174,7 +177,8 @@ TRIAGE_TOOLS: list[dict[str, Any]] = [
             "description": (
                 "REMEDIATION. Trigger a Power BI dataset refresh via the REST API. "
                 "Only valid for a Tier 1 transient failure with no outstanding data "
-                "quality issue. The controller permits exactly one remediation per run."
+                "quality issue. The controller requires current monitoring admission "
+                "and a durable incident-budget reservation before submitting a refresh."
             ),
             "parameters": {
                 "type": "object",
@@ -195,9 +199,9 @@ TRIAGE_TOOLS: list[dict[str, Any]] = [
             "description": (
                 "REMEDIATION REQUIRING HUMAN APPROVAL. Rebind the dataset to a "
                 "different data gateway. Use only when refresh history shows the "
-                "SAME failure repeating, so another refresh will not help. This "
-                "affects every dataset bound to the gateway, not just this one, "
-                "so a human must authorise it before it runs. Propose it, explain "
+                "SAME failure repeating, so another refresh will not help. This changes "
+                "the selected dataset's binding and may add load to a shared gateway, "
+                "so a human must authorise the reviewed configuration. Propose it, explain "
                 "why, and accept the answer."
             ),
             "parameters": {
@@ -406,7 +410,7 @@ class ToolContext:
     ledger: PolicyLedger
     powerbi: PowerBIClient | None
     teams: TeamsNotifier
-    flag_table: DataQualityFlagTable
+    flag_table: FlagStore
     datasets: dict[str, DatasetSource] = field(default_factory=dict)
     known_incident: Any = None  # Incident | None, set by the orchestrator
     signature: str = ""
@@ -444,6 +448,8 @@ class ToolContext:
     approvals: list[ApprovalRecord] = field(default_factory=list)
     gateway_rebound_to: str = ""
     deactivation_risk: Any = None
+    monitoring: MonitoringExecution | None = field(default_factory=current_execution)
+    pending_approval: tuple[ApprovalRequest, ApprovalDecision] | None = None
 
     def default_dataset(self) -> DatasetSource | None:
         return next(iter(self.datasets.values()), None)
@@ -461,6 +467,8 @@ class ToolDispatcher:
         self.ctx = ctx
         self._dq_agent = dq_agent
         self.actions: list[TriageAction] = []
+        if ctx.pipeline is not None:
+            ctx.pipeline.monitoring = ctx.monitoring
 
     def _refusal_guidance(self) -> str:
         """Tell the model what it may still do, not just what it may not.
@@ -506,7 +514,7 @@ class ToolDispatcher:
         # precondition. A refused action must never spend the run's one
         # remediation -- otherwise the next legitimate fix is denied for a
         # reason nobody can see.
-        defer_charge = gated or name in _PRECONDITIONED_ACTIONS
+        defer_charge = is_remediation(name)
 
         try:
             # Gated actions defer the remediation charge until a human has
@@ -534,6 +542,8 @@ class ToolDispatcher:
             or not arguments["justification"].strip()
         ):
             blocked_reason = "Supply only a non-empty justification. The controller owns target IDs and replay parameters."
+        elif name == "rebind_dataset_gateway" and not str(arguments.get("target_gateway") or "").strip():
+            blocked_reason = "A reviewed target gateway is required before requesting approval."
         else:
             blocked_reason = await self._precondition_failure(name)
         if blocked_reason is not None:
@@ -559,38 +569,33 @@ class ToolDispatcher:
                     blocked=True,
                 )
                 return approval_result
-            if name == "rerun_fabric_pipeline":
-                # A human can take minutes. Recheck execution state after the
-                # decision, then atomically reserve before spending or acting.
-                blocked_reason = await self._precondition_failure(name)
-                if blocked_reason is None:
-                    try:
-                        if self.ctx.pipeline is None or not self.ctx.pipeline.reserve():
-                            blocked_reason = "A rerun was already reserved by another invocation."
-                    except ValueError as exc:
-                        logger.warning("Pipeline rerun reservation refused: %s", exc)
-                        blocked_reason = str(exc)
-                    except Exception as exc:
-                        logger.exception("Pipeline rerun reservation failed")
-                        blocked_reason = f"Could not persist the rerun reservation ({type(exc).__name__})."
-                if blocked_reason is not None:
-                    self._record(name, arguments, blocked_reason, started, blocked=True)
-                    return {"status": "blocked_by_policy", "reason": blocked_reason}
-            try:
-                self.ctx.ledger.charge_write(name)
-            except PolicyViolation as violation:
-                self._record(name, arguments, f"BLOCKED: {violation.message}", started, blocked=True)
-                return {
-                    "status": "blocked_by_policy",
-                    "reason": violation.message,
-                    "guidance": (
-                        "Approval was granted but the remediation budget is spent. "
-                        "Notify a human and report 'needs_human'."
-                    ),
-                }
-        elif defer_charge:
-            # Non-gated, but its precondition has now passed, so it really is a
-            # remediation and must be charged as one.
+        if defer_charge:
+            # Approval is not execution authority. Recheck after the human wait,
+            # then consume consent and shared budget in the SQL reservation.
+            blocked_reason = await self._precondition_failure(name)
+            if blocked_reason is None and self.ctx.monitoring is not None:
+                approval = None
+                if self.ctx.pending_approval is not None:
+                    approval = self.ctx.monitoring.approval_reference(*self.ctx.pending_approval)
+                proposal_arguments = (
+                    self.ctx.pending_approval[0].arguments if self.ctx.pending_approval is not None else arguments
+                )
+                allowed, reason = self.ctx.monitoring.reserve(name, approval, proposal_arguments)
+                if not allowed:
+                    blocked_reason = reason
+            elif blocked_reason is None and name == "rerun_fabric_pipeline":
+                if self.ctx.pipeline is None or not self.ctx.pipeline.reserve():
+                    blocked_reason = "A rerun was already reserved by another fixture invocation."
+            if blocked_reason is not None:
+                self._record(name, arguments, blocked_reason, started, blocked=True)
+                return {"status": "blocked_by_policy", "reason": blocked_reason}
+            if self.ctx.monitoring is None and self.ctx.pending_approval is not None:
+                _, decision = self.ctx.pending_approval
+                gate = self.ctx.approval_gate
+                if gate is None or (hasattr(gate, "consume") and not gate.consume(decision)):
+                    self.ctx.ledger.record_approval_denied(name)
+                    self._record(name, arguments, "Approval already used", started, blocked=True)
+                    return {"status": "not_approved", "reason": "Approval already used."}
             try:
                 self.ctx.ledger.charge_write(name)
             except PolicyViolation as violation:
@@ -605,7 +610,7 @@ class ToolDispatcher:
         with tool_span(name):
             try:
                 result = await self._execute(name, arguments)
-            except PolicyViolation:
+            except (PolicyViolation, MonitoringStoreError, SqlUnavailable):
                 raise
             except Exception as exc:  # noqa: BLE001 - tool errors are data
                 logger.exception("Tool '%s' raised", name)
@@ -635,17 +640,22 @@ class ToolDispatcher:
             if name == "rerun_fabric_pipeline" and ctx.pipeline is not None
             else dict(arguments or {})
         )
-        request = ApprovalRequest(
-            action=name,
-            arguments=approval_arguments,
+        fields = dict(
             justification=str(arguments.get("justification", "")),
-            request_id=f"{ctx.request.request_id}:{name}",
             report_name=ctx.request.report_name or "",
             signature=ctx.signature,
             impact=_impact_of(name, approval_arguments),
             timeout_seconds=ctx.approval_timeout_seconds,
             run_id=ctx.run_id,
         )
+        request = (
+            ctx.monitoring.approval_request(name, approval_arguments, **fields)
+            if ctx.monitoring is not None else ApprovalRequest(
+                action=name, arguments=approval_arguments,
+                request_id=f"{ctx.request.request_id}:{name}", **fields,
+            )
+        )
+        ctx.pending_approval = None
 
         if gate is None:
             logger.warning("No approval gate configured; refusing '%s'", name)
@@ -674,12 +684,29 @@ class ToolDispatcher:
         # budget, and with both limits at 300s an honest approval would other-
         # wise kill the run as `timed_out` at the moment it was granted.
         with ctx.ledger.awaiting_human():
+            if ctx.monitoring is not None:
+                channel = ctx.monitoring.approval_channel
+                if isinstance(gate, WebApprovalGate):
+                    channel.open_exact(request)
+                else:
+                    channel.open(request)
+                ctx.monitoring.bind_approval(request)
             decision = await gate.request_approval(request)
+            if (
+                ctx.monitoring is not None and ctx.monitoring.fixture
+                and isinstance(gate, (AutoApproveGate, AutoDenyGate))
+            ):
+                ctx.monitoring.approval_channel.decide_exact(
+                    request.request_id, decision="approve" if decision.granted else "decline",
+                    responder=decision.decided_by, fingerprint=request.fingerprint,
+                    reason=decision.reason,
+                )
+                decision = replace(decision, decided_at=ctx.monitoring.clock())
         waited_ms = int((time.monotonic() - started) * 1000)
 
-        valid, why = decision.is_valid_for(request)
-        if valid and hasattr(gate, "consume") and not gate.consume(decision):
-            valid, why = False, "approval already used"
+        valid, why = decision.is_valid_for(request, now=ctx.monitoring.clock() if ctx.monitoring else None)
+        if valid:
+            ctx.pending_approval = (request, decision)
 
         record = ApprovalRecord(
             action=name,
@@ -725,6 +752,30 @@ class ToolDispatcher:
         """
         ctx = self.ctx
 
+        if is_remediation(name):
+            if ctx.ledger.write_actions >= ctx.ledger.policy.max_write_actions:
+                ctx.ledger.blocked_attempts.append(name)
+                return f"The remediation budget is already exhausted; max_write_actions={ctx.ledger.policy.max_write_actions}."
+            if ctx.monitoring is not None:
+                try:
+                    ctx.monitoring.current_work()
+                    target = ctx.monitoring.current_target()
+                    if not target.action.enabled:
+                        return "The target is observation-only."
+                    await ctx.monitoring.recheck_source(name)
+                except MonitoringLeaseLost:
+                    raise
+                except MonitoringConflict as exc:
+                    return str(exc)
+            if ctx.monitoring is None and (
+                ctx.pipeline.live if ctx.pipeline is not None
+                else not isinstance(ctx.powerbi, MockPowerBIClient)
+            ):
+                return "Live remediation requires an admitted exact execution and a shared monitoring work lease."
+            if ctx.known_incident is not None and (
+                ctx.monitoring is None or ctx.monitoring.work.kind != "deferred_retry"
+            ):
+                return "The failure already has an open incident; do not remediate it again."
         if name == "rerun_fabric_pipeline":
             if ctx.pipeline is None:
                 return "This request has no controller-verified pipeline failure."
@@ -791,6 +842,8 @@ class ToolDispatcher:
                 "now would fail again and disable it again. Fix the cause, get one "
                 "successful refresh, then re-enable."
             )
+        if ctx.monitoring is not None and not ctx.monitoring.fixture:
+            ctx.monitoring.observe_successful_refresh(latest)
         return None
 
     async def _acknowledge_decision(
@@ -824,7 +877,7 @@ class ToolDispatcher:
             timestamp=record.decided_at,
             detail=(
                 record.reason
-                or ("The agent may now perform this one action." if granted else "")
+                or ("The proposal was approved; current monitoring admission is still required." if granted else "")
             ),
             facts={
                 "Decided by": record.decided_by or "nobody",
@@ -933,22 +986,32 @@ class ToolDispatcher:
             return finding.model_dump()
 
         if name == "refresh_powerbi_dataset":
-            outcome = await ctx.require_powerbi().refresh_dataset(ctx.workspace_id, ctx.dataset_id)
+            outcome = (
+                await ctx.monitoring.refresh(ctx.require_powerbi())
+                if ctx.monitoring is not None
+                else await ctx.require_powerbi().refresh_dataset(ctx.workspace_id, ctx.dataset_id)
+            )
             ctx.remediation_outcome = outcome
+            if ctx.monitoring is not None and ctx.monitoring.reservation is not None:
+                ctx.retry_deferred = ctx.monitoring.reservation.retry_work_id is not None
             return {
                 "status": outcome.status,
                 "succeeded": outcome.succeeded,
                 "request_id": outcome.request_id,
                 "duration_ms": outcome.duration_ms,
                 "detail": outcome.detail,
+                "retry_work_id": ctx.monitoring.reservation.retry_work_id if ctx.monitoring and ctx.monitoring.reservation else None,
             }
 
         if name == "rebind_dataset_gateway":
             target = str(args.get("target_gateway") or "").strip()
             if not target:
                 return {"status": "refused", "reason": "No target gateway supplied."}
-            outcome = await ctx.require_powerbi().rebind_gateway(
-                ctx.workspace_id, ctx.dataset_id, target
+            outcome = (
+                await ctx.monitoring.configure(ctx.require_powerbi())
+                if ctx.monitoring is not None else await ctx.require_powerbi().rebind_gateway(
+                    ctx.workspace_id, ctx.dataset_id, target,
+                )
             )
             ctx.remediation_outcome = outcome
             ctx.gateway_rebound_to = target
@@ -984,7 +1047,7 @@ class ToolDispatcher:
                 evidence=finding.evidence,
                 detail=str(args.get("detail") or finding.detail)[:1000],
             )
-            ctx.flag_table.append(flag)
+            flag = ctx.flag_table.append(flag)
             ctx.flag_written = True
             return {"status": "written", "flag": flag.model_dump()}
 
@@ -992,11 +1055,11 @@ class ToolDispatcher:
             reported_outcome = str(args.get("outcome", ""))
             reported_action = str(args.get("action_taken", ""))
             reported_detail = str(args.get("detail", ""))
-            if ctx.pipeline is not None and reported_outcome == "resolved":
+            if reported_outcome == "resolved":
                 if ctx.remediation_outcome is None or not ctx.remediation_outcome.succeeded:
-                    logger.warning("Pipeline notification claimed resolution without a completed rerun")
+                    logger.warning("Notification claimed resolution without verified remediation")
                     reported_outcome = "needs_human"
-                    reported_detail = "Pipeline execution has not been verified successful. " + reported_detail
+                    reported_detail = "Remediation has not been verified successful. " + reported_detail
             if ctx.pipeline is not None:
                 actual = ctx.pipeline.outcome
                 reported_action = (
@@ -1078,8 +1141,11 @@ class ToolDispatcher:
             }
 
         if name == "reenable_refresh_schedule":
-            outcome = await ctx.require_powerbi().set_refresh_schedule_enabled(
-                ctx.workspace_id, ctx.dataset_id, True
+            outcome = (
+                await ctx.monitoring.configure(ctx.require_powerbi())
+                if ctx.monitoring is not None else await ctx.require_powerbi().set_refresh_schedule_enabled(
+                    ctx.workspace_id, ctx.dataset_id, True,
+                )
             )
             # Records the completed remediation, which is what
             # ``_validate_outcome`` checks before it will accept "resolved".
@@ -1104,6 +1170,12 @@ class ToolDispatcher:
                         "never run. Report needs_human instead of deferring."
                     ),
                 }
+            if ctx.monitoring is not None:
+                target = ctx.monitoring.current_target()
+                if not target.action.enabled or target.action.action != "powerbi_refresh":
+                    return {"status": "refused", "reason": "Observation-only admission cannot schedule a future remediation."}
+                if ctx.monitoring.reservation is not None:
+                    return {"status": "refused", "reason": "An existing action fence permits read-only reconciliation, not a new retry."}
             requested = int(args.get("retry_after_seconds") or 0)
             row = ctx.retries.defer(
                 signature=ctx.signature,
@@ -1113,7 +1185,13 @@ class ToolDispatcher:
                 report_name=ctx.request.report_name or "",
                 reason=str(args.get("reason", "")),
                 retry_after_seconds=max(0, requested),
+                **({
+                    "source_execution": ctx.monitoring.work.execution.model_dump(mode="json"),
+                    "policy_revision": ctx.monitoring.store.snapshot(ctx.monitoring.context).control.revision,
+                } if ctx.monitoring is not None else {}),
             )
+            if ctx.monitoring is not None and row.get("status") == "pending":
+                ctx.monitoring.schedule_retry(row)
             ctx.retry_deferred = row.get("status") == "pending"
             return {
                 "status": row.get("status"),
@@ -1179,8 +1257,8 @@ def _impact_of(action: str, arguments: dict[str, Any]) -> str:
     if action == "rebind_dataset_gateway":
         target = arguments.get("target_gateway", "the target gateway")
         return (
-            f"Repoints this dataset to {target}. Other datasets bound to either "
-            "gateway may be affected, and in-flight refreshes will fail."
+            f"Repoints this dataset to {target}. This changes its future routing and may "
+            "add load to a shared gateway; it does not change other datasets' bindings."
         )
     if action == "reenable_refresh_schedule":
         return (

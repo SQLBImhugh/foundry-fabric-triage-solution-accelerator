@@ -35,10 +35,10 @@ from triage.command_center.incident_models import (
 )
 from triage.command_center.models import Actor, ApiFailure, AskInput
 from triage.models import Incident
-from triage.store.fabric_sql import SqlUnavailable
+from triage.store.azure_sql import SqlUnavailable
 from triage.store.incident_workflow import (
     DEFAULT_ACTIVITY_TABLE,
-    FabricSqlIncidentWorkflowStore,
+    AzureSqlIncidentWorkflowStore,
     IncidentProjection,
     IncidentQuery,
     IncidentWorkflowStore,
@@ -87,8 +87,8 @@ class IncidentWorkflowService:
         if store is None:
             if runtime.web.mode == "live":
                 if runtime.db is None:
-                    raise ValueError("Live incident collaboration requires a Fabric SQL database")
-                store = FabricSqlIncidentWorkflowStore(
+                    raise ValueError("Live incident collaboration requires a Azure SQL database")
+                store = AzureSqlIncidentWorkflowStore(
                     runtime.db, activity_table=activity_table,
                     incident_table=runtime.settings.incident_table_name,
                 )

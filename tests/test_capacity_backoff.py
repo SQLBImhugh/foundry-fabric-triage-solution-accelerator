@@ -271,6 +271,26 @@ async def test_nothing_is_drained_before_it_is_due(runner) -> None:
     assert await runner.drain_due_retries() == []
 
 
+async def test_agent_scheduled_retry_reuses_its_original_monitoring_work(runner, repo_root) -> None:
+    from triage.monitoring.runtime import stable_id
+    from triage.runner import Scenario
+
+    artifacts = await runner.run_scenario(Scenario.load(repo_root / "scenarios" / "scenario8-capacity-backoff.yaml"))
+    assert artifacts[0].result.outcome == "deferred_retry"
+    row = runner.retries.pending()[0]
+    from triage.monitoring.models import SourceExecutionIdentity
+
+    source = SourceExecutionIdentity.model_validate(row["source_execution"])
+    identifier = stable_id(f"{source.key}:deferred-retry")
+    before = runner.monitoring.get_work(runner.monitoring_context, identifier)
+    lines = await runner.drain_due_retries(now=datetime.now(UTC) + timedelta(hours=2))
+    after = runner.monitoring.get_work(runner.monitoring_context, identifier)
+    assert lines and "completed" in lines[0]
+    assert after.work_id == before.work_id
+    assert after.state == "completed"
+    assert runner.retries.pending() == []
+
+
 # ---------------------------------------------------------------------------
 # The claim has to be backed by a row
 # ---------------------------------------------------------------------------

@@ -1,286 +1,342 @@
 # Scheduled Fabric pipeline triage
 
-The controller can monitor explicitly configured Fabric Data Factory pipelines,
-triage failed scheduled jobs, and request approval for a bounded full-pipeline
-rerun. It uses the existing Foundry agent, policy ledger, approval channel and
-Fabric SQL incident store. The Power BI mailbox and silent-failure paths remain
-separate.
+The hybrid implementation discovers Fabric items, admits selected pipelines
+through a shared monitoring registry, and collects job evidence through REST
+and an owned Eventstream. The controller can triage a verified failed scheduled
+execution and request approval for a bounded full-pipeline rerun. Discovery and
+collection do not authorize remediation.
+
+All accelerator application state, including pipeline admission, approvals and
+rerun reservations, uses one shared Azure SQL Database. The pipeline jobs,
+activity evidence and native Eventstream transport remain Fabric services.
+
+This guide describes the independently reviewed SQL contract and in-progress
+adapter/controller integration, not completed deployment acceptance. Isolated
+MI transport has received the four observed wire types across manual failure,
+scheduled failure, success and cancellation; that does not prove SQL durable
+handling or normal-worker readiness. The shipped network baseline is public,
+with scoped evaluation SQL/registry access enabled and verified and the public
+Foundry path retained. It requires no VNet, NAT or private endpoint; the worker
+still has no ingress. The original SQL proof receipt is under recovery, so
+bootstrap completion and runtime permissions remain gated. The earlier private
+Foundry preflight error does not block this public architecture.
+The live app/controller remain the prior release, with no history migration/wipe,
+normal worker, hybrid cutover or current-release UI screenshots.
+Earlier private-network and Fabric SQL checks remain historical.
+Keep normal collection and the controller heartbeat gated as described in
+[DeploymentGuide.md](DeploymentGuide.md#12-hybrid-monitoring-worker-and-eventstream).
 
 ## Monitoring contract
 
-`bi-triage pipelines` performs one bounded sweep. A scheduler invokes the hosted
-controller with `pipeline sweep`; it does not send synthetic failure emails.
+In live mode, `bi-triage pipelines` and the hosted `pipeline sweep` request queue
+read-only polling work for currently admitted registry targets. A queued response
+is not a completed scan or remediation. The worker performs collection; the
+controller's `heartbeat` dispatches eligible source work and human commands.
+Do not add another static-target polling scheduler.
 
-The sweep reads the
-[Job Scheduler run list](https://learn.microsoft.com/rest/api/fabric/core/job-scheduler/list-item-job-instances),
-validates that the configured item is a `DataPipeline`, selects
-`invokeType=Scheduled`, `status=Failed` with an end time inside the lookback,
-and re-reads each selected job. Documented `Pipeline` and `Execute` job types
-are recognized for intake. Reruns use the verified Core `Pipeline` route;
-`Execute` jobs are triaged but not automatically mapped onto that route.
-It retrieves activity
-diagnostics through the
+The worker persists observations, not an admitted source or authoritative head.
+Deterministic controller `reconcile_state` work validates the original intake
+and current scope before publication; it invokes neither an agent nor a
+remediation. Live stores select their SQL component explicitly and use checked
+views/static RPCs. An accepted intent or page remains pending until the required
+controller publication, not a successful scan inferred from an HTTP reply.
+
+The collector reads the
+[Job Scheduler run list](https://learn.microsoft.com/rest/api/fabric/core/job-scheduler/list-item-job-instances).
+The controller re-reads the exact execution and requires a supported
+`DataPipeline` job, `invokeType=Scheduled`, `status=Failed`, and trustworthy
+start/completion evidence. Documented `Pipeline` and `Execute` job types are
+recognized for intake; intake support is not permission to choose another
+submission route. Preserve the controller's job-type checks and fixed Core
+`Pipeline` rerun route.
+
+The controller obtains activity diagnostics through the
 [pipeline activity-run API](https://learn.microsoft.com/fabric/data-factory/pipeline-rest-api-capabilities#query-activity-runs).
-Activity names, types, statuses and error details are evidence; activity inputs
-and outputs are not sent to the agent or stored.
+Names, types, statuses and error details are evidence. Activity inputs and
+outputs are not sent to the model or persisted as diagnostics. Notebook
+activities remain pipeline evidence; this is not standalone notebook monitoring.
 
-Notebook activities are included as pipeline evidence. This is not standalone
-notebook-job monitoring, and a notebook cannot be added as an independent
-monitoring target through the command center.
+Canonical target identity includes tenant, epoch, workload, workspace and item
+IDs. Display names are labels. The exact job identity deduplicates
+poll/event/operator overlap, while normalized failure signatures correlate
+distinct executions without replenishing an open incident's remediation budget.
+Historical failures add occurrences without replacing newer evidence or reopening
+a verified resolution. That is incident correlation, not historical backfill.
 
-The source run ID prevents processing the same job on every poll. A separate
-signature, scoped to workspace and pipeline IDs, groups new runs with the same
-failure into one open incident. A pipeline-scoped SQL claim serializes this
-controller's work; notification deduplication remains controller-enforced.
-Historical failures discovered after a newer occurrence are counted without
-replacing the latest evidence or reopening its verified resolution. This is
-incident correlation, not a claim that older data windows were backfilled.
+SQL ownership and fencing protect across processes and invocations. Each REST
+page has a durable identity, expected prior cursor/checkpoint, observation window
+and current work fence. All observations are accepted or explicitly dispositioned
+before that page advances. A partial page is not a completed observation window.
+After a lost commit acknowledgement, reconcile that exact receipt.
+Decode the typed RPC result rather than inferring success from EXEC rowcount.
+Current source reads/publication use `controller.publish_source` under the
+required work/target leases; no-effect dispositions and processed markers use
+`controller.disposition_source`. Raw source/head/disposition writes are not an
+alternate live route.
 
-An API failure, malformed response, unknown trigger, pagination limit, or missing
-evidence is not a healthy result. Monitoring faults are persisted separately as
-`fabric_pipeline_monitor` incidents. The CLI returns a nonzero status for an
-incomplete sweep; the hosted pipeline path propagates that fault to its host.
-Disabled and unconfigured monitors report those states explicitly.
+Malformed responses, unknown invocation/status, permission failures, throttling,
+expired ownership and unfinished pagination are coverage gaps, not healthy empty
+lists. The list API generally retains only the most recent 100 completed jobs
+plus active jobs. A retained window that does not reach the requested lookback
+is incomplete even when every returned page was read.
 
-The list API generally retains only the most recent 100 completed jobs, plus
-active jobs. The configured lookback is a filter, not a guarantee that older
-history remains available. A full retained window that does not reach the
-lookback produces a coverage warning. Poll frequently enough for the pipeline's
-run rate, or use a longer-lived monitoring log.
+The initial hybrid detector does not infer a failure from a schedule's existence,
+a disabled schedule, a job that never started, a manual execution or a cancelled
+execution. Missing expected starts need a separate expected-slot/grace detector.
+Power BI's scheduled-refresh deactivation rule is not a pipeline rule.
 
-This path does not infer failures from a disabled schedule, a job that never
-started, a manual execution, or a cancelled execution. It does not apply Power
-BI's scheduled-refresh deactivation rule to pipelines.
+## Collection and scope
 
-## Monitoring options
-
-| Method | Use | Limits |
+| Method | Role | Limit |
 |---|---|---|
-| Core Job Scheduler polling | Implemented baseline; minimal additional infrastructure and explicit scheduled-run attribution | Recent-job retention is count-limited. Persist run keys and report gaps rather than assuming complete history. |
-| [Fabric Job events](https://learn.microsoft.com/fabric/real-time-hub/explore-fabric-job-events) and Activator | Lower-latency notification; pipelines are a documented source | `ItemJobFailed` also covers stuck/cancelled jobs. Enrich the event's job ID through REST before triage. This repository does not provision an event subscription or claim a native Foundry webhook trigger. |
-| [Workspace monitoring/KQL](https://learn.microsoft.com/fabric/data-factory/workspace-monitoring) | Workspace-wide run/activity analysis and longer-lived operational trends | Preview; the [monitoring overview](https://learn.microsoft.com/fabric/fundamentals/workspace-monitoring-overview) documents 30-day retention and private-link limitations. The pipeline-specific page also limits error details/diagnostics. |
-| Native scheduled-failure email | An existing operations mailbox can receive the notification | Email is a signal, not authoritative run evidence. It must not bypass the inbox filter or choose executable target IDs. |
+| Core Job Scheduler polling | Authoritative execution evidence and reconciliation | Recent completed-job history is count-limited. Persist continuations and expose retention gaps. |
+| [Fabric Job events](https://learn.microsoft.com/fabric/real-time-hub/explore-fabric-job-events) through Eventstream | Lower-latency intake for verified per-item sources | `ItemJobFailed` can include stuck/cancelled jobs; REST must establish eligible failed scheduled execution. |
+| [Workspace monitoring/KQL](https://learn.microsoft.com/fabric/data-factory/workspace-monitoring) | Separate workspace operational analysis | Its support, retention and private-link limits are not guarantees of this collector. |
+| Native scheduled-failure email | Optional signal through the approved mailbox filter | Email cannot choose arbitrary executable targets or replace exact source evidence. |
 
-For eventing, the [private-link support matrix](https://learn.microsoft.com/fabric/security/security-private-links-overview#activator)
-distinguishes direct Fabric events to Activator from Eventstream to Activator.
-Do not assume that a working private polling path proves either eventing path.
-Reconciliation polling is still needed for missed or paused event delivery.
+Activator and Power Automate are not required. The chosen Custom Endpoint uses
+public outbound Entra-authenticated transport and does not support Private Link.
+It needs neither inbound HTTP to the consumer nor another Azure Event Hubs
+namespace. Reconciliation polling remains necessary when events are quiet,
+delayed or disconnected.
+
+Scopes select tenant, domain, workspace or item metadata. Explicit exclusions
+win. Domain descendants and workspace moves must be reconciled; domain membership
+does not grant resource access. Core listings are caller-visible, not
+tenant-complete. Admin Items is preview and needs explicit adapter selection and
+read-admin prerequisites. Unsupported items remain visible with a reason and
+do not count as monitored pipelines.
+
+An Admin previews and activates a versioned scope. New resources require review
+unless automatic **detection-only** enrolment was explicitly selected. Neither
+choice copies a safety review or enables actions. Overlapping includes must not
+produce duplicate targets, poll schedules or action budgets.
 
 ## Failure knowledge and scenarios
 
-Pipeline playbooks are separate from Power BI playbooks. At most three matching
-entries are shown to the model, while the deterministic rerun gate considers
-all matching blockers and every failed activity. An unknown cause does not
-become retryable because another activity had a transient error.
+Pipeline playbooks are separate from Power BI playbooks. Retrieval is capped at
+three entries, while deterministic rerun checks consider all matching blockers
+and every failed activity. An unknown cause does not become retryable because
+another activity had a transient error.
 
 | Failure class | Evidence and initial behavior |
 |---|---|
 | ADLS internal service failure | `ADLSGen2OperationFailed` plus `InternalServerError` is a retry candidate; the wrapper alone is unknown. |
-| SQL connection failure | `SqlOpenConnectionTimeout` or `SqlConnectionIsClosed` is a candidate, subject to replay safety and approval. Generic connection errors are not enough. |
-| Request/capacity throttling | Distinguish monitor-read throttling from activity failure. Honor read backoff; do not add executions to a queue. Capacity recovery is not established by this controller, so it escalates. |
-| Authentication/authorization | `LSROBOTokenFailure`, `SqlUnauthorizedAccess`, or a confirmed login denial requires identity/connection correction. |
-| Gateway/private path | Verify gateway health and approved routing. Do not enable public access or disable TLS checks as a repair. |
-| Missing storage object | Establish the failing source/sink/path and data window. Do not manufacture empty replacement data. |
+| SQL connection failure | `SqlOpenConnectionTimeout` or `SqlConnectionIsClosed` is a candidate, subject to replay safety and approval. Generic connection errors are insufficient. |
+| Request/capacity throttling | Distinguish monitor-read throttling from activity failure. Honor backoff; do not add workload executions to a saturated service. |
+| Authentication/authorization | `LSROBOTokenFailure`, `SqlUnauthorizedAccess` or confirmed login denial requires identity/connection correction. |
+| Gateway/private path | Verify gateway health and approved routing; do not enable public access or disable TLS checks as a repair. |
+| Missing storage object | Establish source/sink/path and data window; do not manufacture empty replacement data. |
 | Text or SQL schema mismatch | Compare mappings, columns and values; require correction before replay. |
-| Notebook/code/resource failure | Inspect the exact execution and failed stage. No notebook regeneration or schema mutation is exposed. |
-| Write timeout/concurrent writer | Commit state may be partial or unknown. Reconcile it before replay, even if an earlier configuration declared the pipeline rerunnable. |
-| Nested/dependency failure | Use the failed child/activity evidence when available; unknown child effects block replay. No automatic parent/child repair is implemented. |
-| Cancelled, queued or running | Not an eligible failed scheduled execution. Never reverse a cancellation by automatically starting again. |
-| Disabled/expired schedule or missing start | Requires a separate expected-slot detector, schedule snapshot and grace period. Not inferred from this run list. |
-| Repeated observation/new failed run | One job ID is processed once; distinct jobs can add occurrences without replenishing an open incident's remediation allowance. |
+| Notebook/code/resource failure | Inspect the exact execution and failed stage; no notebook regeneration or schema mutation is exposed. |
+| Write timeout/concurrent writer | Commit state may be partial or unknown. Reconcile it before replay, even after an earlier replay-safety review. |
+| Nested/dependency failure | Use child/activity evidence; unknown child effects block replay. No automatic parent/child repair is implemented. |
+| Cancelled, queued or running | Not an eligible failed scheduled execution; do not reverse cancellation by starting again. |
+| Disabled/expired schedule or missing start | Requires separate expectations, schedule evidence and grace rules; not inferred from this run list. |
+| Repeated observation/new failed run | An exact job is processed once; distinct jobs can add occurrences without restoring the incident allowance. |
 
-The public sources are carried on each entry in
-[`playbooks.py`](../src/triage/knowledge/playbooks.py). Additional scenario
-guidance comes from
+Public sources are carried in
+[`playbooks.py`](../src/triage/knowledge/playbooks.py). Relevant references include
 [activity retries](https://learn.microsoft.com/fabric/data-factory/activity-retries),
 [pipeline monitoring](https://learn.microsoft.com/fabric/data-factory/monitor-pipeline-runs),
-and [migration/idempotent ELT guidance](https://learn.microsoft.com/fabric/data-factory/migration-best-practices).
-A custom Fail activity does not gain platform-error authority merely by
-containing a known error string; admitting one requires an explicitly scoped
-custom playbook.
+and [idempotent ELT guidance](https://learn.microsoft.com/fabric/data-factory/migration-best-practices).
+A custom Fail activity does not gain platform-error authority by containing a
+known error string; it needs an explicitly scoped custom playbook.
 
-The executable fixtures are:
-
-| Scenario | Expected result |
+| Executable fixture | Expected behavior |
 |---|---|
-| `scenario9-pipeline-authentication` | Escalate without requesting a futile rerun. |
-| `scenario10-pipeline-rerun-approved` | One approved rerun, verified completion. |
-| `scenario11-pipeline-rerun-denied` | No submission and no remediation budget consumed. |
-| `scenario12-pipeline-schema-mismatch` | Escalate; replay-safety configuration does not override a persistent schema error. |
-| `scenario13-pipeline-rerun-pending` | Submission is recorded but not reported as resolution. |
+| `scenario9-pipeline-authentication` | Escalate without a futile rerun. |
+| `scenario10-pipeline-rerun-approved` | One approved rerun, with verified completion. |
+| `scenario11-pipeline-rerun-denied` | No submission and no remediation allowance consumed by denial. |
+| `scenario12-pipeline-schema-mismatch` | Replay-safety configuration does not override a persistent schema error. |
+| `scenario13-pipeline-rerun-pending` | Submission remains unverified, not resolved. |
 | `scenario14-pipeline-write-timeout` | Require commit reconciliation; do not infer rollback. |
 
-Run these with `TRIAGE_TOOL_MODE=mock`. Live mode refuses pipeline fixtures rather
-than returning mock results as if Fabric had executed them.
+Use `MONITORING_MODE=fixture`, `TRIAGE_TOOL_MODE=mock` and
+`TRIAGE_PROVIDER_MODE=mock` for offline fixtures. Fixtures do not import live
+targets or replace an unavailable live backend.
 
 ## Configuration
 
-Start with observation only:
+Live registry access requires:
 
 ```dotenv
-FABRIC_TENANT_ID=<tenant-guid>
-FABRIC_CLIENT_ID=
-PIPELINE_SWEEP_ENABLED=true
-FABRIC_PIPELINE_TARGETS=[{"name":"Orders load","workspace_id":"<workspace-guid>","pipeline_id":"<pipeline-guid>"}]
-PIPELINE_LOOKBACK_HOURS=24
-PIPELINE_MAX_PAGES=10
-PIPELINE_MAX_RUNS_PER_SWEEP=1
-PIPELINE_RERUN_TABLE_NAME=triage_pipeline_reruns
+MONITORING_MODE=live
+MONITORING_TENANT_ID=<tenant-guid>
+AZURE_SQL_SERVER=<server>.database.windows.net
+AZURE_SQL_DATABASE=<database-name>
 ```
 
-Both `FABRIC_SQL_SERVER` and `FABRIC_SQL_DATABASE` are required for a live sweep.
-The runtime uses managed/workload identity, not a client secret or an implicit
-developer login. `FABRIC_CLIENT_ID` optionally selects a managed identity.
-An operator running a local verification must supply an explicit credential;
-the live client does not fall back to the operator's Azure CLI session.
+Use the database name from the Azure deployment, not a Fabric database item.
+Configure Entra-only server authentication, public firewall admission, TLS 1.2
+minimum, Proxy/TCP 1433, auditing and TDE. The default `allowAzureServices=true`
+uses the special start/end `0.0.0.0` SQL rule for Azure-hosted callers, including
+other subscriptions, not all Internet IPs. Optional client rules specify exact
+IPv4 ranges. Network admission never replaces SQL identity permissions.
+The worker, controller and Command Center use
+the same application catalog with separate SQL component permissions; no SQL
+password, credential-string fallback or Fabric SQL compatibility path exists.
+
+No private-network infrastructure is required by the accelerator's shipped
+pipeline-monitoring host. Monitored pipelines and their data connections retain
+their own network requirements; do not change them to fit the host's baseline.
+Any MCAPS public-access exception is resource-scoped; the SQL exception's single
+14-day period is not restarted by re-adding its tag. Longer tests need an
+approved exclusion. See [governed evaluation exceptions](DeploymentGuide.md#governed-evaluation-exceptions).
+
+Remove `FABRIC_PIPELINE_TARGETS` from live configuration. Static targets and
+compatibility loaders are retired; there is no import or alternate target format.
+`PIPELINE_SWEEP_ENABLED`, `PIPELINE_LOOKBACK_HOURS` and
+`PIPELINE_MAX_RUNS_PER_SWEEP` retain fixture-sweep semantics, not live admission
+or cadence control. `PIPELINE_MAX_PAGES` also bounds the existing pipeline
+client's paged reads; it does not replace collector continuation or coverage
+state. Live cadence belongs to the registry's observation policy.
+
+Select the operator identity explicitly for live SQL inspection:
 
 ```powershell
-.\.venv\Scripts\bi-triage.exe pipelines --targets
 .\.venv\Scripts\bi-triage.exe pipelines --preflight
-.\.venv\Scripts\bi-triage.exe pipelines
+.\.venv\Scripts\bi-triage.exe --sql-identity broker --operator-domain "<operator-domain>" pipelines --targets
+.\.venv\Scripts\bi-triage.exe --sql-identity broker --operator-domain "<operator-domain>" pipelines
 ```
 
-`--preflight` checks configuration without connecting. A live sweep is the
-reachability check. `TRIAGE_TOOL_MODE=mock` never queries Fabric.
+`--preflight` is configuration-only. `--targets` reads registry targets in live
+mode; the last command queues source observations. Neither proves that a
+collector read a page or that the controller finished work. The alternative
+global `--sql-identity managed` requires an explicit `AZURE_CLIENT_ID`.
 
-The controller identity needs access to each configured item. The
-[job read API](https://learn.microsoft.com/rest/api/fabric/core/job-scheduler/get-item-job-instance)
-documents user, service-principal and managed-identity support; delegated reads
-use `Item.Read.All` or the applicable item-specific scope. The
-[run API](https://learn.microsoft.com/rest/api/fabric/core/job-scheduler/run-on-demand-item-job)
-documents execute scopes and identity support separately. Delegated scopes do
-not replace workspace/item authorization, and app-only access also depends on
-tenant settings and the pipeline's connections and activities. Verify the
-deployed controller identity, not just a successful call made as an operator.
-For observation, workspace Viewer is the documented role option; executing
-pipelines requires additional authorization, with Contributor or higher as the
-workspace-role option. Prefer validated item-level grants where available.
+The collector and controller need their own required source permissions.
+[Job reads](https://learn.microsoft.com/rest/api/fabric/core/job-scheduler/get-item-job-instance)
+and [job submissions](https://learn.microsoft.com/rest/api/fabric/core/job-scheduler/run-on-demand-item-job)
+document identity/scope requirements separately. Delegated scopes do not replace
+item/workspace authorization. Verify the deployed acting identity and pipeline
+connections/activities, not just an operator's successful GET.
+Domain/read-admin access, stream-workspace access and human app roles are
+separate grants.
 
 ## Approval-gated reruns
 
-Reruns are disabled for a target unless an operator supplies both
-`"rerun_safe": true` and a reviewed `rerun_parameters` object. `{}` explicitly
-means no parameter overrides. It does not reconstruct the failed execution's
-original parameters. A rerun uses the current pipeline definition and reviewed
-configuration, so review defaults, date windows, watermarks and sink writes.
-This is an operator attestation, not an automatic proof of idempotency. Review
-the current revision and all reachable effects, including scripts, notebooks,
-external calls and invoked pipelines. Missing output or zero copied rows does
-not establish that no side effects occurred.
+Live targets start observation-only. A current immutable safety review binds
+the canonical target, policy revision, definition/parameter fingerprints,
+reviewed replay safety and exact-correlation capability. An empty reviewed
+parameter object means no overrides; it does not reconstruct the failed run's
+original parameters.
 
-Parameterized Core submissions use
-`{"executionData":{"parameters":{...}}}`, as in
-[Microsoft's Fabric CLI implementation](https://github.com/microsoft/fabric-cli/blob/b7af89ba878b06cc96d9427e6d07516df5bf9678/src/fabric_cli/utils/fab_cmd_job_utils.py#L349-L421).
-Do not replace that with the generic Core API's top-level typed parameter array,
-or switch endpoints after an ambiguous submission. Both parameter-free and
-parameterized requests still start a new full run, not an exact historical
-replay.
+A rerun uses the current definition and reviewed configuration. Review defaults,
+date windows, watermarks, sink writes and every reachable effect, including
+scripts, notebooks, external calls and child pipelines. Missing output or zero
+copied rows does not establish that no side effects occurred. A transient error
+does not establish replay safety.
 
-The controller requires all of the following before asking for approval, and
-rechecks execution prerequisites after approval:
+The controller uses the bounded `{"executionData":{"parameters":{...}}}` contract.
+See [pipeline REST capabilities](https://learn.microsoft.com/fabric/data-factory/pipeline-rest-api-capabilities).
+Do not replace it with another API's parameter shape or switch endpoints after
+an uncertain response. A full rerun is not rollback, resume from a failed
+activity, notebook repair, connection repair or schedule re-enablement.
 
-- A confirmed failed scheduled pipeline job and available activity diagnostics.
-- A matching retry-candidate playbook, with no matched non-retryable cause.
-- No open incident already handling the failure, no active job and no newer job.
-- Explicit replay-safety configuration and a reachable durable rerun journal.
-- An explicit, matching, unexpired, unused approval for the target, source run
-  and parameter fingerprint.
+Before approval and again before execution, checks require:
 
-The model supplies a justification only. It cannot choose the workspace,
-pipeline, failed run or parameters. Dataset refresh, dataset schedule and
-Power BI deferred-retry tools are excluded from pipeline runs.
+- Exact failed scheduled execution and complete activity evidence, with a
+  retry-candidate playbook and no deterministic blocker.
+- Current registry admission, an unchanged authoritative source head and no
+  conflicting active/newer execution.
+- A current safety review and reachable shared incident/action state.
+- Explicit, fingerprint-matched, unexpired, unused approval bound to the
+  proposed action and source.
 
-`rerun_fabric_pipeline` starts the whole pipeline. It is not rollback, resume
-from the failed activity, notebook repair, connection repair or schedule
-re-enablement. The pipeline may already have committed partial output. A
-transient cause alone does not establish safe replay.
+The model proposes a justification, not workspace/item/run IDs or replay
+parameters. Power BI refresh/schedule/deferred-retry tools are outside the
+pipeline workload allowlist.
+Preserve the full tool argument object and its approval fingerprint; do not
+strip fields into a smaller technical payload to satisfy an older SQL binding.
+The current RPC validates that full proposal and its action-specific schema.
 
-Before POST, the controller inserts a unique reservation into
-`triage_pipeline_reruns`. A second reservation loses at the SQL primary key.
-The submission is never automatically retried, including after transport
-failure or a missing acknowledgement. `reserved` and `unknown` rows require
-operator reconciliation; they do not expire into permission to submit again.
-The normal reset command does not clear this journal.
+The store atomically validates the tenant/epoch, maintenance state, admission,
+source evidence, review, approval and current work/target fence before reserving
+the incident slot. A prior successful read cannot prevent a concurrent
+revocation race. Denial consumes neither approval nor remediation allowance.
 
-The new job ID comes from the validated `Location` response header, never from
-guessing which history row is newest. `Retry-After` is retained before polling.
-HTTP 202 means submitted, not resolved. The correlated job must complete and
-its activity evidence must show no failed or unverified activities before the
-controller accepts resolution. A pipeline can report `Completed` after a
-failure-handling branch; that does not make its failed Copy activity successful.
+The submission ID comes from the validated response, not the newest history
+row. HTTP 202 means accepted, not resolved. Exact job completion and activity
+evidence must agree; a pipeline can report `Completed` after a failure-handling
+branch while a Copy activity remains failed.
 
-A still-running rerun remains unverified. Later pipeline sweeps poll its stored
-job ID, including after controller reconstruction. A verified completion closes
-the matching incident only if a newer failed occurrence has not replaced it.
-A failed rerun remains an investigation and does not trigger another rerun.
+An uncertain submission retains its fence and resumes read-only reconciliation,
+not another POST. Even a confirmed no-effect rejection does not globally refund
+the incident budget or reuse a consumed approval. Only its explicitly bound,
+single-use retry path may reuse the reserved slot after durable parent
+finalization and fresh checks. Do not delete a reservation to manufacture a
+retry opportunity.
+Scope or maintenance changes still block new reservations, but must not erase
+an existing reservation's exact source-read leases, verification or finalization
+path. The already-submitted effect remains the controller's responsibility.
 
-External users and Fabric's scheduler do not acquire this controller's SQL
-claim. They can start a job between the last history read and submission.
-Configure pipeline concurrency and replay semantics accordingly; the controller
-does not claim an atomic lock over all Fabric executions.
+External users and Fabric's scheduler do not take this controller's SQL fence.
+They can start work between a read and submission. Configure workload concurrency
+and replay semantics accordingly; the controller does not lock all Fabric users.
 
 ## Scheduling and deployment
 
-Configure the target list and enable `PIPELINE_SWEEP_ENABLED` in the deployment
-environment. Re-register the prompt agent because its tool catalog and procedure
-changed, then redeploy the hosted controller:
+The following commands are for an approved future cutover after the
+[release gates](DeploymentGuide.md#release-gates), not evidence that this release
+has replaced the existing controller.
+
+Review the registry, collector source access and durable state before activation.
+Re-register after a prompt/tool change and deploy the current controller
+separately:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\register_foundry_agents.py
 azd deploy bi-triage-controller --no-prompt
-azd ai agent invoke bi-triage-controller "pipeline sweep"
 ```
 
-Deploy the existing scheduler template with its new supported command:
+Prepare the common heartbeat schedule disabled:
 
 ```powershell
-az account set --subscription "<subscription>"
-az deployment group create -g <resource-group> `
+az account set --subscription "<subscription-name-or-id>"
+az deployment group create -g "<resource-group>" `
   --template-file infra\scheduled-sweep.json `
-  --parameters name=bi-triage-pipeline-sweep projectEndpoint=<project-endpoint> `
-               command="pipeline sweep" frequency=Minute interval=5 owner=<owner>
+  --parameters name=bi-triage-monitoring-heartbeat projectEndpoint="<project-endpoint>" `
+    command="heartbeat" frequency=Minute interval=1 enabled=false owner="<owner>" `
+    costCenter="<cost-center>" environment="evaluation" dataClassification="<classification>"
 ```
 
 Use the invocation-role grant in [DeploymentGuide.md](DeploymentGuide.md).
-The template's managed identity invokes the controller; the controller's
-identity reads and runs pipelines. Do not grant data access to the prompt
-agents. No new scheduler or monitored pipeline is created by setting the
-configuration alone.
-
-The default is one triaged failure per sweep. Rerun verification and skipped
-historical observations do not consume that limit. Human approval can consume
-the approval timeout in addition to the triage budget. Increase scheduler
-timeouts and claim budgets deliberately before raising the per-sweep limit.
+Enable only after current-release collection, SQL acceptance and controller
+proof; disable overlapping old timers. This schedule invokes the controller,
+not source pipelines. Human approval consumes its timeout in addition to the
+triage budget; keep caller and durable ownership deadlines consistent.
 
 ## Operational state
 
-`triage_incidents.payload.pipeline_failure` contains the latest run and activity
-evidence for a pipeline incident. The existing incident list and monitoring
-cockpit include these rows without a second database or a new data path.
-`triage_processed_messages` also stores namespaced processed pipeline-run keys.
-`triage_pipeline_reruns` stores submission and verification state separately.
+Shared monitoring records/receipts hold canonical source deduplication, work,
+reviews, action reservations and finalization. Existing incident/run/activity
+projections remain consumer views. The historical `triage_pipeline_reruns`
+table is not a substitute for current admission or the common action fence.
+Component-scoped checked views and static RPCs enforce the ownership contract;
+generic base-table writes are not a fallback for unfinished adapters.
 
-The [command center](CommandCenter.md#incident-records) uses the **Fabric
-pipeline** workload filter and opens full incident pages from the queue
-inspector. The filter remains available when there are no matching records;
-selecting it does not configure monitoring. **New investigation** enqueues a
-sweep of a configured pipeline target. It does not itself run the pipeline or
-approve a rerun.
+Pipeline Eventstream sources follow the same logical-proposal, original
+observation and controller-binding path as other supported sources. Desired
+removal fences intake without forgetting component ownership. Retire a binding
+only when the original complete current observation proves remote absence;
+do not treat a cancelled source job or an incomplete inventory as removal proof.
 
-Operator or Admin users can append notes and record **Resolved by user** against
-the current source revision. That is a tracking decision, not a verified Fabric
-job result. It does not reset policy counters, release a rerun reservation or
-authorize another submission. New controller evidence invalidates the closure.
-Read-only discussion is retained with the incident and cannot dispatch tools.
-These application roles do not grant the user or controller Fabric permissions;
-the deployed controller identity still needs the item access described above.
+Terminal incident/outcome, processed-source disposition and work completion
+must be durable together. An in-memory answer does not finish work after a
+persistence error. Reconcile the original finalization receipt after a lost
+acknowledgement; do not repeat an uncertain effect.
 
-Do not delete a rerun reservation to make a retry possible. First identify the
-submitted job, check its activity results and sink effects, and reconcile the
-incident. Automatic retries after an ambiguous acknowledgement can duplicate
-data even when an HTTP client saw only an error.
+The command-center Fabric pipeline filter selects records, not monitors.
+**New investigation** queues an observation for an admitted target; it neither
+runs the pipeline nor approves a rerun.
 
-Command-center **Human reconciliation** applies to interrupted or uncertain
-command-queue entries. It records an administrator's review without executing
-the command; it does not modify or clear `triage_pipeline_reruns`. Closing
-incident tracking is not a substitute for either reconciliation.
+**Resolved by user** is append-only tracking bound to the original SQL NVARCHAR
+payload hash over UTF-16 LE. It is not a verified job result and does not reset
+budgets, approvals, notification counts or action fences. New evidence
+invalidates the closure. Tool-free discussion cannot dispatch actions.
+
+Human reconciliation of a command entry is not external-execution proof or
+permission to clear its action reservation. Follow the controlled prototype
+reset procedure only for an explicitly approved clean start; ordinary
+deployment and investigation do not erase these protections.

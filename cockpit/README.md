@@ -1,20 +1,21 @@
 # Read-only Fabric cockpit
 
-This React 19 + Vite application displays the triage controller's recorded state
-inside a Fabric Data App. It was built from the Rayfin Universal App template;
-the analytics pack is already installed and `CockpitPage` replaces the starter
+This retained React 19 + Vite sample displays semantic-model projections of
+triage state inside a Fabric Data App. It was built from the Rayfin Universal
+App template; the analytics pack is already installed and `CockpitPage` replaces the starter
 home page. It is part of the public MIT-licensed solution accelerator, not a
 supported product.
 
-The cockpit is separate from the Azure-hosted
-[agent command center](../docs/CommandCenter.md). The command center provides
-authenticated approvals, investigations, incident notes and run history. This
-cockpit remains a read-only monitoring surface: it cannot approve an action,
-start a run, resolve an incident or reset controller state.
+The Azure-hosted [Command Center](../docs/CommandCenter.md) is the accelerator's
+operational UI for authenticated approvals, investigations, incident notes and
+run history. This cockpit is not a deployment or state dependency. It remains
+read-only: it cannot approve an action, start a run, resolve an incident or reset
+controller state. All live application state now targets one Azure SQL Database;
+this sample has not been rebound or proved against that database.
 
 ## Data and authentication
 
-The read path is:
+The **earlier-release** read path was:
 
 ```text
 Controller -> standalone Fabric SQL Database -> mirrored SQL analytics endpoint
@@ -26,14 +27,20 @@ DAX queries use the `triageState` connection alias in `fabric.yaml`.
 proxy. Fabric authenticates that access; the absence of an `AuthProvider` in
 `src/main.tsx` does not make the model public.
 
-The controller's state database is provisioned independently of either app.
+That Fabric SQL mirroring path is historical. Azure SQL provisioning does not
+create or retarget the `triageState` semantic model, and no automatic mirror,
+state-copy or compatibility path is provided. An existing cockpit deployment
+may still show prior-release data; it is not current Azure SQL operational proof.
+
+The Azure SQL application database is provisioned independently of either app.
 Keep the Rayfin `data` service disabled in `rayfin/rayfin.yml`. Do not move state
 into an app-owned database, apply Rayfin entity migrations to the controller's
 tables, or delete/recreate the database when redeploying an app.
 
 The page queries on load, not on a polling timer. Reload it to request new
 results. Mirroring and semantic-model visibility can lag the SQL write; this
-is not a real-time view or an unrestricted history report.
+is not a real-time view or an unrestricted history report. These latency notes
+describe the historical semantic-model path, not a new Azure SQL integration.
 
 ## Panels
 
@@ -51,10 +58,11 @@ Recent incidents, approvals and ignored mail use `TOPN(25)` queries. The cockpit
 does not expose the command center's full incident workspace or execution
 timeline.
 
-## Configure and deploy
+## Optional sample configuration and deployment
 
-Complete the controller and state prerequisites in the
-[deployment guide](../docs/DeploymentGuide.md). The semantic model must expose
+Skip this section when deploying the accelerator; use the Command Center and
+the [deployment guide](../docs/DeploymentGuide.md). To evaluate this separate
+sample, supply a separately reviewed read-only semantic model. It must expose
 the tables and columns referenced by `src/queries/triage.ts`, and the intended
 viewers must have the required Fabric/model access.
 
@@ -114,7 +122,7 @@ surface when changing typography.
 | `src/hooks/use-semantic-model-query.ts`, `src/lib/fabric-client.ts` | Query state and Fabric embed transport |
 | `src/global.css` | Canonical dark theme and chart tokens |
 | `fabric.yaml`, `src/fabric.generated.ts` | Model aliases and generated configuration |
-| `rayfin/rayfin.yml` | Fabric app services; state storage stays external |
+| `rayfin/rayfin.yml` | Optional sample services; no app-owned operational state |
 | `.agents/skills/` | Reusable template and platform reference material |
 
 Read [the cockpit contributor guide](AGENTS.md) before changing this app.

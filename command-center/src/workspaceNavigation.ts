@@ -1,7 +1,8 @@
-import { incidentFromSearch, incidentUrl } from './incidentLinks'
+import { applicationSignInState, incidentFromSearch, incidentUrl } from './incidentLinks'
 
-const sections = ['command', 'incidents', 'runs', 'knowledge', 'validation', 'access'] as const
+const sections = ['command', 'incidents', 'runs', 'knowledge', 'validation', 'monitoring', 'access'] as const
 export type WorkspaceSection = typeof sections[number]
+const signInStateKey = 'command_center_workspace'
 
 export function workspaceFromSearch(search: string): { section: WorkspaceSection; incidentId: string | null } {
   const incidentId = incidentFromSearch(search)
@@ -19,4 +20,16 @@ export function workspaceUrl(section: WorkspaceSection, current = window.locatio
   if (section === 'command') url.searchParams.delete('view')
   else url.searchParams.set('view', section)
   return `${url.pathname}${url.search}${url.hash}`
+}
+
+export function workspaceSignInState(search: string): string | undefined {
+  const state = new URLSearchParams(applicationSignInState(search))
+  const { section } = workspaceFromSearch(search)
+  if (section !== 'command') state.set(signInStateKey, section)
+  return state.size ? state.toString() : undefined
+}
+
+export function workspaceFromSignInState(state: string | undefined): WorkspaceSection | null {
+  const value = new URLSearchParams(state).get(signInStateKey)
+  return sections.find((section) => section === value) ?? null
 }

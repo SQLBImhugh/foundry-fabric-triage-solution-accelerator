@@ -13,9 +13,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import json
 import logging
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +32,7 @@ from rich.table import Table
 
 from triage.detectors.silent_failures import load_probes
 from triage.observability import configure_telemetry
-from triage.pipeline_models import load_pipeline_targets
+from triage.pipeline_models import canonical_id
 from triage.runner import (
     RunArtifacts,
     Scenario,
@@ -37,12 +41,80 @@ from triage.runner import (
     discover_scenarios,
 )
 from triage.settings import settings
-from triage.tools.dataset import render_table
+from triage.tools.dataset import render_rows, render_table
 
 console = Console()
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCENARIO_DIR = REPO_ROOT / "scenarios"
+
+
+class _BrokerSqlCredential:
+    """An explicitly tenant/domain-selected operator token, without changing az state."""
+
+    def __init__(self, tenant_id: str, domain: str) -> None:
+        self.tenant_id = canonical_id(tenant_id)
+        if not domain or not domain.strip() or domain != domain.strip():
+            raise ValueError("Broker SQL access requires --operator-domain.")
+        self.domain = domain
+        self.principal_id = ""
+
+    def get_token(self, *scopes, **_kwargs):
+        from azure.core.credentials import AccessToken
+
+        from triage.store.azure_sql import SQL_SCOPE
+
+        if scopes != (SQL_SCOPE,):
+            raise ValueError("This operator credential is restricted to Azure SQL.")
+        process = subprocess.run(
+            [
+                "azureauth", "aad", "--resource", "https://database.windows.net/",
+                "--client", "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
+                "--tenant", self.tenant_id, "--domain", self.domain,
+                "--mode", "broker", "--output", "token", "--verbosity", "error", "--timeout", "2",
+            ],
+            capture_output=True, text=True, timeout=150, check=False,
+        )
+        if process.returncode != 0:
+            raise RuntimeError("Explicit broker SQL authentication failed; no other credential was attempted.")
+        token = process.stdout.strip()
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise RuntimeError("The broker did not return a single access token.")
+        claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+        if claims.get("tid") != self.tenant_id or not claims.get("oid") or int(claims["exp"]) <= time.time():
+            raise RuntimeError("The broker token does not identify the selected tenant and current operator.")
+        self.principal_id = str(claims["oid"])
+        return AccessToken(token, int(claims["exp"]))
+
+
+def _operator_credential(args: argparse.Namespace, *, required: bool = False):
+    if settings.monitoring_mode != "live" and not required:
+        return None
+    choice = getattr(args, "sql_identity", None)
+    if choice == "broker":
+        return _BrokerSqlCredential(settings.monitoring_tenant_id, getattr(args, "operator_domain", ""))
+    if choice == "managed":
+        if not settings.azure_client_id:
+            raise ValueError("Managed SQL access requires an explicitly selected AZURE_CLIENT_ID.")
+        from azure.identity import ManagedIdentityCredential
+
+        return ManagedIdentityCredential(client_id=canonical_id(settings.azure_client_id))
+    raise ValueError("Live SQL commands require --sql-identity broker or managed; no developer credential fallback is used.")
+
+
+def _runner(args: argparse.Namespace, *, fixture: bool = False, **kwargs) -> TriageRunner:
+    selected = settings
+    if fixture:
+        selected = settings.model_copy(update={
+            "monitoring_mode": "fixture", "triage_provider_mode": "mock", "triage_tool_mode": "mock",
+            "azure_sql_server": "", "azure_sql_database": "",
+            "applicationinsights_connection_string": "",
+        })
+    return TriageRunner(
+        selected, base_dir=REPO_ROOT,
+        credential=None if fixture else _operator_credential(args), **kwargs,
+    )
 
 _TOOL_STYLE = {
     "consult_data_quality_agent": "bold magenta",
@@ -282,9 +354,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if scenario.description:
         console.print(f"[dim]{scenario.description}[/dim]\n")
 
-    runner = TriageRunner(
-        settings, base_dir=REPO_ROOT, on_event=_make_event_hook(args.verbose)
-    )
+    runner = _runner(args, fixture=True, on_event=_make_event_hook(args.verbose))
 
     if args.show_data and scenario.datasets:
         for entry in scenario.datasets:
@@ -308,27 +378,21 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # A scenario resets the incident store so it is reproducible, which is
     # right when that store is a JSON file under runs/. It stops being right
-    # the moment the store is Fabric SQL, because that table is the one the
+    # the moment the store is Azure SQL, because that table is the one the
     # hosted controller writes to -- so `run` would silently delete real
     # incidents to make a rehearsal tidy. Discovered the hard way: a single
     # `bi-triage run scenario1-transient` against the live database took the
     # table from seven rows to one.
     #
-    # Refuse rather than guess. Both answers are one flag away and the command
-    # says which is which; deleting somebody's incident history to avoid
-    # asking is not a trade worth making.
-    if (
-        scenario.reset_incidents
-        and not args.keep_incidents
-        and not args.reset_shared_state
-        and getattr(runner.store, "is_durable", False)
-    ):
+    # A scenario cannot target shared state, even without clearing it. Shared
+    # resets belong to the deployment maintenance and action-reconciliation gate.
+    if getattr(runner.store, "is_durable", False):
         console.print(
             "[red]Refusing to run:[/red] this scenario clears the incident "
-            "store, and the store is durable (Fabric SQL), not a local file. "
+            "store, and the store is durable (Azure SQL), not a local file. "
             "That table is shared with the hosted controller.\n\n"
-            "  --keep-incidents       run without clearing anything\n"
-            "  --reset-shared-state   clear it anyway, deliberately"
+            "Use explicit fixture state for scenarios. Shared state reset belongs "
+            "to deployment maintenance tooling."
         )
         return 2
 
@@ -361,13 +425,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_flags(args: argparse.Namespace) -> int:
-    runner = TriageRunner(settings, base_dir=REPO_ROOT)
+    runner = _runner(args, fixture=True)
     console.print(Panel(_render_flags(runner), title="Data quality flag table"))
     return 0
 
 
 def cmd_incidents(args: argparse.Namespace) -> int:
-    runner = TriageRunner(settings, base_dir=REPO_ROOT)
+    runner = _runner(args)
     incidents = runner.store.list_all()
     if not incidents:
         console.print("[dim]No incidents recorded.[/dim]")
@@ -393,7 +457,7 @@ def cmd_incidents(args: argparse.Namespace) -> int:
     return 0
 
 
-def _probe_fabric_sql() -> tuple[str, str, str]:
+def _probe_azure_sql(args: argparse.Namespace | None = None) -> tuple[str, str, str]:
     """Actually connect, and report what happened.
 
     Separate from the settings row on purpose. This is the only part of
@@ -403,9 +467,12 @@ def _probe_fabric_sql() -> tuple[str, str, str]:
     """
     try:
         from triage.settings import settings as _s
-        from triage.store.fabric_sql import FabricSqlDatabase
+        from triage.store.azure_sql import AzureSqlDatabase
 
-        db = FabricSqlDatabase(server=_s.fabric_sql_server, database=_s.fabric_sql_database)
+        db = AzureSqlDatabase(
+            server=_s.azure_sql_server, database=_s.azure_sql_database,
+            credential=_operator_credential(args or argparse.Namespace(), required=True),
+        )
         rows = db.query("SELECT 1")
         if rows and rows[0][0] == 1:
             return ("  \u2514 connection", "SELECT 1 succeeded", "[green]ok[/green]")
@@ -445,7 +512,8 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     )
     live = settings.triage_tool_mode == "live"
     row("Graph tenant", settings.graph_tenant_id, bool(settings.graph_tenant_id), optional=not live)
-    row("Power BI workspace", settings.powerbi_workspace_id, bool(settings.powerbi_workspace_id), optional=not live)
+    row("Monitoring mode", settings.monitoring_mode, True)
+    row("Monitoring tenant", settings.monitoring_tenant_id, bool(settings.monitoring_tenant_id), optional=settings.monitoring_mode != "live")
     # Durable state is what makes the agent idempotent across invocations, so
     # it is reported even offline: a hosted deployment without it silently
     # forgets every open incident on restart and can remediate twice.
@@ -456,19 +524,19 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     # at the first write. Use --check-sql to actually open a connection, which
     # is opt-in because preflight must stay runnable with no network.
     sql_target = (
-        f"{settings.fabric_sql_database} on {settings.fabric_sql_server}"
-        if settings.fabric_sql_server and settings.fabric_sql_database
+        f"{settings.azure_sql_database} on {settings.azure_sql_server}"
+        if settings.azure_sql_server and settings.azure_sql_database
         else ""
     )
     row(
-        "Fabric SQL state",
+        "Azure SQL state",
         sql_target or "(json files under runs/)",
         bool(sql_target),
         optional=not live,
         ok_label="configured",
     )
     if getattr(args, "check_sql", False) and sql_target:
-        table.add_row(*_probe_fabric_sql())
+        table.add_row(*_probe_azure_sql(args))
     row("Teams webhook", "set" if settings.teams_webhook_url else "", bool(settings.teams_webhook_url), optional=not live)
     row(
         "App Insights",
@@ -539,9 +607,7 @@ async def _watch_loop(
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
-    runner = TriageRunner(
-        settings, base_dir=REPO_ROOT, on_event=_make_event_hook(args.verbose)
-    )
+    runner = _runner(args, on_event=_make_event_hook(args.verbose))
     inbox = runner.build_inbox()
     live = type(inbox).__name__ == "GraphInbox"
 
@@ -860,7 +926,7 @@ def cmd_teams_preview(args: argparse.Namespace) -> int:
         return 2
 
     scenario = Scenario.load(path)
-    runner = TriageRunner(settings, base_dir=REPO_ROOT)
+    runner = _runner(args, fixture=True)
     asyncio.run(runner.run_scenario(scenario))
 
     notifier = runner.build_teams()
@@ -886,7 +952,9 @@ def cmd_teams_preview(args: argparse.Namespace) -> int:
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
-    runner = TriageRunner(settings, base_dir=REPO_ROOT)
+    if settings.monitoring_mode == "live":
+        raise ValueError("Live state reset belongs to the deployment maintenance/reset procedure, not the runtime CLI.")
+    runner = _runner(args, fixture=True)
     runner.flag_table.reset()
     runner.store.reset()
 
@@ -921,7 +989,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
 def cmd_approvals(args: argparse.Namespace) -> int:
     """Show what is waiting on a human right now."""
-    runner = TriageRunner(settings, base_dir=REPO_ROOT)
+    runner = _runner(args)
     rows = runner.build_approval_channel().pending()
 
     if not rows:
@@ -957,10 +1025,17 @@ def _decide(args: argparse.Namespace, decision: str) -> int:
     expiry and single-use are all checked on the reading side, so nothing
     written here can authorise more than the action it was asked about.
     """
-    runner = TriageRunner(settings, base_dir=REPO_ROOT)
+    runner = _runner(args)
     channel = runner.build_approval_channel()
 
-    responder = args.responder or os.environ.get("USERNAME") or "unknown"
+    if settings.monitoring_mode == "live":
+        if not isinstance(runner._credential, _BrokerSqlCredential):
+            raise ValueError("A human approval requires the explicitly broker-selected operator identity.")
+        responder = runner._credential.principal_id
+        if not responder:
+            raise ValueError("The operator identity was not established by SQL authentication.")
+    else:
+        responder = args.responder or os.environ.get("USERNAME") or "unknown"
     try:
         row = channel.decide(
             args.request_id,
@@ -1000,7 +1075,7 @@ def cmd_deny(args: argparse.Namespace) -> int:
 
 def cmd_retries(args: argparse.Namespace) -> int:
     """Show retries the agent postponed, and optionally run the due ones."""
-    runner = TriageRunner(settings, base_dir=REPO_ROOT)
+    runner = _runner(args)
     if runner.retries is None:
         console.print("[dim]No retry store configured.[/dim]")
         return 0
@@ -1038,7 +1113,7 @@ def cmd_retries(args: argparse.Namespace) -> int:
 
 def cmd_health(args: argparse.Namespace) -> int:
     """Run the silent-failure sweep, or show what it knows."""
-    runner = TriageRunner(settings, base_dir=REPO_ROOT)
+    runner = None if args.preflight or args.probes else _runner(args)
 
     if args.baselines:
         states = runner.semantic_health.all_states()
@@ -1207,12 +1282,18 @@ def cmd_health(args: argparse.Namespace) -> int:
 
 
 def cmd_pipelines(args: argparse.Namespace) -> int:
-    """Inspect configuration without network, or perform one bounded sweep."""
-    try:
-        targets = load_pipeline_targets(settings.fabric_pipeline_targets)
-    except ValueError as exc:
-        console.print(f"[red]Invalid pipeline configuration:[/red] {escape(str(exc))}")
-        return 2
+    """Inspect registry-backed targets or queue a bounded observation sweep."""
+    if args.preflight:
+        ready = settings.monitoring_mode == "fixture" or bool(
+            settings.monitoring_tenant_id and settings.azure_sql_server and settings.azure_sql_database
+        )
+        console.print(
+            "Pipeline targets and reviews are read from the monitoring registry. "
+            "This is a configuration-only check; no SQL or Fabric connection was attempted."
+        )
+        return 0 if ready else 1
+    runner = _runner(args)
+    targets = runner.pipeline_targets()
     if args.targets:
         table = Table(title="Configured Fabric pipelines")
         for heading in ("Name", "Workspace", "Pipeline", "Reviewed replay"):
@@ -1224,23 +1305,8 @@ def cmd_pipelines(args: argparse.Namespace) -> int:
             )
         console.print(table)
         return 0
-    if args.preflight:
-        if not targets or not settings.pipeline_sweep_enabled:
-            console.print("[yellow]Pipeline monitoring is disabled or has no targets.[/yellow]")
-            return 1
-        if settings.triage_tool_mode == "live" and not (
-            settings.fabric_tenant_id and settings.fabric_sql_server and settings.fabric_sql_database
-        ):
-            console.print("[red]Live pipeline monitoring needs FABRIC_TENANT_ID and both FABRIC_SQL settings.[/red]")
-            return 1
-        console.print(
-            f"{len(targets)} pipeline target(s) configured; tools={settings.triage_tool_mode}. "
-            "Configuration only, not a connection or permission check."
-        )
-        return 0
-    runner = TriageRunner(settings, base_dir=REPO_ROOT)
     try:
-        report = asyncio.run(runner.pipeline_sweep(targets=targets))
+        report = asyncio.run(runner.pipeline_sweep(targets=targets if runner.fixture else None))
     except (ValueError, RuntimeError) as exc:
         console.print(f"[red]Pipeline sweep failed:[/red] {escape(str(exc))}")
         return 1
@@ -1270,7 +1336,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_commands(args: argparse.Namespace) -> int:
-    runner = TriageRunner(settings, base_dir=REPO_ROOT)
+    runner = _runner(args)
     if args.drain:
         from triage.command_center.worker import drain_commands
 
@@ -1305,7 +1371,7 @@ def _render_flags(runner: TriageRunner) -> str:
     rows = runner.flag_table.read_all()
     if not rows:
         return "(empty - 0 rows)"
-    return render_table(runner.flag_table.path)
+    return render_rows(rows)
 
 
 def _resolve_scenario(name: str) -> Path | None:
@@ -1324,6 +1390,8 @@ def _resolve_scenario(name: str) -> Path | None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bi-triage", description=__doc__)
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--sql-identity", choices=["managed", "broker"], help="Explicit identity for live SQL commands")
+    parser.add_argument("--operator-domain", default="", help="Broker account domain for the selected monitoring tenant")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("list", help="List available scenarios").set_defaults(func=cmd_list)
@@ -1336,13 +1404,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-incidents",
         action="store_true",
         help="Do not clear the incident store first (keeps prior runs' evidence visible)",
-    )
-    run.add_argument(
-        "--reset-shared-state",
-        action="store_true",
-        help="Permit clearing a durable (Fabric SQL) incident store. Required "
-             "when the scenario resets incidents and the store is not a local "
-             "file, because that table is shared with the hosted controller.",
     )
     run.set_defaults(func=cmd_run)
 
@@ -1392,7 +1453,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre.add_argument(
         "--check-sql",
         action="store_true",
-        help="Also open a real connection to Fabric SQL. Off by default so "
+        help="Also open a real connection to Azure SQL. Off by default so "
              "preflight works with no network.",
     )
     p_pre.set_defaults(func=cmd_preflight)
@@ -1483,7 +1544,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Without this call the connection string is read and never used, so
     # "tracing is wired up" would be true of the code and false of the process.
-    if settings.applicationinsights_connection_string:
+    offline_command = (
+        args.command in {"run", "teams-preview", "list", "tools", "preflight"}
+        or args.command == "health" and (args.preflight or args.probes)
+        or args.command == "pipelines" and args.preflight
+        or args.command == "serve" and args.mode == "demo"
+    )
+    if settings.applicationinsights_connection_string and not offline_command:
         configure_telemetry(settings.applicationinsights_connection_string)
 
     return int(args.func(args))

@@ -38,6 +38,12 @@ services:
               value: foundry
             - name: TRIAGE_TOOL_MODE
               value: live
+            - name: MONITORING_MODE
+              value: live
+            - name: MONITORING_TENANT_ID
+              value: ${AZURE_TENANT_ID}
+            - name: AZURE_CLIENT_ID
+              value: ${AZURE_CLIENT_ID}
             - name: FOUNDRY_PROJECT_ENDPOINT
               value: ${AZURE_AI_PROJECT_ENDPOINT}
             - name: FOUNDRY_TRIAGE_AGENT_NAME
@@ -80,20 +86,14 @@ services:
             # different thing from removing the check.
             - name: GRAPH_SENDER_ALLOWLIST
               value: ${GRAPH_SENDER_ALLOWLIST}
-            - name: FABRIC_SQL_SERVER
-              value: ${FABRIC_SQL_SERVER}
-            - name: FABRIC_SQL_DATABASE
-              value: ${FABRIC_SQL_DATABASE}
-            - name: FABRIC_TENANT_ID
-              value: ${AZURE_TENANT_ID}
+            - name: AZURE_SQL_SERVER
+              value: ${AZURE_SQL_SERVER}
+            - name: AZURE_SQL_DATABASE
+              value: ${AZURE_SQL_DATABASE}
+            - name: DATA_QUALITY_FLAG_TABLE_NAME
+              value: ${DATA_QUALITY_FLAG_TABLE_NAME}
             - name: FABRIC_CLIENT_ID
               value: ${FABRIC_CLIENT_ID}
-            - name: FABRIC_PIPELINE_TARGETS
-              value: ${FABRIC_PIPELINE_TARGETS}
-            # Unset is disabled. Enabling this does not create a schedule;
-            # deploy scheduled-sweep.json with command="pipeline sweep".
-            - name: PIPELINE_SWEEP_ENABLED
-              value: ${PIPELINE_SWEEP_ENABLED}
             - name: PIPELINE_RERUN_TABLE_NAME
               value: ${PIPELINE_RERUN_TABLE_NAME}
             - name: PIPELINE_LOOKBACK_HOURS
@@ -153,14 +153,8 @@ services:
             # refreshes and reads refresh history as itself. Exchange does not
             # accept it, per the GRAPH_* note above. The two services differ,
             # and this file says so rather than glossing it.
-            - name: POWERBI_TENANT_ID
-              value: ${AZURE_TENANT_ID}
-            - name: POWERBI_WORKSPACE_ID
-              value: ${POWERBI_WORKSPACE_ID}
-            - name: POWERBI_DATASET_ID
-              value: ${POWERBI_DATASET_ID}
-            # Teams delivery. Empty means the notifier stays mocked, which is a
-            # fallback rather than a failure. The URL is a bearer credential:
+            # Teams delivery. Empty means delivery is explicitly unavailable,
+            # never a mock success. The URL is a bearer credential:
             # anyone holding it can post to that channel, so it lives in the azd
             # environment, which is gitignored, and never in this file.
             - name: TEAMS_WEBHOOK_URL
@@ -171,7 +165,7 @@ services:
             - protocol: responses
               version: 2.0.0
 
-    # The two routines below are the native scheduled trigger. They DO NOT FIRE,
+    # The routines below are the native scheduled trigger. They DO NOT FIRE,
     # so they ship disabled.
     #
     # Verified 2026-09-02, six days after registering one: `azd ai routine show`
@@ -219,6 +213,22 @@ services:
             type: invoke_agent_responses_api
             agent_name: bi-triage-controller
             input: "scheduled sweep"
+
+    bi-triage-monitoring-heartbeat:
+        host: azure.ai.routine
+        uses:
+            - bi-triage-controller
+        description: Dispatch due monitoring work and human commands fairly
+        enabled: false
+        triggers:
+            default:
+                type: schedule
+                cron_expression: "* * * * *"
+                time_zone: Etc/UTC
+        action:
+            type: invoke_agent_responses_api
+            agent_name: bi-triage-controller
+            input: "heartbeat"
 
     # The other trigger, and the one the mailbox sweep cannot cover. "scheduled
     # sweep" above drains the inbox and performs due retries; it never runs the

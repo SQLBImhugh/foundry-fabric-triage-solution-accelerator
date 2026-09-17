@@ -40,6 +40,14 @@ from triage.tools.semantic_health import (
 NOW = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def no_live_sql(monkeypatch) -> None:
+    def refuse_connection(_self):
+        pytest.fail("Silent-failure tests must not open a live SQL connection")
+
+    monkeypatch.setattr("triage.store.azure_sql.AzureSqlDatabase._connect", refuse_connection)
+
+
 def _probe(**overrides) -> HealthProbe:
     base = {
         "name": "sales-freshness",
@@ -952,7 +960,15 @@ def _preflight(probes_json: str) -> tuple[int, str]:
     args = cli.build_parser().parse_args(["health", "--preflight"])
     buffer = io.StringIO()
     original_settings, original_console = cli.settings, cli.console
-    cli.settings = Settings(silent_health_probes=probes_json, triage_tool_mode="mock")
+    # Mock tools alone do not select offline stores. An operator's .env or
+    # exported SQL settings must not turn this configuration check into a login.
+    cli.settings = Settings(
+        _env_file=None, silent_health_probes=probes_json,
+        triage_provider_mode="mock", triage_tool_mode="mock",
+        azure_sql_server="", azure_sql_database="",
+        foundry_project_endpoint="", azure_openai_endpoint="",
+        applicationinsights_connection_string="",
+    )
     cli.console = Console(file=buffer, width=200, force_terminal=False)
     try:
         code = cli.cmd_health(args)
@@ -965,6 +981,16 @@ def test_preflight_passes_a_sane_probe() -> None:
     code, _ = _preflight(json.dumps([{
         "name": "sales", "workspace_id": "ws", "dataset_id": "ds",
         "table": "f", "date_table": "d", "date_column": "date",
+    }]))
+    assert code == 0
+
+
+def test_preflight_stays_offline_with_exported_sql_settings(monkeypatch) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "offline-test.invalid")
+    monkeypatch.setenv("AZURE_SQL_DATABASE", "synthetic")
+    code, _ = _preflight(json.dumps([{
+        "name": "sales", "workspace_id": "ws", "dataset_id": "ds",
+        "table": "f", "date_column": "date",
     }]))
     assert code == 0
 

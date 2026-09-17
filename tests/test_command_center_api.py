@@ -14,18 +14,21 @@ from triage.command_center.api import create_app
 from triage.command_center.models import Actor, AskInput, WebSettings
 from triage.command_center.service import CommandCenterService
 from triage.models import TriageResult
+from triage.monitoring.runtime import ensure_fixture_target, fixture_setup, fixture_target
 
 WORKSPACE = "10000000-0000-0000-0000-000000000001"
 DATASET = "20000000-0000-0000-0000-000000000002"
+TARGET = fixture_target("powerbi", WORKSPACE, DATASET)
 
 
 @pytest.fixture
 def service(test_settings):
     settings = test_settings.model_copy(update={
-        "powerbi_workspace_id": WORKSPACE, "powerbi_dataset_id": DATASET,
         "approval_delivery_mode": "web", "run_history_enabled": True,
     })
     result = CommandCenterService(settings, WebSettings(mode="demo", demo_worker=False))
+    with fixture_setup(result.monitoring.store) as setup:
+        ensure_fixture_target(setup, TARGET, "Synthetic report")
     incident = result.incidents.record(TriageResult(
         outcome="needs_human", signature="sample", request_id="request-1",
         summary="Inspect source access", root_cause="Source access failed.",
@@ -70,7 +73,7 @@ def test_readers_cannot_approve_or_enqueue_commands(service) -> None:
             "request_id": request.request_id, "fingerprint": request.fingerprint, "decision": "approve",
         })
         command = client.post("/api/commands", headers=headers, json={
-            "kind": "powerbi_triage", "target_id": f"powerbi:{WORKSPACE}:{DATASET}",
+            "kind": "powerbi_triage", "target_id": TARGET.key,
             "subject": "Refresh failed", "idempotency_key": str(uuid4()),
         })
     assert decision.status_code == 403
@@ -115,7 +118,7 @@ def test_command_target_is_allowlisted_and_idempotency_is_enforced(service) -> N
     with live_client(runtime, ("reader", "operator")) as client:
         headers = {"Authorization": "Bearer test-token"}
         body = {
-            "kind": "powerbi_triage", "target_id": f"powerbi:{WORKSPACE}:{DATASET}",
+            "kind": "powerbi_triage", "target_id": TARGET.key,
             "subject": "Refresh failed", "body": "Synthetic fixture", "idempotency_key": str(uuid4()),
         }
         assert client.post("/api/commands", json=body | {"target_id": "unconfigured"}, headers=headers).status_code == 422

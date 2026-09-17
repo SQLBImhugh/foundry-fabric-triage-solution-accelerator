@@ -24,12 +24,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+
+from triage.store.azure_sql import SqlUnavailable, quote_identifier
 
 logger = logging.getLogger("triage.store.semantic_health")
 
@@ -215,15 +218,8 @@ class JsonFileSemanticHealthStore(InMemorySemanticHealthStore):
             self._path.unlink()
 
 
-class FabricSqlSemanticHealthStore(InMemorySemanticHealthStore):
-    """The deployed path. Degrades to in-memory, loudly, and keeps retrying.
-
-    Degraded, every sweep starts with no history and can never detect a
-    watermark that failed to advance. The detector would run, find nothing,
-    and report health it has not established -- so this logs an error rather
-    than a warning, and reconnects rather than staying blind for the life of
-    the container.
-    """
+class AzureSqlSemanticHealthStore(InMemorySemanticHealthStore):
+    """Shared baselines and sweep leases. Unknown state is not a healthy scan."""
 
     def __init__(
         self,
@@ -232,103 +228,146 @@ class FabricSqlSemanticHealthStore(InMemorySemanticHealthStore):
         table: str = "triage_semantic_health",
         lease_table: str = "triage_sweep_leases",
     ) -> None:
-        from triage.store.fabric_sql import quote_identifier
-
         super().__init__()
+        self._lock = threading.RLock()
         self._db = db
         self._table = quote_identifier(table)
         self._table_name = table
         self._lease_table = quote_identifier(lease_table)
         self._loaded = False
+        self._revisions: dict[str, bytes] = {}
         self._ensure_loaded()
 
     @property
     def is_durable(self) -> bool:
         return self._loaded and self._db.is_available
 
-    def _ensure_loaded(self) -> bool:
-        if self._loaded:
-            return True
+    def _ensure_loaded(self, key: str | None = None) -> None:
+        self._loaded = False
+        self._items.clear()
+        self._revisions.clear()
         try:
-            self._load()
-        except Exception as exc:  # noqa: BLE001
+            self._load(key)
+        except Exception as exc:
             logger.error(
-                "Semantic health store degraded to in-memory: cannot read %s (%s). "
-                "Every sweep will start blind and cannot detect staleness.",
-                self._table_name,
-                type(exc).__name__,
+                "Cannot read deployed probe state in %s (%s); scan stopped",
+                self._table_name, type(exc).__name__,
             )
-            return False
+            raise
         self._loaded = True
-        logger.info(
-            "Loaded %d probe baseline(s) from %s", len(self._items), self._table_name
-        )
-        return True
 
-    def _load(self) -> None:
-        rows = self._db.query(f"SELECT probe_key, payload FROM {self._table}")
+    @staticmethod
+    def _validate_state(key: str, row: Any) -> None:
+        if not isinstance(row, dict) or set(row) != {f.name for f in fields(ProbeState)}:
+            raise ValueError("Probe state does not match the deployed model")
+        for name in (
+            "workspace_id", "dataset_id", "probe_name", "report_name", "last_max_date",
+            "last_healthy_at", "first_suspect_at", "suspect_kind", "last_error",
+            "circuit_opened_at", "updated_at",
+        ):
+            if not isinstance(row[name], str):
+                raise ValueError("Invalid probe text field")
+        if (
+            not row["workspace_id"] or not row["dataset_id"] or not row["probe_name"]
+            or key != probe_key(row["workspace_id"], row["dataset_id"], row["probe_name"])
+        ):
+            raise ValueError("Invalid probe identity")
+        for name in ("suspect_count", "consecutive_errors", "observations"):
+            if type(row[name]) is not int or row[name] < 0:
+                raise ValueError("Invalid probe count")
+        count = row["last_row_count"]
+        if count is not None and (type(count) is not int or count < 0):
+            raise ValueError("Invalid baseline row count")
+        totals = row["last_control_totals"]
+        if not isinstance(totals, dict) or any(
+            not isinstance(name, str) or type(value) not in (float, int) or not math.isfinite(value)
+            for name, value in totals.items()
+        ):
+            raise ValueError("Invalid baseline totals")
+        if not isinstance(row["last_schema"], list) or any(
+            not isinstance(name, str) for name in row["last_schema"]
+        ):
+            raise ValueError("Invalid probe schema")
+        for name in ("last_healthy_at", "first_suspect_at", "circuit_opened_at", "updated_at"):
+            if row[name] and datetime.fromisoformat(row[name]).tzinfo is None:
+                raise ValueError("Probe timestamp has no timezone")
+        if not row["updated_at"]:
+            raise ValueError("Missing probe update timestamp")
+
+    def _load(self, key: str | None = None) -> None:
+        where = " WHERE probe_key = ?" if key is not None else ""
+        params = (key,) if key is not None else ()
+        rows = self._db.query(f"SELECT probe_key, payload FROM {self._table}{where}", *params)
         loaded: dict[str, dict[str, Any]] = {}
-        for key, raw in rows:
-            if not raw:
-                continue
-            try:
-                loaded[str(key)] = json.loads(raw)
-            except Exception:  # noqa: BLE001
-                logger.warning("Skipping unreadable probe state %s", key)
+        revisions: dict[str, bytes] = {}
+        try:
+            for stored_key, raw in rows:
+                row = json.loads(raw)
+                self._validate_state(stored_key, row)
+                if stored_key in loaded:
+                    raise ValueError("Duplicate probe state")
+                loaded[stored_key] = row
+                revisions[stored_key] = hashlib.sha256(raw.encode("utf-16-le")).digest()
+        except (TypeError, ValueError, AttributeError, OverflowError) as exc:
+            raise SqlUnavailable(
+                f"Unreadable probe state in {self._table_name}; repair deployed state."
+            ) from exc
         self._items = loaded
+        self._revisions = revisions
 
     def get(self, workspace_id: str, dataset_id: str, probe_name: str) -> ProbeState | None:
-        # Guarded: a missing baseline reads as "first sighting", which silently
-        # suppresses the staleness finding this store exists to produce.
-        self._ensure_loaded()
-        return super().get(workspace_id, dataset_id, probe_name)
+        with self._lock:
+            self._ensure_loaded(probe_key(workspace_id, dataset_id, probe_name))
+            return super().get(workspace_id, dataset_id, probe_name)
 
     def all_states(self) -> list[ProbeState]:
-        self._ensure_loaded()
-        return super().all_states()
+        with self._lock:
+            self._ensure_loaded()
+            return super().all_states()
+
+    def put(self, state: ProbeState) -> None:
+        with self._lock:
+            self._ensure_loaded(probe_key(state.workspace_id, state.dataset_id, state.probe_name))
+            super().put(state)
 
     def _persist(self, key: str, state: ProbeState) -> None:
-        payload = json.dumps(state.as_dict())
-        promoted = (
-            state.probe_name,
-            state.report_name,
-            state.last_max_date,
-            int(state.last_row_count or 0),
-            int(state.suspect_count),
-            payload,
-        )
         try:
-            updated = self._db.execute(
-                f"UPDATE {self._table} SET probe_name = ?, report_name = ?, "
-                f"last_max_date = ?, last_row_count = ?, suspect_count = ?, "
-                f"payload = ? WHERE probe_key = ?",
-                *promoted,
-                key,
+            raw = state.as_dict()
+            self._validate_state(key, raw)
+            payload = json.dumps(raw, allow_nan=False)
+            promoted = (
+                state.probe_name, state.report_name, state.last_max_date,
+                state.last_row_count, state.suspect_count, payload,
             )
-            if not updated:
-                try:
-                    self._db.execute(
-                        f"INSERT INTO {self._table} (probe_key, probe_name, "
-                        f"report_name, last_max_date, last_row_count, "
-                        f"suspect_count, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        key,
-                        *promoted,
-                    )
-                except self._db.integrity_error():
-                    self._db.execute(
-                        f"UPDATE {self._table} SET probe_name = ?, report_name = ?, "
-                        f"last_max_date = ?, last_row_count = ?, suspect_count = ?, "
-                        f"payload = ? WHERE probe_key = ?",
-                        *promoted,
-                        key,
-                    )
-        except Exception as exc:  # noqa: BLE001
+            revision = self._revisions.get(key)
+            if revision is None:
+                changed = self._db.execute(
+                    f"INSERT INTO {self._table} (probe_key, probe_name, "
+                    "report_name, last_max_date, last_row_count, "
+                    "suspect_count, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    key, *promoted,
+                )
+            else:
+                changed = self._db.execute(
+                    f"UPDATE {self._table} SET probe_name = ?, report_name = ?, "
+                    "last_max_date = ?, last_row_count = ?, suspect_count = ?, "
+                    "payload = ? WHERE probe_key = ? AND HASHBYTES('SHA2_256', payload) = ?",
+                    *promoted, key, revision,
+                )
+            if changed != 1:
+                raise SqlUnavailable(
+                    "Probe write was not confirmed or its shared revision changed; reload before continuing."
+                )
+        except Exception as exc:
             self._loaded = False
+            self._items.clear()
+            self._revisions.clear()
             logger.error(
-                "Could not persist probe baseline %s (%s); the next sweep will be blind",
-                state.probe_name,
-                type(exc).__name__,
+                "Probe baseline %s write unconfirmed (%s); scan stopped",
+                state.probe_name, type(exc).__name__,
             )
+            raise
+        self._revisions[key] = hashlib.sha256(payload.encode("utf-16-le")).digest()
 
     def try_acquire_lease(self, name: str, owner: str, ttl_seconds: int) -> bool:
         """Claim the sweep across instances, using the database as the arbiter.
@@ -340,33 +379,12 @@ class FabricSqlSemanticHealthStore(InMemorySemanticHealthStore):
         suspect-then-confirm rule, which exists to stop false positives, into a
         generator of them.
 
-        Insert-if-absent is the atomic primitive: whoever creates the row wins.
-        An expired row, or one this same owner already holds, is taken over by a
-        conditional UPDATE whose WHERE clause is evaluated on the server, so two
-        instances racing on an expired lease cannot both get ``rowcount`` 1.
+        Conditional UPDATE and INSERT statements use database time and report
+        the winner by row count. An unavailable database is an error, not an
+        ordinary competing sweep. Neither statement falls back to local leases.
         """
-        try:
-            self._db.execute(
-                f"INSERT INTO {self._lease_table} (lease_name, owner, expires_at) "
-                f"VALUES (?, ?, DATEADD(second, ?, SYSUTCDATETIME()))",
-                name,
-                owner,
-                int(ttl_seconds),
-            )
-            return True
-        except Exception as exc:  # noqa: BLE001
-            try:
-                duplicate = isinstance(exc, self._db.integrity_error())
-            except Exception:  # pragma: no cover - driver missing
-                duplicate = False
-            if not duplicate:
-                # Cannot arbitrate, so do not sweep. Declining is safe;
-                # proceeding risks the double confirmation this prevents.
-                logger.warning(
-                    "Could not take sweep lease (%s); skipping", type(exc).__name__
-                )
-                return False
-
+        if not name or not owner or ttl_seconds <= 0:
+            raise ValueError("A sweep lease requires a name, owner and positive lifetime.")
         try:
             won = self._db.execute(
                 f"UPDATE {self._lease_table} "
@@ -378,23 +396,46 @@ class FabricSqlSemanticHealthStore(InMemorySemanticHealthStore):
                 name,
                 owner,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not renew sweep lease (%s); skipping", type(exc).__name__)
-            return False
-        return bool(won)
+            if won not in (0, 1):
+                raise SqlUnavailable("Sweep lease update returned no reliable row count.")
+            if won == 1:
+                return True
+            inserted = self._db.execute(
+                f"INSERT INTO {self._lease_table} (lease_name, owner, expires_at) "
+                "SELECT ?, ?, DATEADD(second, ?, SYSUTCDATETIME()) "
+                f"WHERE NOT EXISTS (SELECT 1 FROM {self._lease_table} "
+                "WITH (UPDLOCK, HOLDLOCK) WHERE lease_name = ?)",
+                name, owner, int(ttl_seconds), name,
+            )
+            if inserted not in (0, 1):
+                raise SqlUnavailable("Sweep lease insert returned no reliable row count.")
+            return inserted == 1
+        except Exception as exc:
+            self._loaded = False
+            logger.error("Sweep lease write unconfirmed (%s); scan stopped", type(exc).__name__)
+            raise
 
     def release_lease(self, name: str, owner: str) -> None:
         try:
-            self._db.execute(
+            released = self._db.execute(
                 f"DELETE FROM {self._lease_table} WHERE lease_name = ? AND owner = ?",
                 name,
                 owner,
             )
-        except Exception:  # noqa: BLE001 - the TTL releases it anyway
-            logger.debug("Could not release sweep lease %s", name)
+            if released not in (0, 1):
+                raise SqlUnavailable("Sweep lease release returned no reliable row count.")
+        except Exception as exc:
+            self._loaded = False
+            logger.error("Sweep lease release unconfirmed (%s)", type(exc).__name__)
+            raise
 
     def _on_reset(self) -> None:
+        self._loaded = False
+        self._revisions.clear()
         try:
-            self._db.execute(f"DELETE FROM {self._table}")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not clear %s (%s)", self._table_name, type(exc).__name__)
+            if self._db.execute(f"DELETE FROM {self._table}") < 0:
+                raise SqlUnavailable("Probe reset returned no reliable affected-row count.")
+        except Exception as exc:
+            logger.error("Could not clear %s (%s)", self._table_name, type(exc).__name__)
+            raise
+        self._loaded = True

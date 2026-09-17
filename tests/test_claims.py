@@ -117,46 +117,30 @@ class _RefusingClaims:
         self.released.append(key)
 
 
-def _retry_runner(refreshes: list[str]):
-    """A stand-in with just the collaborators drain_due_retries touches."""
-    import types
-
+def _retry_runner(refreshes: list[str], tmp_path, settings):
+    """Exercise the real retry admission path with explicit fixture collaborators."""
     from triage.runner import TriageRunner
+    from triage.store.incidents import InMemoryIncidentStore
+    from triage.store.retries import InMemoryRetryStore
+    from triage.tools.powerbi import MockPowerBIClient
 
-    class _Outcome:
-        succeeded = True
-        throttled = False
-        status = "Completed"
-        retry_after_seconds = 0
-
-    class _PowerBI:
+    class _PowerBI(MockPowerBIClient):
         async def refresh_dataset(self, workspace_id: str, dataset_id: str):
             refreshes.append(dataset_id)
-            return _Outcome()
+            return await super().refresh_dataset(workspace_id, dataset_id)
 
-    class _Retries:
-        def due(self, now=None):
-            return [{"signature": "sig-1", "dataset_id": "ds-1",
-                     "workspace_id": "ws-1", "report_name": "R",
-                     "request_id": "r-1"}]
-
-        def complete(self, *_a, **_kw):
-            return None
-
-    class _Store:
-        def find_open(self, _sig):
-            return None
-
-    fake = types.SimpleNamespace(
-        retries=_Retries(),
-        store=_Store(),
-        build_powerbi=lambda: _PowerBI(),
+    fake = TriageRunner(settings, base_dir=tmp_path, store=InMemoryIncidentStore())
+    fake.retries = InMemoryRetryStore()
+    fake.retries.defer(
+        signature="sig-1", dataset_id="ds-1", workspace_id="ws-1",
+        report_name="R", request_id="r-1",
     )
-    fake._drain_one_retry = types.MethodType(TriageRunner._drain_one_retry, fake)
+    fake.retries._items["sig-1"]["due_at"] = "2000-01-01T00:00:00+00:00"
+    fake.build_powerbi = lambda: _PowerBI(latency_ms=0)
     return fake, TriageRunner.drain_due_retries
 
 
-def test_a_claimed_retry_is_not_drained_twice() -> None:
+def test_a_claimed_retry_is_not_drained_twice(tmp_path, test_settings) -> None:
     """A deferred retry issues a real dataset refresh, and `due` and `complete`
     are separate statements — so two replicas draining at the same moment both
     see the row as due. The mailbox path has always claimed per message; the
@@ -165,7 +149,7 @@ def test_a_claimed_retry_is_not_drained_twice() -> None:
     import asyncio
 
     refreshes: list[str] = []
-    fake, drain = _retry_runner(refreshes)
+    fake, drain = _retry_runner(refreshes, tmp_path, test_settings)
     claims = _RefusingClaims()
 
     lines = asyncio.run(drain(fake, claims=claims))
@@ -175,23 +159,25 @@ def test_a_claimed_retry_is_not_drained_twice() -> None:
     assert lines == []
 
 
-def test_an_unclaimed_retry_still_runs_and_releases() -> None:
+def test_an_unclaimed_retry_still_runs_and_releases(tmp_path, test_settings) -> None:
     """The guard must not stop the ordinary single-instance path."""
     import asyncio
 
     refreshes: list[str] = []
-    fake, drain = _retry_runner(refreshes)
+    fake, drain = _retry_runner(refreshes, tmp_path, test_settings)
     claims = InMemoryClaimStore()
 
     lines = asyncio.run(drain(fake, claims=claims))
 
-    assert refreshes == ["ds-1"]
+    from triage.monitoring.runtime import fixture_target
+
+    assert refreshes == [fixture_target("powerbi", "ws-1", "ds-1").item_id]
     assert any("deferred retry completed" in ln for ln in lines)
     # Released, so a later drain in the same process is not locked out.
     assert claims.claim("retry:sig-1") is True
 
 
-def test_the_retry_claim_is_held_until_the_row_is_finished() -> None:
+def test_the_retry_claim_is_held_until_the_row_is_finished(tmp_path, test_settings) -> None:
     """Releasing at the refresh would let a second drainer see the row as still
     due and fire again before it was marked complete."""
     import asyncio
@@ -200,7 +186,7 @@ def test_the_retry_claim_is_held_until_the_row_is_finished() -> None:
     claims = InMemoryClaimStore()
 
     refreshes: list[str] = []
-    fake, drain = _retry_runner(refreshes)
+    fake, drain = _retry_runner(refreshes, tmp_path, test_settings)
 
     original = fake.retries.complete
 

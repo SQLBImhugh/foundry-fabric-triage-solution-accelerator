@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import re
 
-SIGNATURE_VERSION = "v1"
+SIGNATURE_VERSION = "v2"
 
 _GUID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -74,13 +74,15 @@ def compute_signature(
     artifact_kind: str = "dataset",
     artifact_name: str | None = None,
     exception_class: str | None = None,
+    target_key: str | None = None,
 ) -> tuple[str, str]:
     """Return ``(signature, normalized_payload)``.
 
     ``source`` is the triage entry point (e.g. ``"powerbi_refresh_failure"``).
-    ``artifact_name`` scopes the signature to one report/dataset so the same
-    error class on two different reports stays two incidents — which is what
-    an operator actually wants when deciding whether to suppress.
+    Native incidents supply ``target_key``: the registry's tenant, epoch,
+    workload, workspace and item identity. Display names never identify a
+    native incident. ``artifact_name`` is retained for diagnostic records that
+    cannot be bound to an admitted source execution.
 
     The normalized payload is returned for debugging and is deliberately NOT
     persisted; it can contain fragments of the original message.
@@ -92,7 +94,7 @@ def compute_signature(
         [
             source or "",
             artifact_kind or "",
-            (artifact_name or "").strip(),
+            target_key if target_key is not None else (artifact_name or "").strip(),
             exception_class,
             normalized,
         ]

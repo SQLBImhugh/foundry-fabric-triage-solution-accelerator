@@ -17,7 +17,7 @@ from typing import Any, Protocol
 
 from triage.pipeline_models import PipelineRerunRecord, RerunState
 from triage.redaction import redact_text
-from triage.store.fabric_sql import quote_identifier
+from triage.store.azure_sql import quote_identifier
 
 logger = logging.getLogger("triage.store.pipeline_reruns")
 
@@ -118,7 +118,7 @@ class JsonFilePipelineRerunStore(InMemoryPipelineRerunStore):
         temp.replace(self.path)
 
 
-class FabricSqlPipelineRerunStore:
+class AzureSqlPipelineRerunStore:
     """Read-through SQL state. Database errors propagate and prevent dispatch."""
 
     def __init__(self, *, db: Any, table: str = "triage_pipeline_reruns") -> None:

@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from test_command_center_api import DATASET, WORKSPACE
+from test_command_center_api import TARGET
 from test_command_center_api import service as service
 from test_command_center_auth import CLIENT, TENANT, USER
 from test_command_center_auth import signing as signing
@@ -157,8 +157,9 @@ def test_entra_authorization_never_reads_sql_or_honors_a_stale_local_grant(test_
     web = WebSettings(_env_file=None, mode="live", tenant_id=TENANT, client_id=CLIENT)
     runtime = CommandCenterService(
         test_settings.model_copy(update={
-            "fabric_sql_server": "offline.database.fabric.microsoft.com",
-            "fabric_sql_database": "offline_state",
+            "azure_sql_server": "offline.database.windows.net",
+            "azure_sql_database": "offline_state",
+            "monitoring_mode": "live", "monitoring_tenant_id": TENANT,
         }),
         web, db=NoSql(), history=InMemoryCommandCenterStore(), approvals=InMemoryApprovalChannel(),
     )
@@ -189,7 +190,7 @@ def test_real_role_tokens_keep_backend_operation_guards(
             "incident_id": incident.id, "question": "What happened?",
         }).status_code == 200
         command = client.post("/api/commands", headers=headers, json={
-            "kind": "powerbi_triage", "target_id": f"powerbi:{WORKSPACE}:{DATASET}",
+            "kind": "powerbi_triage", "target_id": TARGET.key,
             "subject": "Synthetic failure", "idempotency_key": str(uuid4()),
         })
         assert command.status_code == operator_status

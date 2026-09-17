@@ -45,12 +45,13 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from triage.redaction import redact_text
+from triage.store.azure_sql import SqlUnavailable, quote_identifier
 
 logger = logging.getLogger("triage.store.approvals")
 
 
 def _utcnow() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat()
 
 
 def _redacted(value: Any) -> Any:
@@ -64,7 +65,7 @@ def _redacted(value: Any) -> Any:
 
 
 def _request_row(request: Any) -> dict[str, Any]:
-    return {
+    row = {
         "request_id": request.request_id,
         "action": request.action,
         "fingerprint": request.fingerprint,
@@ -79,6 +80,11 @@ def _request_row(request: Any) -> dict[str, Any]:
         "decision": "", "responder": "", "reason": "", "decided_at": "",
         "consumed_at": "",
     }
+    for name in ("monitoring_work_id", "target_key", "source_execution_key"):
+        value = getattr(request, name, None)
+        if value is not None:
+            row[name] = value
+    return row
 
 
 def _assert_open(row: dict[str, Any], fingerprint: str) -> None:
@@ -327,7 +333,7 @@ class JsonFileApprovalChannel(InMemoryApprovalChannel):
             self._path.unlink()
 
 
-class FabricSqlApprovalChannel(InMemoryApprovalChannel):
+class AzureSqlApprovalChannel(InMemoryApprovalChannel):
     """The deployed path: the agent polls here, a human writes here.
 
     The row is the meeting point between two processes that never share
@@ -335,15 +341,12 @@ class FabricSqlApprovalChannel(InMemoryApprovalChannel):
     from a Teams card or the CLI, in a different process and often a different
     container; the agent reads the answer back on a later poll.
 
-    Every read goes to the database rather than to the in-memory copy, because
-    the in-memory copy cannot contain a decision made somewhere else. Degrades
-    loudly: in that state no human can answer and every gated action fails
-    closed, which is safe but useless, so it keeps retrying.
+    Every read goes to the database. Read, schema and write errors propagate;
+    an unavailable queue must not look empty. The gate treats these errors as
+    no approval. An unacknowledged write is never retried here.
     """
 
     def __init__(self, *, db: Any, table: str = "triage_approvals") -> None:
-        from triage.store.fabric_sql import quote_identifier
-
         super().__init__()
         self._db = db
         self._table = quote_identifier(table)
@@ -353,123 +356,104 @@ class FabricSqlApprovalChannel(InMemoryApprovalChannel):
     def is_durable(self) -> bool:
         return self._db.is_available
 
+    def _decode(self, raw: str, request_id: str | None = None) -> dict[str, Any]:
+        try:
+            row = json.loads(raw)
+            if not isinstance(row, dict):
+                raise ValueError("Approval payload is not an object")
+            for name in (
+                "request_id", "action", "fingerprint", "report_name", "justification",
+                "impact", "signature", "run_id", "requested_at", "expires_at",
+                "decision", "responder", "reason", "decided_at", "consumed_at",
+            ):
+                if not isinstance(row[name], str):
+                    raise ValueError("Invalid approval field")
+            if (
+                not row["request_id"] or not row["action"] or not row["fingerprint"]
+                or (request_id is not None and row["request_id"] != request_id)
+                or not isinstance(row["arguments"], dict)
+                or row["decision"] not in {"", "approve", "decline"}
+            ):
+                raise ValueError("Invalid approval identity or decision")
+            for name in ("requested_at", "expires_at"):
+                if datetime.fromisoformat(row[name]).tzinfo is None:
+                    raise ValueError("Approval timestamp has no timezone")
+            for name in ("decided_at", "consumed_at"):
+                if row[name] and datetime.fromisoformat(row[name]).tzinfo is None:
+                    raise ValueError("Approval timestamp has no timezone")
+            if row["decision"] and (not row["responder"] or not row["decided_at"]):
+                raise ValueError("Approval has no responder or decision timestamp")
+            if row["consumed_at"] and row["decision"] != "approve":
+                raise ValueError("Only an approval can be consumed")
+            return row
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.error("Unreadable approval state in %s; gate closed", self._table_name)
+            raise SqlUnavailable(
+                f"Unreadable approval state in {self._table_name}; repair deployed state."
+            ) from exc
+
     def _fetch(self, request_id: str) -> dict[str, Any] | None:
         try:
             rows = self._db.query(
                 f"SELECT payload FROM {self._table} WHERE request_id = ?", request_id
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.error(
                 "Could not read approval %s (%s); the gate will fail closed",
                 request_id,
                 type(exc).__name__,
             )
-            return None
+            raise
         if not rows:
             return None
-        try:
-            return json.loads(rows[0][0])
-        except Exception:  # noqa: BLE001
-            logger.warning("Approval %s has an unreadable payload", request_id)
-            return None
+        if len(rows) != 1 or len(rows[0]) != 1:
+            raise SqlUnavailable("Approval lookup did not return one unambiguous payload.")
+        return self._decode(rows[0][0], request_id)
+
+    def open(self, request: Any) -> None:
+        self._write(request.request_id, _request_row(request))
 
     async def poll(self, request_id: str) -> dict[str, Any] | None:
         row = self._fetch(request_id)
-        if row is None or not row.get("decision"):
+        if (
+            row is None or not row["decision"] or row["consumed_at"]
+            or datetime.fromisoformat(row["expires_at"]) <= datetime.now(UTC)
+        ):
             return None
         return row
 
     def decide(
         self, request_id: str, *, decision: str, responder: str, reason: str = ""
     ) -> dict[str, Any]:
-        """Record a decision, and refuse if one is already there.
-
-        The check and the write are **one conditional statement**. Reading the
-        row, seeing no decision, and then writing is a race: two responders can
-        both read an unanswered request and both write, and the later one wins
-        silently. The Azure Table version closed that with an ETag; here the
-        ``WHERE`` clause does it, and ``rowcount`` reports who won.
-
-        Losing this race is not an error condition to paper over -- it means
-        somebody else answered first, and their answer stands.
-        """
+        """Use the same fingerprint, expiry and single-assignment guard as the UI."""
         row = self._fetch(request_id)
         if row is None:
             raise KeyError(f"No approval request with id {request_id!r}")
-        if row.get("decision"):
-            raise ValueError(
-                f"Approval {request_id} was already answered "
-                f"({row['decision']} by {row.get('responder') or 'unknown'})"
-            )
-
-        row.update(
-            {
-                "decision": decision,
-                "responder": responder,
-                "reason": reason,
-                "decided_at": _utcnow(),
-            }
+        return self.decide_exact(
+            request_id, decision=decision, fingerprint=row["fingerprint"],
+            responder=responder, reason=reason,
         )
-        payload = json.dumps(row, default=str)
-
-        try:
-            won = self._db.execute(
-                f"UPDATE {self._table} "
-                f"   SET decision = ?, responder = ?, decided_at = ?, payload = ? "
-                f" WHERE request_id = ? AND (decision IS NULL OR decision = '')",
-                decision,
-                responder,
-                row["decided_at"],
-                payload,
-                request_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            # A write that did not happen must not read as a decision. The gate
-            # polls the database, so returning normally here would report an
-            # approval nobody recorded.
-            raise RuntimeError(
-                f"Could not record the decision for {request_id} "
-                f"({type(exc).__name__}); it has not been answered"
-            ) from exc
-
-        if not won:
-            current = self._fetch(request_id) or {}
-            raise ValueError(
-                f"Approval {request_id} was already answered "
-                f"({current.get('decision', 'unknown')} by "
-                f"{current.get('responder') or 'unknown'})"
-            )
-
-        logger.info("Approval %s -> %s by %s", request_id, decision, responder)
-        return row
 
     def pending(self) -> list[dict[str, Any]]:
         try:
             rows = self._db.query(
                 f"SELECT payload FROM {self._table} WHERE decision IS NULL OR decision = ''"
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.error("Could not list pending approvals (%s)", type(exc).__name__)
-            return []
-        out: list[dict[str, Any]] = []
-        for (raw,) in rows:
-            try:
-                out.append(json.loads(raw))
-            except Exception:  # noqa: BLE001
-                continue
-        return out
+            raise
+        return [self._decode(raw) for (raw,) in rows]
 
     def get(self, request_id: str) -> dict[str, Any] | None:
         return self._fetch(request_id)
 
     def get_exact(self, request_id: str) -> dict[str, Any] | None:
-        rows = self._db.query(f"SELECT payload FROM {self._table} WHERE request_id = ?", request_id)
-        return json.loads(rows[0][0]) if rows else None
+        return self._fetch(request_id)
 
     def list_requests(self, limit: int = 200) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 500))
         return [
-            json.loads(row[0]) for row in self._db.query(
+            self._decode(row[0]) for row in self._db.query(
                 f"SELECT TOP ({limit}) payload FROM {self._table} "
                 "ORDER BY CASE WHEN (decision IS NULL OR decision = '') "
                 "AND COALESCE(JSON_VALUE(payload, '$.consumed_at'), '') = '' "
@@ -482,17 +466,7 @@ class FabricSqlApprovalChannel(InMemoryApprovalChannel):
     def open_exact(self, request: Any) -> None:
         row = _request_row(request)
         row["delivery_channel"] = "web"
-        try:
-            self._db.execute(
-                f"INSERT INTO {self._table} (request_id, decision, responder, decided_at, payload) "
-                "VALUES (?, NULL, NULL, NULL, ?)",
-                request.request_id, json.dumps(row),
-            )
-        except self._db.integrity_error():
-            prior = self.get_exact(request.request_id)
-            if prior is None:
-                raise RuntimeError("The existing approval could not be read") from None
-            _assert_open(prior, request.fingerprint)
+        self._write(request.request_id, row)
 
     def decide_exact(
         self, request_id: str, *, decision: str, fingerprint: str,
@@ -516,66 +490,61 @@ class FabricSqlApprovalChannel(InMemoryApprovalChannel):
             decision, responder, decided, decision, responder, redact_text(reason), decided,
             request_id, fingerprint,
         )
-        if won != 1:
+        if won not in (0, 1):
+            raise SqlUnavailable("Approval decision returned no reliable affected-row count.")
+        if won == 0:
             raise ValueError("The proposal expired, changed or was answered by another operator.")
         row.update(decision=decision, responder=responder, reason=redact_text(reason), decided_at=decided)
         return row
 
     def consume_exact(self, request_id: str, fingerprint: str) -> bool:
-        return self._db.execute(
+        consumed = self._db.execute(
             f"UPDATE {self._table} SET payload = JSON_MODIFY(payload, '$.consumed_at', ?) "
             "WHERE request_id = ? AND decision = 'approve' "
             "AND JSON_VALUE(payload, '$.fingerprint') = ? "
             "AND COALESCE(JSON_VALUE(payload, '$.consumed_at'), '') = '' "
             "AND TRY_CAST(JSON_VALUE(payload, '$.expires_at') AS DATETIMEOFFSET) > SYSDATETIMEOFFSET()",
             _utcnow(), request_id, fingerprint,
-        ) == 1
+        )
+        if consumed not in (0, 1):
+            raise SqlUnavailable("Approval consumption returned no reliable affected-row count.")
+        return consumed == 1
 
     def _persist(self, row: dict[str, Any]) -> None:
         self._write(row["request_id"], row)
 
     def _write(self, request_id: str, row: dict[str, Any]) -> None:
-        payload = json.dumps(row, default=str)
-        args = (
-            row.get("decision") or None,
-            row.get("responder") or None,
-            row.get("decided_at") or None,
-            payload,
-            request_id,
-        )
+        payload = json.dumps(row)
+        self._decode(payload, request_id)
+        _assert_open(row, row["fingerprint"])
         try:
-            updated = self._db.execute(
-                f"UPDATE {self._table} SET decision = ?, responder = ?, "
-                f"decided_at = ?, payload = ? WHERE request_id = ?",
-                *args,
+            inserted = self._db.execute(
+                f"INSERT INTO {self._table} (request_id, decision, responder, decided_at, payload) "
+                "SELECT ?, NULL, NULL, NULL, ? "
+                f"WHERE NOT EXISTS (SELECT 1 FROM {self._table} "
+                "WITH (UPDLOCK, HOLDLOCK) WHERE request_id = ?)",
+                request_id, payload, request_id,
             )
-            if not updated:
-                try:
-                    self._db.execute(
-                        f"INSERT INTO {self._table} "
-                        f"(request_id, decision, responder, decided_at, payload) "
-                        f"VALUES (?, ?, ?, ?, ?)",
-                        request_id,
-                        row.get("decision") or None,
-                        row.get("responder") or None,
-                        row.get("decided_at") or None,
-                        payload,
-                    )
-                except self._db.integrity_error():
-                    self._db.execute(
-                        f"UPDATE {self._table} SET decision = ?, responder = ?, "
-                        f"decided_at = ?, payload = ? WHERE request_id = ?",
-                        *args,
-                    )
-        except Exception as exc:  # noqa: BLE001
+            if inserted not in (0, 1):
+                raise SqlUnavailable("Approval insert returned no reliable affected-row count.")
+            if inserted == 0:
+                # Reopening is idempotent only for the same still-open proposal;
+                # it must never erase a decision, consumption or original expiry.
+                prior = self._fetch(request_id)
+                if prior is None:
+                    raise SqlUnavailable("The existing approval could not be confirmed.")
+                _assert_open(prior, row["fingerprint"])
+        except Exception as exc:
             logger.error(
-                "Could not write approval %s (%s); the gate will fail closed",
-                request_id,
-                type(exc).__name__,
+                "Approval %s write unconfirmed (%s); not retried",
+                request_id, type(exc).__name__,
             )
+            raise
 
     def _on_reset(self) -> None:
         try:
-            self._db.execute(f"DELETE FROM {self._table}")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not clear %s (%s)", self._table_name, type(exc).__name__)
+            if self._db.execute(f"DELETE FROM {self._table}") < 0:
+                raise SqlUnavailable("Approval reset returned no reliable affected-row count.")
+        except Exception as exc:
+            logger.error("Could not clear %s (%s)", self._table_name, type(exc).__name__)
+            raise

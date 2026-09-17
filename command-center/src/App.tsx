@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, ArrowRight, BookOpen, ChevronDown, CircleAlert, FileSearch, FlaskConical, Layers3, LayoutDashboard, ListChecks, ListFilter, Moon, Plus, RefreshCw, ShieldCheck, Sun, UserRound } from 'lucide-react'
+import { Activity, ArrowRight, BookOpen, ChevronDown, CircleAlert, FileSearch, FlaskConical, Layers3, LayoutDashboard, ListChecks, ListFilter, Moon, Plus, Radar, RefreshCw, ShieldCheck, Sun, UserRound } from 'lucide-react'
 import { ApiError, asApiError } from './api/errors'
 import type { ApiClient } from './api/client'
 import type { AuthSession } from './api/auth'
 import { AccessApiClient } from './api/access'
 import { IncidentApiClient } from './api/incidents'
+import { MonitoringApiClient } from './api/monitoring'
 import type { AppConfig, Snapshot, WorkSelection } from './api/types'
 import type { QueueFilter } from './domain'
 import { formatDate, humanize, queueFilterLabels } from './domain'
@@ -18,6 +19,7 @@ import { ValidationWorkspace } from './components/ValidationWorkspace'
 import { UserMenu } from './components/UserMenu'
 import { AccessCenter } from './components/AccessCenter'
 import { IncidentWorkspace } from './components/IncidentWorkspace'
+import { MonitoringWorkspace } from './components/MonitoringWorkspace'
 import { canValidateScenarios } from './validation'
 import { approvalFromSearch } from './approvalLinks'
 import { incidentUrl } from './incidentLinks'
@@ -31,6 +33,7 @@ const navigation = [
   { id: 'runs' as const, title: 'Run history', icon: Activity },
   { id: 'knowledge' as const, title: 'Knowledge', icon: BookOpen },
   { id: 'validation' as const, title: 'Scenario validation', icon: ListChecks },
+  { id: 'monitoring' as const, title: 'Monitoring setup', icon: Radar },
   { id: 'access' as const, title: 'Access & permissions', icon: ShieldCheck },
 ]
 const metrics: { key: keyof Snapshot['counts']; label: string; filter: QueueFilter; tone: string }[] = [
@@ -47,6 +50,7 @@ export function App({ api, config, auth }: { api: ApiClient; config: AppConfig; 
   const accessRefresh = useRef<Promise<void> | null>(null)
   const accessApi = useMemo(() => new AccessApiClient(auth.getToken), [auth.getToken])
   const incidentApi = useMemo(() => new IncidentApiClient(auth.getToken), [auth.getToken])
+  const monitoringApi = useMemo(() => new MonitoringApiClient(auth.getToken), [auth.getToken])
   const [initialWorkspace] = useState(() => workspaceFromSearch(window.location.search))
   const [section, setSection] = useState<Section>(initialWorkspace.section)
   const [selectedIncident, setSelectedIncident] = useState<string | null>(initialWorkspace.incidentId)
@@ -57,6 +61,7 @@ export function App({ api, config, auth }: { api: ApiClient; config: AppConfig; 
   const [initialApproval] = useState(() => approvalFromSearch(window.location.search))
   const [selectedRun, setSelectedRun] = useState<string | null>(null)
   const [validationVisited, setValidationVisited] = useState(false)
+  const [monitoringVisited, setMonitoringVisited] = useState(initialWorkspace.section === 'monitoring')
   const [filter, setFilter] = useState<QueueFilter>('all')
   const [query, setQuery] = useState('')
   const [workload, setWorkload] = useState('all')
@@ -76,7 +81,7 @@ export function App({ api, config, auth }: { api: ApiClient; config: AppConfig; 
     && snapshot.data?.permissionRevision === permissionRevision)
   const capabilities = data?.capabilities ?? noCapabilities
   const validationAdmin = canValidateScenarios(data?.actor.roles ?? [])
-  const workspaceHeading = section === 'access' || (Boolean(data) && section === 'incidents')
+  const workspaceHeading = section === 'access' || section === 'monitoring' || (Boolean(data) && section === 'incidents')
   const attentionFilter = section === 'command' && !query.trim() && workload === 'all' ? filter : null
   const unavailable = !data ? 'Waiting for server configuration and permissions.'
     : !fresh ? 'New investigations are unavailable while records cannot be refreshed.'
@@ -127,6 +132,9 @@ export function App({ api, config, auth }: { api: ApiClient; config: AppConfig; 
   useEffect(() => {
     if (section === 'validation' && validationAdmin) setValidationVisited(true)
   }, [section, validationAdmin])
+  useEffect(() => {
+    if (section === 'monitoring') setMonitoringVisited(true)
+  }, [section])
   useEffect(() => {
     if (selection || !data) return
     if (initialApproval) {
@@ -213,7 +221,10 @@ export function App({ api, config, auth }: { api: ApiClient; config: AppConfig; 
         </ErrorNotice>}
         {section === 'access' && <AccessCenter api={accessApi} fresh={fresh} mode={config.mode}
           refreshAccess={refreshToken || config.mode === 'demo' ? refreshAccess : undefined} refreshError={accessError} />}
-        {!data && section !== 'access' ? <div className="initial-loading">{snapshot.loading ? <LoadingState label="Connecting to the triage API" /> : <div className="empty-state"><FileSearch size={30} aria-hidden="true" /><h2>No records loaded</h2><p>The command center requires a successful API connection. It does not substitute sample data.</p><button type="button" className="button secondary" onClick={snapshot.refresh}>Retry connection</button></div>}</div> : data && <>
+        {monitoringVisited && <div hidden={section !== 'monitoring'}><MonitoringWorkspace api={monitoringApi}
+          roles={data?.actor.roles ?? []} userId={data?.actor.id ?? null} fresh={fresh} permissionRevision={permissionRevision}
+          active={section === 'monitoring'} onChanged={snapshot.refresh} /></div>}
+        {!data && section !== 'access' && section !== 'monitoring' ? <div className="initial-loading">{snapshot.loading ? <LoadingState label="Connecting to the triage API" /> : <div className="empty-state"><FileSearch size={30} aria-hidden="true" /><h2>No records loaded</h2><p>The command center requires a successful API connection. It does not substitute sample data.</p><button type="button" className="button secondary" onClick={snapshot.refresh}>Retry connection</button></div>}</div> : data && <>
           {section === 'command' && <>
             <div className="attention-strip" aria-label="Attention summary">
               {metrics.map((metric) => <button type="button" key={metric.key} className={`attention-cell tone-${metric.tone} ${attentionFilter === metric.filter ? 'active' : ''}`} aria-pressed={attentionFilter === metric.filter} onClick={() => selectAttention(metric.filter)}><strong>{data.counts[metric.key].toString().padStart(2, '0')}</strong><span>{metric.label}</span><ArrowRight size={14} aria-hidden="true" /></button>)}

@@ -435,6 +435,7 @@ def test_scenarios_that_should_differ_have_distinct_signatures(repo_root) -> Non
     signatures: dict[str, str] = {}
     for scenario in discover_scenarios(repo_root / "scenarios"):
         if scenario.pipeline is not None:
+            from triage.monitoring.runtime import fixture_target
             from triage.pipeline_models import (
                 PipelineActivity,
                 PipelineFailure,
@@ -451,7 +452,9 @@ def test_scenarios_that_should_differ_have_distinct_signatures(repo_root) -> Non
                     for row in scenario.pipeline.get("activities", [])
                 ],
             )
-            signatures.setdefault(_pipeline_signature(failure), scenario.name)
+            signatures.setdefault(_pipeline_signature(
+                failure, fixture_target("fabric_pipeline", failure.target.workspace_id, failure.target.pipeline_id),
+            ), scenario.name)
             continue
         request = MockInbox.load(repo_root / scenario.email)
         sig, _ = compute_signature(

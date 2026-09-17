@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from triage.approvals import ApprovalRequest, WebApprovalGate
-from triage.store.approvals import FabricSqlApprovalChannel, InMemoryApprovalChannel
+from triage.store.approvals import AzureSqlApprovalChannel, InMemoryApprovalChannel
 
 
 def request(**changes) -> ApprovalRequest:
@@ -119,18 +119,16 @@ def test_sql_queue_limit_cannot_hide_a_low_identifier_pending_request() -> None:
     connection = sqlite3.connect(":memory:")
     connection.execute("CREATE TABLE triage_approvals(request_id TEXT, decision TEXT, payload TEXT)")
     now = datetime.now(UTC)
+    fixture = InMemoryApprovalChannel()
     for index in range(200):
-        row = {
-            "request_id": f"z-history-{index:03}", "decision": "decline",
-            "requested_at": now.isoformat(),
-            "expires_at": (now + timedelta(minutes=10)).isoformat(),
-        }
+        request_id = f"z-history-{index:03}"
+        fixture.open(request(request_id=request_id, requested_at=now, timeout_seconds=600))
+        row = fixture.decide(request_id, decision="decline", responder="operator")
         connection.execute("INSERT INTO triage_approvals VALUES (?, ?, ?)", (row["request_id"], "decline", json.dumps(row)))
-    pending = {
-        "request_id": "a-new-pending", "decision": "",
-        "requested_at": (now - timedelta(seconds=10)).isoformat(),
-        "expires_at": (now + timedelta(minutes=10)).isoformat(),
-    }
+    fixture.open(request(
+        request_id="a-new-pending", requested_at=now - timedelta(seconds=10), timeout_seconds=610,
+    ))
+    pending = fixture.get("a-new-pending")
     connection.execute("INSERT INTO triage_approvals VALUES (?, ?, ?)", (pending["request_id"], None, json.dumps(pending)))
 
     class Sql:
@@ -142,7 +140,7 @@ def test_sql_queue_limit_cannot_hide_a_low_identifier_pending_request() -> None:
             sql = sql.replace("SYSDATETIMEOFFSET()", "julianday('now')")
             return connection.execute(sql + f" LIMIT {limit}", params).fetchall()
 
-    rows = FabricSqlApprovalChannel(db=Sql()).list_requests(200)
+    rows = AzureSqlApprovalChannel(db=Sql()).list_requests(200)
     assert len(rows) == 200
     assert rows[0]["request_id"] == "a-new-pending"
     connection.close()

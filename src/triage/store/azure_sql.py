@@ -1,15 +1,11 @@
-"""Fabric SQL Database plumbing shared by every durable store.
+"""Azure SQL Database plumbing shared by every durable store.
 
-Why a SQL database rather than a key-value table
-------------------------------------------------
-This accelerator is Fabric- and Foundry-centric, and the state it keeps is
-relational: an incident has occurrences, an approval belongs to an action, a
-deferred retry belongs to a signature. Keeping it in the same Fabric workspace
-as the semantic models being triaged means an operator can join incident
-history to the estate in one query, with one identity model, instead of
-exporting a key-value table first.
+Application state is relational: incidents have occurrences, approvals belong
+to actions and deferred retries belong to signatures. One database holds these
+records and the monitoring registry so their receipts, leases and finalization
+can share a transaction. It is independent of Fabric capacity and either UI.
 
-Two properties made the migration worth doing rather than merely tidy:
+Two properties govern the store boundary:
 
 * **A conditional ``UPDATE`` is atomic on its own.** The claim and lease stores
   previously did read-then-write guarded by an ETag, which is three round trips
@@ -18,10 +14,9 @@ Two properties made the migration worth doing rather than merely tidy:
   whether this caller won. A primary-key ``INSERT`` that raises
   ``IntegrityError`` is the same compare-and-set the old code got from
   ``ResourceExistsError``.
-* **There is no key to leak.** Fabric SQL accepts Microsoft Entra tokens and
-  nothing else -- there is no SQL-authentication fallback to disable, so the
-  "no local auth" posture is the platform default rather than a setting that
-  governance has to keep reverting.
+* **Runtime authentication uses Entra tokens only.** Deployment enables
+  Entra-only authentication on the logical server and private connectivity.
+  This adapter has no SQL-login, password or developer-identity fallback.
 
 Why ``mssql-python`` and not ``pyodbc``
 --------------------------------------
@@ -31,8 +26,8 @@ with pip and nothing else. ``pyodbc`` needs the ``msodbcsql18`` system driver,
 which is an apt package and cannot be pip-installed, so it cannot work there.
 ``mssql-python`` ships the driver inside the wheel as a normal dependency
 (``mssql-python-odbc``) and publishes a cp313 manylinux build matching the
-container runtime. Verified against a real Fabric SQL Database before this was
-written, not assumed.
+container runtime. The driver was verified on the previous SQL-backed deployment;
+the Azure SQL target and every deployed identity require their own live proof.
 
 Reconnection is deliberate, not incidental
 ------------------------------------------
@@ -56,6 +51,8 @@ import re
 import struct
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from triage.redaction import redact_text
@@ -66,7 +63,7 @@ logger = logging.getLogger("triage.store.sql")
 #: token, which is how a driver authenticates without a password.
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 
-#: The audience Azure SQL and Fabric SQL accept.
+#: The Azure SQL token audience.
 SQL_SCOPE = "https://database.windows.net/.default"
 
 #: How long to wait before retrying a database that failed to open. Long enough
@@ -99,8 +96,8 @@ def _token_struct(token: str) -> bytes:
     return struct.pack("<I", len(raw)) + raw
 
 
-class FabricSqlDatabase:
-    """Connections to a Fabric SQL Database, shared by all six stores.
+class AzureSqlDatabase:
+    """Connections to an Azure SQL Database, shared by the durable stores.
 
     One handle, but **one connection per thread**. The driver's connections are
     not thread-safe, and serialising every statement behind a single lock was
@@ -142,13 +139,7 @@ class FabricSqlDatabase:
         self._last_error_detail = ""
 
     def ensure_schema_once(self) -> bool:
-        """Create the tables if they are missing, at most once per success.
-
-        Stores call this on every recovery attempt, not just at startup. If the
-        database was unreachable when the process began, nothing created the
-        schema, and a store that only ever retried its ``SELECT`` would keep
-        failing against a table that was never going to appear.
-        """
+        """Deployment-only schema creation; runtime stores must never call it."""
         if self._schema_ready:
             return True
         if not ensure_schema(self, self._tables):
@@ -175,18 +166,18 @@ class FabricSqlDatabase:
         if credential is None:
             from azure.identity import DefaultAzureCredential
 
-            # Plain DefaultAzureCredential, unlike the mail and Power BI
-            # clients, which exclude every human credential so a container
-            # cannot authenticate as whoever last ran `az login`.
-            #
-            # This store is different because the same code runs in two places:
-            # the hosted controller, where the chain resolves to the agent's own
-            # identity, and the operator CLI on a laptop, where `bi-triage
-            # incidents` has to read the same database as the person running it.
-            # Excluding the developer credentials was tried and it broke every
-            # local command. The worst case of a developer login reaching here
-            # is writing demo incidents to a demo database as yourself.
-            credential = DefaultAzureCredential()
+            # A failed service identity must not silently become a developer.
+            # Operator commands inject an explicitly selected credential.
+            credential = DefaultAzureCredential(
+                exclude_environment_credential=True,
+                exclude_cli_credential=True,
+                exclude_developer_cli_credential=True,
+                exclude_interactive_browser_credential=True,
+                exclude_shared_token_cache_credential=True,
+                exclude_visual_studio_code_credential=True,
+                exclude_powershell_credential=True,
+                exclude_broker_credential=True,
+            )
 
         token = credential.get_token(SQL_SCOPE).token
         # 'Connection Timeout' is rejected by this driver's connection-string
@@ -199,8 +190,8 @@ class FabricSqlDatabase:
         # was a bug: every read opened a transaction that nothing closed, and a
         # duplicate-key insert -- which callers here catch deliberately -- left
         # the connection with a failed transaction attached for the next
-        # statement to trip over. Every statement in this module is a single
-        # atomic operation by design, so autocommit is the honest setting.
+        # statement to trip over. Ordinary statements use autocommit;
+        # transaction() disables it only for an explicit synchronous unit.
         return mssql_python.connect(
             conn_str,
             autocommit=True,
@@ -210,14 +201,18 @@ class FabricSqlDatabase:
     def _ensure(self) -> Any | None:
         """Return this thread's connection, opening one if needed.
 
-        Returns ``None`` rather than raising when the database is unreachable.
-        Callers decide what unavailability means for them: the incident store
-        keeps working in memory and says so, while the claim store refuses to
-        hand out a claim, because the cost of guessing differs.
+        Returns ``None`` when opening a connection is unavailable. Operational
+        stores fail closed and retry their read on subsequent use. A transaction
+        never reconnects: that would execute its remaining writes outside the
+        transaction whose connection was lost.
         """
+        if getattr(self._local, "transaction_failed", False):
+            raise SqlTransactionAborted("A statement failed in the current SQL transaction")
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             return conn
+        if getattr(self._local, "transaction_active", False):
+            raise SqlTransactionAborted("The SQL transaction connection was lost")
 
         with self._state_lock:
             unreachable = (
@@ -241,7 +236,7 @@ class FabricSqlDatabase:
             # server name or the network is wrong. Those need different fixes,
             # and the class name alone cannot tell them apart.
             logger.error(
-                "Cannot reach Fabric SQL (%s): %s: %s. Retrying in %.0fs.",
+                "Cannot reach Azure SQL (%s): %s: %s. Retrying in %.0fs.",
                 self.target,
                 type(exc).__name__,
                 detail,
@@ -252,7 +247,7 @@ class FabricSqlDatabase:
         self._local.conn = conn
         with self._state_lock:
             if self._last_error:
-                logger.info("Reconnected to Fabric SQL (%s)", self.target)
+                logger.info("Reconnected to Azure SQL (%s)", self.target)
             self._last_error = ""
             self._last_error_detail = ""
             self._last_failure_at = None
@@ -280,6 +275,82 @@ class FabricSqlDatabase:
 
     # --- statements --------------------------------------------------------
 
+    @contextmanager
+    def transaction(self) -> Iterator[AzureSqlDatabase]:
+        """Join synchronous statements on this thread in one explicit transaction.
+
+        Do not await inside this context. A caught statement error or
+        interruption still aborts the transaction. An interrupted acknowledgement
+        discards the connection and propagates with a reconciliation note.
+        Existing stores using this handle join the same connection.
+        """
+        if getattr(self._local, "transaction_active", False):
+            self._local.transaction_failed = True
+            raise SqlTransactionAborted("Nested SQL transactions are not supported")
+        conn = self._ensure()
+        if conn is None:
+            raise SqlUnavailable(f"Azure SQL unavailable ({self.target})")
+        if not conn.autocommit:
+            self._drop()
+            raise SqlTransactionAborted("The SQL connection has an unowned transaction")
+
+        self._local.transaction_active = True
+        self._local.transaction_failed = False
+        try:
+            try:
+                conn.autocommit = False
+                yield self
+                if self._local.transaction_failed or getattr(self._local, "conn", None) is not conn:
+                    raise SqlTransactionAborted("The SQL transaction did not complete all statements")
+            except BaseException as body_error:
+                try:
+                    conn.rollback()
+                except BaseException as exc:
+                    logger.error(
+                        "SQL transaction rollback was not acknowledged (%s); discarding connection",
+                        type(exc).__name__,
+                    )
+                    self._drop()
+                    message = "SQL rollback was not acknowledged; reconcile before continuing"
+                    # Cleanup must not turn cancellation or process exit into an
+                    # ordinary database error that a caller might retry.
+                    if not isinstance(body_error, Exception):
+                        body_error.add_note(message)
+                        raise body_error from exc
+                    if not isinstance(exc, Exception):
+                        exc.add_note(message)
+                        raise
+                    raise SqlRollbackUncertain(message) from exc
+                raise
+            else:
+                try:
+                    conn.commit()
+                except BaseException as exc:
+                    logger.error(
+                        "SQL commit acknowledgement is uncertain (%s); reconcile before retrying",
+                        type(exc).__name__,
+                    )
+                    self._drop()
+                    message = "SQL commit was not acknowledged; reconcile the durable operation identity"
+                    if not isinstance(exc, Exception):
+                        exc.add_note(message)
+                        raise
+                    raise SqlCommitUncertain(message) from exc
+        finally:
+            self._local.transaction_active = False
+            self._local.transaction_failed = False
+            if getattr(self._local, "conn", None) is conn:
+                try:
+                    conn.autocommit = True
+                except BaseException as exc:
+                    logger.warning(
+                        "Could not restore SQL connection mode (%s); discarding connection",
+                        type(exc).__name__,
+                    )
+                    self._drop()
+                    if not isinstance(exc, Exception):
+                        raise
+
     def execute(self, sql: str, *params: Any) -> int:
         """Run a statement and return the number of rows it affected.
 
@@ -289,13 +360,15 @@ class FabricSqlDatabase:
         """
         conn = self._ensure()
         if conn is None:
-            raise SqlUnavailable(f"Fabric SQL unavailable ({self.target})")
+            raise SqlUnavailable(f"Azure SQL unavailable ({self.target})")
         cur = None
         try:
             cur = conn.cursor()
             cur.execute(sql, *params)
             return cur.rowcount
-        except Exception as exc:
+        except BaseException as exc:
+            if getattr(self._local, "transaction_active", False):
+                self._local.transaction_failed = True
             if _is_connection_error(exc):
                 self._drop()
             raise
@@ -305,13 +378,16 @@ class FabricSqlDatabase:
     def query(self, sql: str, *params: Any) -> list[tuple]:
         conn = self._ensure()
         if conn is None:
-            raise SqlUnavailable(f"Fabric SQL unavailable ({self.target})")
+            raise SqlUnavailable(f"Azure SQL unavailable ({self.target})")
         cur = None
         try:
             cur = conn.cursor()
             cur.execute(sql, *params)
-            return list(cur.fetchall())
-        except Exception as exc:
+            # Driver rows are sequences but may compare by identity, not values.
+            return [tuple(row) for row in cur.fetchall()]
+        except BaseException as exc:
+            if getattr(self._local, "transaction_active", False):
+                self._local.transaction_failed = True
             if _is_connection_error(exc):
                 self._drop()
             raise
@@ -323,9 +399,13 @@ class FabricSqlDatabase:
             return
         try:
             cursor.close()
-        except Exception as exc:
+        except BaseException as exc:
             logger.warning("Could not close SQL cursor (%s); discarding this connection", type(exc).__name__)
             self._drop()
+            if not isinstance(exc, Exception):
+                if getattr(self._local, "transaction_active", False):
+                    self._local.transaction_failed = True
+                raise
 
     def integrity_error(self) -> type[Exception]:
         """The exception a duplicate primary key raises.
@@ -342,6 +422,18 @@ class SqlUnavailable(RuntimeError):
     """The database could not be reached. Never raised for a rejected write."""
 
 
+class SqlCommitUncertain(SqlUnavailable):
+    """A commit might have succeeded; its durable identity must be reconciled."""
+
+
+class SqlRollbackUncertain(SqlUnavailable):
+    """A failed transaction rollback was not acknowledged by the database."""
+
+
+class SqlTransactionAborted(RuntimeError):
+    """The transaction cannot continue or commit partial work."""
+
+
 #: Driver exceptions that mean the connection itself is gone, as opposed to the
 #: statement being rejected. Matched by exact name so this module never has to
 #: import the driver just to classify an error -- and deliberately *not* by
@@ -351,7 +443,7 @@ class SqlUnavailable(RuntimeError):
 _CONNECTION_ERROR_NAMES = frozenset({"OperationalError", "InterfaceError"})
 
 
-def _is_connection_error(exc: Exception) -> bool:
+def _is_connection_error(exc: BaseException) -> bool:
     """Should this thread's connection be thrown away?
 
     Deliberately name-based rather than probing the connection with a test
@@ -372,9 +464,8 @@ def _is_connection_error(exc: Exception) -> bool:
 # be redundant; the payload is what the code reads back, so adding a field to a
 # model never needs a migration.
 #
-# Created with IF NOT EXISTS rather than a migration tool on purpose: this is a
-# solution accelerator that has to come up against an empty database with no
-# extra step, and the schema is small enough to state in one place.
+# Creation is idempotent for explicit deployment retries. Runtime stores inspect
+# the deployed baseline and fail if it is missing; they never apply this DDL.
 
 def schema_statements(tables: dict[str, str]) -> list[str]:
     """Return idempotent DDL for every table the accelerator uses.
@@ -388,6 +479,14 @@ def schema_statements(tables: dict[str, str]) -> list[str]:
     names = DEFAULT_TABLES | tables
     t = {k: quote_identifier(v) for k, v in names.items()}
     return [
+        f"""
+        IF OBJECT_ID('{_bare(t["data_quality_flags"])}') IS NULL
+        CREATE TABLE {t["data_quality_flags"]} (
+            flag_id      NVARCHAR(128) NOT NULL PRIMARY KEY,
+            request_id   NVARCHAR(200) NOT NULL,
+            flagged_at   NVARCHAR(40)  NOT NULL,
+            payload      NVARCHAR(MAX) NOT NULL
+        )""",
         f"""
         IF OBJECT_ID('{_bare(t["incidents"])}') IS NULL
         CREATE TABLE {t["incidents"]} (
@@ -495,7 +594,7 @@ def schema_statements(tables: dict[str, str]) -> list[str]:
             @decision    NVARCHAR(40),
             @responder   NVARCHAR(200),
             @reason      NVARCHAR(400) = '',
-            @fingerprint NVARCHAR(200) = NULL
+            @fingerprint NVARCHAR(200)
         AS
         BEGIN
             SET NOCOUNT ON;
@@ -515,18 +614,21 @@ def schema_statements(tables: dict[str, str]) -> list[str]:
              WHERE request_id = @request_id
                -- Web proposals require the authenticated command-center API,
                -- not an older bearer-link callback carrying a claimed actor.
-               AND COALESCE(JSON_VALUE(payload, '$.delivery_channel'), 'teams') <> 'web'
+               AND JSON_VALUE(payload, '$.delivery_channel') = 'teams'
+               AND @decision IN ('approve', 'decline')
+               AND NULLIF(LTRIM(RTRIM(@responder)), '') IS NOT NULL
                -- Unanswered. This is the single-assignment guarantee: a second
                -- click matches no row and is told so, rather than overwriting.
                AND (decision IS NULL OR decision = '')
                -- Bound to the exact action the link was issued for.
-               AND (@fingerprint IS NULL
-                    OR JSON_VALUE(payload, '$.fingerprint') = @fingerprint)
+               AND DATALENGTH(@fingerprint) = 128
+               AND JSON_VALUE(payload, '$.fingerprint') COLLATE Latin1_General_100_BIN2
+                    = @fingerprint COLLATE Latin1_General_100_BIN2
+               AND NULLIF(JSON_VALUE(payload, '$.consumed_at'), '') IS NULL
                -- Still open. An approval that arrives after the window has
                -- closed is not an approval.
-               AND (JSON_VALUE(payload, '$.expires_at') IS NULL
-                    OR TRY_CAST(JSON_VALUE(payload, '$.expires_at') AS DATETIMEOFFSET)
-                       > SYSDATETIMEOFFSET());
+               AND TRY_CAST(JSON_VALUE(payload, '$.expires_at') AS DATETIMEOFFSET)
+                       > SYSDATETIMEOFFSET();
 
             SELECT @@ROWCOUNT AS recorded;
         END""",
@@ -541,6 +643,7 @@ def _bare(quoted: str) -> str:
 
 
 DEFAULT_TABLES: dict[str, str] = {
+    "data_quality_flags": "triage_data_quality_flags",
     "incidents": "triage_incidents",
     "processed": "triage_processed_messages",
     "approvals": "triage_approvals",
@@ -557,12 +660,11 @@ DEFAULT_TABLES: dict[str, str] = {
 }
 
 
-def ensure_schema(db: FabricSqlDatabase, tables: dict[str, str] | None = None) -> bool:
-    """Create anything missing. Returns False when the database is unreachable.
+def ensure_schema(db: AzureSqlDatabase, tables: dict[str, str] | None = None) -> bool:
+    """Deployment-only baseline creation, returning False on a schema failure.
 
-    Safe to call on every construction: each statement is guarded, and the
-    whole point is that an adopter pointing at an empty database gets a working
-    system without running a migration first.
+    This does not upgrade existing data or make runtime identities need DDL.
+    The deployment caller must verify the result before enabling runtime work.
     """
     statements = schema_statements(tables or DEFAULT_TABLES)
     try:

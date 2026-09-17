@@ -13,8 +13,10 @@ store, and the dedup/persistence behaviour can be tested without a model.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import socket
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -25,13 +27,45 @@ from uuid import uuid4
 import yaml
 
 from triage.agents.data_quality_agent import DataQualityAgent
-from triage.agents.triage_agent import EventHook, TriageAgent, TriageDeps
+from triage.agents.triage import EventHook, TriageAgent, TriageDeps
 from triage.detectors.silent_failures import (
     HealthFinding,
     SilentFailureScanner,
     load_probes,
 )
 from triage.models import BIRequest, Incident, TriageResult
+from triage.monitoring.contracts import MonitoringConflict, MonitoringStore, MonitoringStoreError
+from triage.monitoring.controller import MonitoringExecution, reconcile_monitoring_work
+from triage.monitoring.models import (
+    IncidentIdentity,
+    LeaseRenewal,
+    MonitoringContext,
+    MonitoringWork,
+    MonitoringWorkDraft,
+    SourceExecutionIdentity,
+    SourceRunObservation,
+    TargetIdentity,
+    WorkClaimRequest,
+    WorkDispositionRequest,
+    WorkFinalizationRequest,
+)
+from triage.monitoring.runtime import (
+    FIXTURE_TENANT_ID,
+    ScopedProcessedLog,
+    build_monitoring_store,
+    ensure_fixture_target,
+    fixture_approvals,
+    fixture_clock,
+    fixture_id,
+    fixture_setup,
+    fixture_target,
+    fixture_time,
+    inspect_context,
+    registered_targets,
+    source_work_id,
+    stable_id,
+    target_signature,
+)
 from triage.pipeline_models import (
     PIPELINE_JOB_TYPES,
     PIPELINE_TERMINAL_STATUSES,
@@ -39,16 +73,15 @@ from triage.pipeline_models import (
     PipelineFailure,
     PipelineRun,
     PipelineTarget,
-    load_pipeline_targets,
+    canonical_id,
 )
 from triage.policy import TriagePolicy
 from triage.providers import get_provider
-from triage.signature import compute_signature, incident_id
-from triage.store.approvals import JsonFileApprovalChannel
+from triage.signature import SIGNATURE_VERSION, compute_signature
 from triage.store.claims import ClaimStore, build_claim_store
-from triage.store.incidents import IncidentStore, JsonFileIncidentStore
+from triage.store.incidents import IncidentStore, InMemoryIncidentStore, JsonFileIncidentStore
 from triage.store.pipeline_reruns import (
-    FabricSqlPipelineRerunStore,
+    AzureSqlPipelineRerunStore,
     JsonFilePipelineRerunStore,
     PipelineRerunStore,
 )
@@ -61,7 +94,7 @@ from triage.tools.fabric_pipeline import (
     MockFabricPipelineClient,
     PipelineApiError,
 )
-from triage.tools.flags import DataQualityFlagTable
+from triage.tools.flags import AzureSqlFlagTable, DataQualityFlagTable, FlagStore
 from triage.tools.inbox import GraphInbox, MockInbox
 from triage.tools.pipeline_actions import PipelineToolContext, verify_rerun
 from triage.tools.powerbi import LivePowerBIClient, MockPowerBIClient
@@ -78,13 +111,11 @@ from triage.tools.teams import (
 logger = logging.getLogger("triage.runner")
 
 
-def _pipeline_signature(failure: PipelineFailure) -> str:
-    return compute_signature(
-        source="fabric_pipeline_failure",
-        error=failure.error_text() or "Unspecified pipeline failure",
-        artifact_kind="pipeline", artifact_name=failure.target.key,
+def _pipeline_signature(failure: PipelineFailure, identity: TargetIdentity) -> str:
+    return target_signature(
+        identity, failure.error_text() or "Unspecified pipeline failure",
         exception_class=failure.run.error_code,
-    )[0]
+    )
 
 
 def _require_live_config(component: str, **values: str) -> None:
@@ -217,6 +248,8 @@ class RunArtifacts:
     powerbi_calls: list[Any] = field(default_factory=list)
     pipeline_calls: list[Any] = field(default_factory=list)
     run_id: str = ""
+    monitoring_work_id: str = ""
+    disposition: str = ""
 
 
 @dataclass
@@ -248,17 +281,37 @@ class TriageRunner:
         retry_store_path: Path | None = None,
         semantic_health_path: Path | None = None,
         command_center_store: Any = None,
+        monitoring_store: MonitoringStore | None = None,
+        credential: Any = None,
+        fixture: bool | None = None,
     ):
         self.settings = settings
+        self.fixture = settings.monitoring_mode == "fixture" if fixture is None else fixture
+        if self.fixture and settings.triage_tool_mode == "live":
+            raise ValueError("Live tools require MONITORING_MODE=live; fixture state cannot authorize live effects.")
+        self._credential = credential
+        self._monitoring_store = monitoring_store
+        self._owns_monitoring = monitoring_store is None
         self.base_dir = Path(base_dir)
         self.on_event = on_event
         # One database handle shared by every store. A hosted agent is
         # constructed fresh for each request, so six separate connections would
         # mean six Entra logins per alert rather than one.
         self._sql = self._build_sql()
+        if not self.fixture:
+            inspect_context(self.monitoring, self.settings.monitoring_tenant_id)
+        if self.fixture and store is not None:
+            from triage.store.sql_incidents import AzureSqlIncidentStore
+
+            if isinstance(store, AzureSqlIncidentStore):
+                raise ValueError("Fixture runs cannot use a live SQL incident store.")
         self.store: IncidentStore = store or self._build_store()
-        self.flag_table = DataQualityFlagTable(
-            flag_table_path or (self.base_dir / "runs" / "dq_flags.csv")
+        if flag_table_path is not None and not self.fixture:
+            raise ValueError("A local data quality flag path is permitted only in fixture mode.")
+        self.flag_table: FlagStore = (
+            DataQualityFlagTable(flag_table_path or (self.base_dir / "runs" / "dq_flags.csv"))
+            if self.fixture
+            else AzureSqlFlagTable(self._sql, self.settings.data_quality_flag_table_name)
         )
         # Built once per runner rather than per run: a deferral written by one
         # run has to be visible to the precondition check of the next.
@@ -270,49 +323,69 @@ class TriageRunner:
 
     # --- inbox -------------------------------------------------------------
 
-    @staticmethod
-    @staticmethod
-    def _resolve_id(
-        *candidates: str,
-        untrusted: str = "",
-        label: str = "id",
-    ) -> str:
-        """First non-empty id wins: scenario, then configuration, then the alert.
-
-        Without a fallback the live path called Power BI with empty ids and got a
-        404, and the agent reached a plausible-looking conclusion from a tool
-        failure rather than from evidence. A wrong answer that reads correctly is
-        the worst kind.
-
-        Configuration deliberately outranks the alert. The alert is an email, and
-        the sender of an email is trivially forged, so an attacker who gets one
-        message past the inbox filter could otherwise name any workspace or
-        dataset and have the agent act on it -- bounded only by what the
-        controller's identity happens to reach.
-
-        A deployment that watches many models leaves the configured ids empty and
-        the alert is used, which is the same behaviour as before. That case is
-        steerable by construction, so the disagreement is logged rather than
-        hidden.
-        """
-        resolved = ""
-        for candidate in candidates:
-            if candidate and candidate.strip():
-                resolved = candidate.strip()
-                break
-
-        if untrusted and untrusted.strip() and untrusted.strip() != resolved:
-            logger.warning(
-                "Ignoring %s id %r supplied by the alert; using configured %r",
-                label,
-                untrusted.strip(),
-                resolved,
+    @property
+    def monitoring(self) -> MonitoringStore:
+        if self._monitoring_store is None:
+            self._monitoring_store = build_monitoring_store(
+                self.settings, db=self._sql, fixture=self.fixture, component="controller",
             )
-        return resolved
+        return self._monitoring_store
+
+    @property
+    def monitoring_context(self) -> MonitoringContext:
+        return inspect_context(
+            self.monitoring,
+            FIXTURE_TENANT_ID if self.fixture else self.settings.monitoring_tenant_id,
+        )
+
+    def pipeline_targets(self, *, include_inactive: bool = False) -> list[PipelineTarget]:
+        targets = registered_targets(
+            self.monitoring, self.monitoring_context, workload="fabric_pipeline",
+            include_inactive=include_inactive,
+        )
+        return [self._pipeline_target(item.identity) for item in targets]
+
+    def _pipeline_target(self, identity: TargetIdentity) -> PipelineTarget:
+        target = self.monitoring.resolve_target(identity, include_inactive=True)
+        if target is None:
+            raise MonitoringConflict("The registered pipeline target is unavailable.")
+        review = (
+            self.monitoring.get_safety_review(self.monitoring_context, target.action.review_id)
+            if target.action.review_id is not None else None
+        )
+        return PipelineTarget(
+            name=target.name, workspace_id=identity.workspace_id, pipeline_id=identity.item_id,
+            rerun_safe=bool(review is not None and review.state == "verified" and review.replay_safe),
+            rerun_parameters=review.parameters if review is not None else None,
+        )
+
+    def _request_target(
+        self, request: BIRequest, scenario: Scenario | None,
+        pipeline: PipelineToolContext | None, monitoring: MonitoringExecution | None,
+    ) -> TargetIdentity | None:
+        if monitoring is not None:
+            return monitoring.incident.target
+        if self.fixture:
+            return fixture_target(
+                "fabric_pipeline" if pipeline is not None else "powerbi",
+                pipeline.failure.target.workspace_id if pipeline else scenario.workspace_id if scenario else request.workspace_id or "",
+                pipeline.failure.target.pipeline_id if pipeline else scenario.dataset_id if scenario else request.dataset_id or "",
+            )
+        if not request.workspace_id or not request.dataset_id or pipeline is not None:
+            return None
+        try:
+            identity = TargetIdentity(
+                **self.monitoring_context.model_dump(), workload="powerbi",
+                workspace_id=request.workspace_id, item_id=request.dataset_id,
+            )
+        except ValueError:
+            logger.warning("The human report has no valid native target identity; diagnostics only")
+            return None
+        return identity if self.monitoring.resolve_target(identity) is not None else None
 
     @property
     def sql(self):
-        """The shared Fabric SQL handle, or None when running offline.
+        """The shared Azure SQL handle, or None when running offline.
 
         Exposed so the hosted entry point can build its claim store on the same
         connection instead of opening a second one.
@@ -320,31 +393,21 @@ class TriageRunner:
         return self._sql
 
     def _build_sql(self):
-        """Open the shared Fabric SQL handle, or return None when unconfigured.
-
-        Returning None is the offline path: every store then falls back to its
-        JSON file, which is correct on a laptop and needs no driver installed.
-        The schema is created here rather than by a migration step, so an
-        adopter pointing at an empty database gets a working system without a
-        separate command.
-        """
-        server = getattr(self.settings, "fabric_sql_server", "")
-        database = getattr(self.settings, "fabric_sql_database", "")
-        if not server or not database:
+        """Select explicit fixture state or a DML-only, credential-injected SQL handle."""
+        if self.fixture:
             return None
+        canonical_id(self.settings.monitoring_tenant_id)
+        server = self.settings.azure_sql_server
+        database = self.settings.azure_sql_database
+        if not server or not database:
+            raise ValueError("MONITORING_MODE=live requires AZURE_SQL_SERVER and AZURE_SQL_DATABASE.")
 
-        from triage.store.fabric_sql import FabricSqlDatabase
+        from triage.store.azure_sql import AzureSqlDatabase
 
-        db = FabricSqlDatabase(
-            server=server, database=database, tables=self._sql_tables()
+        return AzureSqlDatabase(
+            server=server, database=database, tables=self._sql_tables(),
+            credential=self._credential,
         )
-        if not db.ensure_schema_once():
-            logger.error(
-                "Could not prepare the triage schema in %s. Stores will run "
-                "degraded and will retry, including the schema, on use.",
-                db.target,
-            )
-        return db
 
     def _sql_tables(self) -> dict[str, str]:
         s = self.settings
@@ -362,6 +425,7 @@ class TriageRunner:
             "agent_events": s.agent_event_table_name,
             "agent_commands": s.agent_command_table_name,
             "incident_activity": s.incident_activity_table_name,
+            "data_quality_flags": s.data_quality_flag_table_name,
         }
 
     def _build_store(self) -> IncidentStore:
@@ -373,17 +437,11 @@ class TriageRunner:
         if self._sql is None:
             return JsonFileIncidentStore(self.base_dir / "runs" / "incidents.json")
 
-        from triage.store.sql_incidents import FabricSqlIncidentStore
+        from triage.store.sql_incidents import AzureSqlIncidentStore
 
-        store = FabricSqlIncidentStore(
+        return AzureSqlIncidentStore(
             db=self._sql, table=self.settings.incident_table_name
         )
-        if not store.is_durable:
-            logger.warning(
-                "Incident table %s unavailable; incidents will not survive a restart",
-                self.settings.incident_table_name,
-            )
-        return store
 
     def build_processed_log(self):
         """Where the record of already-triaged mail lives.
@@ -396,37 +454,31 @@ class TriageRunner:
         if self._sql is None:
             return JsonFileProcessedLog(self.base_dir / "runs" / "processed.json")
 
-        from triage.store.processed import FabricSqlProcessedLog
+        from triage.store.processed import AzureSqlProcessedLog
 
-        log = FabricSqlProcessedLog(
+        log = AzureSqlProcessedLog(
             db=self._sql, table=self.settings.processed_table_name
         )
-        if not log.is_durable:
-            logger.error(
-                "Processed-message log %s is not durable; scheduled sweeps will "
-                "re-triage the same mail and notify repeatedly",
-                self.settings.processed_table_name,
-            )
-        return log
+        return ScopedProcessedLog(log, self.monitoring_context)
 
     def build_inbox_audit(self, path: Path | None = None):
         """Where refused messages are recorded.
 
-        Durable when a database is configured, a JSON file otherwise. Losing it
-        costs evidence rather than correctness — the filter refuses the message
-        either way — so unlike the claim store this one never blocks ingestion.
+        Fixture files are explicit. Missing live evidence blocks ingestion.
         """
         from triage.store.inbox_audit import JsonFileInboxAudit
 
         if path is not None:
+            if not self.fixture:
+                raise ValueError("A local audit file cannot replace live shared state.")
             return JsonFileInboxAudit(path)
 
         if self._sql is None:
             return JsonFileInboxAudit(self.base_dir / "runs" / "inbox_audit.json")
 
-        from triage.store.inbox_audit import FabricSqlInboxAudit
+        from triage.store.inbox_audit import AzureSqlInboxAudit
 
-        return FabricSqlInboxAudit(
+        return AzureSqlInboxAudit(
             db=self._sql,
             table=getattr(self.settings, "inbox_audit_table_name", "triage_inbox_audit"),
         )
@@ -466,12 +518,12 @@ class TriageRunner:
         if self.settings.triage_tool_mode == "live":
             _require_live_config(
                 "Power BI client",
-                powerbi_tenant_id=self.settings.powerbi_tenant_id,
+                monitoring_tenant_id=self.settings.monitoring_tenant_id,
             )
             return LivePowerBIClient(
-                tenant_id=self.settings.powerbi_tenant_id,
-                client_id=self.settings.powerbi_client_id,
-                client_secret=self.settings.powerbi_client_secret,
+                tenant_id=self.settings.monitoring_tenant_id,
+                client_id=self.settings.azure_client_id or self.settings.powerbi_client_id,
+                client_secret="",
             )
         return MockPowerBIClient(
             refresh_result=(scenario.refresh_result if scenario else "Completed"),
@@ -483,119 +535,195 @@ class TriageRunner:
     async def drain_due_retries(
         self, *, now: datetime | None = None, claims: Any = None
     ) -> list[str]:
-        """Perform the retries whose window has passed.
+        if self.fixture:
+            with fixture_time(now):
+                return await self._drain_due_retries(now=now, claims=claims)
+        return await self._drain_due_retries(now=now, claims=claims)
 
-        Deliberately deterministic and model-free. The decision was already
-        made and recorded -- "refresh this dataset after T" -- so re-running
-        triage would ask a model to re-derive a conclusion that is already on
-        disk, and would trip the known-incident check and suppress the very
-        work it was sent to do.
-
-        Nothing drains itself. Without this, ``defer_refresh_retry`` writes a
-        row, reports scheduled work, and the retry never happens.
-
-        ``now`` is injectable so the wait can be tested without waiting, the
-        same reason :class:`PolicyLedger` takes a clock.
-
-        ``claims`` is optional and should be supplied by any caller that can run
-        concurrently with itself. A refresh is a real, effectful action, and
-        ``due()`` and ``complete()`` are separate statements: two replicas
-        draining at the same moment both see the same row as due and both issue
-        the refresh. The mailbox path has always claimed per message; this is
-        the same primitive applied to the path that acts without a message.
-        """
+    async def _drain_due_retries(
+        self, *, now: datetime | None = None, claims: Any = None,
+    ) -> list[str]:
+        """Admit due rows, then execute through the same fenced dispatcher."""
         if self.retries is None:
             return []
-
+        if now is not None and not self.fixture:
+            raise ValueError("Live retry timing is owned by shared database time, not an operator-supplied clock.")
         due = self.retries.due(now=now)
         if not due:
             return []
-
         lines: list[str] = []
-        powerbi = self.build_powerbi()
-
+        held: list[str] = []
+        admitted: set[str] = set()
         for row in due:
-            signature = str(row.get("signature", ""))
-
-            # Claimed on the signature, which is what identifies the work --
-            # a retry row has no message id to key on.
-            claim_key = f"retry:{signature}" if signature else ""
-            if claims is not None and claim_key:
-                if not claims.claim(claim_key):
-                    logger.info(
-                        "Skipping deferred retry for %s: claimed by another "
-                        "invocation", signature
-                    )
-                    continue
-            try:
-                lines.extend(await self._drain_one_retry(row, powerbi))
-            finally:
-                # Held until the row is completed or re-deferred, not just until
-                # the refresh returns: releasing at the refresh would let a
-                # second drainer see the row as still due and fire again.
-                if claims is not None and claim_key:
-                    claims.release(claim_key)
-
-        logger.info("Drained %d due retry/retries", len(due))
-        return lines
-
-    async def _drain_one_retry(self, row: dict, powerbi: Any) -> list[str]:
-        """One due retry, start to finish. Caller owns the claim."""
-        assert self.retries is not None
-        lines: list[str] = []
-        signature = str(row.get("signature", ""))
-        report = str(row.get("report_name") or "the dataset")
+            key = f"retry:{row['signature']}"
+            if claims is not None and not claims.claim(key):
+                continue
+            if claims is not None:
+                held.append(key)
+            admitted.add(row["signature"])
         try:
-            outcome = await powerbi.refresh_dataset(
-                str(row.get("workspace_id", "")), str(row.get("dataset_id", ""))
-            )
-        except Exception as exc:  # noqa: BLE001 - a failed retry is data
-            logger.warning(
-                "Deferred retry for %s raised %s", signature, type(exc).__name__
-            )
-            self.retries.complete(signature, outcome=f"error:{type(exc).__name__}")
-            return [f"- {report}: retry failed ({type(exc).__name__})"]
-
-        if outcome.succeeded:
-            self.retries.complete(signature, outcome="resolved")
-            # Close the incident too. An incident left open after the thing
-            # was fixed keeps suppressing new alerts, so a genuine
-            # recurrence is silently swallowed.
-            open_incident = self.store.find_open(signature)
-            if open_incident is not None:
-                self.store.mark(
-                    open_incident.id,
-                    "resolved",
-                    "Deferred retry completed after the throttling window.",
-                )
-            lines.append(f"- {report}: deferred retry completed")
-        elif outcome.throttled:
-            # Still throttled. Back off further, or give up and say so --
-            # the store enforces the attempt limit.
-            again = self.retries.defer(
-                signature=signature,
-                request_id=str(row.get("request_id", "")),
-                workspace_id=str(row.get("workspace_id", "")),
-                dataset_id=str(row.get("dataset_id", "")),
-                report_name=report,
-                reason="Still throttled when the retry window arrived.",
-                retry_after_seconds=outcome.retry_after_seconds,
-            )
-            if again.get("status") == "pending":
-                lines.append(
-                    f"- {report}: still throttled, retry {again.get('attempts')} "
-                    f"due {again.get('due_at')}"
-                )
-            else:
-                lines.append(
-                    f"- {report}: still throttled after the deferral limit; "
-                    "needs a human"
-                )
-        else:
-            self.retries.complete(signature, outcome=f"failed:{outcome.status}")
-            lines.append(f"- {report}: retry ran and failed ({outcome.status})")
-
+            context = self.monitoring_context
+            for row in due:
+                if row["signature"] not in admitted:
+                    continue
+                if self.fixture and "source_execution" not in row:
+                    identity = fixture_target("powerbi", row.get("workspace_id", ""), row.get("dataset_id", ""))
+                    with fixture_setup(self.monitoring) as setup:
+                        ensure_fixture_target(
+                            setup, identity, row.get("report_name") or "Synthetic retry",
+                            action="powerbi_refresh",
+                        )
+                    source = SourceExecutionIdentity(
+                        target=identity, run_id_kind="powerbi_request",
+                        run_id=fixture_id(row.get("request_id") or row["signature"], kind=f"{identity.key}:retry-source"),
+                    )
+                    revision = self.monitoring.snapshot(context).control.revision
+                else:
+                    source = SourceExecutionIdentity.model_validate(row["source_execution"])
+                    revision = row["policy_revision"]
+                if source.target.epoch != context.epoch or source.target.tenant_id != context.tenant_id:
+                    self.retries.complete(row["signature"], outcome="obsolete_monitoring_context")
+                    lines.append(f"- {row.get('report_name') or 'dataset'}: obsolete retry closed without execution.")
+                    continue
+                target = self.monitoring.resolve_target(source.target)
+                control = self.monitoring.snapshot(context).control
+                if (
+                    source.target.epoch != context.epoch or source.target.tenant_id != context.tenant_id
+                    or revision != control.revision or control.maintenance
+                    or target is None or not target.action.enabled
+                ):
+                    self.retries.complete(row["signature"], outcome="monitoring_admission_changed")
+                    lines.append(f"- {row.get('report_name') or 'dataset'}: no new retry admitted; existing action fences are unchanged.")
+                    continue
+                identifier = row.get("monitoring_work_id") or stable_id(f"{source.key}:deferred-retry")
+                queued = self.monitoring.get_work(context, identifier)
+                if queued is None:
+                    queued = self.monitoring.enqueue_work(MonitoringWorkDraft(
+                        **context.model_dump(), work_id=identifier,
+                        kind="deferred_retry", policy_revision=revision,
+                        due_at=fixture_clock(self.monitoring)() if self.fixture and now is not None else datetime.fromisoformat(row["due_at"]),
+                        created_at=datetime.fromisoformat(row["created_at"]), target=source.target, execution=source,
+                        reason=f"Deferred incident {row['signature']}.",
+                    ))
+                elif queued.execution != source:
+                    raise MonitoringConflict("The deferred work identity belongs to a different source.")
+                if queued.state in {"completed", "dispositioned"}:
+                    action = (
+                        self.monitoring.get_action_reservation(context, queued.action_reservation_id)
+                        if queued.action_reservation_id else None
+                    )
+                    if action is not None and action.state == "rejected":
+                        self._project_rejected_retry(action)
+                        lines.append(f"- {row.get('report_name') or 'dataset'}: confirmed rejection and linked retry reconciled.")
+                        continue
+                    self.retries.complete(row["signature"], outcome=queued.disposition or queued.state)
+                    lines.append(f"- {row.get('report_name') or 'dataset'}: prior durable retry disposition reconciled.")
+                    continue
+                row["source_execution"] = source.model_dump(mode="json")
+                row["policy_revision"] = revision
+                row["monitoring_work_id"] = queued.work_id
+            by_work = {row.get("monitoring_work_id"): row for row in due if row.get("monitoring_work_id")}
+            for _ in range(len(by_work)):
+                selected = self.monitoring.claim_work(WorkClaimRequest(
+                    **context.model_dump(), owner_id=str(uuid4()), kinds=("deferred_retry",),
+                    limit=1, per_workspace_limit=1, lease_seconds=900,
+                ))
+                if not selected:
+                    break
+                work = selected[0]
+                row = by_work.get(work.work_id)
+                if row is None:
+                    raise MonitoringConflict("A due retry has no matching durable retry row.")
+                if work.kind == "verify_action":
+                    lines.append(await self.execute_monitoring_work(work))
+                else:
+                    lines.extend(await self._execute_deferred_work(work, row, self.build_powerbi(), fixture_due=now is not None))
+        finally:
+            if claims is not None:
+                for key in held:
+                    claims.release(key)
         return lines
+
+    async def _execute_deferred_work(
+        self, work: MonitoringWork, row: dict[str, Any], powerbi: Any, *, fixture_due: bool = False,
+    ) -> list[str]:
+        from triage.policy import PolicyLedger
+        from triage.tools.registry import ToolContext, ToolDispatcher
+
+        if work.execution is None or work.lease is None:
+            raise MonitoringConflict("A retry needs current exact source work and its lease.")
+        if self.fixture:
+            instant = fixture_clock(self.monitoring)()
+            prior_source = self.monitoring.get_source(work.execution)
+            observation = prior_source.model_copy(update={"observed_at": instant}) if prior_source else SourceRunObservation(
+                execution=work.execution, origin="fixture", authority="fixture",
+                observed_at=instant, started_at=instant - timedelta(minutes=1),
+                ended_at=instant - timedelta(seconds=30), status="failed", invocation="scheduled",
+                failure_reason=row.get("reason") or "Synthetic throttled refresh", failure_signature=row["signature"],
+            )
+        else:
+            observation = await self.observe_powerbi_execution(work.execution, powerbi, work=work)
+            if target_signature(work.target, observation.failure_reason or "Unspecified failure") != row["signature"]:
+                raise MonitoringConflict("The deferred source failure changed; no retry was submitted.")
+        self.monitoring.observe_source(observation, work_id=work.work_id, lease=work.lease)
+        execution = MonitoringExecution(
+            store=self.monitoring, work=work,
+            incident=IncidentIdentity(target=work.target, signature=row["signature"]),
+            observation=observation, fixture=self.fixture, powerbi_client=powerbi,
+            clock=fixture_clock(self.monitoring) if self.fixture else lambda: datetime.now(UTC),
+        )
+
+        async def refresh_source():
+            return observation.model_copy(update={"observed_at": fixture_clock(self.monitoring)()}) if self.fixture else await self.observe_powerbi_execution(work.execution, powerbi)
+
+        execution.refresh_source = refresh_source
+        if not self.fixture:
+            self._bind_powerbi_history(execution, powerbi)
+        ledger = PolicyLedger(TriagePolicy.from_settings(self.settings))
+        request = BIRequest(
+            request_id=work.execution.key, source="interactive", sender="deferred-retry-controller",
+            subject="Due deferred refresh", body=observation.failure_reason or "",
+            workspace_id=work.target.workspace_id, dataset_id=work.target.item_id,
+            report_name=row.get("report_name", ""),
+        )
+        ctx = ToolContext(
+            request=request, ledger=ledger, powerbi=powerbi, teams=self.build_teams(),
+            flag_table=self.flag_table, signature=row["signature"],
+            workspace_id=work.target.workspace_id, dataset_id=work.target.item_id,
+            monitoring=execution, retries=None if self.fixture and fixture_due else self.retries,
+        )
+        dispatcher = ToolDispatcher(ctx)
+        response = await dispatcher.dispatch("refresh_powerbi_dataset", {"justification": "The persisted throttling window has elapsed."})
+        if execution.persistence_error is not None:
+            raise execution.persistence_error
+        outcome = ctx.remediation_outcome
+        report = row.get("report_name") or "the dataset"
+        rejected = execution.reservation is not None and execution.reservation.state == "rejected"
+        successor = execution.reservation.retry_work_id if rejected else None
+        result = TriageResult(
+            request_id=request.request_id, signature=row["signature"], signature_version=SIGNATURE_VERSION,
+            outcome="deferred_retry" if successor else "resolved" if outcome is not None and outcome.succeeded else "needs_human",
+            summary=(outcome.detail if outcome is not None else response.get("reason", "Retry was refused.")),
+            actions=dispatcher.actions, write_actions=ledger.write_actions,
+            tool_calls=ledger.tool_calls, blocked_attempts=ledger.blocked_attempts,
+        )
+        self._finalize_monitoring_result(execution, result, {
+            "report_name": report, "source": "powerbi_refresh_failure", "agent_name": "DeferredRetryController",
+        })
+        if not rejected:
+            self.retries.complete(row["signature"], outcome=result.outcome)
+        if rejected:
+            if successor:
+                pending = self.monitoring.get_work(execution.context, successor)
+                if pending is None:
+                    raise MonitoringStoreError("Confirmed rejection has no recorded successor work.")
+                return [f"- {report}: still throttled; linked retry {pending.retry_attempt} due {pending.due_at.isoformat()}. No second POST was issued in this invocation."]
+            return [f"- {report}: request rejected without effect; no automatic retry remains or is currently admitted."]
+        if self.fixture and result.outcome == "resolved":
+            known = self.store.find_open(row["signature"])
+            if known is not None:
+                self.store.mark(known.id, "resolved", "Deferred refresh was verified after its backoff window.")
+        return [f"- {report}: deferred retry completed" if result.outcome == "resolved" else f"- {report}: retry not resolved; {result.summary}"]
 
     async def silent_sweep(self, *, now: datetime | None = None) -> list[str]:
         """Look for failures that never sent an alert.
@@ -618,6 +746,15 @@ class TriageRunner:
             # controller. Every entry point must honor the same off switch.
             logger.info("Silent sweep is disabled in configuration; skipping %d probe(s)", len(probes))
             return []
+        if not self.fixture:
+            context = self.monitoring_context
+            for probe in probes:
+                identity = TargetIdentity(
+                    **context.model_dump(), workload="powerbi",
+                    workspace_id=probe.workspace_id, item_id=probe.dataset_id,
+                )
+                if self.monitoring.resolve_target(identity) is None:
+                    raise MonitoringConflict("A configured silent-health probe is outside current registry admission.")
 
         # One sweep at a time across every instance. A schedule can wake more
         # than one container, and two sweeps running together would each
@@ -673,11 +810,18 @@ class TriageRunner:
         so a silent finding and a later alert about the same model collapse
         into one incident rather than two.
         """
+        identity = (
+            fixture_target("powerbi", finding.workspace_id, finding.dataset_id)
+            if self.fixture else TargetIdentity(
+                **self.monitoring_context.model_dump(), workload="powerbi",
+                workspace_id=finding.workspace_id, item_id=finding.dataset_id,
+            )
+        )
         signature, _ = compute_signature(
             source="silent_failure",
             error=finding.detail,
             artifact_kind="semantic_model",
-            artifact_name=finding.report_name or finding.probe,
+            target_key=identity.key,
             exception_class=finding.kind,
         )
 
@@ -754,54 +898,49 @@ class TriageRunner:
         advance, which is the only question it exists to answer.
         """
         if path is not None:
+            if not self.fixture:
+                raise ValueError("A local baseline file cannot replace live shared state.")
             return JsonFileSemanticHealthStore(path)
 
         if self._sql is None:
             return JsonFileSemanticHealthStore(self.base_dir / "runs" / "semantic_health.json")
 
-        from triage.store.semantic_health import FabricSqlSemanticHealthStore
+        from triage.store.semantic_health import AzureSqlSemanticHealthStore
 
-        store = FabricSqlSemanticHealthStore(
+        return AzureSqlSemanticHealthStore(
             db=self._sql,
             table=self.settings.semantic_health_table_name,
             lease_table=getattr(self.settings, "lease_table_name", "triage_sweep_leases"),
         )
-        if not store.is_durable:
-            logger.error(
-                "Semantic health store %s is not durable; the silent-failure "
-                "detector will start blind on every sweep and detect nothing",
-                self.settings.semantic_health_table_name,
-            )
-        return store
 
     def build_health_client(self):
         if self.settings.triage_tool_mode == "live":
             _require_live_config(
                 "semantic health client",
-                powerbi_tenant_id=self.settings.powerbi_tenant_id,
+                monitoring_tenant_id=self.settings.monitoring_tenant_id,
             )
             return LiveSemanticHealthClient(
-                tenant_id=self.settings.powerbi_tenant_id,
-                client_id=self.settings.powerbi_client_id,
-                client_secret=self.settings.powerbi_client_secret,
+                tenant_id=self.settings.monitoring_tenant_id,
+                client_id=self.settings.azure_client_id or self.settings.powerbi_client_id,
+                client_secret="",
             )
         return MockSemanticHealthClient()
 
     def build_pipeline_client(self) -> FabricPipelineClient:
         if self.settings.triage_tool_mode != "live":
             return MockFabricPipelineClient()
-        _require_live_config("Fabric pipeline client", fabric_tenant_id=self.settings.fabric_tenant_id)
+        _require_live_config("Fabric pipeline client", monitoring_tenant_id=self.settings.monitoring_tenant_id)
         from triage.tools.fabric_pipeline import LiveFabricPipelineClient
 
         return LiveFabricPipelineClient(
-            tenant_id=self.settings.fabric_tenant_id,
-            client_id=self.settings.fabric_client_id,
+            tenant_id=self.settings.monitoring_tenant_id,
+            client_id=self.settings.azure_client_id or self.settings.fabric_client_id,
             max_pages=self.settings.pipeline_max_pages,
         )
 
     def build_pipeline_rerun_store(self) -> PipelineRerunStore:
         if self._sql is not None:
-            return FabricSqlPipelineRerunStore(
+            return AzureSqlPipelineRerunStore(
                 db=self._sql, table=self.settings.pipeline_rerun_table_name,
             )
         return JsonFilePipelineRerunStore(self.base_dir / "runs" / "pipeline_reruns.json")
@@ -816,8 +955,11 @@ class TriageRunner:
     async def _triage_pipeline(
         self, failure: PipelineFailure, *, client: FabricPipelineClient,
         reruns: PipelineRerunStore, scenario: Scenario | None = None,
+        monitoring: MonitoringExecution | None = None,
     ) -> RunArtifacts:
-        signature = _pipeline_signature(failure)
+        signature = monitoring.incident.signature if monitoring is not None else _pipeline_signature(
+            failure, fixture_target("fabric_pipeline", failure.target.workspace_id, failure.target.pipeline_id),
+        )
         assert failure.run.end_time is not None
         request = BIRequest(
             request_id=f"pipeline:{failure.key}",
@@ -837,32 +979,69 @@ class TriageRunner:
         timeout = self.settings.triage_timeout_seconds + self.settings.approval_timeout_seconds + 30
         try:
             async with asyncio.timeout(timeout):
-                return await self.run_request(request, scenario=scenario, pipeline=context)
+                return await self.run_request(request, scenario=scenario, pipeline=context, monitoring=monitoring)
+        except MonitoringStoreError:
+            raise
         except Exception as exc:
+            if monitoring is not None and monitoring.persistence_error is not None:
+                raise
             logger.exception("Pipeline triage could not finish")
             result = TriageResult(
                 outcome="timed_out" if isinstance(exc, TimeoutError) else "agent_crashed",
-                request_id=request.request_id, signature=signature,
+                request_id=request.request_id, signature=signature, signature_version=SIGNATURE_VERSION,
                 summary=f"Pipeline triage failed ({type(exc).__name__}); inspect the rerun journal before replay.",
                 exception_class=type(exc).__name__,
             )
-            incident = self.store.record(
-                result, report_name=failure.target.name,
+            provenance = dict(
+                report_name=failure.target.name,
                 original_error=request.error_text(), source="fabric_pipeline_failure",
                 agent_name="TriageAgent", pipeline_failure=failure,
+            )
+            incident = (
+                self._finalize_monitoring_result(monitoring, result, provenance, disposition="failed")
+                if monitoring is not None else self.store.record(result, **provenance)
             )
             return RunArtifacts(
                 result=result, incident=incident, request=request,
                 flag_rows_before=self.flag_table.row_count,
                 flag_rows_after=self.flag_table.row_count,
                 pipeline_calls=list(getattr(client, "calls", [])),
+                monitoring_work_id=monitoring.work.work_id if monitoring is not None else "",
             )
 
     async def run_pipeline_failure(
         self, failure: PipelineFailure, *, client: FabricPipelineClient,
         reruns: PipelineRerunStore, scenario: Scenario | None = None,
+        monitoring: MonitoringExecution | None = None,
     ) -> RunArtifacts | None:
         """Serialize this pipeline and re-check processed state inside the claim."""
+        if monitoring is not None:
+            monitoring.current_work()
+            return await self._triage_pipeline(
+                failure, client=client, reruns=reruns, scenario=scenario, monitoring=monitoring,
+            )
+        if not self.fixture:
+            identity = TargetIdentity(
+                **self.monitoring_context.model_dump(), workload="fabric_pipeline",
+                workspace_id=failure.target.workspace_id, item_id=failure.target.pipeline_id,
+            )
+            work = self.enqueue_execution_reference(SourceExecutionIdentity(
+                target=identity, run_id_kind="fabric_job", run_id=failure.run.id,
+            ))
+            request = BIRequest(
+                request_id=work.execution.key, source="pipeline", sender="pipeline-reference",
+                subject=failure.target.name, body="Exact pipeline reference queued for controller verification.",
+                workspace_id=identity.workspace_id, report_name=failure.target.name,
+            )
+            return RunArtifacts(
+                result=TriageResult(
+                    request_id=request.request_id, outcome="needs_human",
+                    summary=f"Pipeline work {work.work_id} queued; no rerun was submitted.",
+                ),
+                incident=None, request=request,
+                flag_rows_before=self.flag_table.row_count, flag_rows_after=self.flag_table.row_count,
+                monitoring_work_id=work.work_id,
+            )
         claims = self._pipeline_claim_store()
         claim_key = f"pipeline:{failure.target.key}"
         ttl = self.settings.triage_timeout_seconds + self.settings.approval_timeout_seconds + 90
@@ -890,20 +1069,6 @@ class TriageRunner:
                 target=failure.target, run=current, recent_runs=failure.recent_runs,
                 activities=activities, diagnostics_error=diagnostics_error,
             )
-            signature = _pipeline_signature(failure)
-            # Refresh this signature before considering old observations. A
-            # bounded sweep can leave older failures in its backlog after a
-            # newer failure has already been rerun and verified.
-            self.store.find_open(signature)
-            for resolved in (False, True):
-                historical = self.store.note_pipeline_occurrence(
-                    incident_id(signature, resolved=resolved), failure,
-                )
-                if historical is not None:
-                    if self._sql is None or getattr(self.store, "is_durable", False):
-                        processed.mark(event_key, received_at=failure.run.end_time.isoformat())
-                    logger.info("Recorded historical pipeline observation without reopening %s", historical.id)
-                    return None
             artifacts = await self._triage_pipeline(
                 failure, client=client, reruns=reruns, scenario=scenario,
             )
@@ -911,7 +1076,7 @@ class TriageRunner:
                 processed.mark(event_key, received_at=artifacts.request.received_at)
             else:
                 logger.error("Pipeline outcome is not durable; leaving the source run unprocessed")
-            return artifacts
+            return None if artifacts.disposition == "historical" else artifacts
         finally:
             claims.release(claim_key)
 
@@ -986,17 +1151,51 @@ class TriageRunner:
         self, *, now: datetime | None = None,
         client: FabricPipelineClient | None = None,
         targets: list[PipelineTarget] | None = None,
+        selection: TargetIdentity | None = None,
     ) -> PipelineSweepReport:
         report = PipelineSweepReport()
-        if not self.settings.pipeline_sweep_enabled:
+        if selection is not None and selection.workload != "fabric_pipeline":
+            raise ValueError("Pipeline selection must identify a registered Fabric pipeline.")
+        if selection is not None and targets is not None:
+            raise ValueError("Choose a registry selection or explicit fixture targets, never both.")
+        if self.fixture and selection is None and not self.settings.pipeline_sweep_enabled:
             report.status = "disabled"
             return report
-        targets = targets if targets is not None else load_pipeline_targets(self.settings.fabric_pipeline_targets)
+        if not self.fixture:
+            if targets is not None:
+                raise ValueError("Live pipeline targets come only from the monitoring registry.")
+            context = self.monitoring_context
+            snapshot = self.monitoring.snapshot(context)
+            if snapshot.control.maintenance:
+                raise MonitoringConflict("Monitoring is in deployment maintenance.")
+            if selection is not None:
+                selected = self.monitoring.resolve_target(selection)
+                if selected is None:
+                    raise MonitoringConflict("The selected pipeline is not currently admitted.")
+                admitted = [selected]
+            else:
+                admitted = registered_targets(self.monitoring, context, workload="fabric_pipeline")
+            instant = now or datetime.now(UTC)
+            for target in admitted:
+                if not target.observation.enabled:
+                    continue
+                work = self.monitoring.enqueue_work(MonitoringWorkDraft(
+                    **context.model_dump(),
+                    work_id=stable_id(f"{target.key}:operator-poll:{instant.isoformat()}"),
+                    kind="poll", policy_revision=snapshot.control.revision,
+                    due_at=instant, created_at=instant, target=target.identity,
+                    reason="Operator requested a registry-scoped pipeline observation.",
+                ))
+                report.lines.append(f"- {target.name}: polling work queued ({work.work_id}).")
+            report.status = "queued" if report.lines else "unconfigured"
+            return report
+        targets = [self._pipeline_target(selection)] if selection is not None else targets
+        targets = targets if targets is not None else self.pipeline_targets()
         if not targets:
             report.status = "unconfigured"
             return report
         if self.settings.triage_tool_mode == "live" and self._sql is None:
-            raise ValueError("Live pipeline sweeps require Fabric SQL state and claims")
+            raise ValueError("Live pipeline sweeps require Azure SQL state and claims")
         instant = now or datetime.now(UTC)
         if instant.tzinfo is None:
             raise ValueError("Pipeline sweep time must include a time zone")
@@ -1065,21 +1264,16 @@ class TriageRunner:
         stay isolated from each other and from a developer's real runs.
         """
         if path is not None:
+            if not self.fixture:
+                raise ValueError("A local retry file cannot replace live shared state.")
             return JsonFileRetryStore(path)
 
         if self._sql is None:
             return JsonFileRetryStore(self.base_dir / "runs" / "retries.json")
 
-        from triage.store.retries import FabricSqlRetryStore
+        from triage.store.retries import AzureSqlRetryStore
 
-        store = FabricSqlRetryStore(db=self._sql, table=self.settings.retry_table_name)
-        if not store.is_durable:
-            logger.error(
-                "Retry store %s is not durable; deferred retries will be dropped "
-                "rather than performed",
-                self.settings.retry_table_name,
-            )
-        return store
+        return AzureSqlRetryStore(db=self._sql, table=self.settings.retry_table_name)
 
     def build_approval_channel(self):
         """Where approval requests wait and decisions land.
@@ -1088,21 +1282,14 @@ class TriageRunner:
         a JSON file otherwise. It has to be shared state either way -- the whole
         point is that a *different* process writes the answer.
         """
-        if self._sql is None:
-            return JsonFileApprovalChannel(self.base_dir / "runs" / "approvals.json")
+        if self.fixture:
+            return fixture_approvals(self.monitoring)
 
-        from triage.store.approvals import FabricSqlApprovalChannel
+        from triage.store.approvals import AzureSqlApprovalChannel
 
-        channel = FabricSqlApprovalChannel(
+        return AzureSqlApprovalChannel(
             db=self._sql, table=self.settings.approval_table_name
         )
-        if not channel.is_durable:
-            logger.error(
-                "Approval channel %s is not durable; no human can answer and every "
-                "gated action will fail closed",
-                self.settings.approval_table_name,
-            )
-        return channel
 
     def build_approval_gate(self, scenario: Scenario | None):
         """Choose the approval channel for this run.
@@ -1188,6 +1375,8 @@ class TriageRunner:
             self.flag_table.reset()
         if scenario.reset_incidents and not keep_incidents:
             self.store.reset()
+            if self.fixture and self._owns_monitoring:
+                self._monitoring_store = None
             # Deferred retries are run state too. Leaving them behind means the
             # next scenario inherits an open backoff window and its refresh is
             # refused for a reason belonging to the previous run -- and repeated
@@ -1198,15 +1387,20 @@ class TriageRunner:
     async def run_scenario(
         self, scenario: Scenario, *, keep_incidents: bool = False
     ) -> list[RunArtifacts]:
-        if scenario.pipeline is not None and self.settings.triage_tool_mode != "mock":
+        if not self.fixture or self.settings.triage_tool_mode != "mock":
             raise ValueError(
-                "Pipeline scenario fixtures require TRIAGE_TOOL_MODE=mock. "
-                "Use the pipelines command for live job monitoring."
+                "Scenario fixtures require explicit fixture state and TRIAGE_TOOL_MODE=mock. "
+                "Live source work uses the monitoring controller."
             )
         self.prepare(scenario, keep_incidents=keep_incidents)
         if scenario.pipeline is not None:
             target = PipelineTarget.model_validate(scenario.pipeline["target"])
-            runs = [PipelineRun.model_validate(row) for row in scenario.pipeline["runs"]]
+            runs = [
+                PipelineRun.model_validate({
+                    **row, "id": stable_id(f"fixture:{scenario.name}:pipeline-run:{row['id']}"),
+                })
+                for row in scenario.pipeline["runs"]
+            ]
             client = MockFabricPipelineClient(
                 runs, rerun_status=scenario.pipeline.get("rerun_status", "Completed"),
                 activities=[
@@ -1259,12 +1453,12 @@ class TriageRunner:
         if self._command_center_store is not None:
             return self._command_center_store
         from triage.store.command_center import (
-            FabricSqlCommandCenterStore,
+            AzureSqlCommandCenterStore,
             JsonFileCommandCenterStore,
         )
 
         self._command_center_store = (
-            FabricSqlCommandCenterStore(
+            AzureSqlCommandCenterStore(
                 self._sql, run_table=self.settings.agent_run_table_name,
                 event_table=self.settings.agent_event_table_name,
                 command_table=self.settings.agent_command_table_name,
@@ -1278,20 +1472,68 @@ class TriageRunner:
         self, request: BIRequest, *, scenario: Scenario | None = None,
         datasets: dict[str, DatasetSource] | None = None,
         pipeline: PipelineToolContext | None = None,
+        monitoring: MonitoringExecution | None = None,
+        source_execution: SourceExecutionIdentity | None = None,
     ) -> RunArtifacts:
+        target = self._request_target(request, scenario, pipeline, monitoring)
+        if monitoring is None and not self.fixture:
+            if source_execution is None and target is not None:
+                match = re.search(
+                    r"(?i)\bPower\s*BI\s+refresh\s+request\s+ID\s*[:=]\s*([0-9a-f-]{36})\b",
+                    request.error_text(),
+                )
+                if match is not None:
+                    source_execution = SourceExecutionIdentity(
+                        target=target, run_id_kind="powerbi_request", run_id=match[1],
+                    )
+            if source_execution is not None:
+                if source_execution.target.workload == "powerbi" and source_execution.run_id_kind == "powerbi_refresh":
+                    expected = self.monitoring_context
+                    if (source_execution.target.tenant_id, source_execution.target.epoch) != (expected.tenant_id, expected.epoch):
+                        raise MonitoringConflict("Source alias belongs to another deployment.")
+                    if self.monitoring.resolve_target(source_execution.target) is None:
+                        raise MonitoringConflict("Source alias is outside current admission.")
+                    observed = await self.observe_powerbi_execution(source_execution, self.build_powerbi())
+                    source_execution = observed.execution
+                work = self.enqueue_execution_reference(source_execution)
+                return RunArtifacts(
+                    result=TriageResult(
+                        request_id=request.request_id, outcome="needs_human",
+                        summary=f"Exact execution reference queued as monitoring work {work.work_id}; no remediation was performed by this request.",
+                    ),
+                    incident=None, request=request,
+                    flag_rows_before=self.flag_table.row_count, flag_rows_after=self.flag_table.row_count,
+                    monitoring_work_id=work.work_id,
+                )
+        if monitoring is not None:
+            signature = monitoring.incident.signature
+        elif self.fixture and target is not None:
+            signature = target_signature(
+                target, pipeline.failure.error_text() if pipeline else request.error_text(),
+                exception_class=pipeline.failure.run.error_code if pipeline else None,
+            )
+        else:
+            # An annotation is not a native execution and must not suppress its
+            # incident or spend its budget when REST evidence arrives later.
+            signature = compute_signature(
+                source="human_report", error=request.error_text(),
+                artifact_kind="diagnostic", artifact_name=request.request_id,
+                target_key=target.key + ":diagnostic:" + request.request_id if target else None,
+            )[0]
+        if pipeline is not None:
+            pipeline.signature = signature
+        if self.fixture and monitoring is None and target is not None:
+            monitoring = self._fixture_execution(request, target, signature, scenario, pipeline)
+            target = monitoring.incident.target
         if not self.settings.run_history_enabled:
             return await self._run_request_impl(
                 request, scenario=scenario, datasets=datasets, pipeline=pipeline,
-                event_hook=self.on_event,
+                event_hook=self.on_event, signature=signature, target=target, monitoring=monitoring,
             )
         from triage.store.command_center import RunEvent, RunRecord
 
         history = self.build_command_center_store()
         run_id = str(uuid4())
-        signature = pipeline.signature if pipeline else compute_signature(
-            source="powerbi_refresh_failure", error=request.error_text(),
-            artifact_kind="dataset", artifact_name=request.report_name or request.dataset_id or "",
-        )[0]
         history.start_run(RunRecord(
             id=run_id, request_id=request.request_id, signature=signature,
             target=request.report_name or request.dataset_id or "",
@@ -1328,6 +1570,7 @@ class TriageRunner:
             artifacts = await self._run_request_impl(
                 request, scenario=scenario, datasets=datasets, pipeline=pipeline,
                 event_hook=emit, run_id=run_id, notification_emit=persist_event,
+                signature=signature, target=target, monitoring=monitoring,
             )
         except BaseException as exc:
             history.finish_run(run_id, TriageResult(
@@ -1354,21 +1597,45 @@ class TriageRunner:
         event_hook: EventHook | None = None,
         run_id: str = "",
         notification_emit: Any = None,
+        signature: str,
+        target: TargetIdentity | None,
+        monitoring: MonitoringExecution | None = None,
     ) -> RunArtifacts:
         if request.source == "pipeline" and pipeline is None:
             raise ValueError("Pipeline requests require controller-verified job evidence")
-        if pipeline is not None:
-            signature = pipeline.signature
-        else:
-            signature, _payload = compute_signature(
-                source="powerbi_refresh_failure",
-                error=request.error_text(),
-                artifact_kind="dataset",
-                artifact_name=request.report_name or request.dataset_id or "",
-            )
-        known = self.store.find_open(signature)
+        if monitoring is not None and monitoring.observation is not None:
+            state = self.monitoring.get_incident_state(monitoring.incident)
+            prior = self.monitoring.get_incident(monitoring.incident)
+            started = monitoring.observation.started_at
+            if state and prior and state.latest_started_at and started and started < state.latest_started_at:
+                result = TriageResult(
+                    request_id=request.request_id, signature=signature, signature_version=SIGNATURE_VERSION,
+                    outcome=prior.outcome, summary="Historical source counted without reopening newer incident evidence.",
+                )
+                incident = self._finalize_monitoring_result(
+                    monitoring, result,
+                    {"source": prior.source, "pipeline_failure": prior.pipeline_failure},
+                    disposition="historical",
+                )
+                return RunArtifacts(
+                    result=result, incident=incident, request=request,
+                    flag_rows_before=self.flag_table.row_count, flag_rows_after=self.flag_table.row_count,
+                    monitoring_work_id=monitoring.work.work_id, disposition="historical",
+                )
+        known = (
+            self.monitoring.get_incident(monitoring.incident)
+            if monitoring is not None else self.store.find_open(signature)
+        )
+        if known is not None and known.status not in {"open", "investigating"}:
+            known = None
 
-        powerbi = None if pipeline is not None else self.build_powerbi(scenario)
+        powerbi = (
+            None if pipeline is not None or target is None
+            else monitoring.powerbi_client if monitoring is not None and monitoring.powerbi_client is not None
+            else self.build_powerbi(scenario)
+        )
+        if monitoring is not None and powerbi is not None and not self.fixture:
+            self._bind_powerbi_history(monitoring, powerbi)
         if self.settings.notification_channel == "web":
             if notification_emit is None:
                 raise ValueError("Web notifications require RUN_HISTORY_ENABLED")
@@ -1420,20 +1687,8 @@ class TriageRunner:
             teams=teams,
             flag_table=self.flag_table,
             datasets=datasets or {},
-            workspace_id=pipeline.failure.target.workspace_id if pipeline else self._resolve_id(
-                scenario.workspace_id if scenario else "",
-                self.settings.powerbi_workspace_id,
-                request.workspace_id,
-                untrusted=request.workspace_id,
-                label="workspace",
-            ),
-            dataset_id="" if pipeline else self._resolve_id(
-                scenario.dataset_id if scenario else "",
-                self.settings.powerbi_dataset_id,
-                request.dataset_id,
-                untrusted=request.dataset_id,
-                label="dataset",
-            ),
+            workspace_id=target.workspace_id if target is not None else "",
+            dataset_id=target.item_id if target is not None and pipeline is None else "",
             signature=signature,
             known_incident=known,
             approval_gate=self.build_approval_gate(scenario),
@@ -1441,6 +1696,7 @@ class TriageRunner:
             retries=self.retries,
             pipeline=pipeline,
             run_id=run_id,
+            monitoring=monitoring,
         )
 
         flags_before = self.flag_table.row_count
@@ -1449,8 +1705,8 @@ class TriageRunner:
         finally:
             await agent.close()
 
-        incident = self.store.record(
-            result,
+        result = result.model_copy(update={"signature_version": SIGNATURE_VERSION})
+        provenance = dict(
             report_name=request.report_name or "",
             original_error=request.error_text(),
             agent_name=agent.AGENT_NAME,
@@ -1461,9 +1717,16 @@ class TriageRunner:
             # Only a card that actually went out counts. Passing "attempted"
             # here would let one failed delivery silence every future one.
             notified=result.notification_delivered,
-            source="fabric_pipeline_failure" if pipeline else "powerbi_refresh_failure",
+            source=(
+                "human_report" if not self.fixture and monitoring is None
+                else "fabric_pipeline_failure" if pipeline else "powerbi_refresh_failure"
+            ),
             pipeline_failure=pipeline.failure if pipeline else None,
         )
+        if monitoring is None:
+            incident = self.store.record(result, **provenance)
+        else:
+            incident = self._finalize_monitoring_result(monitoring, result, provenance)
 
         return RunArtifacts(
             result=result,
@@ -1474,7 +1737,547 @@ class TriageRunner:
             teams_messages=list(getattr(teams, "messages", [])),
             powerbi_calls=list(getattr(powerbi, "calls", [])),
             pipeline_calls=list(getattr(pipeline.client, "calls", [])) if pipeline else [],
+            monitoring_work_id=monitoring.work.work_id if monitoring else "",
         )
+
+    def _finalize_monitoring_result(
+        self, execution: MonitoringExecution, result: TriageResult, provenance: dict[str, Any],
+        *, disposition: str | None = None,
+    ) -> Incident:
+        # An explicit candidate is not a live fallback. No terminal result is
+        # returned until the registry commits incident, source and work together.
+        candidate = InMemoryIncidentStore()
+        prior = self.monitoring.get_incident(execution.incident)
+        if prior is not None:
+            candidate._items[prior.id] = prior
+        if execution.work.kind == "verify_action" and prior is not None:
+            incident = candidate.mark(
+                prior.id, "resolved" if result.outcome == "resolved" else "investigating", result.summary,
+            )
+            if incident is None:
+                raise MonitoringConflict("The draft lost its recorded incident.")
+            incident.outcome = result.outcome
+        else:
+            incident = candidate.record(result, **provenance)
+        if disposition == "historical":
+            incident.status = "wont_fix"
+            incident.requires_investigation = False
+        work = execution.current_work()
+        if work.lease is None or work.execution is None:
+            raise MonitoringConflict("Finalization requires the current exact work lease.")
+        request = WorkFinalizationRequest(
+            **execution.context.model_dump(),
+            finalization_id=stable_id(f"{work.key}:finalization"),
+            work_id=work.work_id, expected_work_revision=work.revision,
+            lease=work.lease, source_execution=work.execution,
+            incident_identity=execution.incident, incident=incident,
+            source_disposition=disposition or ("duplicate" if result.outcome == "duplicate_suppressed" else "triaged"),
+            action_reservation_id=execution.reservation.reservation_id if execution.reservation else None,
+        )
+        self.monitoring.finalize_work(request)
+        persisted = self.monitoring.get_incident(execution.incident)
+        if persisted is None:
+            raise MonitoringStoreError("Finalization returned no durable incident.")
+        if self.fixture and isinstance(self.store, InMemoryIncidentStore):
+            # Offline file output is an artifact of the fixture simulation, not
+            # a second live authority or a source imported into registry state.
+            with self.store._lock:
+                self.store._items[persisted.id] = persisted.model_copy(deep=True)
+                self.store._persist(persisted)
+        if execution.reservation is not None and execution.reservation.state == "rejected":
+            self._project_rejected_retry(execution.reservation)
+        return persisted
+
+    def _project_rejected_retry(self, action: Any) -> None:
+        """Maintain the CLI retry view from durable linked work, never vice versa."""
+        if self.retries is None:
+            return
+        context = action.request.expected
+        signature = action.request.incident.signature
+        if action.retry_work_id is None:
+            self.retries.complete(signature, outcome="confirmed_rejection_no_successor")
+            return
+        work = self.monitoring.get_work(context, action.retry_work_id)
+        if work is None or work.retry_of != action.reservation_id or work.execution != action.request.source_execution:
+            raise MonitoringStoreError("Confirmed rejection successor is missing or belongs to another source.")
+        if work.state in {"completed", "dispositioned"}:
+            return
+        target = self.monitoring.resolve_target(work.target, include_inactive=True)
+        self.retries.record_linked_retry(
+            signature=signature, work_id=work.work_id, retry_of=work.retry_of,
+            attempt=work.retry_attempt, due_at=work.due_at, created_at=work.created_at,
+            source_execution=work.execution.model_dump(mode="json"), policy_revision=work.policy_revision,
+            report_name=target.name if target else "",
+        )
+
+    def _fixture_execution(
+        self, request: BIRequest, identity: TargetIdentity, signature: str,
+        scenario: Scenario | None, pipeline: PipelineToolContext | None,
+    ) -> MonitoringExecution:
+        action = "pipeline_rerun" if pipeline else "powerbi_refresh"
+        parameters = pipeline.failure.target.rerun_parameters if pipeline else None
+        if scenario is not None and pipeline is None:
+            if scenario.check_schedule:
+                action, parameters = "reenable_refresh_schedule", {"enabled": True}
+            elif len([row for row in scenario.refresh_history if row.get("status") == "Failed"]) >= 2:
+                action = "rebind_dataset_gateway"
+                parameters = {
+                    "gateway_id": fixture_id("gw-onprem-02", kind="gateway"),
+                    "datasource_ids": [fixture_id(identity.item_id, kind="datasource")],
+                }
+        with fixture_setup(self.monitoring) as setup:
+            target = ensure_fixture_target(
+                setup, identity, request.report_name or "Synthetic target",
+                action=action, parameters=parameters,
+            )
+        context = self.monitoring_context
+        now = fixture_clock(self.monitoring)()
+        source = SourceExecutionIdentity(
+            target=identity, run_id_kind="fabric_job" if pipeline else "powerbi_request",
+            run_id=pipeline.failure.run.id if pipeline else fixture_id(
+                f"{scenario.name}:{request.request_id}" if scenario is not None else request.request_id,
+                kind=f"{identity.key}:source",
+            ),
+        )
+        observation = SourceRunObservation(
+            execution=source, origin="fixture", authority="fixture", observed_at=now,
+            started_at=pipeline.failure.run.start_time if pipeline else now - timedelta(minutes=1),
+            ended_at=pipeline.failure.run.end_time if pipeline else now - timedelta(seconds=30),
+            status="failed", invocation="scheduled", job_type="Pipeline" if pipeline else None,
+            failure_reason=(pipeline.failure.error_text() if pipeline else request.error_text())[:4096] or None,
+            failure_signature=signature,
+            error_code=pipeline.failure.run.error_code or None if pipeline else None,
+        )
+        identifier = source_work_id(source)
+        prior_work = self.monitoring.get_work(context, identifier)
+        if prior_work is not None:
+            raise MonitoringConflict("The fixture execution is already completed or owned.")
+        queued = self.monitoring.enqueue_work(MonitoringWorkDraft(
+            **context.model_dump(), work_id=identifier,
+            kind="triage", policy_revision=self.monitoring.snapshot(context).control.revision,
+            due_at=now, created_at=now, target=identity, execution=source,
+            reason="Explicit deterministic scenario source.",
+        ))
+        claimed = self.monitoring.claim_work(WorkClaimRequest(
+            **context.model_dump(), owner_id=stable_id(f"fixture-owner:{source.key}"),
+            kinds=("triage",), limit=100, per_workspace_limit=100, lease_seconds=900,
+        ))
+        work = next((item for item in claimed if item.work_id == queued.work_id), None)
+        if work is None:
+            raise MonitoringConflict("The fixture execution is already completed or owned.")
+        self.monitoring.observe_source(observation, work_id=work.work_id, lease=work.lease)
+        if scenario is not None and scenario.check_schedule and scenario.refresh_history and scenario.refresh_history[0].get("status") == "Completed":
+            self.monitoring.observe_source(SourceRunObservation(
+                execution=SourceExecutionIdentity(
+                    target=identity, run_id_kind="powerbi_request",
+                    run_id=stable_id(f"{source.key}:healthy-fixture-head"),
+                ),
+                origin="fixture", authority="fixture", observed_at=now,
+                started_at=now - timedelta(seconds=10), ended_at=now - timedelta(seconds=5),
+                status="succeeded", invocation="manual",
+            ), work_id=work.work_id, lease=work.lease)
+
+        async def refresh_source() -> SourceRunObservation:
+            return observation.model_copy(update={"observed_at": fixture_clock(self.monitoring)()})
+
+        return MonitoringExecution(
+            store=self.monitoring, work=work,
+            incident=IncidentIdentity(target=target.identity, signature=signature),
+            observation=observation, approval_channel=self.build_approval_channel(),
+            fixture=True, refresh_source=refresh_source,
+            clock=fixture_clock(self.monitoring),
+        )
+
+    async def observe_powerbi_execution(
+        self, execution: SourceExecutionIdentity, client: Any, *,
+        work: MonitoringWork | None = None, action: str | None = None,
+    ) -> SourceRunObservation:
+        target = execution.target
+        observed_at = datetime.now(UTC)
+        rows = await client.get_refresh_history(target.workspace_id, target.item_id, top=100)
+        matches = [
+            row for row in rows
+            if (
+                str(row.get("requestId", "")).lower() == execution.run_id
+                if execution.run_id_kind == "powerbi_request"
+                else str(row.get("id", "")) == execution.run_id
+            )
+        ]
+        if len(matches) != 1:
+            raise MonitoringConflict("Refresh history does not identify one exact source execution.")
+        observations: list[SourceRunObservation] = []
+        seen: set[str] = set()
+        selected = None
+        for row in rows:
+            try:
+                canonical = SourceExecutionIdentity(
+                    target=target,
+                    run_id_kind="powerbi_request" if row.get("requestId") else "powerbi_refresh",
+                    run_id=str(row.get("requestId") or row.get("id") or ""),
+                )
+                started = datetime.fromisoformat(row["startTime"].replace("Z", "+00:00")) if row.get("startTime") else None
+                ended = datetime.fromisoformat(row["endTime"].replace("Z", "+00:00")) if row.get("endTime") else None
+                status = {
+                    "Completed": "succeeded", "Failed": "failed", "Cancelled": "cancelled",
+                    "Unknown": "running", "InProgress": "running", "NotStarted": "not_started",
+                }.get(row.get("status"), "unknown")
+                reason = row.get("serviceExceptionJson") or row.get("failureReason") or ""
+                observation = SourceRunObservation(
+                    execution=canonical, origin="fixture" if self.fixture else "poll",
+                    authority="fixture" if self.fixture else "rest", observed_at=observed_at,
+                    started_at=started, ended_at=ended, status=status,
+                    invocation="scheduled" if row.get("refreshType") == "Scheduled" else "manual",
+                    failure_reason=(json.dumps(reason) if isinstance(reason, dict) else str(reason))[:4096] or None,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MonitoringConflict("Refresh history contains unidentifiable or malformed execution evidence.") from exc
+            if observation.key in seen:
+                raise MonitoringConflict("Refresh history contains duplicate or conflicting execution identities.")
+            seen.add(observation.key)
+            observations.append(observation)
+            if row is matches[0]:
+                selected = observation
+        if selected is None or selected.execution.run_id_kind != "powerbi_request":
+            raise MonitoringConflict("The exact refresh alias has no authoritative request ID.")
+        if work is not None:
+            if work.lease is None or work.target != target:
+                raise MonitoringConflict("History reconciliation requires this target's current work lease.")
+            # Record the whole returned window, not just the failure. Otherwise
+            # source_head cannot see the newer or active runs we just read.
+            for observation in observations:
+                self.monitoring.observe_source(observation, work_id=work.work_id, lease=work.lease)
+        if action is not None:
+            if work is None:
+                raise MonitoringConflict("Action history checks require owned shared work.")
+            if selected.status != "failed" or selected.started_at is None or selected.ended_at is None:
+                raise MonitoringConflict("The exact source is not a complete failed refresh.")
+            for observation in observations:
+                if observation.execution == selected.execution:
+                    continue
+                if observation.status in {"running", "not_started", "unknown"}:
+                    raise MonitoringConflict("Another refresh is active or its state is unknown.")
+                if observation.started_at is None:
+                    raise MonitoringConflict("Refresh ordering cannot be established from incomplete history.")
+                if observation.started_at > selected.started_at and not (
+                    action == "reenable_refresh_schedule" and observation.status == "succeeded"
+                ):
+                    raise MonitoringConflict("A newer refresh exists; do not remediate the older failure.")
+        return selected
+
+    def _bind_powerbi_history(self, execution: MonitoringExecution, client: Any) -> None:
+        async def refresh_history(action: str) -> SourceRunObservation:
+            try:
+                return await self.observe_powerbi_execution(
+                    execution.work.execution, client, work=execution.current_work(), action=action,
+                )
+            except MonitoringConflict:
+                raise
+            except Exception as exc:
+                execution.persistence_error = exc
+                raise
+
+        execution.refresh_history = refresh_history
+
+    def enqueue_execution(self, observation: SourceRunObservation) -> MonitoringWork:
+        context = self.monitoring_context
+        if (observation.execution.target.tenant_id, observation.execution.target.epoch) != (context.tenant_id, context.epoch):
+            raise MonitoringConflict("The source execution belongs to another deployment.")
+        control = self.monitoring.snapshot(context).control
+        if observation.started_at is None or observation.started_at < control.activation_cutoff:
+            raise MonitoringConflict("The source execution has no current-epoch start time.")
+        return self.monitoring.enqueue_work(MonitoringWorkDraft(
+            **context.model_dump(), work_id=source_work_id(observation.execution),
+            kind="triage", policy_revision=control.revision,
+            due_at=datetime.now(UTC), created_at=datetime.now(UTC),
+            target=observation.execution.target, execution=observation.execution,
+            reason="REST-bound source execution accepted for the common controller.",
+        ))
+
+    def enqueue_execution_reference(self, execution: SourceExecutionIdentity) -> MonitoringWork:
+        """Accept a reference, not asserted failure facts or remediation permission."""
+        context = self.monitoring_context
+        if (execution.target.tenant_id, execution.target.epoch) != (context.tenant_id, context.epoch):
+            raise MonitoringConflict("Execution reference belongs to another deployment.")
+        if self.monitoring.resolve_target(execution.target) is None:
+            raise MonitoringConflict("Execution reference is outside current monitoring admission.")
+        identifier = source_work_id(execution)
+        existing = self.monitoring.get_work(context, identifier)
+        if existing is not None:
+            if existing.execution != execution:
+                raise MonitoringConflict("The work identity names a different execution.")
+            return existing
+        return self.monitoring.enqueue_work(MonitoringWorkDraft(
+            **context.model_dump(), work_id=identifier,
+            kind="triage", policy_revision=self.monitoring.snapshot(context).control.revision,
+            due_at=datetime.now(UTC), created_at=datetime.now(UTC),
+            target=execution.target, execution=execution,
+            reason="An operator or mail reference requires exact REST verification before reasoning or action.",
+        ))
+
+    async def drain_monitoring_work(self, *, limit: int = 20) -> list[str]:
+        context = self.monitoring_context
+        owner = str(uuid4())
+        lines: list[str] = []
+        for _ in range(max(1, min(limit, 100))):
+            # Claim only what can start now. Leasing a whole batch before slow
+            # model/approval calls would let later leases expire in our hands.
+            work = self.monitoring.claim_work(WorkClaimRequest(
+                **context.model_dump(), owner_id=owner,
+                kinds=("reconcile_state", "triage", "deferred_retry", "verify_action", "finalize"),
+                limit=1, per_workspace_limit=1,
+                lease_seconds=min(900, max(15, self.settings.triage_timeout_seconds + self.settings.approval_timeout_seconds + 90)),
+            ))
+            if not work:
+                break
+            lines.append(await self.execute_monitoring_work(work[0]))
+        return lines
+
+    async def execute_monitoring_work(
+        self, work: MonitoringWork, *, pipeline_client: FabricPipelineClient | None = None,
+        powerbi_client: Any = None,
+    ) -> str:
+        from triage.monitoring.sql_kernel_contracts import work_policy
+
+        policy = work_policy(work.model_dump(mode="json"))
+        if policy.component != "controller":
+            raise MonitoringConflict("Collection work cannot be dispatched as a controller action.")
+        if policy.dispatch_route == "reconcile_state":
+            result = await asyncio.to_thread(reconcile_monitoring_work, self.monitoring, work)
+            return f"- {work.work_id}: deterministic reconciliation {result.state}."
+        if work.execution is None or work.target is None or work.lease is None:
+            raise MonitoringConflict("Controller dispatch requires exact leased source work.")
+        context = MonitoringContext(tenant_id=work.tenant_id, epoch=work.epoch)
+        reservation = (
+            self.monitoring.get_action_reservation(context, work.action_reservation_id)
+            if work.action_reservation_id is not None else None
+        )
+        source = self.monitoring.get_source(work.execution)
+        if reservation is not None and reservation.state == "rejected":
+            if source is None:
+                raise MonitoringStoreError("Rejected action finalization has no original source evidence.")
+            execution = MonitoringExecution(
+                store=self.monitoring, work=work, incident=reservation.request.incident,
+                observation=source, fixture=self.fixture, reservation=reservation,
+                clock=fixture_clock(self.monitoring) if self.fixture else lambda: datetime.now(UTC),
+            )
+            result = TriageResult(
+                request_id=work.execution.key, signature=execution.incident.signature,
+                signature_version=SIGNATURE_VERSION,
+                outcome="deferred_retry" if reservation.retry_work_id else "needs_human",
+                summary="Definitive no-effect rejection recovered; only its linked successor may submit again.",
+            )
+            self._finalize_monitoring_result(execution, result, {
+                "source": "powerbi_refresh_failure", "agent_name": "MonitoringController",
+            })
+            return f"- {work.work_id}: confirmed rejection finalized without another POST."
+        owns_pipeline_client = pipeline_client is None
+        powerbi = powerbi_client
+        failure = None
+        try:
+            if work.target.workload == "fabric_pipeline":
+                target = self._pipeline_target(work.target)
+                pipeline_client = pipeline_client or self.build_pipeline_client()
+                if reservation is None:
+                    run = await pipeline_client.get_run(target, work.execution.run_id)
+                    if run.id != work.execution.run_id or run.item_id != work.target.item_id:
+                        raise MonitoringConflict("The exact pipeline response belongs to a different job or item.")
+                    source = SourceRunObservation(
+                        execution=work.execution,
+                        authority="fixture" if self.fixture else "rest",
+                        origin="fixture" if self.fixture else "poll",
+                        observed_at=datetime.now(UTC), started_at=run.start_time, ended_at=run.end_time,
+                        status={
+                            "Failed": "failed", "Completed": "succeeded", "Cancelled": "cancelled",
+                            "InProgress": "running", "NotStarted": "not_started",
+                        }.get(run.status, "unknown"),
+                        invocation="scheduled" if run.invoke_type == "Scheduled" else "manual" if run.invoke_type == "Manual" else "unknown",
+                        job_type=run.job_type or None, error_code=run.error_code or None,
+                        failure_reason=run.error_text()[:4096] or None,
+                        evidence={"job_status": run.status},
+                    )
+                    source = self.monitoring.observe_source(source, work_id=work.work_id, lease=work.lease)
+                    if not run.failed_scheduled or run.end_time is None:
+                        return self._disposition_pipeline_candidate(work, source)
+                    history = await pipeline_client.list_runs(target)
+                    activities = await pipeline_client.activity_runs(target, run)
+                    failure = PipelineFailure(target=target, run=run, recent_runs=history, activities=activities)
+                    source = source.model_copy(update={"failure_reason": failure.error_text()[:4096] or None})
+            else:
+                powerbi = powerbi or self.build_powerbi()
+                if reservation is None:
+                    source = await self.observe_powerbi_execution(work.execution, powerbi, work=work)
+            if source is None:
+                raise MonitoringConflict("The controller cannot finalize without recorded source evidence.")
+            identity = reservation.request.incident if reservation else IncidentIdentity(
+                target=work.target, signature=target_signature(
+                    work.target, source.failure_reason or source.error_code or "Unspecified failure",
+                    exception_class=source.error_code,
+                ),
+            )
+            if reservation is None:
+                source = source.model_copy(update={"failure_signature": identity.signature})
+                source = self.monitoring.observe_source(source, work_id=work.work_id, lease=work.lease)
+            execution = MonitoringExecution(
+                store=self.monitoring, work=work, incident=identity, observation=source,
+                approval_channel=self.build_approval_channel(), fixture=self.fixture,
+                reservation=reservation, powerbi_client=powerbi,
+            )
+            if powerbi is not None:
+                self._bind_powerbi_history(execution, powerbi)
+            elif failure is not None:
+                async def refresh_source():
+                    run = await pipeline_client.get_run(failure.target, work.execution.run_id)
+                    return SourceRunObservation(
+                        execution=work.execution, authority="rest", origin="poll",
+                        observed_at=datetime.now(UTC), started_at=run.start_time, ended_at=run.end_time,
+                        status="failed" if run.status == "Failed" else "unknown",
+                        invocation="scheduled" if run.invoke_type == "Scheduled" else "manual",
+                        job_type=run.job_type, error_code=run.error_code or None,
+                        failure_reason=run.error_text()[:4096] or None,
+                    )
+                execution.refresh_source = refresh_source
+            if reservation is not None:
+                if reservation.state == "reserved":
+                    execution._submission(execution=None, detail="A previous invocation reserved an action without a confirmed submission.")
+                if execution.reservation.next_verification_at and execution.reservation.next_verification_at > datetime.now(UTC):
+                    self.monitoring.renew_lease(LeaseRenewal(lease=work.lease, lease_seconds=15))
+                    return f"- {work.work_id}: waiting for the recorded verification interval; no action resubmitted."
+                if execution.reservation.state in {"verified_succeeded", "verified_failed"}:
+                    from triage.tools.powerbi import RefreshOutcome
+
+                    outcome = RefreshOutcome(
+                        status="Completed" if execution.reservation.state == "verified_succeeded" else "Failed",
+                        detail=execution.reservation.detail,
+                    )
+                elif pipeline_client is not None:
+                    outcome = await execution.verify_pipeline(pipeline_client, target)
+                elif execution.reservation.request.action in {"rebind_dataset_gateway", "reenable_refresh_schedule"}:
+                    outcome = await execution.verify_configuration(powerbi)
+                else:
+                    outcome = await execution.verify_refresh(powerbi)
+                if execution.reservation.state not in {"verified_succeeded", "verified_failed"}:
+                    current = execution.current_work()
+                    self.monitoring.renew_lease(LeaseRenewal(lease=current.lease, lease_seconds=15))
+                    return f"- {work.work_id}: action remains uncertain; read-only reconciliation retained."
+                result = TriageResult(
+                    request_id=work.execution.key, signature=identity.signature,
+                    signature_version=SIGNATURE_VERSION,
+                    outcome="resolved" if outcome.succeeded else "needs_human",
+                    summary=outcome.detail or f"Exact action verified {outcome.status}.",
+                )
+                self._finalize_monitoring_result(execution, result, {
+                    "report_name": self.monitoring.resolve_target(work.target, include_inactive=True).name,
+                    "source": "fabric_pipeline_failure" if pipeline_client else "powerbi_refresh_failure",
+                    "agent_name": "MonitoringController",
+                })
+                return f"- {work.work_id}: {result.outcome}; exact action verification finalized."
+            control = self.monitoring.snapshot(context).control
+            if source.started_at is None or source.started_at < control.activation_cutoff:
+                execution.incident = IncidentIdentity(
+                    target=work.target,
+                    signature=compute_signature(
+                        source="historical_source", error=source.failure_reason or "Unknown source time",
+                        target_key=work.target.key, artifact_name=work.execution.key,
+                    )[0],
+                )
+                result = TriageResult(
+                    request_id=work.execution.key, signature=execution.incident.signature,
+                    outcome="needs_human", summary="Source evidence predates the monitoring cutoff or lacks a valid start time.",
+                )
+                self._finalize_monitoring_result(
+                    execution, result, {"source": "monitoring_historical_baseline"},
+                    disposition="historical",
+                )
+                return f"- {work.work_id}: historical baseline recorded; no native incident budget was consumed."
+            if source.status != "failed":
+                result = TriageResult(
+                    request_id=work.execution.key, signature=identity.signature,
+                    signature_version=SIGNATURE_VERSION, outcome="needs_human",
+                    summary="The exact source is not a current failed execution; no action was submitted.",
+                )
+                self._finalize_monitoring_result(execution, result, {"source": "monitoring_diagnostic"})
+                return f"- {work.work_id}: source no longer eligible; non-executing outcome finalized."
+            if work.kind == "deferred_retry":
+                if work.retry_of is not None:
+                    parent = self.monitoring.get_action_reservation(context, work.retry_of)
+                    if parent is None or parent.retry_work_id != work.work_id or parent.request.source_execution != work.execution:
+                        raise MonitoringStoreError("Deferred retry has no matching rejected predecessor.")
+                    row = {
+                        "signature": parent.request.incident.signature,
+                        "reason": parent.detail, "attempts": work.retry_attempt,
+                        "report_name": self.monitoring.resolve_target(work.target, include_inactive=True).name,
+                    }
+                else:
+                    row = self.retries.get(source.failure_signature or identity.signature)
+                    if row is None:
+                        raise MonitoringConflict("Deferred work has no authoritative retry row.")
+                return "\n".join(await self._execute_deferred_work(work, row, powerbi))
+            if failure is not None:
+                artifacts = await self.run_pipeline_failure(
+                    failure, client=pipeline_client, reruns=self.build_pipeline_rerun_store(),
+                    monitoring=execution,
+                )
+            else:
+                target_view = self.monitoring.resolve_target(work.target)
+                request = BIRequest(
+                    request_id=work.execution.key, source="interactive", sender="monitoring-controller",
+                    received_at=source.ended_at.isoformat() if source.ended_at else "",
+                    subject="Verified Power BI source failure", body=source.failure_reason or "Power BI reported failure.",
+                    report_name=target_view.name if target_view else "",
+                    workspace_id=work.target.workspace_id, dataset_id=work.target.item_id,
+                )
+                artifacts = await self.run_request(request, monitoring=execution)
+            return f"- {work.work_id}: {artifacts.result.outcome}; incident and processed source finalized."
+        finally:
+            if pipeline_client is not None and owns_pipeline_client:
+                await pipeline_client.close()
+
+    def _disposition_pipeline_candidate(self, work: MonitoringWork, source: SourceRunObservation) -> str:
+        """An event is only a candidate; REST-ineligible jobs do not enter triage."""
+        detail = (
+            f"Exact pipeline job is {source.status}, invocation={source.invocation}, "
+            f"job_type={source.job_type}; no pipeline remediation was authorized."
+        )
+        context = MonitoringContext(tenant_id=work.tenant_id, epoch=work.epoch)
+        current = self.monitoring.get_work(context, work.work_id)
+        if current is None or current.lease is None or (
+            current.lease.owner_id, current.lease.fence, current.lease.resource_key
+        ) != (work.lease.owner_id, work.lease.fence, work.lease.resource_key):
+            raise MonitoringConflict("Pipeline candidate disposition lost its work ownership.")
+        if (
+            source.invocation == "scheduled" and source.job_type in PIPELINE_JOB_TYPES
+            and (
+                source.evidence.get("job_status") not in PIPELINE_TERMINAL_STATUSES
+                or source.status == "failed" and source.ended_at is None
+            )
+        ):
+            self.monitoring.disposition_work(WorkDispositionRequest(
+                **context.model_dump(), request_id=stable_id(f"{work.key}:candidate-wait:{current.attempts}"),
+                work_id=work.work_id, expected_work_revision=current.revision, lease=current.lease,
+                disposition="retry",
+                retry_at=(fixture_clock(self.monitoring)() if self.fixture else datetime.now(UTC)) + timedelta(seconds=60),
+                detail=detail,
+            ))
+            return f"- {work.work_id}: pipeline candidate is not terminal; read-only follow-up queued."
+        identity = IncidentIdentity(
+            target=work.target,
+            signature=compute_signature(
+                source="pipeline_candidate", error=f"{source.status}:{source.invocation}:{source.job_type}",
+                target_key=work.target.key, artifact_kind="diagnostic",
+            )[0],
+        )
+        execution = MonitoringExecution(
+            store=self.monitoring, work=current, incident=identity, observation=source, fixture=self.fixture,
+        )
+        result = TriageResult(
+            request_id=work.execution.key, signature=identity.signature,
+            signature_version=SIGNATURE_VERSION, outcome="needs_human", summary=detail,
+        )
+        self._finalize_monitoring_result(
+            execution, result, {"source": "monitoring_candidate", "agent_name": "MonitoringController"},
+            disposition="refused",
+        )
+        return f"- {work.work_id}: ineligible pipeline candidate durably refused ({source.status}, {source.invocation})."
 
 
 def check_expectations(scenario: Scenario, artifacts: RunArtifacts) -> list[str]:

@@ -1,5 +1,17 @@
 # Architecture
 
+All accelerator application state targets one shared **Azure SQL Database**.
+Power BI semantic-model refreshes, scheduled Fabric pipelines and native Fabric
+Job-event transport remain the monitored services. The Command Center is the
+operational UI; Rayfin is not a state or deployment dependency. The shipped
+infrastructure now uses public networking with Entra authentication. Scoped
+evaluation SQL/registry access is verified, while the original SQL proof receipt
+is under recovery and application/runtime acceptance remains unfinished.
+The live app/controller remain the prior release. Earlier private-network
+proofs and the private Foundry preflight error are historical, not prerequisites
+or blockers for the chosen public architecture.
+See the [release gates](DeploymentGuide.md#release-gates).
+
 ## Entry points and controller flow
 
 `TriageRunner` owns client and store construction, signatures, open-incident
@@ -10,10 +22,12 @@ decide which calls may execute.
 | Entry point | Implementation | Boundary |
 |---|---|---|
 | Power BI alert mailbox | `tools/inbox.py`, CLI watch loop and `src/app.py` | Filtered Graph polling and processed-message tracking |
-| Interactive alert | `src/app.py::TriageControllerAgent._triage_text` | Same runner, with the concurrency limitation documented below |
+| Interactive alert | `src/app.py::TriageControllerAgent._triage_text` | Same runner and canonical target admission; an unbound diagnostic is not permission to act |
 | Silent-failure sweep | `TriageRunner.silent_sweep` | Configured deterministic semantic-model probes |
-| Scheduled pipeline monitor | `TriageRunner.pipeline_sweep` | Explicit pipeline targets, scheduled failed jobs and activity evidence |
-| Command-center investigation | `command_center/api.py` and `command_center/worker.py` | Authenticated request stored in SQL; a controller command sweep executes it |
+| REST monitoring collector | `monitoring/inventory.py` and `monitoring/polling.py` | Registry-backed discovery, bounded history reads and durable source/work admission |
+| Fabric Job events | `monitoring/events.py` and `monitoring/worker.py` | Managed-identity receiver, original event receipts and SQL checkpoints; REST verifies the referenced execution |
+| Scheduled pipeline monitor | `TriageRunner.pipeline_sweep` | Admitted registry targets, scheduled failed jobs and activity evidence |
+| Command-center investigation | `command_center/api.py` and `command_center/worker.py` | Authenticated request stored in SQL; the controller heartbeat drains queued work |
 
 The Power BI triage decisions map to these components:
 
@@ -21,13 +35,114 @@ The Power BI triage decisions map to these components:
 |---|---|---|
 | BI Request Inbox | `tools/inbox.py` — `MockInbox` \| `GraphInbox` | Mock files or filtered polling, normalized to `BIRequest` |
 | Data Quality Issue? | `consult_data_quality_agent` → `agents/data_quality_agent.py` | A separate agent, reached through a tool |
-| Is There a Known Related Issue? | `signature.py` + `store/incidents.py::find_open` | 16-char signature over a normalized error |
+| Is There a Known Related Issue? | `monitoring/runtime.py::target_signature`, `signature.py` and the incident store | Canonical target identity plus a 16-char normalized failure signature |
 | Wait for Resolution, Then Continue | outcome `duplicate_suppressed` | Increments the parent incident; no second remediation |
 | Does It Qualify as Tier 1? | `TriageClassification.tier` | Model classifies; controller constrains what follows |
 | Agentic Resolution | `ToolDispatcher` and `PolicyLedger` | Refresh, gateway binding or schedule restoration, subject to the action's gates |
 | Is Issue Resolved? | `TriageAgent._validate_outcome` | Checks the claim against the evidence |
 | Send Resolution Summary | `notify_teams` and recorded terminal result | Report, error, action, outcome, timestamp; web delivery does not require Teams |
 | Human Involvement | Approval gate or outcome `needs_human` | A person can approve an allowlisted proposal or investigate; no unrestricted human repair workflow is automated |
+
+## Shared monitoring registry
+
+`triage.monitoring` separates inventory, source evidence, coverage and action
+authority. Discovering an item does not establish that its history is readable,
+that its monitoring is current or that the controller may remediate it.
+
+| Component | Responsibility |
+|---|---|
+| Models and store contracts | Typed target/execution/incident identities, tenant/epoch/revision, scopes, work, reviews and operation receipts |
+| Inventory collector | Named tenant/domain/workspace/item metadata, pagination generations, access probes and supported-workload classification |
+| REST poller | Bounded pipeline/Power BI history windows, source ID correlation, durable cursors and explicit retention/completeness gaps |
+| Eventstream reconciler | Desired versus observed sources in app-owned topology; existing component IDs and destination metadata remain bound to that ownership |
+| Event receiver | Pinned managed identity, original CloudEvent receipts, partition ownership, quarantine and checkpoint-after-acceptance |
+| Controller | Fresh source verification, common admission, policy/approval checks, atomic action reservation and durable finalization |
+| Monitoring API/UI | Readable coverage, scope preview/activation, safety reviews and original-request reconciliation; no browser remediation or permission grants |
+
+Scopes can include or exclude tenant, domain, workspace or item selections.
+Exclusions take precedence; future-resource admission is explicit. Domain
+membership is metadata, not a permission grant. A complete empty scope differs
+from one that could not be enumerated. Unsupported item types remain visible
+as unsupported rather than being treated as operationally monitored.
+
+Power BI refreshes and scheduled Fabric pipeline executions are the supported
+failure workloads. Notebook activities can supply pipeline evidence; this is
+not standalone notebook monitoring or a universal Fabric audit subscription.
+Native events and REST polling are complementary. Neither Activator, Power
+Automate nor Eventhouse is required by this path.
+
+Live configuration is held in Azure SQL. `MONITORING_MODE=fixture` selects an
+explicit offline registry; it is never a fallback for a failed live connection.
+Static live pipeline target environment lists are not imported or retained as
+a second source of truth.
+
+Every deployment has a tenant, epoch and activation cutoff. A reset creates a
+new epoch, not a migration of prototype history. Old mail, events, job history
+and approval links do not become fresh action opportunities merely because
+their local records were cleared.
+
+The hybrid implementation and its live acceptance are tracked in
+[HybridMonitoringPlan.md](HybridMonitoringPlan.md). Successful infrastructure
+provisioning does not establish event delivery or durable end-to-end operation.
+
+### SQL writer boundary
+
+Runtime monitoring stores require an explicit component. Database permissions
+separate producer evidence from controller authority; a Python class or a
+table-level DML grant over mixed state is not that boundary.
+
+| Component | Permitted write path |
+|---|---|
+| Worker | Checked inventory, REST, stream and topology observations, with lease and receipt checks |
+| Web | Validated human configuration/review intents and their immutable operation receipts |
+| Controller | Deterministic publication, admission, source disposition, action reservation and terminal finalization |
+| Deployment operator | Schema installation, protected writer registration and separately reviewed reset |
+
+Checked single-writer views and fixed ownership-chained procedures expose these
+paths. Runtime identities receive no general monitoring-table DML or schema
+creation rights. The SQL adapter binds named arguments through the current
+kernel contract and decodes its typed result; an `EXEC` rowcount cannot establish
+success. Native permission acceptance must use separate real Entra connections
+to Azure SQL. Azure SQL supports `CREATE USER ... WITHOUT LOGIN` and
+`EXECUTE AS USER` for database-scoped testing, but those do not prove deployed
+MI sign-in, network/firewall admission or reconnect behavior. Runtime principals
+receive no impersonation grants. Earlier Fabric SQL CREATE/rollback results
+are historical and do not establish the new platform's acceptance.
+
+The heartbeat processes targetless `reconcile_state` work before execution
+admission. Configuration reconciliation does not invent an execution target.
+Completing producer collection does not validate its facts: a protected pending
+source-validation frontier continues to fence new actions until the controller
+publishes the original evidence.
+
+An accepted safety-review intent has `publication_status=pending_validation`;
+it is not a verified review. Pending revocation immediately denies new action
+reservations, while existing reservations can still verify and finalize without
+refunding approval or remediation budgets. Reconciliation of an original request
+returns its original receipt, not a later review that happens to use the same
+target or profile. Current published authority is a separate lookup.
+
+A structurally valid verification intent may be accepted after its review window
+has expired, but the controller publishes it as `unverifiable` and leaves actions
+disabled. An expired revocation remains valid denial intent and retains the
+original `reviewed_at` and `expires_at`; it cannot renew authority by rewriting
+those timestamps.
+
+### Eventstream source publication
+
+Source additions begin as logical proposals without caller-invented physical
+component IDs. The controller publishes desired topology while holding its
+work lease. The worker applies only that published intent and records the
+original remote operation and observed definition. The controller then binds
+the observed physical IDs through the original observation receipt; a worker's
+successful API call alone cannot publish effective readiness.
+
+Desired removal immediately fences intake but retains physical ownership.
+Only a current, complete, original definition observation proving exact absence
+of the owned node, physical ID and stream reference permits retirement and an
+immutable tombstone. Partial, inherited or uncertain observations do not prove
+absence. Mixed additions/removals preserve unrelated owners, and replay of an
+old receipt cannot replace newer state.
 
 ## Run sequence
 
@@ -163,18 +278,32 @@ standalone notebooks.
 
 ## Signatures and suppression
 
-```python
-signature = sha1(source | artifact_kind | artifact_name | exception_class | normalized_error)[:16]
+An admitted target is identified by its tenant, epoch, workload, workspace and
+item IDs. Its display name is a label. The current target-key wire format is
+`monitor:v1:{epoch}:{tenant_id}:{workload}:{workspace_id}:{item_id}`.
+
+The deterministic failure signature remains:
+
+```text
+sha1(source | artifact_kind | canonical_target_key | exception_class | normalized_error)[:16]
 ```
+
+`monitoring.runtime.target_signature` supplies this immutable key to
+`compute_signature`. An execution identity adds an explicitly typed source-run
+ID; an incident identity combines the target with its normalized failure
+signature. Power BI numeric history IDs and request GUIDs are different
+namespaces, and adapters must resolve their aliases with authoritative evidence.
+The controller's own remediation job ID is a separate identity again.
 
 Normalization strips GUIDs, timestamps, line numbers, URL paths, IPs, hex
 suffixes, temp paths, long hashes and request IDs. Case is preserved — SQL
 identifier case is significant in some dialects, and folding it merges genuinely
 distinct failures.
 
-`artifact_name` is in the payload on purpose: the same error class on two
-different reports stays two incidents, because suppressing across unrelated
-reports would hide a real second outage.
+Two equally named items in different workspaces cannot share a live incident,
+and a rename cannot grant a new remediation budget. Diagnostic records without
+an admitted execution can still use an artifact label, but that diagnostic
+signature does not authorize a live action.
 
 **Only open incidents suppress.** A resolved incident recurring is new
 information and must be allowed to trigger action again.
@@ -227,20 +356,21 @@ the answer from somewhere else entirely; the agent reads it back on a later
 poll. It has to be durable shared state — the writer and the reader are
 different processes, and on a hosted agent often different invocations.
 
-**Who can answer.** Web and legacy approval channels have different trust
+**Who can answer.** Web and optional Teams approval channels have different trust
 boundaries:
 
 | Channel | Needs | Use |
 |---|---|---|
 | Command-center decision controls | Valid delegated API token with Approver or Admin app permission | Authenticated, fingerprint-bound web decisions; responder comes from the token |
-| `bi-triage approve` / `deny` | Local state access offline, or the operator's Entra SQL permissions live | Operator/legacy channel, not browser authentication |
-| Legacy Teams card buttons | `APPROVAL_CALLBACK_URL` | Bearer-link callback; supplied responder text is not an Entra-verified person |
+| `bi-triage approve` / `deny` | Local state access offline, or the operator's Entra SQL permissions live | Operator channel, not browser authentication |
+| Teams callback buttons | `APPROVAL_CALLBACK_URL` | Bearer-link callback; supplied responder text is not an Entra-verified person |
 
 `APPROVAL_DELIVERY_MODE=web` uses the command-center decision path and does not
-require Teams. Optional Teams delivery links to that web proposal. The legacy
-SQL callback procedure explicitly refuses web proposals.
+require Teams. Optional Teams delivery links to that web proposal. The
+SQL callback procedure explicitly refuses web proposals and any row without an
+explicit `teams` delivery channel.
 
-The legacy buttons are `Action.OpenUrl`, not `Action.Submit`. A card posted
+The callback buttons are `Action.OpenUrl`, not `Action.Submit`. A card posted
 through an incoming webhook has no bot behind it, so a submit button renders a
 control that silently does nothing — which looks exactly like a recorded decision.
 
@@ -268,8 +398,10 @@ so it passed for exactly as long as the feature was broken. Its replacements
 assert properties instead: that no definition references a trigger method, and
 that the GET workflow holds no connection and no `ApiConnection` action.
 
-**How it writes.** The recording workflow uses the SQL managed connector
-against Fabric SQL as its own system-assigned identity. Managed
+**Historical callback write path.** The earlier recording workflow used the SQL
+managed connector against Fabric SQL as its own system-assigned identity. This
+optional bearer-link integration is not part of the new secretless cutover and
+has not been proved against Azure SQL. Managed
 identity lives in the connector's `oauthMI` parameter value set, whose only
 parameter is a token constrained to `location: "logicapp"` — supplied by the
 workflow at run time, so the connection holds no credential. The database user
@@ -283,21 +415,29 @@ the link. The procedure makes the whole decision in one statement:
 ```sql
 UPDATE triage_approvals SET decision = @decision, ...
  WHERE request_id = @request_id
-   AND COALESCE(JSON_VALUE(payload, '$.delivery_channel'), 'teams') <> 'web'
+   AND JSON_VALUE(payload, '$.delivery_channel') = 'teams'
+   AND @decision IN ('approve', 'decline')
+   AND NULLIF(LTRIM(RTRIM(@responder)), '') IS NOT NULL
    AND (decision IS NULL OR decision = '')           -- unanswered, exactly once
-   AND (@fingerprint IS NULL OR ... = @fingerprint)  -- bound to this action
-   AND (... expires_at > SYSDATETIMEOFFSET())        -- still open
+   AND DATALENGTH(@fingerprint) = 128                -- required 64-char fingerprint
+   AND (... COLLATE Latin1_General_100_BIN2
+        = @fingerprint COLLATE Latin1_General_100_BIN2)
+   AND NULLIF(JSON_VALUE(payload, '$.consumed_at'), '') IS NULL
+   AND (... expires_at > SYSDATETIMEOFFSET())        -- explicit, unexpired window
 ```
 
 `@@ROWCOUNT` tells the workflow whether it won. Zero means unknown, already
-answered, expired, or fingerprint mismatch; all four render as a refusal and
+answered/consumed, expired, invalid or fingerprint mismatch; these render as a refusal and
 none changed anything. A failed write renders as a failure rather than falling
 through to a success page. The agent revalidates all of it independently.
 
-Verified end to end against a live Fabric SQL Database: GET renders the page and
+The preceding callback deployment was verified against a live Fabric SQL
+Database: GET renders the page and
 changes nothing, POST records, a second POST is refused with the first decision
 intact, and mismatched-fingerprint, expired and unknown requests are all
-refused.
+refused. That historical result proves neither the Azure SQL deployment nor a
+changed procedure definition; the stricter current predicate requires its own
+deployment/readback proof.
 
 **The clock stops while a person decides.** `PolicyLedger.awaiting_human()`
 excludes that time from the wall clock. The run timeout and the approval timeout
@@ -344,6 +484,9 @@ it was sent to do. A successful retry marks the incident resolved — an inciden
 left open after the fix keeps suppressing genuine recurrences.
 
 `bi-triage retries` shows what is postponed; `--drain` performs what is due.
+In live mode a due retry still enters canonical monitoring admission. A prior
+deferral cannot bypass a revoked scope, changed safety review, newer source
+execution or an existing action fence.
 
 ## Silent-failure detection
 
@@ -414,16 +557,20 @@ and what policy allowed, which can inform a review of future automation.
 Redaction happens *inside* `record()`, not at call sites, so a new code path
 cannot forget it.
 
-### Why a Fabric SQL Database
+### Shared Azure SQL application state
 
-State lives in a **Fabric SQL Database**, in the same workspace as the semantic
-models being triaged. It replaced Azure Table Storage, and the reasons were
-practical rather than tidy:
+All live application state lives in **one Azure SQL Database** on an Azure SQL
+logical server. It is an Azure resource, independent of Fabric workspaces and
+the UIs. The selected prototype switch imports no Fabric SQL history and keeps
+no compatibility adapter, legacy setting aliases or mixed-version path.
+
+SQL replaced Azure Table Storage in the earlier design. Its relational and
+atomic-operation requirements still apply:
 
 * **The state is relational.** An incident has occurrences, an approval belongs
   to an action, a deferred retry belongs to a signature. An operator asking
   "which reports failed most this quarter, and were they the ones we retried"
-  can answer it in one query against the same estate they already report on,
+  can answer it in one query against the application database,
   instead of exporting a key-value table first.
 * **A conditional `UPDATE` is atomic on its own.** Claims and leases used to be
   read-then-write guarded by an ETag: three round trips and a race the code had
@@ -432,16 +579,32 @@ practical rather than tidy:
   evaluated on the server, so it does not depend on any container's clock. A
   primary-key `INSERT` raising `IntegrityError` gives the same compare-and-set
   the old code got from `ResourceExistsError`.
-* **There is no key to leak.** Fabric SQL accepts Entra tokens and nothing else.
-  There is no SQL-authentication fallback to switch off, so "no local auth" is
-  the platform default rather than a setting governance has to keep reverting.
-  The storage account it replaced arrived with shared-key access already
-  disabled by policy; this removes the argument entirely.
+* **Cross-store commits share one catalog.** Incident persistence, processed
+  source disposition, monitoring work and their receipts need one transaction.
+  Separate web/worker/controller databases would split that boundary. SQL
+  roles and checked interfaces separate their authority within the same database.
+* **Authentication is configured as Entra-only.** Azure SQL also supports SQL
+  authentication. The logical server must explicitly enable Microsoft
+  Entra-only authentication; runtime configuration has no SQL login, password
+  or credential-bearing connection string. This preserves the no-shared-key
+  requirement that the earlier storage design encountered under governance.
 
-`ensure_schema` and its delegated schema builders define the tables below.
-The controller can install them when it has the required grants. Install the
-schema as an administrator before using the command center: its more restricted
-web identity performs no schema installation.
+Set `AZURE_SQL_SERVER=<server>.database.windows.net` and
+`AZURE_SQL_DATABASE=<database-name>` from the Azure deployment. Configure the
+server Entra administrator separately from application roles, configure the
+public SQL firewall and enable auditing before runtime startup. The Command
+Center Admin role grants no SQL server administration.
+
+An optional temporary proof database may share the logical server but never
+operational state. One database per component is not the design. The provisioned
+evaluation topology is not a final sizing or pricing recommendation. The shipped
+template uses one S1 application database and an optional Basic proof database,
+not an elastic pool.
+
+The deployment operator installs the application schema and explicit monitoring
+baseline. Neither the controller, monitoring worker nor web identity creates,
+upgrades or repairs schemas at startup. Missing or incompatible state is a
+visible deployment failure, not a fallback to local files.
 
 | Table | Holds |
 |---|---|
@@ -450,6 +613,7 @@ web identity performs no schema installation.
 | `triage_approvals` | approval requests and the decisions written against them |
 | `triage_deferred_retries` | work postponed by capacity backoff |
 | `triage_semantic_health` | silent-failure baselines |
+| `triage_data_quality_flags` | redacted flags with deterministic request/evidence identity; controller-only runtime append |
 | `triage_sweep_leases` | one sweep at a time, across instances |
 | `triage_claims` | one invocation acts, across instances |
 | `triage_inbox_audit` | what the inbox filter refused, and why |
@@ -458,6 +622,12 @@ web identity performs no schema installation.
 | `triage_agent_events` | redacted progress and tool-result events, linked to a run |
 | `triage_agent_commands` | idempotent operator requests, conditional execution state and reconciliation audit |
 | `triage_incident_activity` | append-only notes, source-revision-bound human resolutions, questions and answers |
+| `triage_monitoring_control` | singleton tenant, schema version, epoch, registry revision, activation cutoff, maintenance and bootstrap identity |
+| `triage_monitoring_records` | typed scopes, inventory snapshots, targets, work, source evidence, reviews, action state, coverage and connector records |
+| `triage_monitoring_leases` | shared owner/fence/expiry state |
+| `triage_monitoring_receipts` | original operation identities, fingerprints and committed results |
+| `triage_monitoring_rate_budget` | shared service/API request budgets, retained across a prototype state reset |
+| `triage_deployment_registration`, `triage_deployment_writers` | protected deployment/identity bindings and registration evidence, retained across operational resets |
 
 Most record tables carry promoted filter columns plus a JSON `payload`. Claims
 and leases use dedicated columns. Command execution columns changed by
@@ -466,8 +636,8 @@ record is reconstructed.
 
 The SQL access-grant table and service are retired. App authorization does not
 read operational tables to discover user roles. The state database remains an
-independent Fabric item; changing command-center authentication or removing a
-web frontend must not remove incidents, approvals or execution journals.
+independent Azure SQL database; changing command-center authentication or removing
+a web frontend must not remove incidents, approvals or execution journals.
 
 ### The driver choice is a container constraint
 
@@ -483,13 +653,13 @@ Connections are **per thread**. One shared connection behind a lock was tried
 first and failed under eight concurrent callers with an `OperationalError`
 followed by `InterfaceError` on every subsequent use.
 
-### Degradation must be temporary
+### Fail-closed durability and transaction ownership
 
-The controller's record stores can degrade to in-memory while reporting the
-outage. That is not durable success, and recovery must re-check the backend and
-reload its state. Coordination and live web stores fail closed instead:
-claims, pipeline reservations and command-center collaboration cannot substitute
-process-local state for a shared database.
+All affected live record and coordination stores fail closed. An unreachable
+database cannot be replaced by process-local incidents, approvals, processed
+messages, retries, baselines, claims or command-center state. Recovery retries
+the connection on use and reads authoritative state; it does not replay a
+cached mutation whose original commit may have succeeded.
 
 The previous implementation opened its client once in `__init__` and, on
 failure, stayed in-memory for the life of the process. Tenant policy disabled
@@ -499,16 +669,30 @@ outcomes while persisting none of them. Restoring connectivity changed nothing,
 because nothing ever tried again. Three invocations were lost before a forced
 redeploy fixed it.
 
-Recovery has to include a **reload**, not just a reconnect. `find_open` is what
+Recovery requires a fresh read, not just a reconnect. `find_open` is what
 stops the agent remediating the same failure twice, and an empty cache answers
-"no open incident" to everything. `tests/test_store_sql.py` holds the regression
-test, and reverting the fix makes it fail.
+"no open incident" to everything. The SQL store tests cover recovery and
+fail-closed behavior rather than treating an in-memory result as success.
+
+`AzureSqlDatabase.transaction()` is synchronous and thread-bound. Store calls
+inside it share the same connection; no await, nested transaction or reconnect
+is allowed. A caught statement failure or interruption still aborts the
+transaction. An uncertain commit discards the connection and requires durable
+receipt reconciliation, not blind replay. Interrupted commit/rollback
+acknowledgements preserve cancellation or process-exit propagation, add an
+explicit reconciliation note and never restore autocommit on the unresolved
+connection.
+
+Action reservation checks current scope, review, source head, work lease,
+approval and budget in one transaction. Terminal finalization similarly binds
+the incident, source disposition and work completion. A persistence timeout
+leaves work unfinished and retains any action fence; recovery finalizes or
+verifies the existing action instead of issuing another one.
 
 ## Claims: only one invocation acts
 
-The store above is checked *before* the work and written *after* it, and the
-processed-message log has the same shape. Both are correct for one process and
-wrong for two.
+The original incident and processed-message paths checked state before doing
+work and wrote it afterward. That was sufficient for one process, not two.
 
 A hosted agent can be invoked manually while a schedule fires, or run as more
 than one replica. Both invocations then see the same alert as untriaged and no
@@ -527,27 +711,31 @@ UPDATE triage_claims SET owner = ?                              -- or I steal it
 
 The insert raises `IntegrityError` when somebody already holds the claim. The
 update reports through `rowcount` whether this caller won, and two racers
-cannot both get 1. Verified against the live database with eight concurrent
-threads: exactly one winner.
+cannot both get 1. A previous live check with eight concurrent threads produced
+exactly one winner; the monitoring registry's additional transaction boundaries
+require separate current-release proof.
 
-Claims expire, so a container that dies mid-remediation does not hold one for
-ever — that would turn a duplicate-work bug into a lost-alert bug.
+Claims expire so a failed controller does not hold work forever. An action
+reservation does not expire merely because its worker lease does: another
+worker may verify or finalize the original effect, not repeat it.
 
-Unlike the incident and processed stores, this one does **not** degrade quietly
-to in-memory when the database is unreachable. Those degrade because losing them
-makes the agent noisy; losing this one makes it act twice.
+Claims and the other live stores now share the fail-closed rule. Losing incident
+or processed-source state can also authorize repeated effects, not merely
+produce extra notifications.
 
-### Which paths are claimed, and one that is not
+### Common admission across entry points
 
-Entry paths that can reach a real action are not equally protected:
+Path-specific claims still limit duplicate scheduling, but they are not the
+cross-entry-point action boundary:
 
-| Path | Claim key | Covered |
+| Path | Scheduling identity | Action authority |
 |---|---|---|
-| Mailbox sweep | `message:{request_id}` | Yes |
-| Deferred retry drain | `retry:{signature}` | Yes |
-| Scheduled pipeline triage and rerun verification | `pipeline:{target.key}` | Yes, plus a durable submission reservation per failed run |
-| Queued command-center investigation | `command-target:{target_id.casefold()}` and command-row ownership | Yes, among commands for that target; pipeline work also takes its pipeline claim |
-| Interactive alert pasted into the Playground | — | **No** |
+| Mailbox sweep | Message identity | Canonical admitted target and source execution |
+| Deferred retry drain | Retry/signature identity | Fresh common admission and existing action-fence check |
+| Pipeline and Power BI polling | Durable history position and source execution | Verified current source state, not the observation's arrival order |
+| Native events | Original event identity and stream position | REST-verified execution; an event alone authorizes no action |
+| Queued human investigation | Command identity and command-row ownership | Current target scope/review and shared reservation |
+| Interactive alert | Runner-resolved target and source evidence | Same shared admission; unresolved context remains diagnostic only |
 
 The retry drain was unclaimed until recently, which was the sharper of the two
 gaps: `due()` and `complete()` are separate statements, so two replicas
@@ -556,27 +744,39 @@ dataset refresh. The claim is held until the row is completed or re-deferred,
 not merely until the refresh returns — releasing at the refresh would let a
 second drainer see the row as still due.
 
-The interactive path remains unclaimed and is documented rather than fixed.
-There is no external mailbox message id to claim, and signature construction
-belongs inside the runner rather than the hosted text adapter. `find_open`
-reading through to SQL on every check narrows the gap — an incident already
-opened by a sweep is visible and suppresses — but two
-callers can still pass that check before either persists. Closing it properly
-means defining shared signature-claim ownership inside `TriageRunner`, rather
-than assuming the existing path-specific keys serialize one another. That
-affects the offline scenarios too, so the gap remains explicit.
+The former interactive-alert gap came from treating path-specific keys as if
+they serialized one another. A Playground request has no mailbox message ID,
+and a command ID is not a source-run ID. The runner now binds native work to
+canonical monitoring identities before it reaches the dispatcher.
+
+Reservation is the action decision point. It atomically checks tenant/epoch,
+maintenance, current admission, safety review, current source head, work
+ownership, approval and budget. If revocation wins, the effect is refused
+without consuming its approval or remediation budget. If reservation wins,
+a later disable cannot retract the already committed external action.
+
+Power BI refresh and pipeline rerun submissions retain the exact returned job
+identity. A concurrent unrelated refresh cannot establish success. Gateway
+rebinding and schedule restoration instead retain a reviewed configuration
+intent and verify the exact bindings or schedule through GET readback; they
+do not invent a job ID for a configuration mutation.
+
+A lost acknowledgement, 5xx response or transport error preserves uncertainty.
+Only explicitly classified definitive rejection can enter the store's bounded
+linked-successor policy. It does not restore an already consumed approval or
+turn an unverified action into a successful remediation.
 
 ## Scheduled Fabric pipeline failures
 
-An explicit pipeline monitor feeds the same `TriageAgent` and `ToolDispatcher`.
+Registry-admitted pipeline monitoring feeds the same `TriageAgent` and `ToolDispatcher`.
 It reads scheduled failed job instances and activity evidence, using immutable
 workspace/pipeline/run identifiers rather than model-supplied targets.
 `PIPELINE_ACTIONS` excludes Power BI dataset actions from this path.
 Notebook activity failures contribute evidence within these configured
 pipelines. There is no standalone notebook monitor or notebook-editing tool.
 
-The pipeline-scoped claim serializes this controller's work. A separate,
-non-expiring SQL reservation prevents a second POST for the same failed run,
+Canonical monitoring admission and the pipeline-scoped claim serialize work.
+A non-expiring SQL action reservation prevents a second POST for the same failed run,
 including after an ambiguous transport failure. Approval covers the configured
 target and parameter fingerprint. A correlated new run and its activity
 evidence must be verified before accepting success.
@@ -620,6 +820,13 @@ enterprise application's assignments; group owners manage membership.
 already authorized operator. Group-based application assignment requires
 Entra P1/P2. These setup permissions are not runtime app permissions.
 
+Monitoring setup uses the same roles: Readers inspect scopes, coverage and
+existing safety reviews; Admins preview/activate configuration and save/revoke
+reviews. An Admin safety review enables an action capability, not an individual
+approval. Approver remains a separate per-proposal decision role. Uncertain
+configuration writes are reconciled by their original operation receipt; an
+older current review cannot confirm that a newer revocation committed.
+
 **Access & permissions** replaces the editable SQL Admin center. `/api/access`
 returns effective token roles, identity metadata and token issue/expiry times.
 It does not return a user roster, memberships or which group supplied a role.
@@ -640,14 +847,14 @@ The optional profile photo uses a separate delegated Graph `User.Read` token.
 
 ### Commands, approvals and history
 
-The API records commands and web decisions in the standalone Fabric SQL
+The API records commands and web decisions in the shared Azure SQL
 database. A controller command sweep performs the work. Target-level claims
 prevent overlapping command executions; durable interrupted rows retain
 uncertainty after a timeout or process loss. An administrator must reconcile
 the actual target state before clearing that barrier. Reconciliation records
 an audit entry and never executes a tool.
 
-Web proposals are excluded from the legacy approval procedure. Optional Teams
+Web proposals are excluded from the Teams callback procedure. Optional Teams
 notification is concurrent with web polling, so it cannot spend the approval
 window before a person can answer.
 
@@ -693,26 +900,26 @@ observer; an interrupted or failed request is retained rather than replayed
 automatically. Explanations and answers use the shared safe Markdown renderer:
 raw HTML, images and unsafe links are not rendered.
 
-See [CommandCenter.md](CommandCenter.md) for deployment, role grants, private
-access, operator workflows and validation boundaries.
+See [CommandCenter.md](CommandCenter.md) for deployment, role grants, public
+HTTPS and optional caller filters, operator workflows and validation boundaries.
 
 ## The monitoring cockpit
 
-`cockpit/` is a read-only [Fabric App](https://github.com/microsoft/rayfin) over
-the controller's own state — incidents, approvals, deferred retries,
-semantic-health baselines, and the claims and leases that stop two invocations
-acting on the same alert. It has no trigger buttons, no reset, and no scripted
-scenarios: nothing in it can change the system it watches.
+`cockpit/` is a retained read-only [Fabric App](https://github.com/microsoft/rayfin)
+sample for incidents, approvals, deferred retries, semantic-health baselines,
+claims and leases. It has no trigger buttons, reset or scripted scenarios.
+It is not required for the Azure SQL deployment, and its earlier semantic-model
+binding has not been retargeted or verified against the new application state.
 
-### Why it reads a semantic model rather than the database
+### Historical semantic-model read path
 
 This cockpit uses `@microsoft/fabric-app-data`'s
 `FabricClient.semanticModel()`. In the tested embed host,
 `IFabricApiProxy` declared `lakehouse.executeSql` and `warehouse.executeSql`
-without working implementations. The selected read path therefore remains:
+without working implementations. The earlier release therefore used:
 
 ```
-Fabric SQL Database        the controller writes here, over TDS
+Fabric SQL Database        earlier-release controller state, over TDS
       |  auto-mirrored to OneLake
       v
 SQL analytics endpoint     types itself MirroredWarehouse
@@ -724,16 +931,21 @@ Semantic model             bi-triage-state
 Fabric App                 the cockpit
 ```
 
-The cockpit adds no writer; controller, web and legacy callback grants remain
-scoped to their respective operations. The alternative — projecting rows into
-the app's own store — was rejected because a
-deployed Fabric app accepts Fabric SSO only, leaving no headless credential for
-the controller to write with, and because a second copy of the truth is a second
-thing that can be wrong.
+The cockpit adds no writer. In that release, projecting rows into the app's own
+store was rejected: the tested Fabric app accepted Fabric SSO only, without a
+headless controller write path, and a second operational copy could diverge.
+Rayfin `data.enabled` remains false.
+
+Azure SQL provisioning does not reproduce that Fabric SQL auto-mirroring path
+or create a new semantic-model binding. No state-copy or compatibility path is
+included. An existing cockpit can still display prior-release data; that is not
+current operational evidence. A future read-only reporting integration would
+need separate source, network, permissions and latency verification.
 
 Direct Lake avoids a separate import-refresh schedule, but mirroring and
 semantic-model framing still introduce read latency. The command center reads
-the operational SQL store directly through its API; the cockpit does not.
+the operational Azure SQL store directly through its API; the cockpit does not.
+The mirroring latency description applies only to the historical read path.
 
 ### Cockpit rendering constraints
 
@@ -773,98 +985,140 @@ client SDK. Preview SDKs churn; a deployment that breaks because a package minor
 the week before is a deployment failure. The REST implementation also keeps the
 wire contract explicit.
 
-## Network isolation
+## Public networking
 
-The command-center template `infra/command-center.bicep` is private by default:
-App Service public access is disabled, a private endpoint handles inbound
-access, and a separate VNet integration subnet handles outbound traffic.
-`defaultOutboundAccess=false` requires the supplied NAT gateway for explicit
-public egress; private destinations still need working routes and DNS. The NAT
-public IP is outbound-only, not an application listener.
+All shipped Bicep uses normal public networking. No private endpoint, VNet,
+subnet, NAT Gateway or private DNS is a deployment prerequisite. Authentication
+and authorization remain independent of network reachability.
 
-This template does not create or isolate the existing Foundry project and
-Fabric workspace. Configure their supported private-network paths separately,
-retain Entra-only service authentication and Foundry managed-network isolation,
-and verify connectivity from each executing identity. A governance exemption
-tag is not a substitute for network controls.
+| Component | Network and identity boundary |
+|---|---|
+| Azure SQL | Public endpoint, Entra-only authentication, TLS 1.2 minimum, Proxy/TCP 1433, explicit firewall admission, auditing and TDE |
+| Foundry | Public account/project/model with local authentication disabled; no managed-network injection or network-approver dependency |
+| Registry | Public Basic ACR with admin/anonymous access disabled, Entra ARM authentication and scoped MI pull permission |
+| Command Center | Public HTTPS; validated API app roles and Entra-authenticated SCM publishing, with independent optional app/SCM client filters |
+| Worker | Public Consumption environment and keyless Azure Monitor routing; one selected MI and no ingress |
 
-### Fabric SQL and Azure SQL network boundaries
+`publicAccessClientCidrs` and `scmAccessClientCidrs` are separate optional arrays.
+An empty list leaves that endpoint's network public; it does not grant an API
+role or deployment access. Public worker networking does not create a listener.
 
-The reference implementation this project was compared against
-([ZacharyZurloMSFT/agentic-pbi-error-triage](https://github.com/ZacharyZurloMSFT/agentic-pbi-error-triage))
-isolates its state with a textbook Azure design: a VNet, a private endpoint on
-the SQL server, a `privatelink.database.windows.net` private DNS zone, and
-delegated subnets for the Function App and the Foundry agent runtime.
+Fabric Eventstream custom-endpoint destinations do not support tenant/workspace
+Private Link. The selected receiver uses public outbound TLS with Entra, without
+a separate Azure Event Hubs namespace. This transport does not alter the source
+workload's own access requirements.
 
-**It does not port here.** That design isolates `Microsoft.Sql/servers`, an ARM
-resource that takes a private endpoint. This accelerator's state is a **Fabric
-SQL Database** — a Fabric item, not an ARM resource. It has no
-`Microsoft.Network/privateEndpoints` of its own and no
-`privatelink.database.windows.net` zone to link. Copying the Bicep would produce
-a VNet protecting nothing.
+Endpoint namespace, entity and consumer group are nonsecret metadata. The
+documented connection endpoint can return keys alongside those fields, so it
+is not used as a supposedly key-free discovery shortcut. Bootstrap from the
+Entra-only metadata surface and bind the values to the owned destination;
+automated key-free metadata discovery remains a platform proof gate.
 
-### Fabric private-link scopes
+### Public SQL firewall and governed exceptions
 
-Fabric secures **inbound** access with private links at two scopes:
+The application-state logical server is `Microsoft.Sql/servers`, with public
+network access enabled. Use `<server>.database.windows.net` with certificate
+validation. `allowAzureServices=true` is the default: it creates Azure SQL's
+special start/end `0.0.0.0` firewall rule. That permits Azure-hosted callers,
+including other subscriptions, **not all Internet IPs**. It is not an
+identity or tenant boundary; Entra authentication and database permissions
+remain mandatory. Optional `clientFirewallRules` admit exact IPv4 ranges.
+See [SQL firewall rules](https://learn.microsoft.com/azure/azure-sql/database/firewall-configure)
+and [connectivity architecture](https://learn.microsoft.com/azure/azure-sql/database/connectivity-architecture).
+
+Ordinary deployments do not inherit MCAPS exemptions. Optional
+`sqlNetworkExceptionTags`, `registryExceptionTags` and
+`accountNetworkExceptionTags` apply only to the explicitly selected resource.
+The approved MCAPS SQL exception uses `SecurityControl=Ignore` with reason/review
+tags for one 14-day period; removing/re-adding the tag does not restart it.
+Longer-running tests require an approved exclusion. These exceptions change
+neither SQL identity permissions nor TLS/auditing. See
+[governed evaluation exceptions](DeploymentGuide.md#governed-evaluation-exceptions).
+
+On 2026-09-17, scoped evaluation SQL/registry public access was enabled and read
+back; the public Foundry path is retained. This is network-access evidence, not
+schema recovery, runtime permission or application-cutover proof.
+
+### Optional private-network hardening: historical scope
+
+Private endpoints and private DNS may be part of a separately reviewed hardened
+deployment, but are not emitted by this accelerator's public templates.
+For Azure SQL, that design would use the `sqlServer` private-endpoint subresource,
+`privatelink.database.windows.net` DNS links and independently verified runtime
+routes. It must keep the normal server hostname and certificate validation.
+See [Azure SQL private endpoints](https://learn.microsoft.com/azure/azure-sql/database/private-endpoint-overview).
+
+That optional Azure pattern also appears in the public reference
+[ZacharyZurloMSFT/agentic-pbi-error-triage](https://github.com/ZacharyZurloMSFT/agentic-pbi-error-triage).
+Its resource layout does not prove this deployment's network path. The previous
+Fabric SQL state store was a Fabric item, so Azure SQL private-endpoint Bicep
+could not isolate it. That historical limitation no longer describes the
+selected application-state platform.
+
+The earlier private Foundry attempt created foundation resources but encountered
+a managed private-endpoint service preflight failure after verified
+prerequisites. That investigation is historical; it does not block the retained
+public Foundry controller path or establish categorical lack of private-hosting
+support. A separately designed private hosted path must account for its managed
+self endpoint for model/project calls, SQL and registry access independently
+from web ingress. Do not broaden roles or rewrite platform-managed networking
+to guess at a fix. Earlier private infrastructure has not been deleted.
+
+### Optional Fabric private-link scopes
+
+Fabric offers **inbound** workload hardening at two scopes. These are separate
+from the accelerator's public Azure state/hosting baseline:
 
 | Scope | Effect | Use when |
 |---|---|---|
-| [Tenant-level](https://learn.microsoft.com/fabric/security/security-private-links-overview) | Network policy across the entire tenant | **This accelerator** — the only scope that covers a Fabric SQL Database |
-| [Workspace-level](https://learn.microsoft.com/fabric/security/security-workspace-level-private-links-overview) | One workspace mapped to a VNet; others stay public | Workspaces built from supported items — which this one is not |
+| [Tenant-level](https://learn.microsoft.com/fabric/security/security-private-links-overview) | Network policy across the entire tenant | Required Fabric workload/API support and tenant-wide policy have been reviewed |
+| [Workspace-level](https://learn.microsoft.com/fabric/security/security-workspace-level-private-links-overview) | One workspace mapped to a VNet; others stay public | Only the currently supported workload/item combinations are present |
 
-Two entries on Microsoft's
+The earlier Fabric SQL/cockpit design could not use workspace-level private
+links: the reviewed support matrix excluded both SQL database items and
+workspaces containing Power BI semantic models. Tenant-level support was the
+available scope for that combination, not a per-workspace switch. An earlier
+recommendation had incorrectly inferred support from the feature's purpose.
+Keep that lesson, but do not use it to choose networking for Azure SQL.
+
+Recheck the public
 [supported-scenarios list](https://learn.microsoft.com/fabric/security/security-workspace-level-private-links-support)
-rule out workspace-level private links for this combination of items:
-
-- **SQL databases** — "Tenant-level private links are available for SQL
-  database, but currently, workspace-level private links are not available in
-  SQL database." The state store is the one thing most worth isolating, and it
-  is the one thing workspace-level scope does not reach.
-- **Semantic models** — "Power BI semantic models aren't supported in workspaces
-  with workspace-level private links enabled. If a workspace contains any Power
-  BI semantic models, you can't enable workspace-level private links for that
-  workspace." This cockpit's read path uses a semantic model, whose presence
-  blocks workspace-level private links for the workspace.
-
-So a workspace holding the SQL database, the semantic model and the cockpit
-cannot have workspace-level private links enabled, and **tenant-level is the
-only scope that covers this combination of items**. It is a tenant-wide network
-policy, not a per-workspace change. Recheck the support matrix when planning a
-deployment because platform support can change.
-
-An earlier revision of this document recommended the opposite, having reasoned
-from what the feature is for rather than from its support matrix. It is recorded
-here because the unsupported item types were exactly the ones in use; the
-feature's purpose did not establish support for the chosen resources.
+for the Fabric items actually monitored or queried. The retained cockpit's
+historical topology is not a deployment prerequisite. The selected Eventstream
+Custom Endpoint still lacks tenant/workspace Private Link and uses the
+separately reviewed public outbound TLS path.
 
 Two settings in the admin portal govern the tenant-level behaviour — **Azure
 Private Links** and **Block Public Internet Access** — and the second is the one
 that actually closes the door. With private links configured but public access
-still allowed, the workspace is reachable both ways; Microsoft's own guidance
-calls that a testing configuration rather than a production one, because it
-provides no inbound protection.
+still allowed, the workspace is reachable both ways. For a private-only rollout,
+Microsoft describes that as a testing configuration: it does not establish
+private-only inbound protection. This caveat does not make private networking a
+prerequisite for the selected public accelerator.
 
 ### Outbound connectivity
 
-**A private endpoint secures traffic *into* Fabric. It does nothing for traffic
-*out* of Fabric or the hosted applications.** The controller calls Power BI,
-Fabric APIs, optional Microsoft Graph and Foundry/Azure OpenAI. Each needs its
-own supported endpoint, DNS and egress policy. Enabling Fabric inbound Private
-Link does not isolate those clients.
+The controller calls Power BI, Fabric APIs, optional Microsoft Graph and
+Foundry/Azure OpenAI through their public service endpoints. Verify DNS, TLS,
+service firewall admission and each executing identity. Standard public
+Consumption hosting supplies the worker's outbound path; no dedicated NAT is
+required by this baseline.
+
+For optional private hardening, a private endpoint secures traffic *into*
+Fabric, not traffic *out* of Fabric or the hosted applications. Enabling Fabric
+inbound Private Link does not isolate those outbound clients.
 
 ### Network provisioning scope
 
-`infra/command-center.bicep` provisions the web app's Azure network resources,
-not tenant-level Fabric Private Link or Foundry networking. There is no generic
-`network.bicep` that protects the whole system. Fabric SQL is a Fabric item,
-not an Azure SQL server resource, and an ARM private endpoint targeting an
-unrelated SQL server would protect none of this state.
+`infra/command-center.bicep`, `infra/foundry.bicep`, `infra/state-sql.bicep` and
+the monitoring templates have separate public service and identity boundaries.
+The deployment helper's optional app/SCM filters are persistent; it has no
+temporary-public mode or automatic return to private access. Preserve approved
+filters during code-only updates.
 
-Temporary public access in the command-center deployment helper is explicitly
-scoped to client host addresses and restored to Disabled afterward. It is a
-deployment/verification exception, not the steady-state design. Existing
-private endpoint DNS, peering and tenant settings still need to be supplied
-and verified by the deployment operator.
+Additional private hardening is a separate architecture and deployment task.
+Do not treat an older private plan, retained resources or historical image
+proof as authority to reintroduce those dependencies into the public baseline.
 
 ## Observability
 
@@ -879,6 +1133,18 @@ to be a hard dependency of the accelerator running.
 content recording ingests customer data and secrets into a telemetry store with
 different access controls than the source system.
 
+Monitoring state records worker/receiver heartbeats, inventory completeness,
+poll/event freshness, checkpoint positions, queue backlog and connector drift.
+An idle stream is not proof that its source is healthy. Coverage must retain
+unknown permissions, interrupted pagination and retention gaps instead of
+subtracting them from its denominator.
+
+Service-wide and API-specific read budgets are acquired together. A denied API
+budget must not consume the service allowance when no request was sent.
+Throttling and missed cadence are operational states, not successful empty
+history. Deployment alert rules and sustained canary evidence must be verified
+separately from these stored health projections.
+
 ## Extending it
 
 **A new remediation**: add the tool schema to `TRIAGE_TOOLS`, add a branch to
@@ -891,12 +1157,20 @@ and prompt, controller-collected evidence and a tool-free interpretation call
 where no additional tools are needed. Expose it to the orchestrator as one tool.
 Re-register Foundry agents after prompt or tool-schema changes.
 
-**A different durable store**: subclass the in-memory store and override
-`_load`, `_persist` and `_on_reset`, as `FabricSqlIncidentStore` does. Keep
-redaction inside `record`, and make sure a failed open can recover rather than
-degrading for the life of the process. Coordination and live web stores instead
-require fail-closed shared state; do not copy a record-store fallback into them.
+**A different durable store**: preserve the synchronous transaction and
+fail-closed shared-state contract. Keep redaction inside persistence methods,
+re-read after reconnect, and reconcile original receipts after uncertain writes.
+Prove independent-instance arbitration and actual backend persistence in
+addition to offline protocol tests. An in-memory fixture is a separate explicit
+implementation, not runtime recovery for a failed database.
 
-**A real flag table**: replace `DataQualityFlagTable` with three methods against
-the real table. Keep the CSV path for evaluation — a table you can open in Excel is
-easier to show than a query result.
+**Data-quality flag persistence**: `FlagStore` separates live
+`AzureSqlFlagTable` from fixture-only CSV `DataQualityFlagTable`. Live flags use
+the same application catalog, with `DATA_QUALITY_FLAG_TABLE_NAME` defaulting to
+`triage_data_quality_flags` and physical-table key `data_quality_flags`.
+Only the controller may append at runtime. Conditional insert and original-row
+readback preserve deterministic request/evidence identity across retries and
+reject conflicts. Both stores redact at persistence, and tools return the
+stored flag. SQL has no local fallback and refuses runtime reset; the deployment
+reset catalogue includes the flag table. The source binding is implemented,
+but native Azure SQL table/grant/identity and persistence proof remain gates.

@@ -20,7 +20,7 @@ This is the missing primitive: a claim that exactly one caller can hold.
 
 ``INSERT`` on a primary key fails with ``IntegrityError`` when the row is
 already there. That is an atomic compare-and-set against shared state, which is
-all a lease needs. No extra service, and it reuses the Fabric SQL database the
+all a lease needs. No extra service, and it reuses the Azure SQL database the
 incident store already requires.
 
 Claims expire. A container that crashes mid-remediation must not hold a lock for
@@ -101,7 +101,7 @@ class InMemoryClaimStore:
             self._held.pop(key, None)
 
 
-class FabricSqlClaimStore:
+class AzureSqlClaimStore:
     """A lease held in a row, taken with a primary-key insert.
 
     Unlike the incident and processed stores, this one does **not** degrade
@@ -125,7 +125,7 @@ class FabricSqlClaimStore:
     """
 
     def __init__(self, *, db: Any, table: str = "triage_claims") -> None:
-        from triage.store.fabric_sql import quote_identifier
+        from triage.store.azure_sql import quote_identifier
 
         self._db = db
         self._table = quote_identifier(table)
@@ -224,7 +224,7 @@ def _is_duplicate_key(db: Any, exc: Exception) -> bool:
 
 
 def build_claim_store(*, db: Any = None, table: str = "triage_claims") -> ClaimStore:
-    """Durable when a Fabric SQL database is configured, in-process when not."""
+    """Durable with an explicit Azure SQL handle; otherwise an offline store."""
     if db is None:
         return InMemoryClaimStore()
-    return FabricSqlClaimStore(db=db, table=table)
+    return AzureSqlClaimStore(db=db, table=table)

@@ -12,6 +12,7 @@ trains people to update it without looking.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 import re
@@ -38,7 +39,7 @@ CLI_REFERENCE = re.compile(r"bi-triage(?:\.exe)?\s+([a-z][a-z\-]*)")
 def _cli_commands() -> set[str]:
     parser = build_parser()
     for action in parser._actions:  # noqa: SLF001 - argparse offers no public API
-        if hasattr(action, "choices") and action.choices:
+        if isinstance(action, argparse._SubParsersAction):
             return set(action.choices)
     return set()
 
@@ -282,7 +283,7 @@ def test_routine_inputs_reach_a_command_the_agent_handles() -> None:
             continue
         for target in node.targets:
             name = getattr(target, "id", None)
-            if name in ("_SWEEP_COMMANDS", "_SILENT_COMMANDS", "_PIPELINE_COMMANDS", "_WEB_COMMANDS"):
+            if name in ("_SWEEP_COMMANDS", "_SILENT_COMMANDS", "_PIPELINE_COMMANDS", "_WEB_COMMANDS", "_HEARTBEAT_COMMANDS"):
                 # Both are frozenset({...}) rather than bare literals, so unwrap
                 # the call before evaluating its argument.
                 value = node.value
@@ -293,7 +294,7 @@ def test_routine_inputs_reach_a_command_the_agent_handles() -> None:
                     value = value.args[0]
                 commands[name] = set(ast.literal_eval(value))
 
-    assert set(commands) == {"_SWEEP_COMMANDS", "_SILENT_COMMANDS", "_PIPELINE_COMMANDS", "_WEB_COMMANDS"}, (
+    assert set(commands) == {"_SWEEP_COMMANDS", "_SILENT_COMMANDS", "_PIPELINE_COMMANDS", "_WEB_COMMANDS", "_HEARTBEAT_COMMANDS"}, (
         f"could not read the command sets out of src/app.py, found {sorted(commands)}. "
         "If they were renamed or built dynamically, update this test rather than "
         "letting it pass without checking anything."
@@ -675,20 +676,24 @@ def test_the_scheduler_waits_longer_than_the_approval_window() -> None:
     assert "Nothing was triaged" not in failure_card
 
 
-def test_command_center_routes_outbound_traffic_explicitly() -> None:
+def test_command_center_public_network_defaults_keep_authentication_and_bounded_rule_descriptions() -> None:
     import re
 
     template = (REPO_ROOT / "infra" / "command-center.bicep").read_text(encoding="utf-8")
-    assert re.search(r"outboundVnetRouting:\s*\{\s*allTraffic:\s*true\s*\}", template)
-    assert "defaultOutboundAccess: false" in template
-    assert "publicNetworkAccess: enablePublicAccess ? 'Enabled' : 'Disabled'" in template
+    assert "outboundVnetRouting:" not in template
+    assert "virtualNetworkSubnetId:" not in template
+    assert "publicNetworkAccess: 'Enabled'" in template
+    assert "httpsOnly: true" in template
+    assert template.count("allow: false") == 2
     helper = (REPO_ROOT / "scripts" / "deploy_command_center.ps1").read_text(encoding="utf-8")
     for name in ("integrationSubnetNsgId", "privateEndpointSubnetNsgId"):
-        assert name in template and name in helper
-    rules = template.split("var temporaryAccessRules =", 1)[1].split("\n}]", 1)[0]
-    description = re.search(r"description: '([^']*)'", rules)
-    assert description is not None
-    assert len(description.group(1)) <= 64
+        assert name not in template and name not in helper
+    for name in ("clientAccessRules", "scmAccessRules"):
+        rules = template.split(f"var {name} =", 1)[1].split("\n}]", 1)[0]
+        description = re.search(r"description: '([^']*)'", rules)
+        assert description is not None
+        assert len(description.group(1)) <= 64
+    assert "properties.publicNetworkAccess=Disabled" not in helper
 
 
 def test_scheduler_rejects_failed_responses_even_when_http_succeeds() -> None:

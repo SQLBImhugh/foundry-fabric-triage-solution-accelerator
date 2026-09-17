@@ -23,6 +23,10 @@ def repo_root() -> Path:
 def test_settings() -> Settings:
     """Always offline. A test that reaches the network is a flaky test."""
     return Settings(
+        _env_file=None,
+        monitoring_mode="fixture",
+        monitoring_tenant_id="",
+        azure_client_id="",
         triage_provider_mode="mock",
         triage_tool_mode="mock",
         foundry_project_endpoint="",
@@ -32,10 +36,10 @@ def test_settings() -> Settings:
         teams_webhook_url="",
         applicationinsights_connection_string="",
         # Without these an operator's populated .env would silently point the
-        # test suite at a live Fabric SQL database. Tests that reach the
+        # test suite at a live Azure SQL database. Tests that reach the
         # network are not tests.
-        fabric_sql_server="",
-        fabric_sql_database="",
+        azure_sql_server="",
+        azure_sql_database="",
     )
 
 

@@ -1,9 +1,10 @@
 # Read-only Fabric cockpit contributor guide
 
 The [repository contributor contract](../AGENTS.md) applies here. This directory
-contains the existing React/Vite monitoring cockpit, not an unconfigured
-Universal App starter. Read [README.md](README.md) for its deployment and command
-reference.
+contains the retained React/Vite monitoring cockpit, not an unconfigured
+Universal App starter. It is not required for the accelerator deployment or
+application state. Read [README.md](README.md) for its historical data binding
+and optional deployment/command reference.
 
 ## Scope and safety boundaries
 
@@ -11,10 +12,12 @@ reference.
   it has no remediation, approval, reset or incident-resolution controls.
   Operator workflows belong to the separate
   [Azure-hosted command center](../docs/CommandCenter.md).
-- Keep the standalone Fabric SQL state database independent of both apps.
-  Rayfin `data.enabled` is `false`. Do not enable an app-owned data service,
-  migrate the controller's tables through Rayfin or delete the database as an
-  app deployment step.
+- All live accelerator application state belongs in one shared Azure SQL
+  Database, independent of this sample. Rayfin `data.enabled` is `false`.
+  Do not enable an app-owned data service, copy the controller's tables through
+  Rayfin or delete the database as an app deployment step. The existing
+  semantic-model alias is an earlier-release binding, not evidence that the
+  sample reads the new Azure SQL state.
 - Preserve Fabric-hosted authentication. `src/lib/fabric-client.ts` uses the
   Fabric embed proxy; no app `AuthProvider` is needed for that path. A local
   Vite server does not provide the Fabric host or authorize model access.

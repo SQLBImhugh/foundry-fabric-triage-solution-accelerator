@@ -8,7 +8,21 @@ from uuid import uuid4
 import pytest
 
 from triage.models import BIRequest
+from triage.monitoring.runtime import (
+    ensure_fixture_target,
+    fixture_component,
+    fixture_setup,
+    fixture_target,
+)
 from triage.runner import Scenario
+
+
+@pytest.fixture
+def command_target(runner):
+    with fixture_setup(runner.monitoring) as setup:
+        return ensure_fixture_target(
+            setup, fixture_target("powerbi", "workspace", "dataset"), "Synthetic dataset",
+        )
 
 
 async def test_full_result_and_safe_progress_events_are_recorded(runner, repo_root) -> None:
@@ -59,16 +73,14 @@ async def test_failed_history_start_prevents_untracked_execution(runner, monkeyp
     assert not calls
 
 
-async def test_operator_command_is_claimed_once_and_not_replayed(runner, monkeypatch) -> None:
+async def test_operator_command_is_claimed_once_and_not_replayed(runner, command_target, monkeypatch) -> None:
     from triage.command_center.worker import drain_commands
     from triage.store.command_center import CommandRecord, InMemoryCommandCenterStore
 
     store = InMemoryCommandCenterStore()
     runner._command_center_store = store
-    runner.settings.powerbi_workspace_id = "workspace"
-    runner.settings.powerbi_dataset_id = "dataset"
     command = CommandRecord(
-        id=str(uuid4()), kind="powerbi_triage", target_id="powerbi:workspace:dataset",
+        id=str(uuid4()), kind="powerbi_triage", target_id=command_target.key,
         actor_id="operator", subject="Synthetic refresh failure",
     )
     store.enqueue(command)
@@ -87,6 +99,62 @@ async def test_operator_command_is_claimed_once_and_not_replayed(runner, monkeyp
     assert len(seen) == 1
     assert seen[0].source == "web"
     assert store.get_command(command.id).state == "completed"
+
+
+async def test_selected_pipeline_command_uses_the_delivered_core_binding(runner, monkeypatch) -> None:
+    from triage.command_center.models import Actor, CommandInput, WebSettings
+    from triage.command_center.service import CommandCenterService
+    from triage.command_center.worker import drain_commands
+    from triage.store.command_center import InMemoryCommandCenterStore
+
+    runner.settings = runner.settings.model_copy(update={"pipeline_sweep_enabled": True})
+    with fixture_setup(runner.monitoring) as setup:
+        selected = ensure_fixture_target(
+            setup, fixture_target("fabric_pipeline", "workspace-a", "pipeline-a"),
+            "Same display name",
+        )
+        ensure_fixture_target(
+            setup, fixture_target("fabric_pipeline", "workspace-b", "pipeline-b"),
+            "Same display name",
+        )
+    history = InMemoryCommandCenterStore()
+    runner._command_center_store = history
+    runtime = CommandCenterService(
+        runner.settings, WebSettings(_env_file=None, mode="demo", demo_worker=False),
+        monitoring_store=fixture_component(runner.monitoring, "web"), history=history, incidents=runner.store,
+        approvals=runner.build_approval_channel(),
+    )
+
+    class ReadOnlyPipelineClient:
+        def __init__(self):
+            self.targets = []
+            self.closed = False
+
+        async def list_runs(self, target):
+            self.targets.append((target.workspace_id, target.pipeline_id))
+            return []
+
+        async def close(self):
+            self.closed = True
+
+    client = ReadOnlyPipelineClient()
+    monkeypatch.setattr(runner, "build_pipeline_client", lambda: client)
+    value = CommandInput(
+        kind="pipeline_sweep", target_id=selected.key, idempotency_key=str(uuid4()),
+    )
+    runtime.enqueue(value, Actor(id="operator", display_name="Operator", roles=["operator"]))
+    before = runner.settings.model_dump()
+    lines = await drain_commands(runner)
+    assert len(lines) == 1
+    assert client.targets == [(selected.identity.workspace_id, selected.identity.item_id)]
+    assert client.closed
+    assert runtime.monitoring.store.component == "web" and runner.monitoring.component == "controller"
+    assert runtime.monitoring.store._backend.state is runner.monitoring._backend.state
+    assert history.get_command(value.idempotency_key).state == "completed"
+    assert history.get_command(value.idempotency_key).run_id == ""
+    assert runner.settings.model_dump() == before
+    assert runner.store.list_all() == []
+    assert await drain_commands(runner) == []
 
 
 async def test_changed_target_does_not_execute_an_operator_command(runner, monkeypatch) -> None:
@@ -110,17 +178,15 @@ async def test_changed_target_does_not_execute_an_operator_command(runner, monke
     assert store.get_command(command.id).state == "failed"
 
 
-async def test_distinct_commands_for_one_target_do_not_overlap(runner, monkeypatch) -> None:
+async def test_distinct_commands_for_one_target_do_not_overlap(runner, command_target, monkeypatch) -> None:
     from triage.command_center.worker import drain_commands
     from triage.store.command_center import CommandRecord, InMemoryCommandCenterStore
 
     store = InMemoryCommandCenterStore()
     runner._command_center_store = store
-    runner.settings.powerbi_workspace_id = "workspace"
-    runner.settings.powerbi_dataset_id = "dataset"
     for _ in range(2):
         store.enqueue(CommandRecord(
-            id=str(uuid4()), kind="powerbi_triage", target_id="powerbi:workspace:dataset",
+            id=str(uuid4()), kind="powerbi_triage", target_id=command_target.key,
             actor_id="operator", subject="Synthetic failure",
         ))
     active, peak, calls = 0, 0, 0
@@ -146,17 +212,15 @@ async def test_distinct_commands_for_one_target_do_not_overlap(runner, monkeypat
     assert calls == 2
 
 
-async def test_timeout_retains_target_uncertainty_without_reexecution(runner, monkeypatch) -> None:
+async def test_timeout_retains_target_uncertainty_without_reexecution(runner, command_target, monkeypatch) -> None:
     import triage.command_center.worker as worker
     from triage.store.command_center import CommandRecord, InMemoryCommandCenterStore
 
     store = InMemoryCommandCenterStore()
     runner._command_center_store = store
-    runner.settings.powerbi_workspace_id = "workspace"
-    runner.settings.powerbi_dataset_id = "dataset"
     for _ in range(2):
         store.enqueue(CommandRecord(
-            id=str(uuid4()), kind="powerbi_triage", target_id="powerbi:workspace:dataset",
+            id=str(uuid4()), kind="powerbi_triage", target_id=command_target.key,
             actor_id="operator", subject="Synthetic failure",
         ))
     writes = []
@@ -171,21 +235,21 @@ async def test_timeout_retains_target_uncertainty_without_reexecution(runner, mo
     await worker.drain_commands(runner)
     await worker.drain_commands(runner)
     assert writes == ["accepted"]
-    assert store.target_blocked("powerbi:workspace:dataset")
+    assert store.target_blocked(command_target.key)
     assert sorted(row.state for row in store.commands()) == ["interrupted", "queued"]
     assert runner.store.list_all() == []
 
 
-async def test_expired_finalization_is_not_retried_as_execution_failure(runner, monkeypatch) -> None:
+async def test_expired_finalization_is_not_retried_as_execution_failure(
+    runner, command_target, monkeypatch,
+) -> None:
     from triage.command_center.worker import drain_commands
     from triage.store.command_center import CommandRecord, InMemoryCommandCenterStore
 
     store = InMemoryCommandCenterStore()
     runner._command_center_store = store
-    runner.settings.powerbi_workspace_id = "workspace"
-    runner.settings.powerbi_dataset_id = "dataset"
     store.enqueue(CommandRecord(
-        id=str(uuid4()), kind="powerbi_triage", target_id="powerbi:workspace:dataset", actor_id="operator",
+        id=str(uuid4()), kind="powerbi_triage", target_id=command_target.key, actor_id="operator",
     ))
     finishes = []
     finish = store.finish_command
@@ -210,17 +274,15 @@ async def test_expired_finalization_is_not_retried_as_execution_failure(runner, 
 
 @pytest.mark.parametrize("overrun", [0, 61])
 async def test_command_acquisition_cannot_extend_the_execution_deadline(
-    runner, monkeypatch, overrun,
+    runner, command_target, monkeypatch, overrun,
 ) -> None:
     import triage.command_center.worker as worker
     from triage.store.command_center import CommandRecord, InMemoryCommandCenterStore
 
     store = InMemoryCommandCenterStore()
     runner._command_center_store = store
-    runner.settings.powerbi_workspace_id = "workspace"
-    runner.settings.powerbi_dataset_id = "dataset"
     command = CommandRecord(
-        id=str(uuid4()), kind="powerbi_triage", target_id="powerbi:workspace:dataset",
+        id=str(uuid4()), kind="powerbi_triage", target_id=command_target.key,
         actor_id="operator",
     )
     store.enqueue(command)
@@ -254,14 +316,14 @@ async def test_command_acquisition_cannot_extend_the_execution_deadline(
     assert runner.store.list_all() == []
 
 
-async def test_unrelated_command_progresses_behind_100_blocked_target_commands(runner, monkeypatch) -> None:
+async def test_unrelated_command_progresses_behind_100_blocked_target_commands(
+    runner, command_target, monkeypatch,
+) -> None:
     from triage.command_center.worker import drain_commands
     from triage.store.command_center import CommandRecord, InMemoryCommandCenterStore
 
     store = InMemoryCommandCenterStore()
     runner._command_center_store = store
-    runner.settings.powerbi_workspace_id = "workspace"
-    runner.settings.powerbi_dataset_id = "dataset"
     blocked = CommandRecord(
         id=str(uuid4()), kind="powerbi_triage", target_id="previously-configured-target",
         actor_id="operator",
@@ -272,7 +334,7 @@ async def test_unrelated_command_progresses_behind_100_blocked_target_commands(r
     for _ in range(100):
         store.enqueue(blocked.model_copy(update={"id": str(uuid4())}))
     eligible = blocked.model_copy(update={
-        "id": str(uuid4()), "target_id": "powerbi:workspace:dataset",
+        "id": str(uuid4()), "target_id": command_target.key,
         "created_at": (datetime.now(UTC) + timedelta(seconds=1)).isoformat(),
     })
     store.enqueue(eligible)

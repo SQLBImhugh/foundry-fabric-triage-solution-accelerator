@@ -24,8 +24,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from triage.models import Incident
 from triage.redaction import redact_text
+from triage.store.azure_sql import AzureSqlDatabase, SqlUnavailable, quote_identifier
 from triage.store.command_center import _digest, _identifier, _sql_time, _timestamp
-from triage.store.fabric_sql import FabricSqlDatabase, SqlUnavailable, quote_identifier
 from triage.store.incidents import InMemoryIncidentStore
 
 logger = logging.getLogger("triage.store.incident_workflow")
@@ -495,13 +495,13 @@ def _revision_sql(alias: str) -> str:
     return f"LOWER(CONVERT(VARCHAR(64), HASHBYTES('SHA2_256', {alias}.payload), 2))"
 
 
-class FabricSqlIncidentWorkflowStore(IncidentWorkflowStore):
+class AzureSqlIncidentWorkflowStore(IncidentWorkflowStore):
     """Read-through, fail-closed SQL state with single-statement append/CAS."""
 
     is_durable = True
 
     def __init__(
-        self, db: FabricSqlDatabase, *, activity_table: str = DEFAULT_ACTIVITY_TABLE,
+        self, db: AzureSqlDatabase, *, activity_table: str = DEFAULT_ACTIVITY_TABLE,
         incident_table: str = "triage_incidents",
     ) -> None:
         self._db = db
