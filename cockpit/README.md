@@ -73,6 +73,18 @@ Set-Location .\cockpit
 npm ci
 ```
 
+Use Node.js 22 LTS or 24 LTS, matching the Rayfin CLI's supported runtimes.
+The Rayfin packages are pinned together at `1.35.0`: the published `1.35.1`
+CLI and auth-provider manifests refer to an unavailable `rayfin-lib@1.35.1`.
+Do not upgrade one member without resolving and validating the complete set.
+
+The npm overrides patch vulnerable leaves in Rayfin's pinned OpenTelemetry
+tree without changing its SDK API: vulnerable 2.x `core` and
+`propagator-jaeger` versions move to patched 2.x releases, and the `0.217.0`
+transformer's protobuf dependency moves to a patched 8.x release. Remove these
+overrides when upstream constraints admit secure versions, then rerun the
+offline tests, Fabric build and `npm audit`.
+
 Set the `triageState` workspace and semantic-model item in `fabric.yaml` to your
 deployment. Regenerate `src/fabric.generated.ts` through the build rather than
 editing generated output:
