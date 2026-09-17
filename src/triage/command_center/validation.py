@@ -40,8 +40,15 @@ async def validate_scenario(service, root: Path, name: str, provider: str, actor
         target=name, workload="validation", agent_name="Scenario validation",
     ))
     started = time.monotonic()
+    # Validation is deliberately offline: an in-memory incident store and local
+    # flag/retry/health files, with synthetic tools. Clearing the SQL settings is
+    # not enough -- a live deployment inherits MONITORING_MODE=live, and the
+    # runner then rejects the very isolation this path depends on, refusing both
+    # the empty server/database and the local flag path. This is the sanctioned
+    # explicit use of fixture mode, not a fallback for unavailable live state.
     config = service.settings.model_copy(update={
         "triage_provider_mode": provider, "triage_tool_mode": "mock",
+        "monitoring_mode": "fixture",
         "azure_sql_server": "", "azure_sql_database": "",
         "run_history_enabled": False, "notification_channel": "teams",
         "approval_delivery_mode": "teams", "teams_webhook_url": "",

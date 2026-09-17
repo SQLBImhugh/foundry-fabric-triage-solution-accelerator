@@ -222,3 +222,31 @@ async def test_validation_history_writes_do_not_run_on_the_api_event_loop(
     assert result["passed"]
     assert set(calls) == {"start_run", "append_event", "finish_run"}
     assert runtime.incidents.get(incident.id).status == "open"
+
+
+async def test_validation_stays_offline_when_the_deployment_monitors_live(
+    service, monkeypatch, repo_root,
+) -> None:
+    """A live deployment must not drag its SQL requirement into synthetic validation.
+
+    The deployed command centre runs with MONITORING_MODE=live, which the runner
+    reads to mean "a real Azure SQL handle is mandatory". Validation clears the
+    server and database to stay isolated, so without an explicit fixture mode the
+    scenario crashed with "MONITORING_MODE=live requires AZURE_SQL_SERVER and
+    AZURE_SQL_DATABASE" -- every case reported as agent_crashed in production.
+    """
+    from triage.command_center.validation import validate_scenario
+
+    runtime, _, _ = service
+    monkeypatch.setattr(runtime, "settings", runtime.settings.model_copy(update={
+        "monitoring_mode": "live",
+        "monitoring_tenant_id": "edf144d9-f468-4b8e-8443-f51dadfbc4f9",
+        "azure_sql_server": "example.database.windows.net",
+        "azure_sql_database": "example-state",
+    }))
+    result = await validate_scenario(
+        runtime, repo_root, "scenario10-pipeline-rerun-approved", "mock",
+        Actor(id="admin", display_name="Admin", roles=["admin"]),
+    )
+    assert result["outcome"] != "agent_crashed", result["failures"]
+    assert result["passed"], result["failures"]
