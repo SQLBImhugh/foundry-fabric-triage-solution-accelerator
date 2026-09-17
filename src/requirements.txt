@@ -39,3 +39,21 @@ pyyaml>=6.0
 azure-identity>=1.17
 mssql-python>=1.14
 azure-monitor-opentelemetry>=1.6
+
+# Required by the heartbeat, not by any HTTP server this container runs.
+# "heartbeat" drains queued command-centre work through
+# triage.command_center.worker, which imports triage.command_center.monitoring
+# for resolve_command_target -- and that module is also the FastAPI router, so
+# importing the monitoring service imports FastAPI. The same chain reaches
+# triage.command_center.auth, which imports PyJWT to validate web tokens the
+# controller never sees.
+#
+# Without these the deployed agent fails every invocation with
+# "No module named 'fastapi'" and reports it only in the response body: no
+# telemetry, no run record, and a container that looks deployed and healthy.
+#
+# The better fix is to split the monitoring service away from its router so the
+# controller depends on neither. Until then these are load-bearing, and the
+# versions track the web extra in pyproject.toml.
+fastapi>=0.115,<1
+PyJWT[crypto]>=2.9,<3
