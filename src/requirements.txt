@@ -19,7 +19,7 @@
 # hand. Bump this deliberately and redeploy, rather than discovering a new beta
 # during a demo.
 agent-framework-core>=1.17,<2
-agent-framework-foundry-hosting==1.0.0b260903
+agent-framework-foundry-hosting==1.0.0b260910
 
 pydantic>=2.7
 pydantic-settings>=2.2
