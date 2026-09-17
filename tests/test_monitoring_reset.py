@@ -1284,7 +1284,19 @@ def test_explicit_delegated_azure_cli_selection_is_pinned_without_fallback(monke
 
 
 def test_explicit_broker_path_uses_selected_tenant_domain_and_no_shared_az_switch(monkeypatch):
+    import sys
+    from types import ModuleType
+
     commands = []
+    azure = ModuleType("azure")
+    core = ModuleType("azure.core")
+    credentials = ModuleType("azure.core.credentials")
+    credentials.AccessToken = lambda value, expires: SimpleNamespace(token=value, expires_on=expires)
+    azure.core = core
+    core.credentials = credentials
+    monkeypatch.setitem(sys.modules, "azure", azure)
+    monkeypatch.setitem(sys.modules, "azure.core", core)
+    monkeypatch.setitem(sys.modules, "azure.core.credentials", credentials)
 
     def broker(command, **kwargs):
         commands.append(command)
