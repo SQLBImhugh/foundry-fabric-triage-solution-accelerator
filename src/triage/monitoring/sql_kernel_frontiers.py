@@ -120,7 +120,13 @@ DECLARE @frontier_evidence nvarchar(max)=(SELECT full_key AS binding_key,payload
     FROM {records} WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='accepted_fact'
       AND JSON_VALUE(payload,'$.batch_id')=@request_id
     ORDER BY full_key COLLATE Latin1_General_100_BIN2 FOR JSON PATH);
-DECLARE @frontier_evidence_digest char(64)={payload_hash("N'"+operation+"'+@binding_hash+@frontier_evidence")},
+-- FOR JSON PATH returns NULL, not an empty array, when no accepted_fact rows
+-- match. Concatenating that NULL made the digest NULL, and the handoff payload
+-- below is built without INCLUDE_NULL_VALUES, so the key vanished entirely and
+-- ValidationHandoff.evidence_digest failed to decode on every controller read.
+-- A web intent with no accepted evidence -- the first discovery a user queues --
+-- hit this, so hash the empty set explicitly rather than propagating NULL.
+DECLARE @frontier_evidence_digest char(64)={payload_hash("N'"+operation+"'+@binding_hash+COALESCE(@frontier_evidence,N'[]')")},
     @frontier_handoff_key nvarchar(1024)=@frontier_key+N':handoff:'+CONVERT(nvarchar(30),@frontier_revision);
 DECLARE @frontier_handoff nvarchar(max)=(SELECT @frontier_key AS frontier_key,
     @frontier_revision AS frontier_revision,N'{producer}' AS producer,@request_id AS producer_request_id,
@@ -389,8 +395,8 @@ IF @proof IS NULL OR COALESCE(@decision,'') NOT IN ('published','rejected')
    OR COALESCE(JSON_VALUE(@proof,'$.frontier_key'),'')<>@frontier_key
    OR COALESCE(TRY_CONVERT(bigint,JSON_VALUE(@proof,'$.through_revision')),-1)<>@accepted
    OR COALESCE(JSON_VALUE(@proof,'$.producer_request_id'),'')<>@producer_request_id
-   OR COALESCE(JSON_VALUE(@proof,'$.producer_fingerprint'),'')<>JSON_VALUE(@handoff,'$.producer_fingerprint')
-   OR COALESCE(JSON_VALUE(@proof,'$.evidence_digest'),'')<>JSON_VALUE(@handoff,'$.evidence_digest')
+   OR COALESCE(JSON_VALUE(@proof,'$.producer_fingerprint'),'')<>COALESCE(JSON_VALUE(@handoff,'$.producer_fingerprint'),'')
+   OR COALESCE(JSON_VALUE(@proof,'$.evidence_digest'),'')<>COALESCE(JSON_VALUE(@handoff,'$.evidence_digest'),'')
    OR NULLIF(JSON_VALUE(@proof,'$.detail'),'') IS NULL
     THROW 51072, 'Controller proof is not correlated to this work, intent and committed frontier', 1;
 IF EXISTS (SELECT 1 FROM OPENJSON(@proof) WHERE [key]='acknowledge_handoff' AND type<>3)

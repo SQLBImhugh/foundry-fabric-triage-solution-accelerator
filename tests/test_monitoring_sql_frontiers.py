@@ -274,3 +274,35 @@ def test_frontier_rpc_and_publication_contract_is_explicit():
     assert "frontier_digest" in contract["controller_publication_contracts"]["reservation_validation"]
     assert contract["work_policy"]["reconcile_state"]["dispatch_route"] == "reconcile_state"
     assert not contract["work_policy"]["reconcile_state"]["action_ownership"]
+
+
+def test_accepted_handoff_digest_hashes_an_empty_evidence_set(kernel):
+    """A web intent with no accepted_fact rows must still produce a digest.
+
+    FOR JSON PATH returns NULL rather than an empty array when nothing matches,
+    and the handoff payload is built without INCLUDE_NULL_VALUES, so a NULL
+    digest dropped the key and ValidationHandoff refused to decode. Every
+    controller heartbeat then failed with "A persisted monitoring record is
+    unreadable" -- triggered by the first discovery a user queues.
+    """
+    builders = [obj for obj in kernel.objects if "@frontier_evidence" in obj.ddl]
+    assert builders, "No kernel object builds the frontier evidence digest"
+    for obj in builders:
+        assert "COALESCE(@frontier_evidence,N'[]')" in obj.ddl, obj.logical_name
+        assert "+@frontier_evidence)" not in obj.ddl, (
+            f"{obj.logical_name} still concatenates the evidence set without COALESCE"
+        )
+
+
+def test_no_correlation_guard_compares_against_a_bare_handoff_value(kernel):
+    """A missing handoff field must fail the guard, not silently pass it.
+
+    SQL comparisons against NULL are UNKNOWN, so `<>JSON_VALUE(@handoff, ...)`
+    contributes nothing to an OR chain when the key is absent: the proof
+    correlation check failed open exactly when the handoff was malformed. Every
+    sibling condition already COALESCEs both sides.
+    """
+    for obj in kernel.objects:
+        assert "<>JSON_VALUE(@handoff," not in obj.ddl, (
+            f"{obj.logical_name} compares a proof value against a bare handoff value"
+        )
