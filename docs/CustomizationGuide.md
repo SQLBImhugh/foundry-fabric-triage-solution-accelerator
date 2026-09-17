@@ -383,8 +383,9 @@ Use the same tracking projection for the queue, counts and full incident record.
 
 Preserve the shared safe Markdown renderer for explanations and answers:
 no raw HTML, images or unsafe links. Presentation tokens live in
-`command-center/src/styles.css`; the current design uses self-hosted DejaVu
-Serif Condensed, Onyx dark/light colors and Ink-style geometry and shadows.
+`command-center/src/styles.css`; the current design prefers system Georgia,
+with DejaVu Serif and self-hosted DejaVu Serif Condensed fallbacks, Onyx
+dark/light colors and Ink-style geometry and shadows.
 Keep the supplied PNG logo and packaged font assets unless a deliberate branding
 change updates the asset checks too. The Command Center is the operational UI.
 The separate Rayfin cockpit remains a read-only sample, not an alternative

@@ -206,8 +206,9 @@ by the server. No scenario request is automatically retried.
 ## Appearance and font license
 
 `src/styles.css` centralizes Onyx dark/light colors, Ink two-pixel geometry and
-hard shadows. DejaVu Serif Condensed regular and bold are self-hosted under
-`public/fonts`; there are no external webfont requests. The unmodified
+hard shadows. Georgia is the preferred system font, followed by DejaVu Serif
+and DejaVu Serif Condensed. DejaVu Serif Condensed regular and bold remain
+self-hosted under `public/fonts`; there are no external webfont requests. The unmodified
 distribution license is `public/fonts/LICENSE.txt`, retrieved from:
 
 <https://github.com/dejavu-fonts/dejavu-fonts/blob/master/LICENSE>

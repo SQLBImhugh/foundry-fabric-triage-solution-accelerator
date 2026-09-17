@@ -42,7 +42,7 @@ approval.
 The cockpit has a canonical dark theme in `src/global.css`, system fonts
 (Segoe UI and Cascadia Mono) and no theme-toggle control. Preserve that design
 unless a redesign is explicitly requested. The command center has a separate
-theme; its DejaVu Serif Condensed/Onyx styling does not redefine this app.
+theme; its Georgia-first/Onyx styling does not redefine this app.
 Check both `src/main.tsx` and `index.html` before making a claim about font
 downloads.
 

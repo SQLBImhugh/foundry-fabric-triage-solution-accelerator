@@ -9,7 +9,8 @@ read-only Fabric App in `cockpit/` is not a deployment or state dependency; its
 earlier semantic-model binding does not establish an Azure SQL read path.
 All application stores use one database, independent of either UI.
 
-The interface uses self-hosted DejaVu Serif Condensed and Onyx colors in its
+The interface prefers the system Georgia font, with DejaVu Serif and
+self-hosted DejaVu Serif Condensed fallbacks, and uses Onyx colors in its
 dark/light themes, with Ink geometry: 2px corners and 7px offset shadows.
 Font licensing is included with the frontend assets.
 The supplied triage artwork appears in the sidebar, sign-in view and favicon.
