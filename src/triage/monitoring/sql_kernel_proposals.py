@@ -81,7 +81,7 @@ IF EXISTS (SELECT 1 FROM OPENJSON(@proposals) AS p WHERE
     OR NOT ({canonical_guid("JSON_VALUE(p.value,'$.proposal_id')")})
     OR NULLIF(JSON_VALUE(p.value,'$.node_name'),'') IS NULL
     OR DATALENGTH(JSON_VALUE(p.value,'$.node_name'))>512
-    OR JSON_VALUE(p.value,'$.node_name') COLLATE Latin1_General_100_BIN2 LIKE '%[^A-Za-z0-9_.-]%'
+    OR JSON_VALUE(p.value,'$.node_name') COLLATE Latin1_General_100_BIN2 LIKE '%[^-A-Za-z0-9_.]%'
     OR NOT EXISTS (SELECT 1 FROM OPENJSON(p.value) WHERE [key]='source_id' AND type=0)
     OR JSON_VALUE(p.value,'$.source_id') IS NOT NULL)
     THROW 51073, 'A logical proposal has a node name and null physical source_id, never a fabricated ID', 1;

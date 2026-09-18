@@ -490,11 +490,11 @@ IF EXISTS (SELECT 1 FROM OPENJSON(@observation_json) WHERE
     THROW 51073, 'Connector observation field has the wrong JSON type', 1;
 IF JSON_QUERY(@observation_json,'$.endpoint') IS NOT NULL AND (
     NULLIF(JSON_VALUE(@observation_json,'$.endpoint.namespace'),'') IS NULL
-    OR JSON_VALUE(@observation_json,'$.endpoint.namespace') COLLATE Latin1_General_100_BIN2 LIKE '%[^A-Za-z0-9.-]%'
+    OR JSON_VALUE(@observation_json,'$.endpoint.namespace') COLLATE Latin1_General_100_BIN2 LIKE '%[^-A-Za-z0-9.]%'
     OR NULLIF(JSON_VALUE(@observation_json,'$.endpoint.entity'),'') IS NULL
-    OR JSON_VALUE(@observation_json,'$.endpoint.entity') COLLATE Latin1_General_100_BIN2 LIKE '%[^A-Za-z0-9_./-]%'
+    OR JSON_VALUE(@observation_json,'$.endpoint.entity') COLLATE Latin1_General_100_BIN2 LIKE '%[^-A-Za-z0-9_./]%'
     OR NULLIF(JSON_VALUE(@observation_json,'$.endpoint.consumer_group'),'') IS NULL
-    OR JSON_VALUE(@observation_json,'$.endpoint.consumer_group') COLLATE Latin1_General_100_BIN2 LIKE '%[^A-Za-z0-9$_.-]%')
+    OR JSON_VALUE(@observation_json,'$.endpoint.consumer_group') COLLATE Latin1_General_100_BIN2 LIKE '%[^-A-Za-z0-9$_.]%')
     THROW 51073, 'Endpoint fields must be nonsecret host/entity/group metadata, not credentials or URLs', 1;
 DECLARE @next nvarchar(max)=@prior,@field nvarchar(128),@value nvarchar(max),@type int;
 DECLARE fields CURSOR LOCAL FAST_FORWARD FOR SELECT [key],value,type FROM OPENJSON(@observation_json);
@@ -561,7 +561,7 @@ SET @result=(SELECT @connector_id AS connector_id,JSON_QUERY(@next) AS connector
 def _budget(names: SqlNames, contract: RpcContract) -> KernelObject:
     table = names.table("monitoring_rate_budget")
     body = f"""IF LEN(@bucket) NOT BETWEEN 1 AND 128
-   OR @bucket COLLATE Latin1_General_100_BIN2 LIKE '%[^A-Za-z0-9_.:-]%'
+   OR @bucket COLLATE Latin1_General_100_BIN2 LIKE '%[^-A-Za-z0-9_.:]%'
    OR (@delay_seconds IS NOT NULL AND @delay_seconds NOT BETWEEN 0 AND 2147483647)
     THROW 51073, 'Invalid rate bucket or cooldown', 1;
 DECLARE @bucket_hash char(64)=LOWER(CONVERT(char(64),{key_hash('@bucket')},2)),

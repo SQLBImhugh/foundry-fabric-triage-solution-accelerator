@@ -270,10 +270,11 @@ IF @stored_work_kind='reconcile_state' AND (
 
 
 def partition_identity(names: SqlNames) -> str:
+    # SQL LIKE needs a leading hyphen here to keep it literal.
     pair_sql = """N'["'+@consumer_group+N'","'+@partition_id+N'"]'"""
     return f"""IF NOT ({canonical_guid('@connector_id')})
     THROW 51073, 'Connector must be a canonical nonempty GUID', 1;
-IF @consumer_group COLLATE Latin1_General_100_BIN2 LIKE '%[^A-Za-z0-9$_.-]%'
+IF @consumer_group COLLATE Latin1_General_100_BIN2 LIKE '%[^-A-Za-z0-9$_.]%'
    OR LEN(@consumer_group) NOT BETWEEN 1 AND 50
    OR @partition_id COLLATE Latin1_General_100_BIN2 LIKE '%[^0-9]%'
    OR LEN(@partition_id) NOT BETWEEN 1 AND 32
