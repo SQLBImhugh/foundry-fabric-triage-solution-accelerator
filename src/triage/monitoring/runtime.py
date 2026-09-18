@@ -251,6 +251,7 @@ def inspect_context(store: MonitoringStore, tenant_id: str) -> MonitoringContext
 def build_monitoring_store(
     settings: Any, *, db: AzureSqlDatabase | None = None, fixture: bool = False,
     component: Literal["worker", "web", "controller"] | None = None,
+    policy: TriagePolicy | None = None,
 ) -> MonitoringStore:
     """Build the common API/worker/controller store and verify deployment identity.
 
@@ -300,7 +301,10 @@ def build_monitoring_store(
         if exc.name != "triage.monitoring.sql_store":
             raise
         raise MonitoringUnavailable("The live monitoring-store implementation is not installed.") from exc
-    store = AzureSqlMonitoringStore(db=db, component=component, policy=TriagePolicy.from_settings(settings))
+    store = AzureSqlMonitoringStore(
+        db=db, component=component,
+        policy=policy if policy is not None else TriagePolicy.from_settings(settings),
+    )
     inspect_context(store, tenant_id)
     return store
 

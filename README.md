@@ -41,13 +41,31 @@ services, including native Fabric Eventstream delivery.
 > SQL remains Entra-only with auditing/TDE, and registry admin/anonymous access
 > stays disabled. The public Foundry path is retained with local auth disabled.
 >
-> The original SQL proof receipt is under guarded recovery; completion,
-> full-schema bootstrap, runtime permissions, worker recovery and cutover are
-> not accepted. Earlier private image/network proofs remain historical. The
-> private Foundry preflight error does not block this public architecture.
-> The live app/controller remain the prior release; no history migration/wipe,
-> normal-worker rollout, hybrid application push or current-release UI
-> screenshots are complete.
+> **SQL recovery is complete.** Append-only adjudication preserves the original
+> failed `STARTED` receipt and binds its approved replacement. Schemas are
+> committed, Command Center and the hosted controller use Azure SQL with the
+> correct acting-identity grants. Maintenance is now `false`;
+> the earlier `maintenance=true`, revision `0` bootstrap capture is historical.
+>
+> A no-ingress **collector-only worker is deployed**. Native Fabric metadata
+> reads durably accepted 332 workspaces; the authenticated workspace selectors
+> are enabled. Item coverage remains partial, including source-access 401s and
+> request-budget/throttling gaps. Metadata discovery grants neither source
+> access nor remediation authority; no scopes or actions were auto-admitted.
+>
+> The existing one-minute scheduler now calls `heartbeat`, with three actual
+> recurrence responses verified completed. Portal-only missing/failed-heartbeat
+> alerts have no configured delivery destination. Collector-only mode runs no
+> Eventstream receiver/provisioner, so event and end-to-end acceptance remain
+> open. Eight bounded role cases and 19 SELECT controls are not the full 27-RPC
+> matrix. Hosted metadata telemetry now uses an app-owned channel, with Foundry
+> project content tracing kept disconnected. Native Application Insights queries
+> now contain `heartbeat_started` and completed `heartbeat_finished` metadata,
+> with queue counts and zero exporter failure/warning counters in the captured
+> runs. This proves bounded metadata ingestion, not full event, overnight or
+> end-to-end acceptance.
+> Earlier private proofs and screenshots remain historical; the private Foundry
+> error does not block this public architecture.
 > Follow the [release gates](./docs/DeploymentGuide.md#release-gates) and the
 > [approved implementation and acceptance plan](./docs/HybridMonitoringPlan.md).
 
@@ -104,11 +122,15 @@ For the current boundaries, see the
 | ![Solution architecture](./docs/images/readme/solution-architecture.png) |
 | ------------------------------------------------------------------------ |
 
+Start with [collector-only setup](./docs/DeploymentGuide.md#collector-only-quickstart)
+for inventory and REST polling; it needs no Eventstream metadata. Event intake
+is a separately configured mode, not a fallback selected by missing settings.
 The hybrid source path is:
 
 ```text
 Command Center scope/review requests -> durable web intents (pending)
-REST inventory/polling and native Job events -> worker observations + receipts
+Collector-only REST inventory/polling -> worker observations + receipts
+Optional event-enabled mode -> native Job receipts with an owned binding
 Controller heartbeat -> deterministic reconcile_state (no agent or action)
   -> published registry/source/connector authority
 Controller heartbeat -> eligible source work and human-command queues
@@ -331,7 +353,7 @@ The table below lists the major Microsoft products used.
 | [Azure Container Registry](https://learn.microsoft.com/azure/container-registry/) | Public Basic registry with scoped managed-identity image pull; admin and anonymous access disabled. | [Pricing](https://azure.microsoft.com/pricing/details/container-registry/) |
 | [Azure Logic Apps](https://learn.microsoft.com/azure/logic-apps/) | Schedules controller heartbeat and optional mailbox/health work. Consumption tier with managed identity. | [Pricing](https://azure.microsoft.com/pricing/details/logic-apps/) |
 | [Azure App Service](https://learn.microsoft.com/azure/app-service/) | Public HTTPS Command Center host with Entra authorization and separate optional app/SCM caller filters; no baseline private endpoint or NAT Gateway. | [Pricing](https://azure.microsoft.com/pricing/details/app-service/linux/) |
-| [Application Insights](https://learn.microsoft.com/azure/azure-monitor/app/app-insights-overview) | Optional. Traces every run as spans carrying metadata only. | [Pricing](https://azure.microsoft.com/pricing/details/monitor/) |
+| [Application Insights](https://learn.microsoft.com/azure/azure-monitor/app/app-insights-overview) | Entra-authenticated, app-owned metadata telemetry; paired heartbeat records have been queried natively. Foundry project content tracing remains disconnected. | [Pricing](https://azure.microsoft.com/pricing/details/monitor/) |
 | [Microsoft 365 / Exchange Online](https://learn.microsoft.com/exchange/exchange-online) | Optional mailbox ingestion for Power BI failure alerts; not a dependency of hybrid polling or Eventstream intake. | [Pricing](https://www.microsoft.com/microsoft-365/business/compare-all-microsoft-365-business-products) |
 | [Microsoft Teams](https://learn.microsoft.com/microsoftteams/) | Optional. Receives notification and approval cards. | [Pricing](https://www.microsoft.com/microsoft-teams/compare-microsoft-teams-business-options) |
 
@@ -366,6 +388,16 @@ and event intake; do not create another controller timer for every target.
 Create the scheduler disabled, verify its identity and database prerequisites,
 then enable it as part of the approved cutover. A successful idle heartbeat is
 not proof of fresh inventory, polling coverage or event delivery.
+
+The current deployment reused its existing one-minute command scheduler and
+changed only the command to `heartbeat`; it added no second timer and enabled
+no mailbox processing. Three actual recurrences returned decoded completed
+responses. The controller's 840-second monotonic admission budget includes lock
+wait, runs two automatic and one human-command concurrent slots, and refills
+them only within queue limits and the remaining execution allowance. It stops
+new claims without cancelling admitted work when insufficient time remains.
+Portal-only heartbeat health alerts are configured, but no email/webhook/Action
+Group delivery or missing-heartbeat canary has been proved.
 
 Re-test routines in your own tenant before enabling them; the observed behavior
 may be regional or fixed in a later preview release. An enabled declaration is
@@ -471,6 +503,13 @@ tokens in other sessions: roles can remain valid until token expiry or renewal,
 with the backend's 30-second validation leeway. Authorization needs no runtime
 Graph directory permission. The optional profile photo uses a separate delegated
 Graph `User.Read` token.
+
+Hosted telemetry is separate from Foundry project tracing. The application uses
+`TRIAGE_TELEMETRY_CONNECTION_STRING` with managed identity and metadata-only
+instrumentation; it does not fall back to the platform-reserved locator.
+Connecting Application Insights to the Foundry project enables tracing across
+agents that may contain prompts/responses, so that connection stays absent.
+See [metadata-only telemetry and bounded native proof](./docs/DeploymentGuide.md#8-observability).
 
 The source retains these credential-bearing inputs for older optional mailbox
 and Teams integrations. They are not supported shortcuts for the secretless

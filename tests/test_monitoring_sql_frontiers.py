@@ -315,6 +315,17 @@ def test_producer_handoff_emits_an_empty_evidence_array_not_json_null(kernel):
         assert "FOR JSON PATH),N'[]')) AS evidence," in obj.ddl, obj.logical_name
 
 
+def test_accepted_catalogue_uses_receipt_hash_index_without_dropping_full_identity_checks(kernel):
+    sql = _sql(kernel, "accepted_worker_facts")
+    assert "receipt.request_hash=HASHBYTES" in sql
+    assert "accepted.key_hash=HASHBYTES" in sql
+    assert "N'accepted:'+receipt.request_id+N':'+r.record_kind" in sql
+    assert "receipt.request_id=JSON_VALUE(accepted.payload,'$.batch_id')" in sql
+    assert "receipt.fingerprint=JSON_VALUE(accepted.payload,'$.batch_fingerprint')" in sql
+    assert "JSON_VALUE(accepted.payload,'$.fact_key')=r.full_key" in sql
+    assert "JSON_VALUE(accepted.payload,'$.row_hash')" in sql
+
+
 def _proof_rejected(db, kernel, proof, handoff):
     sql = _sql(kernel, "controller.resolve_frontier")
     predicate = re.search(

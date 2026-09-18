@@ -582,10 +582,12 @@ def _heartbeat(names: SqlNames, contract: RpcContract) -> KernelObject:
    OR @accepted_positions<0 OR LEN(@worker_id)=0
    OR @last_delivery_at>@now OR @last_maintenance_at>@now
     THROW 51073, 'Heartbeat fields are invalid', 1;
-IF NOT EXISTS (SELECT 1 FROM {records} WHERE tenant_id=@tenant_id AND epoch=@epoch
+IF @connector_id IS NULL AND (@transport_connected<>0 OR @accepted_positions<>0 OR @last_delivery_at IS NOT NULL)
+    THROW 51073, 'Collector-only heartbeat cannot assert event delivery', 1;
+IF @connector_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM {records} WHERE tenant_id=@tenant_id AND epoch=@epoch
     AND record_kind='connector' AND full_key=@connector_id)
     THROW 51072, 'Heartbeat requires an owned connector', 1;
-DECLARE @heartbeat_key nvarchar(1024)=@connector_id+N':'+@worker_id,@heartbeat_revision bigint;
+DECLARE @heartbeat_key nvarchar(1024)=COALESCE(@connector_id,N'collector')+N':'+@worker_id,@heartbeat_revision bigint;
 IF @maintenance=1 AND @state='running' SET @state='blocked';
 SELECT @heartbeat_revision=revision FROM {records} WHERE tenant_id=@tenant_id AND epoch=@epoch
   AND record_kind='receiver_heartbeat' AND full_key=@heartbeat_key;

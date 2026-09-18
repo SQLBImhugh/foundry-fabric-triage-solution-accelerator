@@ -14,12 +14,27 @@ Isolated MI event transport has been demonstrated across manual and
 scheduled failure, success and cancellation; SQL durable handling and normal
 worker readiness have not. The shipped infrastructure now uses public networking
 with Entra authentication and no PE/VNet/NAT/private-DNS prerequisites.
-Scoped evaluation SQL/registry public access is verified, but the original SQL
-proof receipt is under recovery and bootstrap/runtime acceptance remains gated.
+Scoped evaluation SQL/registry public access is verified. SQL recovery and
+proof/application schema commits are complete; append-only adjudication keeps
+the original failed receipt unchanged. The initialization maintenance capture is
+historical. Command Center and the hosted controller use Azure SQL
+with correctly mapped SQL users, kernel roles and application grants;
+maintenance is `false`. The controller completed bounded discovery-intent
+reconciliation, published its frontier `1/1` and queued one inventory item
+without actions or receipt/control changes.
 Earlier private-network proofs and the private Foundry preflight error are
 historical, not blockers for the retained public Foundry path.
-The live app/controller remain the prior release; normal-worker rollout,
-history migration/wipe and hybrid cutover are not complete. Keep those gates distinct; see
+The collector-only worker is now deployed and has durably accepted 332 workspace
+metadata records. Item coverage remains partial, with source-permission and
+request-budget/throttling gaps; no scopes or remediation were auto-admitted.
+Collector-only mode has no event receiver/provisioner. Three real heartbeat
+recurrences and portal-only alert deployment do not prove event delivery,
+notification delivery or sustained hybrid coverage. Native app-owned
+started/completed heartbeat metadata is now present in Application Insights;
+project content tracing stays disconnected. This is bounded ingestion proof,
+not acceptance of every telemetry path.
+Eight bounded role/effect cases and 19 SELECT controls do not replace the full
+27-RPC matrix. Keep those gates distinct; see
 [DeploymentGuide.md](DeploymentGuide.md#release-gates).
 
 ## Decide the tier before writing any code
@@ -161,6 +176,14 @@ No missing setting, unavailable backend or partial response may select a
 fixture or restore `FABRIC_PIPELINE_TARGETS`. Static live targets and
 compatibility loaders are retired.
 
+Preserve the explicit collector-only boundary. `--collector-only` permits a
+missing connector only in that mode and rejects partial/residual event metadata.
+Its zero-write policy has empty action allowlists rather than copied controller
+settings. It starts no receiver/provisioner, and its durable
+`connector_id=null` heartbeat cannot assert transport or delivery.
+Event mode retains complete owned-binding validation. Do not make unavailable
+event settings silently select another mode.
+
 Discovery work uses `discovery_selector`; API-triggered discovery delegates
 revision/idempotency handling to `request_discovery(expected, selector,
 request_id=...)`. Do not add an alias or perform an API preflight that rejects
@@ -273,6 +296,13 @@ that several autocommit calls form one transaction. Async collectors offload
 blocking persistence. Use database time, conditional ownership and fences,
 shared service/API budgets and fair workspace shares across replicas.
 
+Lease renewal must re-read the authoritative work revision. New inventory rows
+use checked-view batches bounded to 50 rows/950 parameters under the same lease
+and atomic acceptance boundary; a short rowcount rolls back. Catalogue paging
+may optimize receipt lookup but must retain original identity, fingerprints,
+payload and row-hash evidence. Neither metadata read performance nor a complete
+HTTP page can replace acceptance or authority checks.
+
 Use `AZURE_SQL_SERVER` and `AZURE_SQL_DATABASE`, with the hostname and catalog
 from the Azure deployment. The public SQL endpoint requires Entra-only
 authentication, TLS, auditing/TDE and explicit firewall admission. The default
@@ -294,6 +324,53 @@ Creation/bootstrap/reset belong to explicit deployment tooling. Runtime stores
 must not acquire DDL, upgrade schema, import old state or delete an uncertain
 action journal. Preserve original operation IDs after a timeout and reconcile
 their receipts. The deployment-only prototype reset is not a recovery fallback.
+
+Use [`scripts\prepare_azure_sql.py`](../scripts/prepare_azure_sql.py) for a local
+current-source bootstrap candidate instead of maintaining copied SQL/grant
+lists. The strict request selects the target, bootstrap identity, operation and
+digest-pinned SDK/native base image. Preparation derives ordered batches,
+fixed metadata expectations and the current ABI; `kernel.statements` already
+contains its component grants. Do not append the grants again.
+`static_budget_policies()` derives all current service/API/provisioning buckets
+and adds their tenant-bound deployment seeds through `budget_policy_statements`.
+Overlapping bucket sources refuse. Matching policy rows keep usage/window/
+cooldown state; changed limits/windows fail instead of resetting state.
+The fixed `budget_policies` readback excludes mutable counters and refuses
+missing, changed or extra policies. The current output is 164 batches/115 checks,
+not a pinned ABI or native-acceptance claim.
+
+The new-directory output is an immutable context plus manifest.
+`--verify` checks exact local files/hashes and the artifact/readback model;
+it does not run SQL, build an image, initialize control, grant runtime access
+or authorize an operation. New native types/scales and unsupported metadata
+shapes require reviewed support rather than inferred constants. Prior native
+proof of primitive metadata is not acceptance of a new generated candidate.
+Do not infer native precision or temporal storage metadata from `ColumnSpec`.
+New type/scale/view shapes require reviewed support. Existing live deployments
+need a separately reviewed one-off policy repair, not replay of a fresh bootstrap
+bundle or rehashing of immutable historical evidence.
+Current-source verification compares trusted preparation-source hashes and
+regenerated source maps, SQL, readback expectations and ABI. A self-consistent
+manifest with altered hashes is not provenance; the payload remains inert
+Python data. Historical evidence uses the separate read-only recovery path.
+See [the request and output contract](DeploymentGuide.md#local-sql-candidate-preparation).
+
+Keep bootstrap receipts and recovery adjudications outside reset's deletion
+scope. `dbo.triage_sql_bootstrap_receipts` and
+`dbo.triage_sql_bootstrap_recoveries` are optional retained journals: validate
+their exact supported structure and lack of runtime mutation authority if
+present, but never create, clear or repair them through reset. Journal entries
+belong only in `retained_counts`, never `deleted_counts`. There is no wildcard
+exemption for accelerator-looking object names. Normal startup must not depend on reset writer
+registration, ancillary-writer classification or quiescence.
+
+Recovery baseline approval is not part of local artifact export. The current
+trusted `bootstrap.recovery_baseline_fingerprint(db, artifact.bundle)` helper
+reads the bounded full empty/security catalogue; it does not make an arbitrary
+returned hash safe to approve. Preserve and independently review the target,
+original receipt, source hash and collected evidence before approving
+`recovery.empty_baseline_sha256`. Fresh recovery compares it before any write.
+Do not substitute an empty `sys.objects` check or a hash from another database.
 
 Add deterministic fake transport/clock/transaction cases for denial, malformed
 or partial evidence, retention exhaustion, duplicate source aliases, stale
@@ -391,6 +468,29 @@ change updates the asset checks too. The Command Center is the operational UI.
 The separate Rayfin cockpit remains a read-only sample, not an alternative
 command writer or a deployment/state dependency. Its earlier model binding
 is not a verified Azure SQL integration.
+
+## Telemetry and infrastructure changes
+
+Preserve the hosted app-owned `TRIAGE_TELEMETRY_CONNECTION_STRING` boundary;
+the CLI's standard setting is not a hosted fallback. Keep Foundry project
+tracing disconnected because it can capture content across all project agents.
+Force message-content capture off before SDK/agent/host construction, disable
+the host's default observability callback and export only the approved metadata
+logger families. SDK diagnostics must expose counts/types/sanitized source
+locations, not raw messages or payloads.
+
+The empty-platform-locator normalization must only remove an exact empty value
+before SDK configuration after requiring the explicit app-owned locator; never
+replace/delete a nonempty value, redeclare the platform variable or add a hosted
+fallback. The current native paired-heartbeat capture proves bounded ingestion;
+source configuration success alone remains insufficient. See
+[telemetry setup and platform/privacy sources](DeploymentGuide.md#8-observability).
+
+CI compiles all 12 shipped public Bicep templates without credentials outside
+the default pytest path and supplies the existing eight compiled-template test inputs.
+Keep default tests offline; do not make them invoke Azure CLI or obtain tenant
+credentials. Preserve the exact hosting-library pin and ordinary public-customer
+defaults without baked-in governance exemptions.
 
 ## Change the model
 

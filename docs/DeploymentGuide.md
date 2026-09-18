@@ -24,25 +24,32 @@ is blocked.
 The selected network baseline is now **public networking with Entra
 authentication**. The shipped Bicep and deployment helpers do not require a
 private endpoint, VNet, NAT Gateway, subnet or private DNS. Scoped SQL/registry
-evaluation access has been enabled and read back. That network change does not
-complete SQL recovery or cut over the live application.
+evaluation access has been enabled and read back. Network access alone is not
+schema or runtime acceptance; the completed SQL bootstrap and remaining
+activation/cutover gates are distinguished below.
 
 ### Release gates
 
 | Gate | Current evidence/status | Not established |
 |---|---|---|
-| SQL ownership contract | Independently reviewed offline, including the current correction set | Native role evaluation, checked-view updatability or MI procedure execution |
+| SQL ownership contract | Independent review, eight bounded native `EXECUTE AS` role/effect cases and 19 native SELECT-predicate controls passed. Three correctly mapped EXTERNAL users have kernel roles and reviewed application DML grants | These bounded cases are not the full 27-RPC matrix or normal-worker execution proof |
 | Event transport | A historical isolated MI canary received all four observed wire event types across manual failure, scheduled failure, success and cancellation | Azure SQL durable handling, normal-worker recovery or application cutover |
-| Live source integration | Final component-store, controller and connector acceptance, including source acknowledgement and work completion, remains required | A test-only fixture or passing local scenario is not the live path |
-| Data-quality flag persistence | Source now selects `AzureSqlFlagTable` for live runs and CSV only for fixtures | Native Azure SQL table/grant/identity and persistence proof remain outstanding; source closure is not deployment acceptance |
+| Controller reconciliation | The deployed controller completed the original discovery-intent work without actions or changes to its original receipt/control; the existing one-minute scheduler now invokes `heartbeat` | A completed invocation is not full collection, access or remediation proof |
+| Collector-only inventory | A no-ingress worker is deployed in a public Consumption environment with its dedicated MI and explicit `tenant_admin_preview` selection. Fabric domain/workspace reads succeeded and 332 workspaces were durably accepted; authenticated workspace selectors show 333 options including the placeholder | Broader item enumeration is partial. Power BI dataset reads returned 401 without source permissions, and request-budget/throttling gaps remain visible. No scopes or remediation were automatically admitted |
+| Data-quality flag persistence | Source selects `AzureSqlFlagTable` for live runs; its table is included in the committed application schema | Actual controller-MI append/readback and runtime persistence acceptance remain outstanding |
 | Public SQL/registry access | Approved resource-scoped evaluation exceptions and public access were read back on 2026-09-17. SQL remains Entra-only with TLS 1.2 and the special Azure-services firewall rule; registry access is public with default Allow, bypass None and admin/anonymous access disabled | Network access does not establish SQL schema, runtime permissions, application acceptance or an indefinite governance exemption |
 | Earlier private image proof | A historical cold pull succeeded with registry public access Disabled, default Deny and bypass None; the reviewed shipping contents, private DNS and native imports matched | Not proof of the current public-network source bundle, a new application release or runtime recovery |
-| Native schema and bootstrap | The original `STARTED` proof receipt is under guarded recovery. Earlier full-schema DDL rollback and subsequent exact module-metadata checks remain bounded evidence | Recovery completion, full-catalogue bootstrap commit, runtime SQL users/memberships, allowed/denied operations and effect proof are not accepted |
+| Recovery and native schema | Recovery is complete through append-only operator adjudication; the original failed `STARTED` receipt is unchanged. Proof and application schema operations each committed 145 DDL batches and passed 114 readbacks | Not a rewrite of the original receipt, permission to replay committed bundles or full runtime acceptance |
+| Bootstrap control and public route | Historical initialization readback captured `maintenance=true`, revision `0` and a bootstrap receipt; a separate no-VNet bootstrap-MI job passed 114 application readbacks over encrypted TCP/FEDERATED authentication | This capture is not current maintenance state or authority to restore old settings/grants |
 | Public Foundry path | The retained Foundry account/controller path is public with local authentication disabled; `infra/foundry.bicep` implements that baseline | The earlier managed private-endpoint preflight failure is historical and does not block the selected public architecture |
-| Current-release cutover | Not performed; the live app/controller remain the prior release | No accepted application baseline/runtime-permission proof, history migration/wipe, normal-worker rollout, hybrid application push or current-release UI screenshots |
+| Current web/controller cutover | Command Center and the hosted controller use Azure SQL and the reviewed acting-identity grants; maintenance is released (`false`). The API preserves latest-generation partial coverage even with no configured scopes | Event receiver/provisioner operation, full inventory/source access, restart recovery and end-to-end hybrid acceptance remain open |
+| Scheduler and alerts | The existing one-minute command scheduler was changed to `heartbeat`; three actual recurrence responses were decoded and confirmed completed. Missing/failed-heartbeat Azure Monitor alerts are deployed with empty action lists | No second timer, mailbox enablement, alert delivery destination or missing-heartbeat canary is implied |
+| Application telemetry | The active controller's app-owned Entra channel has native Application Insights `heartbeat_started` and completed `heartbeat_finished` records with queue counts and zero captured exporter failure/warning counters; project tracing remains disconnected | Bounded ingestion is not proof of every span, future delivery, an alert destination, overnight stability or end-to-end hybrid operation |
 
-Keep the worker and controller heartbeat disabled until the current release
-passes its gates. The evaluation now has one Azure SQL application database and
+Do not undo the completed web/controller cutover or restore maintenance from a
+historical bootstrap capture. The collector-only deployment proves bounded
+inventory progress, not complete tenant health or event transport. Unattended
+hybrid coverage still requires separate acceptance. The evaluation has one Azure SQL application database and
 a temporary isolated proof database on the same logical server. This is not a
 final sizing or pricing recommendation. The SQL template uses one S1 application
 database and an optional Basic proof database, with no elastic pool. Approve
@@ -92,9 +99,67 @@ workspace/tenant approval; Azure tags cannot override Fabric network policy.
 
 ### Native proof and bootstrap status
 
-The original SQL proof receipt is under guarded recovery; completion is not
-accepted. The following records the **earlier private-network proof**, not the
-current public deployment. Its image matched the reviewed
+**Recovery is complete and both SQL schemas are committed.** Append-only
+operator adjudication binds the proved empty rollback to one approved
+replacement; the original failed `STARTED` receipt remains unchanged.
+The proof replacement and the separately approved application operation each
+committed 145 DDL batches and passed 114 readbacks.
+
+Those counts describe the earlier native artifact. The current preparer adds
+the complete 19-policy static budget seed set and one fixed policy readback,
+producing 164 batches and 115 checks at this source revision. That newer
+candidate has local validation, not a new managed-build/image/native SQL proof.
+Missing policies in an existing deployment require a separately reviewed
+one-off policy installation, not bootstrap replay or a change to original receipts.
+
+At initialization, independent application-control readback captured
+`maintenance=true`, revision `0` and the persisted bootstrap receipt. This is
+historical evidence: maintenance has since been released and is now `false`.
+Eight bounded native role/effect cases using `EXECUTE AS`, including cleanup,
+passed; the later 19 native SELECT-predicate controls are also bounded. Neither
+set establishes the full 27-RPC acceptance matrix or the normal worker path.
+
+A separate public-route job in a no-VNet Container Apps environment connected
+over encrypted TCP with FEDERATED bootstrap-MI authentication and passed all
+114 application readbacks without changing maintenance at that capture time.
+Proof jobs were quiesced and human SQL administration restored afterward.
+
+Command Center has since cut over to live monitoring and Azure SQL. Controller
+operation uses Azure SQL settings and the correct acting identity,
+not a substituted Foundry account MI. Three correctly mapped EXTERNAL SQL users
+have their kernel roles and reviewed application DML grants.
+
+After reviewed SQL procedure corrections and narrowly bound handoff-metadata
+repairs, the deployed controller heartbeat returned `response.completed`.
+Independent SQL readback confirmed the original discovery-intent work completed,
+its validation frontier was published `1/1`, one inventory-worker item was queued
+and no actions were taken. The original receipt and control were unchanged.
+The SQL-only corrections did not require another controller deployment.
+
+The subsequent collector-only worker has durably accepted 332 workspace records
+from native Fabric metadata reads. The authenticated Include and Inventory
+workspace selectors are enabled with 333 options each, including the placeholder,
+without selector error alerts. This is not an all-tenant health verdict:
+item enumeration remains partial, Power BI source reads can return 401 and
+budget/throttling gaps remain visible. The 19 static REST budget policies were
+installed through a separate deployment-only repair and verified natively,
+without resetting counters or replaying bootstrap. The new preparer/image still
+needs its own proof; the earlier 145/114 capture is not its acceptance record.
+
+Collector-only mode has no Eventstream receiver or provisioner. Event intake,
+full source access, restart/sustained coverage and end-to-end acceptance remain
+open. Bounded native application-heartbeat telemetry is now proved; its reserved
+environment-variable fix, privacy boundary and limits are described under
+[Observability](#8-observability).
+
+The workstation's proxy path produced changing public egress addresses across
+SQL attempts. Use the approved Azure-hosted execution path for repeatable native
+proof rather than chasing those addresses, widening firewall ranges or changing
+the network posture. A workstation connection failure does not establish a
+platform limitation.
+
+The following records the **earlier private-network proof**, not proof of the
+current public application release. Its image matched the reviewed
 251 shipping files, directory layout, source and bundle; private DNS and native
 Python/SQL-driver imports were verified. This is image and bootstrap-host evidence,
 not an application release.
@@ -114,15 +179,18 @@ procedure/function controls matched the corrected hashes. All six diagnostic
 objects were rolled back; the original receipt and full catalogue remained
 unchanged, and bootstrap authority was restored to the authorized human operator.
 SQL/readback fences were not loosened. This proves metadata formatting only.
-It did not resolve the original receipt or establish a committed application
-schema, runtime permissions or safe retry. Current receipt recovery remains a
-separate gate; do not substitute a fresh apply or a new operation ID for it.
+Those metadata checks alone did not resolve the original receipt or commit a
+schema. The later append-only recovery and separate replacement/application
+applies established the committed state above; they did not erase the original
+evidence or authorize automatic replay.
 
 The prepared SQL surfaces are [state infrastructure](../infra/state-sql.bicep),
 [identity/manual bootstrap job](../infra/state-sql-bootstrap.bicep) and the
 [bootstrap operator](../scripts/bootstrap_azure_sql.py). The operator defaults
-to preflight; apply requires an explicit reviewed fingerprint. Source availability
-does not establish bootstrap completion.
+to read-only preflight. `reconcile` reads schema receipts; `reconcile-recovery`
+reads recovery acknowledgements, including immutable historical evidence.
+See the [operator interface](#sql-bootstrap-operator-interface) for the five
+modes, explicit artifact/bundle selection and separately approved mutation.
 
 ## 0. Establish the operator context
 
@@ -387,7 +455,8 @@ SQL deployment principal for schema and user/role setup. Do not make a runtime
 identity the server administrator or infer SQL access from a human app role.
 
 Give the deployment operator the reviewed DDL permissions and runtime identities
-only their component's checked-view/static-RPC permissions.
+only their component's checked-view/static-RPC permissions plus the reviewed
+object/column grants required by their ancillary application stores.
 `runtime_table_permissions()` is retired and raises instead of emitting broad
 monitoring-table DML. Use the exact `runtime_grants(component)` contract and the
 role returned by the current kernel generator. The runtime has no DDL,
@@ -411,9 +480,10 @@ little-endian GUID bytes, not its directory object ID. Azure RBAC assignments
 instead use the **principal object ID**. For a user/group, SQL uses the object
 ID; groups use `TYPE = X`. The SID form does not validate the name, so verify the
 identity before creation, then prove its sign-in and the stored principal SID
-on the native Azure SQL target. Earlier bootstrap-MI login and authority checks
-are bounded historical evidence; runtime-component users, memberships and
-permission/effect proof remain outstanding. Do not generalize an observed equality of agent object/client IDs
+on the native Azure SQL target. Correct runtime mappings and grants are now
+installed, and web/controller SQL paths have been exercised with the intended
+identities. Normal-worker execution and broader permission/effect coverage
+remain separate proof obligations. Do not generalize an observed equality of agent object/client IDs
 to ordinary service principals. See
 [CREATE USER](https://learn.microsoft.com/sql/t-sql/statements/create-user-transact-sql#arguments).
 
@@ -439,6 +509,11 @@ closure appends activity and does not UPDATE the core incident. Check inherited
 schema/database roles and callable module/trigger paths as well as
 explicit grants; `db_datawriter`, `db_owner` and runtime DDL defeat the boundary.
 
+A generic monitoring role alone is not a complete runtime grant profile.
+Ancillary store calls need their reviewed object/column permissions too; for
+example, web command expiry updates `finished_at` as well as state/summary.
+Verify the current call contract rather than copying an older grant list.
+
 Static RPC calls use their exact named contracts:
 
 ```python
@@ -463,6 +538,351 @@ network/firewall admission or reconnect behavior. Runtime identities still recei
 impersonation permissions. CREATE/binding success, offline fixtures and a T-SQL
 parser do not prove the component roles, updatable views or procedure
 transactions. Earlier Fabric SQL CREATE/rollback evidence remains historical.
+
+### Local SQL candidate preparation
+
+[`scripts\prepare_azure_sql.py`](../scripts/prepare_azure_sql.py) exports a
+current-source bootstrap candidate entirely locally. It uses explicit request
+values, not environment-derived target or identity defaults. It acquires no
+credentials and performs no network, SQL, subprocess/cloud-tooling, image-build
+or deployment operation.
+
+Create an operator-owned UTF-8 JSON request outside committed source. The
+following template shows the complete request shape; replace every placeholder
+with the reviewed value before use:
+
+```json
+{
+  "version": 1,
+  "operation_id": "<reviewed-operation-uuid>",
+  "target": {
+    "server": "<server>.database.windows.net",
+    "application_database": "<application-database>",
+    "database": "<application-database>-proof",
+    "kind": "proof"
+  },
+  "identity": {
+    "tenant_id": "<tenant-uuid>",
+    "client_id": "<bootstrap-uami-client-uuid>",
+    "object_id": "<bootstrap-uami-object-uuid>"
+  },
+  "base_image": "<reviewed-registry>/<sdk-native-image>@sha256:<64-lowercase-hex-digest>"
+}
+```
+
+The request is strict: version `1`, nonzero UUID operation/identity fields,
+the bootstrap runner's exact target model and a digest-pinned SDK/native-library
+base image. Extra fields and duplicate JSON keys are refused. The logical-server
+hostname must be lowercase. The database must equal `application_database` for
+`kind="application"` or that name plus `-proof` for `kind="proof"`; system
+catalogues are refused.
+
+The identity is the dedicated bootstrap UAMI, not the controller's acting
+identity or a runtime-grant request. Omit the sole optional target field,
+`private_ip`, for the public baseline; an explicit value must be a reviewed
+RFC1918 IPv4 address with exact DNS matching. No credentials, connection strings,
+runtime-user/membership requests, recovery approvals, policy overrides or
+arbitrary SQL/readback inputs are accepted. The base image must be reviewed
+separately; preparation does not resolve, pull, build or approve it.
+
+From the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\prepare_azure_sql.py `
+  --request "<operator-owned-directory>\candidate.json" `
+  --output .azure\sql-candidate
+
+.\.venv\Scripts\python.exe scripts\prepare_azure_sql.py --verify .azure\sql-candidate
+```
+
+Exactly one of `--request` or `--verify` is required. `--request` requires
+`--output`; `--verify` takes no `--output`. The output directory must not exist,
+even as an empty directory, and cannot be under the repository's `src` tree.
+Source drift detected during preparation refuses the candidate before writing.
+Existing evidence is never overwritten. The result is:
+
+```text
+sql-candidate\
+  manifest.json
+  context\
+    src\                         current Python source bytes
+    scripts\bootstrap_azure_sql.py
+    sql\NNN.sql                  ordered generated batches
+    bundle.json
+    Dockerfile
+```
+
+Each request exports one bound bundle. Prepare proof and application candidates
+in separate new directories with their respective reviewed requests; do not
+rename a proof bundle or edit its target to make it an application artifact.
+
+The exporter preserves every current `src` Python file and the bootstrap runner
+as exact bytes, without newline normalization. It emits one driver batch per
+numbered SQL file, without `GO`. The strict bundle records version, operation,
+`ddl_owner="dbo"`, target, identity, the canonical relative POSIX source-path
+hash map, ordered batch paths/hashes and fixed checks. `source_sha256` is the
+runner's canonical source-map digest, not a value inferred from a Git revision.
+
+The ordered application/monitoring/rate-budget/kernel SQL, static budget seeds,
+metadata expectations and ABI come from current helpers. The current complete
+output is **164 batches and 115 fixed checks**; these are generated counts, not
+an ABI assumption. `kernel.statements` already includes component grants;
+do not append `kernel.grants` a second time.
+Previously native-verified primitive tuples inform the metadata model, including
+`datetime2` scales 3, 6 and 7. New types/scales/view shapes refuse rather than
+guessing precision or copying `ColumnSpec` storage widths. Module expectations
+use the existing `native_module_hash` helper.
+
+The strict manifest has `status="candidate_not_authorized"`. It records the
+request, `bundle_sha256`, `source_sha256`, `kernel_contract_hash`,
+`preparation_sources`, the exact `files` map with sizes/hashes, `context_sha256`,
+`batch_count` and `metadata_check_count`. `preparation_sources` records the
+prepare/reset script hashes. Context-file keys are canonical relative POSIX
+paths; `context_sha256` hashes canonical JSON of all file size/hash records,
+including the Dockerfile. The manifest is outside the context and is not
+self-hashed. A payload-only hash or image tag is not an exact build-context binding.
+
+The generated Dockerfile uses the reviewed digest-pinned base, explicitly copies
+the source/runner/SQL/bundle into `/opt/state-sql-bootstrap`, makes the payload
+read-only and selects user `65532:65532`. Its entry point is the current runner
+through `python3 -I -B`. These Linux image paths are intentional; they do not
+change the Windows operator command paths or prove the image has been built.
+
+Preparation and `--verify` use the existing `load_artifact` validation offline.
+Verification checks the exact file map, context hash, generated Dockerfile and
+bundle/manifest bindings; missing, changed, extra or symlinked payload files
+and paths escaping the context are refused. It verifies the local artifact and
+readback model, **not native SQL readbacks**. Successful output still says `native_sql_proven=false` and
+`image_built=false`.
+
+Verification also requires matching current trusted preparation-source hashes
+and regenerates the expected source map, ordered SQL, checks and kernel ABI
+from that checkout. A self-consistent edited manifest is not enough to establish
+provenance. Payload Python stays inert data; verification never imports or
+executes it. Current-source drift refuses the candidate. Preserve historical
+evidence unchanged and use the separate SELECT-only historical recovery reader,
+not `--verify` or rehashing, when its source version differs.
+
+Treat the candidate as immutable. Review the target, bootstrap identity, ordered
+SQL, metadata expectations and all file hashes before a separately authorized
+build using the exact generated `context` and its Dockerfile. Image-digest
+approval and current native SQL/image/readback/role proof remain separate.
+The exporter does not initialize monitoring control, create runtime users or
+memberships, assign administrator authority, register reset writers, authorize
+an apply/recovery or generate `empty_baseline_sha256`.
+
+Do not edit a candidate manifest to bless changed payload bytes, reuse a
+committed operation ID with a different bundle, or mint a new ID to evade an
+uncertain write. Use the [bootstrap operator interface](#sql-bootstrap-operator-interface)
+and the [empty rollback baseline process](#empty-rollback-baseline-evidence)
+for those separate boundaries.
+
+#### Static REST budget seeds and readback
+
+`prepare_azure_sql.static_budget_policies()` derives the complete current
+`SERVICE_POLICIES` (2), `API_POLICIES` (12) and `PROVISIONING_POLICIES` (5).
+Buckets use `service:<name>` or `api:<name>`; overlapping sources are refused.
+`budget_policy_statements()` adds 19 deployment-only seed batches for
+`request.identity.tenant_id`. Bucket identities are SHA-256 of their UTF-8
+names; the supported names are ASCII.
+
+Seeds insert missing policies only. A matching existing policy retains its
+`used`, `window_ends_at` and `blocked_until` state. A changed `request_limit`
+or `window_seconds` throws instead of resetting it. This adds no runtime
+upsert, extra grant pass or relaxed RPC guard.
+
+The runner's `budget_policies` check is a fixed, tenant-bound
+`SELECT TOP (2049)` over `bucket_hash`, `request_limit` and `window_seconds`
+from `dbo.triage_monitoring_rate_budget`, ordered by the bucket hash with BIN2
+collation. The bundle binds its argument to `identity.tenant_id` and requires
+nonempty, sorted, unique lowercase SHA-256 rows with bounded integer limits
+and windows. It accepts no caller-supplied SQL.
+
+The readback deliberately excludes `used`, `window_ends_at` and `blocked_until`.
+`apply` and schema `reconcile` refuse missing, changed or extra policies; neither
+requires clearing live counters, windows or cooldowns to match the bundle.
+Do not replay bootstrap to install these seeds into a running deployment.
+Such repair needs a separately reviewed one-off policy install that preserves
+live state and original operation evidence. The new local candidate and its
+offline tests do not prove that repair, a managed image build or native acceptance.
+
+### SQL bootstrap operator interface
+
+`infra\state-sql-bootstrap.bicep` and `scripts\bootstrap_azure_sql.py` expose
+`preflight` (the read-only default), `apply`, `recover`, `reconcile` and
+`reconcile-recovery`.
+Keep the saved job read-only and job-start/override permission with the
+authorized deployment operator. Use the dedicated bootstrap UAMI and its
+explicit authority window, not a controller `ServiceIdentity` or a runtime
+app-role claim. `deployJob=false` is identity-only preparation; enabling the job
+does not change its default `mode=preflight` or its zero automatic retries.
+
+| Mode | Effect and approval |
+|---|---|
+| `preflight` | Read-only validation; no application schema batches |
+| `recover` | Fresh, doubly approved append-only adjudication for an exact original `STARTED` receipt and proved empty rollback/security catalogue; zero application schema batches |
+| `apply` | Separately approved application of the selected bundle's schema batches and readbacks |
+| `reconcile` | Read-only schema-receipt lookup under its normal bundle/source checks; it does not inspect recovery-record acknowledgements |
+| `reconcile-recovery` | Fixed SELECT-only lookup using the original recovery file and hash; no mutation approvals. `MATCHING` exits `0`; `MISSING` or `CONFLICT` exits `2` |
+
+The image may contain separate proof and application bundles. Select the exact
+file, matching `targetKind`, bundle SHA-256 and bundle operation ID; do not
+rename, copy over or relabel the proof bundle as an application bundle.
+
+| Bicep parameter | Default and runner mapping |
+|---|---|
+| `bundlePath` | `/opt/state-sql-bootstrap/bundle.json` -> `--bundle`; the accepted multi-bundle layout keeps the application at `/opt/state-sql-bootstrap/application-bundle.json` |
+| `recoveryPath` | Empty -> `--recovery`, emitted for `recover` and `reconcile-recovery` |
+| `recoverySha256` | Empty -> `--recovery-sha256`, emitted for `recover` and `reconcile-recovery` |
+| `approvedRecoverySha256` | Empty -> `--approve-recovery-sha256`, emitted only when `mode=recover` |
+| `artifactRoot` | Empty -> `--artifact-root`, emitted only for `reconcile-recovery` when nonempty; original archived artifacts are verified as data |
+
+For both `apply` and `recover`, `approvedFingerprint` must equal the selected,
+reviewed `bundleSha256`; in the recovery flow this is the replacement bundle.
+The runner flag is `--approve-fingerprint`.
+For `recover`, `approvedRecoverySha256` must also exactly match
+`recoverySha256`. `operationId` is the replacement bundle's operation ID, not
+the original failed operation's ID; the hash-reviewed recovery request binds
+the original receipt separately. Read-only recovery acknowledgement uses the
+recorded replacement bundle/operation bound by that original request.
+For `reconcile-recovery`, leave approval parameters empty and omit approval
+flags in direct CLI calls. Pass only the original recovery path/hash and, when
+needed, the historical artifact root. There is no environment-variable change.
+
+The approved UTF-8 recovery JSON must be operator-staged **inside the execution
+before the runner starts**. The runner validates exact file bytes; neither the
+runner nor the template stages or decodes the request from an environment
+variable. Fresh `recover` requests require timezone-aware `observed_at` and
+`expires_at` with a positive, current window of at most 15 minutes.
+The required `empty_baseline_sha256` binds the full native empty/security
+catalogue before any write. Hash approval does not waive the allowed-baseline
+checks or permit unexpected objects, roles, triggers or permissions.
+Native other-session, schema and principal checks remain mandatory.
+
+#### Empty rollback baseline evidence
+
+Use the current trusted
+`bootstrap.recovery_baseline_fingerprint(db, artifact.bundle)` reader to collect
+the expected baseline for an independently reviewed empty target with the same
+original receipt catalogue. It executes the bounded, SELECT-only
+`EMPTY_BASELINE_SQL` contract with complete standard-security validation.
+`MAX_BASELINE_ROWS=20,000` is one shared total row budget across all categories;
+each query consumes the remaining budget. It is not a per-category allowance.
+An empty `sys.objects` result alone is not an empty or safe recovery baseline.
+
+Preserve the target and original-receipt identity, trusted source hash, collected
+catalogue/security evidence and returned digest in a separate operator evidence
+record. Review that evidence independently of the failed operation's claims.
+The digest binds the server, database and physical catalogue: it is not a
+generic empty-database hash and cannot be guessed or copied from an unrelated
+target. Never accept the failed target's current metadata as its own expected
+baseline without the independent empty-baseline review.
+
+Put the separately approved digest into `recovery.empty_baseline_sha256`.
+Fresh `recover` compares the full native baseline inside its transaction
+**before any recovery DDL or write**, alongside its original-receipt,
+identity/session and current evidence-window checks. Local
+`scripts\prepare_azure_sql.py` export deliberately does not generate or authorize
+this digest. Artifact preparation, native evidence collection and mutation
+approval are separate steps.
+
+The same explicitly authorized operator may review, prepare and execute.
+Independent baseline evidence does not require a second person, signer,
+certificate or new key. A mismatch, unexpected authority or incomplete
+catalogue is a refusal, not a request to approve a different hash.
+
+#### Recovery execution and acknowledgement lookup
+
+Use a reviewed one-shot execution override, not a stale approval baked into an
+image. Mutations still require the exact current runner/source and approvals.
+Historical requests may be expired when read with `reconcile-recovery`; keep
+their original bytes, timestamps and hash rather than refreshing or rewriting
+them for the new reader.
+
+The commands below describe separately authorized invocations inside the approved
+Linux execution, not workstation PowerShell or commands to replay the completed
+proof. Set the common values for each invocation from its reviewed bundle:
+
+```bash
+runner=/opt/state-sql-bootstrap/scripts/bootstrap_azure_sql.py
+bundle=/opt/state-sql-bootstrap/bundle.json
+bundle_sha="<reviewed-bundle-sha256>"
+operation_id="<bundle-operation-id>"
+args=(--bundle "$bundle" --bundle-sha256 "$bundle_sha" --operation-id "$operation_id")
+python3 -I -B "$runner" "${args[@]}"
+```
+
+For an approved failed operation with a fresh staged recovery request, recovery
+records adjudication only:
+
+```bash
+python3 -I -B "$runner" "${args[@]}" --mode recover \
+  --approve-fingerprint "<approved-replacement-bundle-sha256>" \
+  --recovery "<absolute-recovery-json-path-in-execution>" \
+  --recovery-sha256 "<reviewed-recovery-sha256>" \
+  --approve-recovery-sha256 "<approved-recovery-sha256>"
+```
+
+Only after adjudication is durable, a **separately approved** apply uses the same
+replacement bundle. A fresh application operation uses its distinct application
+bundle path, matching target environment, SHA-256 and operation ID:
+
+```bash
+python3 -I -B "$runner" "${args[@]}" --mode apply \
+  --approve-fingerprint "<approved-bundle-sha256>"
+```
+
+Already committed operations require no further recovery/apply. For a schema
+receipt, `reconcile` uses its normal bundle/source checks; it is not a
+recovery-acknowledgement query and does not accept `--artifact-root`:
+
+```bash
+python3 -I -B "$runner" "${args[@]}" --mode reconcile
+```
+
+For a recovery acknowledgement with matching current-source artifacts, use the
+original request and its hash, with no approval arguments:
+
+```bash
+python3 -I -B "$runner" "${args[@]}" --mode reconcile-recovery \
+  --recovery "<operator-staged-original-recovery-json>" \
+  --recovery-sha256 "<original-recovery-sha256>"
+```
+
+`MATCHING` confirms the exact recorded recovery binding, not current application
+authority or end-to-end readiness. `MISSING` or `CONFLICT` does not authorize a
+restart, a new request ID or another mutation. Keep the original evidence.
+
+If the original bundle belongs to an older runner, stage its immutable artifact
+directory and original recovery request outside the new image. Point
+`bundlePath` inside that archive and use `artifactRoot` only with this SELECT-only
+mode. Always run the **current trusted reader and adapter**, never an archived
+script. They verify the original bundle, source and SQL bytes as data and execute
+fixed SELECTs; they do not import or execute archived code/SQL. Do not rewrite
+or assign new hashes to the original bundle to make it match a newer runner.
+
+```bash
+archive_root="<operator-staged-original-artifact-directory>"
+python3 -I -B "$runner" --mode reconcile-recovery \
+  --artifact-root "$archive_root" \
+  --bundle "$archive_root/<recorded-bundle-file>" \
+  --bundle-sha256 "<recorded-replacement-bundle-sha256>" \
+  --operation-id "<recorded-replacement-operation-id>" \
+  --recovery "<operator-staged-original-recovery-json>" \
+  --recovery-sha256 "<original-recovery-sha256>"
+```
+
+All other CLI modes reject `--artifact-root`; leave the Bicep parameter empty
+for them. This is read-only historical evidence compatibility, not application
+state migration, schema downgrade or permission to mutate with archived code.
+
+For a normal public target, omit `target.private_ip` or leave it `null`.
+An explicit pin must be a reviewed RFC1918 address and match actual DNS exactly.
+The approved FQDN, application/proof database relationship, tenant/client/object
+identity, encrypted certificate-validated SQL and required bootstrap authority
+remain bound. There is no private-IP environment variable or connection-secret
+fallback. A refusal or uncertain write is not a retry opportunity: preserve
+original IDs, fingerprints and evidence and reconcile durable records.
 
 ### Verify persistence without clearing shared state
 
@@ -497,13 +917,16 @@ rollback: reconcile the original operation/finalization receipt before retrying.
 
 ## 3a. Hybrid registry and controlled prototype reset
 
-These are prepared operator procedures for Azure SQL only. The application and
-isolated proof databases are provisioned, with public evaluation access enabled.
-The original proof receipt is under guarded recovery; completion and a current
-application baseline are not accepted here. The earlier rolled-back proof
-journal was not a monitoring baseline. The [release gates](#release-gates),
-receipt resolution, committed native bootstrap and exact reset approval must
-precede execution. No history migration or wipe has occurred.
+These are operator procedures for a fresh Azure SQL deployment or a separately
+authorized reset, not instructions to repeat the completed initialization.
+Recovery and proof/application schema commits are complete. The initialization
+capture of `maintenance=true`, revision `0` is historical; the current deployment
+has `maintenance=false`, installed runtime users/grants and live web/controller
+services. The original failed proof receipt remains unchanged with append-only
+adjudication. Do not restore old maintenance, schema or grant state from that
+capture. Existing exact-manifest, epoch, writer and effect guards remain required
+for any later reset; normal-worker and broader acceptance remain separate
+[release gates](#release-gates). No history migration or wipe occurred.
 
 The selected switch is a clean start, not an upgrade of the prior Fabric SQL
 database. Install the current application schema in Azure SQL, then initialize
@@ -559,6 +982,29 @@ no old Fabric SQL rows are copied into them. There is no automatic runtime DDL
 or schema-upgrade path.
 Retain the original initialization manifest and receipt after any lost reply.
 
+### Optional retained bootstrap journals
+
+`dbo.triage_sql_bootstrap_receipts` and
+`dbo.triage_sql_bootstrap_recoveries` are optional, preserved operator evidence.
+Their absence is permitted; reset neither creates them nor requires them for
+normal startup. If present, their exact columns, declared BIN2 collations,
+nullability, primary/unique keys, status check, UTC defaults, table features and
+`dbo` ownership must match the supported contract. Foreign keys and runtime
+mutation, DDL or unreviewed-module authority are not permitted.
+Unknown, lookalike or case-variant accelerator objects remain blocked; there is
+no `triage_*` exemption. An incompatible journal is refused, not repaired or replaced.
+
+Initialization and reset never delete journal rows or rewrite an original
+receipt/recovery record. A reset result that claims either journal in
+`deleted_counts` is invalid; they may appear only in `retained_counts`.
+Offline bootstrap-apply/initialization coverage verifies
+receipt preservation, not a newly built image or native deployment.
+The bootstrap runner still creates its receipt table under its explicit operator
+protocol; only the approved `recover` path creates the optional recovery journal.
+Reset's optional-journal recognition does not transfer either responsibility.
+
+### Reset-only writer registration
+
 Install the reviewed permission kernel with the explicit deployer helper
 `initialize_monitoring_permission_kernel`; runtime stores never call it.
 Inspect the separate registration DDL without connecting to SQL:
@@ -570,6 +1016,23 @@ Inspect the separate registration DDL without connecting to SQL:
 Registration preparation can report old broad roles and running writers, but
 such a preparation is not protected acceptance. Retire only the reviewed legacy
 grants, stop writers and reconcile effects before accepting a fresh registration.
+
+Ancillary-writer classification belongs to this reset procedure only.
+`deployment_schema.ancillary_table_permissions()` describes accessed-table
+profiles, not permission to mutate every listed table. Its current profiles
+cover 13 controller, 7 web and 0 worker ancillary tables; approval access is
+SELECT-only. Source-reviewed object/column writes count as writer authority
+and still require discovery, quiescence and registration for a reset.
+
+Classification requires actual transitive membership in a declared `dbo`-owned
+kernel role with its real anchor-RPC grant and verified module/ownership
+boundary. Runtime principal names alone do not qualify. Broad roles/grants,
+raw approval mutation, unrestricted monitoring/control/receipt writes, grant
+option, triggers/cascades and escalation paths still refuse.
+This classification neither grants permissions nor endorses current live grants.
+Do not turn reset registration, writer quiescence or a zero-writer result into
+a normal web, controller or worker startup dependency.
+
 The separate installation and acceptance operations are explicit:
 
 ```powershell
@@ -850,7 +1313,16 @@ Keep the workflow disabled while preparing the new baseline and release:
 | `pipeline sweep` | Queue observations for currently admitted registry pipelines | Operator request; not a second collector |
 | `command sweep` | Drain authenticated human commands only | Optional diagnostic/operator drain |
 
-For example, after its prerequisites are ready:
+For a **new deployment**, prepare the workflow disabled after its prerequisites
+are ready. For an existing deployment, update its reviewed scheduler rather than
+creating an overlapping timer. The current deployment reused the existing
+one-minute command scheduler and changed only its command to `heartbeat`;
+mailbox processing was not enabled and the separate silent-sweep schedule was
+unchanged. Three actual recurrence invocations produced decoded completed
+responses. That evidence is scoped to those recorded invocations, not every
+later controller version.
+
+New-deployment example:
 
 ```powershell
 az account set --subscription $subscription
@@ -873,12 +1345,15 @@ may fail with 403. The project-scoped grant permits that project's agent
 endpoints, not just the named controller; use a narrower supported scope when
 required. A workflow definition or successful deployment is not invocation proof.
 
-The caller timeout is `PT15M`, covering the default combined triage and
-approval budgets plus worker allowance (`300 + 300 + 30` seconds). `PT10M`
-covered the approval window alone but not the combined deadline. A shorter
-caller timeout can abandon work while a person's approval is still valid.
-HTTP invocation retries are disabled: an ambiguous POST must not replay a
-possibly executed action.
+The caller timeout is `PT15M`. The controller uses an 840-second monotonic
+admission window starting before lock acquisition, with two automatic and one
+human-command concurrent slots. Slots refill within bounded queue quotas only
+when the remaining window covers the execution allowance. Exhausted lock-wait
+time defers that caller without cancelling the lock holder; insufficient
+remaining allowance prevents new claims. Already admitted work settles under its existing policy/fences rather
+than being cancelled by the admission timer. A completed heartbeat is not a
+promise that every queued item ran. HTTP invocation retries remain disabled:
+an ambiguous POST must not replay a possibly executed action.
 
 The workflow records failed invocations/invalid responses as `SweepFailed`.
 Its run history is not an alerting channel. The optional `alertWebhookUrl`
@@ -886,6 +1361,21 @@ is a legacy bearer-URL integration; use an approved alerting route without
 making it a prerequisite for the web deployment. Review both schedule history
 and durable triage outcomes: a transport-completed response is not necessarily
 a healthy business result.
+
+The scheduler validates controller response status/error and decodes supported
+base64 `$content` envelopes; HTTP 200 or CLI exit zero is not sufficient.
+[controller-health-alerts.bicep](../infra/controller-health-alerts.bicep) targets
+the existing heartbeat workflow, not a second schedule:
+
+| Alert | Condition | Window |
+|---|---|---|
+| Missing heartbeat | `RunsSucceeded < 1` | 15 minutes |
+| Failed heartbeat | `RunsFailed > 0` | 5 minutes |
+
+Both use one-minute evaluation. `actionGroupResourceIds` defaults to an empty
+array, so the deployed alerts are portal-only. Deployment/readback does not prove
+an absence canary or notification delivery. No Action Group, email address or
+webhook destination has been configured or inferred.
 
 Live pipeline eligibility and cadence come from the monitoring registry, not
 `PIPELINE_SWEEP_ENABLED` or `FABRIC_PIPELINE_TARGETS`. Discovery may identify
@@ -917,10 +1407,10 @@ live SQL store refuses runtime `reset()`.
 Flag IDs bind the request and deterministic evidence. Atomic conditional insert
 and original-row readback reconcile duplicate or uncertain appends; a
 conflicting record is rejected. Both CSV and SQL redact inside persistence,
-and the tool returns the actually stored redacted flag. These are implemented
-source behaviors, not native deployment proof. Azure SQL table installation,
-controller grants, identity access and cross-instance/restart persistence
-remain release gates.
+and the tool returns the actually stored redacted flag. The flag table is now
+part of the committed application schema. Actual controller-MI grants/logins,
+append/readback and cross-instance/restart persistence remain release gates;
+schema installation is not runtime acceptance.
 
 ## 7b. Silent-failure detector
 
@@ -1018,21 +1508,74 @@ Spans carry metadata only, never prompt/completion content. Container logs,
 durable run/events, the authenticated API and scheduler history provide
 different evidence; none alone proves all dependencies are healthy.
 
-The existing `configure_telemetry` helper is optional and consumes
-`APPLICATIONINSIGHTS_CONNECTION_STRING`; without it telemetry is a no-op.
-It does not explicitly pass an Entra credential to the exporter. The
-command-center deployment helper rejects connection-string settings, and its
-`-ApplicationInsightsResourceId` only adds a portal link. **Neither setting
-proves secretless telemetry is configured.** An Entra-authorized exporter needs
-separate implementation/configuration and proof; do not generate a key or claim
-the portal link does this. Private ingestion would be optional additional
-hardening, not a prerequisite for the public baseline.
+**Bounded native ingestion is verified.** In the 2026-09-18 capture, the active
+hosted controller version 18 produced both `heartbeat_started` and
+`heartbeat_finished` records in actual Application Insights queries. Captured
+finished records had `status=completed`, elapsed times of approximately
+6,000-26,000 ms, queue counts and zero exporter failure/warning counters.
+This is backend ingestion evidence, not a conclusion drawn only from console
+logs or SDK configuration. It is not an overnight, all-spans or full hybrid
+acceptance claim.
 
-When Entra-authenticated telemetry is configured, grant only the needed
-monitoring role, such as Monitoring Metrics Publisher, to the exporting
-identity. Preserve governance-created diagnostic settings; add separate
-diagnostics rather than deleting them. Do not disable content filters or
-Defender to make an evaluation succeed.
+The earlier missing-telemetry failure had a specific cause: a value present on
+an agent-version definition was empty in the hosted process because the
+Foundry project had no tracing connection. Microsoft documents
+`APPLICATIONINSIGHTS_CONNECTION_STRING` as platform-reserved and injected from
+project monitoring, not an agent override. See
+[hosted telemetry settings](https://learn.microsoft.com/azure/foundry/agents/how-to/configure-hosted-agent-telemetry#how-hosted-agents-emit-opentelemetry).
+
+Do not fix application health by linking Application Insights to the Foundry
+project. That enables tracing across all project agents and can collect prompts,
+responses and tool content, contrary to this accelerator's metadata-only rule.
+Keep project tracing disconnected. See Microsoft's
+[tracing and data handling](https://learn.microsoft.com/azure/foundry/observability/concepts/trace-data).
+
+The hosted application uses `TRIAGE_TELEMETRY_CONNECTION_STRING`, read through
+the `repr=False` setting `triage_telemetry_connection_string`, with managed-identity
+authentication. `azure.yaml` maps that custom variable from the operator's azd
+`${APPLICATIONINSIGHTS_CONNECTION_STRING}` locator value. This is not a runtime
+fallback to the platform-reserved variable. The CLI continues to use its
+separate standard `APPLICATIONINSIGHTS_CONNECTION_STRING` setting.
+Keep locator values out of committed files and never add a secret-based fallback.
+
+The public [application-telemetry.bicep](../infra/application-telemetry.bicep)
+creates Entra-only Application Insights (`DisableLocalAuth=true`) against an
+existing Log Analytics workspace. Optional `publisherPrincipalIds` assign
+resource-scoped Monitoring Metrics Publisher to the actual emitting identities.
+It outputs only the resource ID and creates no Foundry project connection.
+Ordinary public deployments have no baked-in MCAPS exemption. Existing network
+settings, tags, publisher grants and governance diagnostics must be preserved.
+The verified resource has `DisableLocalAuth=true`; its existing scoped agent
+publisher assignment, public networking, tags and Log Analytics binding were
+preserved. See [Microsoft Entra authentication for Application Insights](https://learn.microsoft.com/azure/azure-monitor/app/azure-ad-authentication).
+
+Hosted startup forces `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false`
+before SDK configuration and agent/host construction. It passes
+`configure_observability=None` to `ResponsesHostServer`, keeping the platform
+host's content-capable default pipeline out of this application-owned route.
+Only the allowlisted `triage.telemetry` logger family is exported. Failure
+diagnostics contain counters, exception types and sanitized source
+basename/function/line, never raw exception text, SDK responses, prompts or
+completions.
+
+An empty platform `APPLICATIONINSIGHTS_CONNECTION_STRING` also caused the Azure
+Monitor SDK to raise a parse `ValueError` even with a valid explicit custom
+locator: the parser still examined the empty environment value. Hosted
+configuration now requires the explicit app-owned locator before normalizing
+only an **exactly empty** standard value to unset. Never redeclare the reserved
+variable, delete/mask a nonempty value or use it as a hosted fallback.
+CLI standard-variable handling is unchanged.
+
+The correction was followed by the native paired-heartbeat evidence above,
+without creating a Foundry Application Insights connection or enabling content
+tracing. A `configured` result alone still does not prove ingestion; keep
+console diagnostics, durable SQL outcomes, scheduler responses and queried
+Application Insights records as separate evidence.
+
+The web deployment helper's `-ApplicationInsightsResourceId` is only a portal
+link. Neither it nor an existing publisher role proves telemetry ingestion.
+Preserve governance-created diagnostic settings; add separate diagnostics
+rather than deleting them, and do not disable content filters or Defender.
 
 Use `azd ai agent monitor bi-triage-controller --tail 300` for hosted
 diagnostics. The default 50 lines can hide the error behind SDK output; 300 is
@@ -1042,8 +1585,11 @@ date-stamped betas previously broke container startup.
 
 ## 9. Foundry hosted controller deployment
 
-Run this procedure only after the [release gates](#release-gates) and approved
-cutover. It has not been performed for the current hybrid release.
+The hosted controller is deployed on Azure SQL with its correct
+acting identity. The following is a reference for separately reviewed future
+deployments, not an instruction to redeploy the working controller or reverse
+the completed cutover. The earlier bounded reconciliation fix was SQL-only;
+the later app-owned telemetry startup correction is in the active hosted build.
 The Foundry project, model and standalone database must already exist. Deploying
 the controller neither deploys the App Service UI nor creates a working timer.
 Use the existing azd environment for updates; create a new one only for a
@@ -1397,12 +1943,19 @@ and [private endpoints](https://learn.microsoft.com/azure/app-service/overview-p
 
 ## 12. Hybrid monitoring worker and Eventstream
 
-The normal worker entry point is `python -m triage.monitoring.worker`; a
-current-release worker has not been deployed. Its contract is to collect raw
-evidence, durably accept intake and reconcile app-owned monitoring topology.
-The controller separately publishes validated authority. The worker must not
-run a reasoning agent, refresh a semantic model, rerun a business pipeline,
-grant permissions or publish readiness from its own observations.
+The worker supports two explicit modes. The deployed starting point is
+`python -m triage.monitoring.worker --collector-only`: durable inventory and
+REST polling without Eventstream configuration. Event mode omits that flag and
+requires the complete owned connector binding before enabling receiver and
+provisioner behavior. The controller separately publishes validated authority.
+Neither worker mode runs a reasoning agent, refreshes a semantic model, reruns a
+business pipeline or grants permissions.
+
+The worker uses a dedicated zero-write policy with empty action allowlists,
+not controller settings or an implicit permissive default. Collector-only
+configuration rejects partial or residual event metadata; missing metadata is
+not an automatic mode switch. Its durable heartbeat has `connector_id=null`
+and cannot assert transport connectivity, delivery or connector readiness.
 
 ### Stage the environment before the consumer
 
@@ -1455,8 +2008,8 @@ other resources or Fabric, and does not retag an existing environment.
 For the full worker, select a new public environment with `-EnvironmentName`
 or a verified existing public Consumption environment with
 `-ExistingEnvironmentResourceId`; do not supply both. Supply the worker name, its dedicated existing
-UAMI, ACR resource ID, immutable image digest, SQL hostname/catalog and connector
-bootstrap file. The helper neither builds/pushes an image nor grants its external
+UAMI, ACR resource ID, immutable image digest and SQL hostname/catalog. Choose
+`-CollectorOnly` or `-ConnectorBootstrapFile`, never both. The helper neither builds/pushes an image nor grants its external
 permissions. Build `Dockerfile.monitoring` for `linux/amd64` through the approved
 build path; ACR admin authentication stays disabled and image pull uses the
 selected UAMI.
@@ -1465,6 +2018,63 @@ The worker has no HTTP/TCP ingress or health endpoint. Its template uses one
 container, single-revision mode and bounded replicas, not backlog autoscaling.
 Verify MI image pull, public DNS, outbound TLS/SQL firewall admission, quotas and measured
 resource use; ARM success is not worker or hybrid acceptance.
+
+### Collector-only quickstart
+
+Use this path to populate the workspace inventory before configuring an
+Eventstream. The existing SQL baseline, dedicated MI, reviewed SQL/Fabric
+permissions, registry image and public environment remain prerequisites; the
+script does not grant access or auto-admit monitoring scopes.
+
+```powershell
+.\scripts\deploy_monitoring_worker.ps1 -CollectorOnly `
+  -SubscriptionId "<subscription-id>" -TenantId "<tenant-id>" `
+  -ResourceGroup "<resource-group>" -Location "<region>" `
+  -WorkerName "<worker-name>" `
+  -WorkerIdentityResourceId "<dedicated-uami-resource-id>" `
+  -RegistryResourceId "<registry-resource-id>" `
+  -Image "<registry>/<repository>@sha256:<reviewed-image-digest>" `
+  -ExistingEnvironmentResourceId "<public-consumption-environment-resource-id>" `
+  -LogAnalyticsWorkspaceResourceId "<log-workspace-resource-id>" `
+  -AzureSqlServer "<server>.database.windows.net" `
+  -AzureSqlDatabase "<application-database>" `
+  -InventoryMode caller_visible `
+  -CostCenter "<cost-center>" -Owner "<owner>" -Environment "evaluation" `
+  -DataClassification "<classification>" `
+  -OutputDirectory "<new-operator-output-directory>" -Mode Prepare
+```
+
+`Prepare` is local. Review its output, then use the helper's explicit cloud modes
+with an isolated `-AzureConfigDirectory`; only `-Mode WhatIf -Execute` permits
+the reviewed deployment. For authorized tenant-admin inventory, explicitly
+select `-InventoryMode tenant_admin_preview`. This selects admin domains/
+workspaces and preview Admin Items; it grants no permission and does not prove
+source telemetry access.
+
+The Bicep default is `collectorOnly=true` with nullable `connectorBootstrap`.
+The PowerShell helper requires the explicit `-CollectorOnly` switch or the
+complete event-mode bootstrap file, avoiding accidental event-mode omission.
+Leave all `MONITORING_CONNECTOR_ID`/`MONITORING_EVENTSTREAM_*` values absent in
+collector-only mode. When event transport has its own reviewed ownership and
+identity proof, select event mode explicitly (`collectorOnly=false`) with the
+full nonsecret binding; do not weaken the event-mode validation.
+
+That operator binding must identify the owned connector, transport workspace,
+Eventstream and destination IDs, plus namespace, entity and consumer group.
+Verify the selected worker MI's stream access and the controller-published
+connector authority; a file of IDs does not grant ownership or access.
+Obtain the nonsecret values through the reviewed Entra endpoint/topology path,
+never a key-returning API. Switching modes still requires actual event receipt,
+durable acceptance/checkpoint and restart proof before claiming hybrid coverage.
+
+After deployment, distinguish worker liveness, durable metadata acceptance,
+source-access probes, configured/admitted scopes and action authority.
+The verified snapshot accepted 332 workspaces and enabled both authenticated
+workspace selectors with 333 options including the placeholder. Broader item
+coverage is partial; dataset 401s and request-budget/throttling gaps remain
+visible. A latest partial generation must not become `complete` because zero
+scopes happen to be configured. No fake workspace list, automatic scope admission
+or extra Fabric grants are part of this quickstart.
 
 ### Owned canary and nonsecret endpoint binding
 
@@ -1486,7 +2096,7 @@ owned definition/topology. Do not copy connection strings, shared keys or SAS.
 This manual bootstrap remains required. Key-free endpoint automation is
 unproved; a successful isolated MI reception test does not establish it.
 
-The full-worker helper expects `ConnectorBootstrapFile` to contain exactly:
+The event-mode helper expects `ConnectorBootstrapFile` to contain exactly:
 
 ```json
 {
@@ -1531,9 +2141,10 @@ An uncertain/inherited observation or null SQL-derived
 `observed_definition_hash` is not absence proof.
 
 Keep desired state, actual observations, receipt-bound materialization and
-readiness separate. The current adapter/controller/worker wiring is still being
-completed; a passing fixture does not establish that the normal deployed path
-performs these steps.
+readiness separate. The deployed collector-only worker and controller have
+proved bounded metadata collection and reconciliation, not the event-mode
+connector lifecycles. A populated workspace selector does not establish source
+materialization, event delivery or source removal.
 
 ### Worker configuration and checks
 
@@ -1545,8 +2156,8 @@ The deployment template supplies these exact nonsecret settings:
 | Inventory selection | `MONITORING_INVENTORY_MODE=caller_visible` by default; explicit `tenant_admin_preview` opt-in |
 | Pinned UAMI | `AZURE_SUBSCRIPTION_ID`, `AZURE_CLIENT_ID`, `MONITORING_IDENTITY_OBJECT_ID`, `MONITORING_IDENTITY_RESOURCE_ID` |
 | Durable state | `AZURE_SQL_SERVER`, `AZURE_SQL_DATABASE`; the same application catalog as web/controller |
-| Owned connector | `MONITORING_CONNECTOR_ID`, `MONITORING_EVENTSTREAM_WORKSPACE_ID`, `MONITORING_EVENTSTREAM_ID`, `MONITORING_EVENTSTREAM_DESTINATION_ID` |
-| Entra endpoint | `MONITORING_EVENTSTREAM_NAMESPACE`, `MONITORING_EVENTSTREAM_ENTITY`, `MONITORING_EVENTSTREAM_CONSUMER_GROUP` |
+| Owned connector, event mode only | `MONITORING_CONNECTOR_ID`, `MONITORING_EVENTSTREAM_WORKSPACE_ID`, `MONITORING_EVENTSTREAM_ID`, `MONITORING_EVENTSTREAM_DESTINATION_ID`; absent in collector-only mode |
+| Entra endpoint, event mode only | `MONITORING_EVENTSTREAM_NAMESPACE`, `MONITORING_EVENTSTREAM_ENTITY`, `MONITORING_EVENTSTREAM_CONSUMER_GROUP`; absent in collector-only mode |
 
 The worker reads its process environment, not `.env`. It rejects fixture mode and
 credential-bearing environment settings. Normal startup requires ready shared
@@ -1556,6 +2167,8 @@ falls back to an in-memory store or transport-only probe.
 With the required process environment supplied, these are separate operations:
 
 ```powershell
+.\.venv\Scripts\python.exe -m triage.monitoring.worker --collector-only
+
 .\.venv\Scripts\python.exe -m triage.monitoring.worker --transport-probe `
   --probe-workspace-id "<owned-source-workspace-uuid>" `
   --probe-item-id "<owned-source-pipeline-uuid>" --probe-seconds 120
@@ -1569,8 +2182,17 @@ Its source workspace may differ from the transport workspace. Never run that
 finite command as an always-restarted production container.
 `--reconcile-once` uses shared SQL work and can update an owned Eventstream
 definition; it is not a harmless connectivity check or proof of event delivery.
-Normal `python -m triage.monitoring.worker` starts the long-running consumer
-and maintenance loops.
+Explicit `--collector-only` starts durable inventory/polling and non-transport
+health only, with no receiver/provisioner. `python -m triage.monitoring.worker`
+without that flag remains the strict event-enabled consumer/maintenance path.
+
+Lease renewal re-reads the authoritative work revision rather than replaying a
+stale local revision. New inventory rows are accepted through bounded checked-view
+batches of at most 50 rows/950 parameters under the same lease and atomic
+acceptance transaction. A short affected-row count rolls the write back.
+Receipt-backed catalogue metadata reads retain original identity, fingerprint,
+payload and row-hash evidence; their paging optimization does not publish
+admission or broaden worker authority.
 
 ### Coverage, identity and network limits
 
@@ -1600,7 +2222,7 @@ obtain the narrowly scoped approval, record its review/expiry and verify the
 actual route. An Azure tag cannot override a Fabric network policy, and a review
 date does not automatically revoke an exception.
 
-Before enabling normal consumption and the controller heartbeat, prove actual
+Before accepting normal consumption and unattended hybrid operation, prove actual
 UAMI receipt, owned-envelope validation, durable acceptance before checkpoint,
 restart/replica recovery, source correlation, denied operations and terminal
 shared-state persistence. Treat missing proof as blocked/incomplete coverage,

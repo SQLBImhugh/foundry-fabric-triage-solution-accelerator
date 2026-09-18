@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -8,7 +10,12 @@ import pytest
 from triage.approvals import AutoApproveGate
 from triage.models import BIRequest, TriageResult
 from triage.monitoring.contracts import MonitoringNotBootstrapped, MonitoringUnavailable
-from triage.monitoring.controller import MonitoringExecution, controller_heartbeat
+from triage.monitoring.controller import (
+    HEARTBEAT_BUDGET_SECONDS,
+    HeartbeatBudget,
+    MonitoringExecution,
+    controller_heartbeat,
+)
 from triage.monitoring.models import (
     IncidentIdentity,
     MonitoringWorkDraft,
@@ -334,15 +341,19 @@ async def test_selected_live_pipeline_command_never_queues_other_targets(configu
     assert queued[0].target == selected
 
 
-async def test_heartbeat_interleaves_bounded_automatic_and_human_work() -> None:
+async def test_heartbeat_interleaves_bounded_automatic_and_human_work(test_settings) -> None:
     calls = []
 
     class Runner:
-        async def drain_monitoring_work(self, *, limit):
+        settings = test_settings
+
+        async def drain_monitoring_work(self, *, limit, budget):
+            assert budget.can_claim()
             calls.append(("automatic", limit))
             return ["automatic result"] if len(calls) <= 2 else []
 
-    async def human(_runner, *, limit):
+    async def human(_runner, *, limit, budget):
+        assert budget.can_claim()
         calls.append(("human", limit))
         return ["human result"] if len(calls) <= 2 else []
 
@@ -353,13 +364,175 @@ async def test_heartbeat_interleaves_bounded_automatic_and_human_work() -> None:
     assert calls.count(("human", 1)) == 2
 
 
-async def test_heartbeat_does_not_turn_sql_outage_into_an_empty_success() -> None:
+async def test_heartbeat_does_not_turn_sql_outage_into_an_empty_success(test_settings) -> None:
     class Runner:
-        async def drain_monitoring_work(self, *, limit):
+        settings = test_settings
+
+        async def drain_monitoring_work(self, *, limit, budget):
             raise MonitoringUnavailable("Synthetic SQL outage")
 
-    async def human(_runner, *, limit):
+    async def human(_runner, *, limit, budget):
         return []
 
     with pytest.raises(MonitoringUnavailable):
         await controller_heartbeat(Runner(), command_drain=human)
+
+
+async def test_heartbeat_stops_before_second_long_human_command(test_settings, caplog):
+    elapsed = [0.0]
+    calls = []
+
+    class Runner:
+        settings = test_settings
+
+        async def drain_monitoring_work(self, *, limit, budget):
+            calls.append(("automatic", budget.deadline))
+            return []
+
+    async def human(_runner, *, limit, budget):
+        calls.append(("human", budget.deadline))
+        assert budget.work_seconds == 690
+        await asyncio.sleep(0)
+        elapsed[0] += 500
+        return ["private incident text not for telemetry"]
+
+    with caplog.at_level("INFO", logger="triage.telemetry.heartbeat"):
+        result = await controller_heartbeat(Runner(), command_drain=human, clock=lambda: elapsed[0])
+    assert len(result) == 1 and sum(queue == "human" for queue, _ in calls) == 1
+    assert all(deadline == HEARTBEAT_BUDGET_SECONDS for _, deadline in calls)
+    assert "elapsed_ms=500000" in caplog.text and "human_results=1" in caplog.text
+    assert "budget_exhausted=True" in caplog.text
+    assert "private incident text" not in caplog.text
+
+
+async def test_heartbeat_includes_elapsed_time_before_it_acquires_the_invocation_lock(test_settings):
+    async def unexpected(*args, **kwargs):
+        pytest.fail("Insufficient invocation budget must leave both queues unclaimed")
+
+    runner = SimpleNamespace(settings=test_settings, drain_monitoring_work=unexpected)
+    result = await controller_heartbeat(
+        runner, command_drain=unexpected, started_at=100.0, clock=lambda: 251.0,
+    )
+    assert len(result) == 1 and "budget exhausted" in result[0] and "remains pending" in result[0]
+
+
+async def test_heartbeat_shared_quotas_still_bound_fast_work(test_settings):
+    calls = {"automatic": 0, "human": 0}
+
+    class Runner:
+        settings = test_settings
+
+        async def drain_monitoring_work(self, *, limit, budget):
+            calls["automatic"] += 1
+            await asyncio.sleep(0)
+            return ["automatic"]
+
+    async def human(_runner, *, limit, budget):
+        calls["human"] += 1
+        await asyncio.sleep(0)
+        return ["human"]
+
+    assert len(await controller_heartbeat(Runner(), rounds=4, command_drain=human, clock=lambda: 0.0)) == 8
+    assert calls == {"automatic": 4, "human": 4}
+
+
+async def test_heartbeat_waits_for_claimed_sibling_after_failure_without_cancelling_it(test_settings):
+    entered, release = asyncio.Event(), asyncio.Event()
+    automatic_calls = 0
+    completed = []
+
+    class Runner:
+        settings = test_settings
+
+        async def drain_monitoring_work(self, *, limit, budget):
+            nonlocal automatic_calls
+            automatic_calls += 1
+            if automatic_calls == 1:
+                await entered.wait()
+                raise MonitoringUnavailable("Private SQL error must not enter heartbeat telemetry")
+            return []
+
+    async def human(_runner, *, limit, budget):
+        entered.set()
+        await release.wait()
+        completed.append("original action completion")
+        return ["completed once"]
+
+    task = asyncio.create_task(controller_heartbeat(Runner(), command_drain=human))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+    with pytest.raises(MonitoringUnavailable):
+        await asyncio.wait_for(task, 2)
+    assert completed == ["original action completion"]
+
+
+async def test_elapsed_heartbeat_deadline_does_not_cancel_or_repeat_claimed_work(test_settings):
+    elapsed = [0.0]
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    class Runner:
+        settings = test_settings
+
+        async def drain_monitoring_work(self, *, limit, budget):
+            return []
+
+    async def human(_runner, *, limit, budget):
+        calls.append("claimed")
+        entered.set()
+        await release.wait()
+        calls.append("completed")
+        return ["original result"]
+
+    task = asyncio.create_task(controller_heartbeat(Runner(), command_drain=human, clock=lambda: elapsed[0]))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        elapsed[0] = HEARTBEAT_BUDGET_SECONDS + 1
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+    assert await asyncio.wait_for(task, 2) == ["original result"]
+    assert calls == ["claimed", "completed"]
+
+
+async def test_monitoring_drain_rechecks_budget_after_context_read(runner, monkeypatch):
+    elapsed = [0.0]
+    context = runner.monitoring_context
+
+    def slow_context(_runner):
+        elapsed[0] = 200.0
+        return context
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("No SQL work claim is allowed after context lookup exhausted admission time")
+
+    monkeypatch.setattr(type(runner), "monitoring_context", property(slow_context))
+    monkeypatch.setattr(runner.monitoring, "claim_work", forbidden)
+    budget = HeartbeatBudget(840, 690, lambda: elapsed[0])
+    assert await runner.drain_monitoring_work(limit=10, budget=budget) == []
+
+
+async def test_monitoring_drain_leaves_later_work_queued_after_elapsed_budget(runner, monkeypatch):
+    elapsed = [0.0]
+    claims = []
+
+    def claim(request):
+        claims.append(request)
+        return (SimpleNamespace(work_id="original"),)
+
+    async def execute(work):
+        elapsed[0] += 500
+        return "completed"
+
+    monkeypatch.setattr(runner.monitoring, "claim_work", claim)
+    monkeypatch.setattr(runner, "execute_monitoring_work", execute)
+    assert await runner.drain_monitoring_work(
+        limit=10, budget=HeartbeatBudget(840, 690, lambda: elapsed[0]),
+    ) == ["completed"]
+    assert len(claims) == 1

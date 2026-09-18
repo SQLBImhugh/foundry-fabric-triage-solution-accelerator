@@ -32,9 +32,26 @@ Committed receipt plus current readback, not job exit/HTTP status, is the eviden
 An interrupted clean bootstrap can be adjudicated with --mode recover and a
 separately hash-approved --recovery file. It requires the exact original receipt,
 fresh evidence that the original job is read-only and quiescent, no other SQL
-sessions, and no installed user schema or principals. It appends a resolution
-bound to ONE replacement bundle without rewriting the original receipt. This is
-operator recovery of an empty rollback, never automatic retry or schema repair.
+sessions, and no installed user schema or principals. Fresh adjudication also
+requires empty_baseline_sha256 in the approved recovery request. Capture it with
+recovery_baseline_fingerprint() on the independently reviewed empty target, using
+the same original receipt catalogue. Never bless the failed target's current
+metadata as its own baseline. The complete fixed security/catalogue query set is
+compared inside the recovery transaction before any recovery CREATE or INSERT.
+Recovery appends a resolution bound to ONE replacement bundle without rewriting
+the original receipt. This is operator recovery, never automatic schema repair.
+
+--mode reconcile-recovery takes the ORIGINAL --recovery and --recovery-sha256
+without either approval argument. It performs SELECTs only and reports MATCHING,
+MISSING or CONFLICT; only MATCHING exits zero. Expired requests and older requests
+without an empty-baseline fingerprint may be read, but do not authorize mutation.
+MISSING is not permission to restart. Schema reconciliation remains --mode
+reconcile. Preserve the original immutable payload/source tree for either read.
+For historical recovery evidence, --artifact-root selects that unchanged tree
+ONLY in reconcile-recovery mode. Its bundle, Python files and SQL batches are
+hash-checked as data; none of its code is imported or executed. The current
+trusted runner and its own SQL adapter perform the fixed SELECTs. Other modes
+reject --artifact-root and retain this runner's source-root/hash requirements.
 
 The job deadline bounds native calls; SQL locks also have a short timeout. A native
 driver can outlive a Python timeout, so do not substitute a local timer for the
@@ -77,6 +94,7 @@ SQL_SCOPE = "https://database.windows.net/.default"
 RECEIPT_TABLE = "dbo.triage_sql_bootstrap_receipts"
 RECOVERY_TABLE = "dbo.triage_sql_bootstrap_recoveries"
 ROOT = Path(__file__).resolve().parents[1]
+MAX_BASELINE_ROWS = 20_000
 
 # Parameterized metadata only. This is not a parser for untrusted deployment SQL.
 CHECK_SQL = {
@@ -111,6 +129,9 @@ CHECK_SQL = {
         JOIN sys.database_principals r ON r.principal_id=m.role_principal_id
         JOIN sys.database_principals u ON u.principal_id=m.member_principal_id
         WHERE r.name=? ORDER BY u.name COLLATE Latin1_General_100_BIN2""",
+    "budget_policies": """SELECT TOP (2049) bucket_hash,request_limit,window_seconds
+        FROM dbo.triage_monitoring_rate_budget WHERE tenant_id=CONVERT(UNIQUEIDENTIFIER,?)
+        ORDER BY bucket_hash COLLATE Latin1_General_100_BIN2""",
 }
 TARGET_SQL = """SELECT CONVERT(NVARCHAR(128),SERVERPROPERTY('ServerName')), DB_NAME(),
     CONVERT(INT,SERVERPROPERTY('EngineEdition')), USER_NAME(),
@@ -156,6 +177,83 @@ EMPTY_PRINCIPALS_SQL = """SELECT name,type FROM sys.database_principals
 OTHER_SESSIONS_SQL = """SELECT session_id FROM sys.dm_exec_sessions
     WHERE is_user_process=1 AND database_id=DB_ID() AND session_id<>@@SPID
     ORDER BY session_id"""
+RECOVERY_OBJECT_SQL = "SELECT OBJECT_ID(?,N'U'),OBJECT_ID(?)"
+
+# These use the authority reader's whole-universe approach, not a filtered list
+# of expected grants. SQL errors or unknown row shapes must stop adjudication.
+EMPTY_BASELINE_SQL = {
+    "database": (5, """SELECT database_id,is_trustworthy_on,is_db_chaining_on,containment,
+        LOWER(CONVERT(VARCHAR(256),owner_sid,2)) FROM sys.databases WHERE name=DB_NAME()"""),
+    "principals": (8, """SELECT principal_id,type,authentication_type_desc,
+        LOWER(CONVERT(VARCHAR(256),sid,2)),is_fixed_role,owning_principal_id,name,default_schema_name
+        FROM sys.database_principals ORDER BY principal_id"""),
+    "permissions": (7, """SELECT grantee_principal_id,grantor_principal_id,class,major_id,
+        minor_id,permission_name,state FROM sys.database_permissions
+        ORDER BY grantee_principal_id,grantor_principal_id,class,major_id,minor_id,permission_name,state"""),
+    "memberships": (2, """SELECT member_principal_id,role_principal_id
+        FROM sys.database_role_members ORDER BY member_principal_id,role_principal_id"""),
+    "schemas": (3, """SELECT schema_id,name,principal_id FROM sys.schemas ORDER BY schema_id"""),
+    "objects": (10, """SELECT o.object_id,o.schema_id,o.name,RTRIM(o.type),o.parent_object_id,
+        o.principal_id,o.is_ms_shipped,m.execute_as_principal_id,m.is_schema_bound,
+        LOWER(CONVERT(VARCHAR(64),HASHBYTES('SHA2_256',CONVERT(VARBINARY(MAX),m.definition)),2))
+        FROM sys.objects o LEFT JOIN sys.sql_modules m ON m.object_id=o.object_id
+        ORDER BY o.object_id"""),
+    "columns": (11, """SELECT object_id,column_id,name,user_type_id,max_length,precision,scale,
+        is_nullable,is_identity,is_computed,collation_name FROM sys.columns ORDER BY object_id,column_id"""),
+    "indexes": (8, """SELECT object_id,index_id,name,type,is_unique,is_primary_key,
+        is_disabled,filter_definition FROM sys.indexes ORDER BY object_id,index_id"""),
+    "index_columns": (7, """SELECT object_id,index_id,index_column_id,column_id,key_ordinal,
+        is_descending_key,is_included_column FROM sys.index_columns
+        ORDER BY object_id,index_id,index_column_id"""),
+    "constraints": (5, """SELECT object_id,parent_object_id,name,definition,is_disabled
+        FROM sys.check_constraints UNION ALL
+        SELECT object_id,parent_object_id,name,definition,0 FROM sys.default_constraints
+        ORDER BY object_id"""),
+    "triggers": (9, """SELECT t.object_id,t.parent_class,t.parent_id,t.name,t.is_disabled,
+        t.is_instead_of_trigger,t.is_ms_shipped,m.execute_as_principal_id,
+        LOWER(CONVERT(VARCHAR(64),HASHBYTES('SHA2_256',CONVERT(VARBINARY(MAX),m.definition)),2))
+        FROM sys.triggers t LEFT JOIN sys.sql_modules m ON m.object_id=t.object_id
+        ORDER BY t.parent_class,t.object_id"""),
+    "credentials": (5, """SELECT credential_id,name,credential_identity,
+        CONVERT(VARCHAR(33),create_date,126),CONVERT(VARCHAR(33),modify_date,126)
+        FROM sys.database_scoped_credentials ORDER BY credential_id"""),
+    "external_data_sources": (5, """SELECT data_source_id,name,type_desc,location,credential_id
+        FROM sys.external_data_sources ORDER BY data_source_id"""),
+    "external_file_formats": (3, """SELECT file_format_id,name,format_type
+        FROM sys.external_file_formats ORDER BY file_format_id"""),
+    "assemblies": (7, """SELECT assembly_id,name,principal_id,permission_set,is_user_defined,
+        CONVERT(VARCHAR(33),modify_date,126),clr_name FROM sys.assemblies ORDER BY assembly_id"""),
+    "types": (7, """SELECT user_type_id,schema_id,name,system_type_id,is_user_defined,
+        is_assembly_type,is_table_type FROM sys.types ORDER BY user_type_id"""),
+    "xml_schema_collections": (3, """SELECT xml_collection_id,schema_id,name
+        FROM sys.xml_schema_collections ORDER BY xml_collection_id"""),
+    "certificates": (3, """SELECT certificate_id,name,principal_id
+        FROM sys.certificates ORDER BY certificate_id"""),
+    "asymmetric_keys": (3, """SELECT asymmetric_key_id,name,principal_id
+        FROM sys.asymmetric_keys ORDER BY asymmetric_key_id"""),
+    "symmetric_keys": (3, """SELECT symmetric_key_id,name,principal_id
+        FROM sys.symmetric_keys ORDER BY symmetric_key_id"""),
+    "column_master_keys": (2, """SELECT column_master_key_id,name
+        FROM sys.column_master_keys ORDER BY column_master_key_id"""),
+    "column_encryption_keys": (2, """SELECT column_encryption_key_id,name
+        FROM sys.column_encryption_keys ORDER BY column_encryption_key_id"""),
+    "module_signatures": (4, """SELECT class,major_id,
+        LOWER(CONVERT(VARCHAR(256),thumbprint,2)),crypt_type FROM sys.crypt_properties
+        ORDER BY class,major_id,thumbprint,crypt_type"""),
+    "queues": (6, """SELECT object_id,is_activation_enabled,is_receive_enabled,
+        activation_procedure,execute_as_principal_id,is_ms_shipped
+        FROM sys.service_queues ORDER BY object_id"""),
+    "plan_guides": (4, """SELECT plan_guide_id,name,is_disabled,scope_type
+        FROM sys.plan_guides ORDER BY plan_guide_id"""),
+}
+EMPTY_BASELINE_ABSENT = frozenset({
+    "credentials", "external_data_sources", "external_file_formats", "certificates",
+    "asymmetric_keys", "symmetric_keys", "column_master_keys", "column_encryption_keys",
+    "module_signatures", "plan_guides",
+})
+EMPTY_PUBLIC_PERMISSIONS = frozenset({
+    "CONNECT", "VIEW ANY COLUMN ENCRYPTION KEY DEFINITION", "VIEW ANY COLUMN MASTER KEY DEFINITION",
+})
 
 
 class BootstrapError(RuntimeError):
@@ -208,7 +306,7 @@ class Batch(StrictModel):
 
 
 class Check(StrictModel):
-    kind: Literal["object", "columns", "principal", "permissions", "members"]
+    kind: Literal["object", "columns", "principal", "permissions", "members", "budget_policies"]
     name: Annotated[str, Field(pattern=r"^[A-Za-z0-9_.-]{1,128}$")]
     argument: Annotated[str, Field(min_length=1, max_length=256)]
     expected: Annotated[list[list[str | int | None]], Field(max_length=2048)]
@@ -245,6 +343,21 @@ class Bundle(StrictModel):
                 raise ValueError("Each object must have explicit dbo ownership")
             if check.kind == "columns" and not check.expected:
                 raise ValueError("Column readback must describe the expected schema")
+            if check.kind == "budget_policies":
+                if check.argument != str(self.identity.tenant_id) or not check.expected:
+                    raise ValueError("Budget policy readback requires the bundle tenant and nonempty policies")
+                if any(
+                    len(row) != 3 or not isinstance(row[0], str) or not re.fullmatch(r"[0-9a-f]{64}", row[0])
+                    or type(row[1]) is not int or not 1 <= row[1] <= 1_000_000
+                    or type(row[2]) is not int or not 1 <= row[2] <= 86_400
+                    for row in check.expected
+                ):
+                    raise ValueError("Budget readback accepts only bounded hash, limit and window metadata")
+                if (
+                    len({row[0] for row in check.expected}) != len(check.expected)
+                    or check.expected != sorted(check.expected)
+                ):
+                    raise ValueError("Budget policy readback must be unique and hash-ordered")
         return self
 
 
@@ -264,7 +377,7 @@ class QuiescentExecution(StrictModel):
 class QuiescentJob(StrictModel):
     id: Annotated[str, Field(pattern=r"^/subscriptions/[0-9a-f-]{36}/resourceGroups/[^/]+/providers/Microsoft\.App/jobs/[^/]+$")]
     definition_sha256: SHA256
-    mode: Literal["preflight", "reconcile", "diagnostic"]
+    mode: Literal["preflight", "reconcile", "reconcile-recovery", "diagnostic"]
     executions: Annotated[list[QuiescentExecution], Field(max_length=100)]
 
     @model_validator(mode="after")
@@ -286,6 +399,7 @@ class RecoveryRequest(StrictModel):
     original_receipt_object_id: Annotated[int, Field(gt=0)]
     original_job_id: str
     rollback_evidence_sha256: SHA256
+    empty_baseline_sha256: SHA256 | None = None
     replacement_operation_id: UUID
     replacement_fingerprint: SHA256
     replacement_source_sha256: SHA256
@@ -298,7 +412,8 @@ class RecoveryRequest(StrictModel):
         jobs = {job.id: job for job in self.jobs}
         original = jobs.get(self.original_job_id)
         if (
-            len(jobs) != len(self.jobs) or original is None or original.mode != "reconcile"
+            len(jobs) != len(self.jobs) or original is None
+            or original.mode not in {"reconcile", "reconcile-recovery"}
             or self.original_operation_id.int == 0 or self.replacement_operation_id.int == 0
             or self.original_operation_id == self.replacement_operation_id
             or self.observed_at.tzinfo is None or self.expires_at.tzinfo is None
@@ -520,12 +635,81 @@ def _lock(db: Sql) -> None:
 
 
 def _recovery_table_exists(db: Sql) -> bool:
-    rows = db.query("SELECT OBJECT_ID(?,N'U')", RECOVERY_TABLE)
-    if rows == [(None,)]:
+    rows = db.query(RECOVERY_OBJECT_SQL, RECOVERY_TABLE, RECOVERY_TABLE)
+    if rows == [(None, None)]:
         return False
-    if len(rows) != 1 or len(rows[0]) != 1 or type(rows[0][0]) is not int:
+    if len(rows) != 1 or len(rows[0]) != 2 or any(
+        value is not None and type(value) is not int for value in rows[0]
+    ):
         raise BootstrapError("recovery_catalogue_unreadable")
+    if rows[0][0] is None or rows[0][0] != rows[0][1]:
+        raise BootstrapError("recovery_object_type_conflict")
     return True
+
+
+def recovery_baseline_fingerprint(db: Sql, bundle: Bundle) -> str:
+    """Read/hash a review candidate, never approve the observed state implicitly."""
+    check_sql_target(db, bundle)
+    if db.query(EMPTY_SCHEMA_SQL) or db.query(EMPTY_PRINCIPALS_SQL):
+        raise BootstrapError("recovery_requires_empty_rollback")
+    catalogue = {}
+    remaining = MAX_BASELINE_ROWS
+    for name, (width, sql) in EMPTY_BASELINE_SQL.items():
+        rows = db.query(sql)
+        remaining -= len(rows)
+        if remaining < 0 or any(
+            len(row) != width or any(type(value) not in {str, int, bool, type(None)} for value in row)
+            for row in rows
+        ) or name == "database" and len(rows) != 1:
+            raise BootstrapError(f"recovery_baseline_unreadable:{name}")
+        catalogue[name] = [list(row) for row in rows]
+    _standard_empty_security(catalogue)
+    document = {
+        "contract": "triage.bootstrap.empty-baseline.v1",
+        "server": bundle.target.server, "database": bundle.target.database,
+        "queries": EMPTY_BASELINE_SQL, "catalogue": catalogue,
+    }
+    return hashlib.sha256(json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")).hexdigest()
+
+
+def _standard_empty_security(catalogue: dict[str, list[list]]) -> None:
+    if catalogue["database"][0][1] or catalogue["database"][0][2]:
+        raise BootstrapError("recovery_empty_security_not_standard:database_flags")
+    principals = {row[6]: row for row in catalogue["principals"]}
+    required = {"dbo", "guest", "sys", "INFORMATION_SCHEMA", "public", "db_owner"}
+    if (
+        not required <= principals.keys() or len(principals) != len(catalogue["principals"])
+        or any(name not in required and not row[4] for name, row in principals.items())
+    ):
+        raise BootstrapError("recovery_empty_security_not_standard:principals")
+    schemas = {
+        name: row[0] for name, row in principals.items()
+        if name in {"dbo", "guest", "sys", "INFORMATION_SCHEMA"} or row[4]
+    }
+    public_id, owner_id = principals["public"][0], principals["dbo"][0]
+    if any(row[1] not in schemas or row[2] != schemas[row[1]] for row in catalogue["schemas"]):
+        raise BootstrapError("recovery_empty_security_not_standard:schemas")
+    if any(
+        row[0] != public_id or row[1] != owner_id or row[2:5] != [0, 0, 0]
+        or row[5] not in EMPTY_PUBLIC_PERMISSIONS or row[6] != "G"
+        for row in catalogue["permissions"]
+    ):
+        raise BootstrapError("recovery_empty_security_not_standard:permissions")
+    if any(row != [owner_id, principals["db_owner"][0]] for row in catalogue["memberships"]):
+        raise BootstrapError("recovery_empty_security_not_standard:memberships")
+    if any(not row[6] for row in catalogue["triggers"]):
+        raise BootstrapError("recovery_empty_security_not_standard:triggers")
+    for name in sorted(EMPTY_BASELINE_ABSENT):
+        if catalogue[name]:
+            raise BootstrapError(f"recovery_empty_security_not_standard:{name}")
+    if any(row[4] for row in catalogue["assemblies"]) or any(row[4] for row in catalogue["types"]):
+        raise BootstrapError("recovery_empty_security_not_standard:user_types_or_assemblies")
+    if any(row[1] != principals["sys"][0] for row in catalogue["xml_schema_collections"]):
+        raise BootstrapError("recovery_empty_security_not_standard:xml_schema_collections")
+    if any(not row[5] and (row[1] or row[2] and row[3]) for row in catalogue["queues"]):
+        raise BootstrapError("recovery_empty_security_not_standard:queue_activation")
 
 
 def _pending_count(db: Sql, artifact: Artifact) -> list[tuple]:
@@ -579,6 +763,8 @@ def _recovery_readback(db: Sql, recovery: Recovery) -> bool:
         f"SELECT {RECOVERY_COLUMNS} FROM {RECOVERY_TABLE} WHERE original_operation_id=?",
         str(recovery.request.original_operation_id),
     )
+    if not rows:
+        return False
     expected = _recovery_values(recovery)
     if len(rows) == 1 and len(rows[0]) == 7:
         actual = (*rows[0][:2], str(rows[0][2]).lower(), *rows[0][3:])
@@ -609,6 +795,10 @@ def recover(db: Sql, artifact: Artifact, recovery: Recovery) -> dict:
                 raise BootstrapError("recovery_requires_empty_rollback")
             if db.query(f"SELECT COUNT_BIG(*) FROM {RECEIPT_TABLE}") != [(1,)]:
                 raise BootstrapError("recovery_requires_single_original_receipt")
+            if request.empty_baseline_sha256 is None:
+                raise BootstrapError("approved_empty_baseline_required")
+            if recovery_baseline_fingerprint(db, artifact.bundle) != request.empty_baseline_sha256:
+                raise BootstrapError("recovery_empty_baseline_changed")
             db.execute(CREATE_RECOVERIES)
             if db.execute(
                 f"INSERT INTO {RECOVERY_TABLE} (original_operation_id,"
@@ -629,6 +819,37 @@ def recover(db: Sql, artifact: Artifact, recovery: Recovery) -> dict:
     }
 
 
+def reconcile_recovery(db: Sql, artifact: Artifact, recovery: Recovery) -> dict:
+    """Observe the original adjudication only; missing is not a mutation license."""
+    request = recovery.request
+    if (
+        request.replacement_operation_id != artifact.bundle.operation_id
+        or request.replacement_fingerprint != artifact.fingerprint
+        or request.replacement_source_sha256 != artifact.source_sha256
+    ):
+        raise BootstrapError("recovery_replacement_mismatch")
+    check_sql_target(db, artifact.bundle)
+    code = None
+    try:
+        _original_receipt(db, request)
+        status = "MATCHING" if _recovery_readback(db, recovery) else "MISSING"
+    except BootstrapError as exc:
+        if str(exc) not in {
+            "recovery_original_receipt_object_changed", "recovery_original_receipt_changed",
+            "recovery_receipt_conflict", "recovery_object_type_conflict",
+        }:
+            raise
+        status, code = "CONFLICT", str(exc)
+    if status != "MATCHING":
+        logger.warning("Read-only recovery lookup %s (%s)", status, code or "record_not_found")
+    return {
+        "status": status, "read_only": True, "code": code,
+        "original_operation_id": str(request.original_operation_id),
+        "replacement_operation_id": str(request.replacement_operation_id),
+        "recovery_sha256": recovery.fingerprint, "batches_executed": 0,
+    }
+
+
 def reconcile(db: Sql, artifact: Artifact) -> dict:
     check_sql_target(db, artifact.bundle)
     if receipt(db, artifact) != "committed":
@@ -637,18 +858,26 @@ def reconcile(db: Sql, artifact: Artifact) -> dict:
     return {"status": "committed_and_read_back", "metadata_checks": len(artifact.bundle.checks)}
 
 
-def run(
-    db: Sql, artifact: Artifact, mode: str, approval: str = "",
-    recovery: Recovery | None = None, recovery_approval: str = "",
-) -> dict:
-    if mode not in {"preflight", "apply", "reconcile", "recover"}:
+def _validate_mode(
+    artifact: Artifact, mode: str, approval: str, recovery: Recovery | None, recovery_approval: str,
+) -> None:
+    if mode not in {"preflight", "apply", "reconcile", "recover", "reconcile-recovery"}:
         raise BootstrapError("unknown_mode")
     if mode in {"apply", "recover"} and approval != artifact.fingerprint:
         raise BootstrapError("explicit_apply_approval_required")
     if mode == "recover" and (recovery is None or recovery_approval != recovery.fingerprint):
         raise BootstrapError("explicit_recovery_approval_required")
-    if mode != "recover" and (recovery is not None or recovery_approval):
+    if mode == "reconcile-recovery" and (recovery is None or approval or recovery_approval):
+        raise BootstrapError("recovery_lookup_requires_original_request_without_approval")
+    if mode not in {"recover", "reconcile-recovery"} and (recovery is not None or recovery_approval):
         raise BootstrapError("recovery_inputs_require_recover_mode")
+
+
+def run(
+    db: Sql, artifact: Artifact, mode: str, approval: str = "",
+    recovery: Recovery | None = None, recovery_approval: str = "",
+) -> dict:
+    _validate_mode(artifact, mode, approval, recovery, recovery_approval)
     check_sql_target(db, artifact.bundle)
     if mode == "preflight":
         return {"status": "preflight_only", "schema_checked": False, "batches_executed": 0}
@@ -657,6 +886,9 @@ def run(
     if mode == "recover":
         assert recovery is not None
         return recover(db, artifact, recovery)
+    if mode == "reconcile-recovery":
+        assert recovery is not None
+        return reconcile_recovery(db, artifact, recovery)
     with db.transaction():
         check_sql_target(db, artifact.bundle)
         _lock(db)
@@ -705,24 +937,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--bundle-sha256", required=True)
     parser.add_argument("--operation-id", type=UUID, required=True)
-    parser.add_argument("--mode", choices=("preflight", "apply", "reconcile", "recover"), default="preflight")
+    parser.add_argument("--mode", choices=("preflight", "apply", "reconcile", "recover", "reconcile-recovery"), default="preflight")
     parser.add_argument("--approve-fingerprint", default="")
     parser.add_argument("--recovery", type=Path)
     parser.add_argument("--recovery-sha256", default="")
     parser.add_argument("--approve-recovery-sha256", default="")
+    parser.add_argument("--artifact-root", type=Path)
     args = parser.parse_args(argv)
     context: dict = {}
     try:
-        artifact = load_artifact(ROOT, args.bundle, args.bundle_sha256, args.operation_id)
+        if args.artifact_root is not None and args.mode != "reconcile-recovery":
+            raise BootstrapError("artifact_root_requires_reconcile_recovery")
+        artifact_root = args.artifact_root.resolve() if args.artifact_root is not None else ROOT
+        artifact = load_artifact(artifact_root, args.bundle, args.bundle_sha256, args.operation_id)
         check_environment(artifact.bundle, os.environ)
         recovery = load_recovery(args.recovery, args.recovery_sha256, artifact) if args.recovery else None
-        if args.mode in {"apply", "recover"} and args.approve_fingerprint != artifact.fingerprint:
-            raise BootstrapError("explicit_apply_approval_required")
-        if args.mode == "recover" and (
-            recovery is None or args.approve_recovery_sha256 != recovery.fingerprint
-        ):
-            raise BootstrapError("explicit_recovery_approval_required")
-        if args.mode != "recover" and (args.recovery or args.recovery_sha256 or args.approve_recovery_sha256):
+        _validate_mode(
+            artifact, args.mode, args.approve_fingerprint, recovery, args.approve_recovery_sha256,
+        )
+        if args.mode not in {"recover", "reconcile-recovery"} and (args.recovery or args.recovery_sha256 or args.approve_recovery_sha256):
             raise BootstrapError("recovery_inputs_require_recover_mode")
         context = {
             "operation_id": str(artifact.bundle.operation_id),
@@ -731,6 +964,7 @@ def main(argv: list[str] | None = None) -> int:
             "identity": artifact.bundle.identity.model_dump(mode="json"), "mode": args.mode,
         }
         print(json.dumps({**context, "status": "inputs_verified"}), flush=True)
+        # A historical artifact root supplies evidence bytes, never executable imports.
         db = open_database(ROOT, artifact.bundle)
         sql_identity = check_sql_target(db, artifact.bundle)
         print(json.dumps({
@@ -741,7 +975,7 @@ def main(argv: list[str] | None = None) -> int:
             recovery, args.approve_recovery_sha256,
         )
         print(json.dumps({**context, **result, "runtime_identity_acceptance": "not_performed"}), flush=True)
-        return 0
+        return 2 if args.mode == "reconcile-recovery" and result["status"] != "MATCHING" else 0
     except Exception as exc:
         # A CLI boundary reports typed failure without logging tokens, SQL or arbitrary driver text.
         uncertain = type(exc).__name__ in {"SqlCommitUncertain", "SqlRollbackUncertain"}

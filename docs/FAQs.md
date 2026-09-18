@@ -37,8 +37,12 @@ dual writes or old history/target import. The application and temporary isolated
 proof databases are provisioned on the same logical server. That evaluation
 topology is not a final sizing or pricing recommendation. The shipped template
 uses one S1 application database and an optional Basic proof database, not an
-elastic pool. The original SQL proof receipt is under recovery; full-schema
-commit, runtime permissions and cutover are not accepted.
+elastic pool. SQL recovery is complete and both schemas are committed.
+The initialization capture of `maintenance=true`, revision `0` is historical.
+Maintenance is now `false`, and Command Center, the hosted controller and a
+collector-only worker use Azure SQL with their reviewed identities.
+Workspace metadata is durably populated, but item/source-access coverage is
+partial and full event/hybrid acceptance remains outstanding.
 
 Power BI models, Fabric pipelines, business data and native Eventstream transport
 remain in their services. Moving **application state** does not move or replace
@@ -115,6 +119,28 @@ Standalone notebook-job monitoring is not implemented. Missing expected starts,
 disabled pipeline schedules, report usage, audit, capacity and tenant-wide data
 quality need separate detectors or collectors. Existing silent-health probes
 remain explicitly configured business checks.
+
+## Can I populate workspace selectors before configuring Eventstream?
+
+Yes. Use the worker's explicit `--collector-only` mode, or
+`-CollectorOnly` in `scripts\deploy_monitoring_worker.ps1`. It performs durable
+inventory/REST collection with no Eventstream receiver or provisioner.
+The helper accepts that switch or `-ConnectorBootstrapFile`, exclusively.
+Partial/residual event settings are rejected, not treated as a fallback.
+See the [collector-only quickstart](DeploymentGuide.md#collector-only-quickstart).
+
+In the verified deployment, native Fabric metadata reads accepted 332
+workspaces. Both authenticated workspace selectors had 333 enabled options
+including the placeholder, with no selector error alerts. This is not proof
+that the worker can read every dataset: item enumeration remains partial,
+Power BI dataset reads can return 401 without source permissions, and budgets/
+throttling still bound collection. Latest partial coverage remains partial
+even with zero configured scopes.
+
+Metadata, source access, current observations and remediation authority are
+separate. No scope or remediation was automatically admitted, and no extra
+Fabric grants were added to make the selectors work. Collector-only heartbeats
+have `connector_id=null` and cannot claim transport/delivery.
 
 ## How are live targets configured now?
 
@@ -253,19 +279,49 @@ TLS/auditing/TDE and its special Azure-services firewall rule. Registry
 admin/anonymous access remains disabled, and the retained public Foundry path
 has local authentication disabled.
 
-The original SQL `STARTED` proof receipt is under guarded recovery; completion,
-committed schema and runtime permission/effect proof are not accepted.
+Recovery is complete without changing the original failed `STARTED` receipt.
+Append-only operator adjudication binds its proved empty rollback to one
+approved replacement. Proof and application schemas each committed 145 DDL
+batches and passed 114 readbacks. Independent initialization readback captured
+`maintenance=true`, revision `0` and the bootstrap receipt; that is historical,
+not current control state.
+
+Eight bounded native SQL role/effect cases using `EXECUTE AS` and cleanup
+passed. The later 19 native SELECT-predicate controls are also bounded; neither
+set is the full 27-RPC or end-to-end acceptance matrix.
+A separate no-VNet public-route job connected over encrypted TCP with FEDERATED
+bootstrap-MI authentication and passed 114 application readbacks without changing
+maintenance at that capture time. Proof jobs were quiesced and human SQL
+administration restored afterward.
 Earlier private bootstrap/image checks and module-hash controls remain bounded
 historical evidence. The private Foundry preflight error does not block the
 chosen public architecture or establish that private hosted agents are
 categorically unsupported.
 
-The live app/controller remain the prior release. No history migration/wipe,
-normal-worker rollout, hybrid release push or current-release UI screenshots
-are complete. Earlier Fabric SQL checks and screenshots remain historical.
+The web app and hosted controller have since cut over to Azure SQL with the
+correct acting-identity mapping, kernel roles and application grants.
+Maintenance is `false`. After reviewed SQL-only corrections, the deployed
+heartbeat completed the original discovery-intent work and published its
+frontier `1/1`. Independent SQL readback confirmed one inventory-worker item
+queued, zero actions and unchanged original receipt/control.
 
-Native Azure SQL durability, checkpoint/restart recovery, the normal worker and
-full application cutover remain deployment gates. The final frontend test/lint/build
+The deployed collector-only worker subsequently accepted 332 workspaces.
+Broader item/source-access coverage remains partial and the mode runs no
+Eventstream receiver/provisioner. Three actual recurrences of the reused
+one-minute heartbeat scheduler completed after response decoding. Portal-only
+missing/failed-heartbeat alerts were deployed, but no notification delivery or
+absence canary is claimed. Earlier screenshots remain historical.
+
+Hosted telemetry's reserved platform locator was empty without a project
+tracing connection. The source now uses a separate metadata-only app channel
+and normalizes only an exact empty platform value before SDK configuration.
+Native Application Insights queries now contain `heartbeat_started` and
+completed `heartbeat_finished` metadata, with queue counts and zero exporter
+failure/warning counters in the captured runs. This bounded proof does not
+justify enabling project-wide prompt/content traces.
+
+Full event/source-access coverage, checkpoint/restart recovery and sustained
+operation remain acceptance gates. The final frontend test/lint/build
 rerun follows the final integration handoff, not each intermediate source
 change. Earlier-release screenshots remain labelled as earlier-release
 evidence and must not be presented as the current deployment. See the
@@ -449,10 +505,13 @@ after an uncertain response; cases are not automatically retried. See
 
 ## How do I know it is still running?
 
-Nothing alerts on the agent having stopped unless you configure it to. Set
-`alertWebhookUrl` when deploying the scheduled sweep and a failed run posts to
-Teams; the Logic App also keeps its own run history, and a failed sweep
-terminates as failed rather than being handled quietly.
+Inspect scheduler run history, controller responses, durable worker/SQL
+heartbeats and coverage separately. The deployed Azure Monitor alerts use
+`RunsSucceeded < 1` over 15 minutes and `RunsFailed > 0` over 5 minutes, evaluated
+every minute. Their empty action lists create portal alerts only: no Action
+Group, email or webhook delivery destination has been configured. No
+missing-heartbeat canary or external notification delivery is claimed.
+The legacy `alertWebhookUrl` is not a prerequisite or the current alert route.
 
 This is not hypothetical. An unpinned dependency once crash-looped the container
 at startup, and because nothing was watching, the agent answered nothing for
@@ -473,3 +532,28 @@ bi-triage incidents
 A quiet incident list or an idle heartbeat is not proof of health. There may
 be no failures, no configured targets, incomplete inventory or a disconnected
 collector; coverage and its explicit gaps distinguish those cases.
+
+The existing one-minute command schedule was changed to `heartbeat`, not
+duplicated. Three real recurrences were decoded as completed. The controller
+has an 840-second monotonic admission window, including lock wait, with two
+automatic and one human-command concurrent slots. Refills obey queue quotas
+and require enough remaining execution allowance; the timer never cancels
+already admitted work.
+
+## Why is Foundry project tracing disconnected?
+
+Microsoft's [hosted telemetry documentation](https://learn.microsoft.com/azure/foundry/agents/how-to/configure-hosted-agent-telemetry)
+reserves `APPLICATIONINSIGHTS_CONNECTION_STRING` for project monitoring.
+Connecting Application Insights to the project enables traces across its agents
+that can include prompts/responses/tool content; see
+[tracing and data handling](https://learn.microsoft.com/azure/foundry/observability/concepts/trace-data).
+That conflicts with this accelerator's metadata-only telemetry rule.
+
+Hosted code instead uses `TRIAGE_TELEMETRY_CONNECTION_STRING` and managed identity
+for a separate Entra-only application telemetry resource. It disables the
+host's default observability callback, forces message-content capture off and
+exports only approved metadata. CLI telemetry keeps its standard setting; there
+is no hosted fallback to it. Console diagnostics and successful SDK configuration
+are not cloud-ingestion receipts. The current proof uses records actually
+queried from Application Insights: paired started/completed heartbeat metadata.
+It does not establish every span, overnight delivery or full hybrid acceptance.

@@ -131,9 +131,9 @@ def test_utf8_sql_catalogue_and_complete_kernel_abi_remain_unchanged() -> None:
     # These pin the reviewed frontier null/empty-set fixes; native header
     # projection must not rewrite their UTF-8 source or API contract.
     assert kernel_contract_hash(tables) == (
-        "06a093a919ee25896891202f04c3939226fb09f385398744b0733dff3eeacce3"
+        "75fdc702325a1fccd53dc2eb95651a9214d9b8eda3806a905f12eec8d7202889"
     )
     assert fingerprint(kernel_abi(tables)) == kernel_contract_hash(tables)
     assert fingerprint(list(kernel.catalogue())) == (
-        "66b27e7dc0b7ec0bfde833b84dd6a4d3eeac6bad4e2dbb86808238804e07f4f8"
+        "bfaac49a89cd84cc485d2387af38fa3b81245e8cc25ffad9af17a436e21c05ff"
     )

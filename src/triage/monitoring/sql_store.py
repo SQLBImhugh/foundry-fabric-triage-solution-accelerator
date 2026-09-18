@@ -125,6 +125,7 @@ class CollectionFrame:
     context: m.MonitoringContext
     request: BaseModel | dict[str, object]
     records: dict[tuple[str, str], StoredRecord] = field(default_factory=dict)
+    pending_inserts: dict[tuple[str, str], StoredRecord] = field(default_factory=dict)
     part_ids: tuple[str, ...] = ()
 
 
@@ -271,6 +272,7 @@ class SqlBackend:
             raise MonitoringComponentDenied(f"{self.component} cannot route {operation}")
         if not getattr(self._local, "active", False):
             raise MonitoringConflict("A guarded SQL operation must join the monitoring transaction")
+        self._flush_inventory_inserts()
         self.operation_identity(operation, str(arguments.get("request_id") or arguments.get("work_id") or "read"))
         sql, values = contract.bind(arguments)
         rows = self.db.query(sql, *values)
@@ -383,6 +385,15 @@ class SqlBackend:
         table = self.write_route(record.kind, insert=record.version == 1)
         if not getattr(self._local, "active", False):
             raise MonitoringConflict("Monitoring records must be written inside their acceptance transaction")
+        if record.version == 1 and self.component == "worker" and self.collection is not None and self.collection.operation == "inventory":
+            # A workspace page writes both generation and current catalogue rows.
+            # Per-row network round trips can exhaust the work lease before
+            # acceptance; bounded inserts retain the same checked view and transaction.
+            self.collection.pending_inserts[(record.kind, record.key)] = record
+            self.collection.records[(record.kind, record.key)] = record
+            self._local.records[(record.context.tenant_id, record.context.epoch, record.kind, record.key)] = record
+            return
+        self._flush_inventory_inserts()
         values = (
             record.version, record.status, record.workload, record.workspace_id, record.item_id,
             _digest(record.target_key), record.target_key, _digest(record.parent_key), record.parent_key,
@@ -420,6 +431,37 @@ class SqlBackend:
         if self.collection is not None:
             self.collection.records[(record.kind, record.key)] = record
 
+    def _flush_inventory_inserts(self) -> None:
+        frame = self.collection
+        if frame is None or not frame.pending_inserts:
+            return
+        grouped: dict[str, list[StoredRecord]] = {}
+        for record in frame.pending_inserts.values():
+            grouped.setdefault(self.write_route(record.kind, insert=True), []).append(record)
+        for table, records in grouped.items():
+            for offset in range(0, len(records), 50):
+                batch = records[offset:offset + 50]
+                values = []
+                for row in batch:
+                    values.extend((
+                        row.key, row.version, row.status, row.workload, row.workspace_id, row.item_id,
+                        _digest(row.target_key), row.target_key, _digest(row.parent_key), row.parent_key,
+                        row.work_kind, row.generation_id, _db_time(row.due_at) if row.due_at else None,
+                        row.sequence_number, row.payload, row.context.tenant_id, row.context.epoch,
+                        row.kind, _digest(row.key),
+                    ))
+                placeholders = ", ".join("(" + ", ".join("?" for _ in range(19)) + ")" for _ in batch)
+                changed = self.db.execute(
+                    f"INSERT INTO {table} "
+                    "(full_key, revision, status, workload, workspace_id, item_id, target_hash, target_key, "
+                    "parent_hash, parent_key, work_kind, generation_id, due_at, sequence_number, payload, "
+                    f"tenant_id, epoch, record_kind, key_hash) VALUES {placeholders}",
+                    *values,
+                )
+                if changed != len(batch):
+                    raise MonitoringConflict("An inventory insert batch did not persist every checked row")
+        frame.pending_inserts.clear()
+
     def _filters(self, filters: dict[str, object] | None) -> tuple[str, list[object]]:
         clauses = []
         params = []
@@ -452,6 +494,7 @@ class SqlBackend:
         self, kind: str, context: m.MonitoringContext, *, limit: int,
         after: str | None = None, filters: dict[str, object] | None = None,
     ) -> list[StoredRecord]:
+        self._flush_inventory_inserts()
         where, params = self._filters(filters)
         if after is not None:
             where += " AND key_hash > ?"
@@ -466,6 +509,7 @@ class SqlBackend:
     def count(
         self, kind: str, context: m.MonitoringContext, *, filters: dict[str, object] | None = None,
     ) -> int:
+        self._flush_inventory_inserts()
         where, params = self._filters(filters)
         rows = self.db.query(
             f"SELECT COUNT(*) FROM {self.read_route(kind)} "
@@ -477,6 +521,7 @@ class SqlBackend:
         return rows[0][0]
 
     def change_counter(self, kind: str, context: m.MonitoringContext) -> int:
+        self._flush_inventory_inserts()
         rows = self.db.query(
             f"SELECT COALESCE(SUM(revision), 0) FROM {self.read_route(kind)} "
             "WHERE tenant_id = ? AND epoch = ? AND record_kind = ?",

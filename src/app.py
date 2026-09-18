@@ -20,9 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
+import re
+import time
 from collections.abc import AsyncIterator, Sequence
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
@@ -35,8 +39,8 @@ from agent_framework import (
 from agent_framework._agents import ResponseStream
 from agent_framework_foundry_hosting import ResponsesHostServer
 
-from triage.monitoring.controller import controller_heartbeat
-from triage.observability import configure_telemetry
+from triage.monitoring.controller import HEARTBEAT_BUDGET_SECONDS, controller_heartbeat
+from triage.observability import configure_telemetry, telemetry_status
 from triage.runner import TriageRunner
 from triage.settings import settings
 from triage.store.claims import build_claim_store
@@ -187,15 +191,32 @@ class TriageControllerAgent(BaseAgent):
         return AgentResponse(messages=[Message("assistant", [text])])
 
     async def _run_once(self, messages: Any) -> AgentResponse[Any]:
+        started_at = time.monotonic()
         text = _latest_text(messages)
         command = text.strip().lower()
         is_sweep = command in _SWEEP_COMMANDS
         is_silent = command in _SILENT_COMMANDS
         is_pipeline = command in _PIPELINE_COMMANDS
         if command in _HEARTBEAT_COMMANDS:
-            async with self._lock:
-                summary = await self._heartbeat()
+            remaining = max(0.0, HEARTBEAT_BUDGET_SECONDS - (time.monotonic() - started_at))
+            try:
+                # Time out this waiter only, never the lock holder or admitted work.
+                await asyncio.wait_for(self._lock.acquire(), timeout=remaining)
+            except TimeoutError:
+                logging.getLogger("triage.telemetry.heartbeat").warning(
+                    "heartbeat_deferred reason=lock_budget_exhausted elapsed_ms=%d "
+                    "automatic_calls=0 human_calls=0 budget_exhausted=True ingestion=unverified",
+                    max(0, int((time.monotonic() - started_at) * 1000)),
+                )
+                return AgentResponse(messages=[Message("assistant", [
+                    "Heartbeat deferred: admission budget exhausted while waiting for the controller lock. "
+                    "No new work was claimed; queued work remains pending.",
+                ])])
+            try:
+                summary = await self._heartbeat(started_at=started_at)
                 return AgentResponse(messages=[Message("assistant", [summary])])
+            finally:
+                self._lock.release()
         if command in _WEB_COMMANDS:
             from triage.command_center.worker import drain_commands
 
@@ -228,9 +249,9 @@ class TriageControllerAgent(BaseAgent):
 
     # --- the two entry paths ----------------------------------------------
 
-    async def _heartbeat(self) -> str:
+    async def _heartbeat(self, *, started_at: float | None = None) -> str:
         """Give automatic source work and human commands one slot per round."""
-        lines = await controller_heartbeat(self._runner)
+        lines = await controller_heartbeat(self._runner, started_at=started_at)
         return "\n".join(lines) if lines else "No due controller or human command work; monitoring coverage is reported separately."
 
     async def _triage_text(self, text: str) -> str:
@@ -392,21 +413,74 @@ def _summarise(artifacts: Any) -> str:
     return " | ".join(parts)
 
 
+def _startup_telemetry_metadata(configured: bool) -> dict[str, Any]:
+    exporters = {}
+    allowed = {"none", "console", "otlp", "otlp_proto_http", "otlp_proto_grpc", "azuremonitor"}
+    for name in ("OTEL_LOGS_EXPORTER", "OTEL_TRACES_EXPORTER", "OTEL_METRICS_EXPORTER"):
+        value = os.environ.get(name)
+        exporters[name] = (
+            "unset" if value is None else value if value == "" or (
+                len(value) <= 128 and all(part.strip().lower() in allowed for part in value.split(","))
+            ) else "unrecognized"
+        )
+    providers = {"traces": "unavailable", "metrics": "unavailable", "logs": "unavailable"}
+    try:
+        from opentelemetry import metrics, trace
+        from opentelemetry._logs import get_logger_provider
+
+        for signal, provider in (
+            ("traces", trace.get_tracer_provider()),
+            ("metrics", metrics.get_meter_provider()),
+            ("logs", get_logger_provider()),
+        ):
+            name = type(provider).__name__
+            providers[signal] = name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) else "unrecognized"
+    except Exception as exc:
+        logger.warning("Telemetry provider inspection unavailable error_type=%s", type(exc).__name__)
+    versions = {}
+    for package in (
+        "agent-framework-foundry-hosting", "agent-framework-core",
+        "azure-ai-agentserver-core", "azure-ai-agentserver-responses",
+        "microsoft-opentelemetry", "azure-monitor-opentelemetry",
+        "azure-monitor-opentelemetry-exporter", "opentelemetry-sdk",
+    ):
+        try:
+            value = version(package)
+            versions[package] = value if re.fullmatch(r"[0-9][0-9A-Za-z.+!_-]{0,63}", value) else "unrecognized"
+        except PackageNotFoundError:
+            versions[package] = "not_installed"
+    state = telemetry_status()["configuration"]
+    return {
+        "configuration": state if state in {"unconfigured", "disabled", "configured", "failed"} else "unrecognized",
+        "sdk_configured": configured, "ingestion": "unverified",
+        "exporter_settings": exporters, "provider_classes": providers, "package_versions": versions,
+    }
+
+
 def main() -> None:
-    # Telemetry has to be configured here, not only in the CLI. The hosted
-    # container is the deployment that most needs a trace -- nobody is watching
-    # a terminal -- and it was the one path that never called this, so
-    # APPLICATIONINSIGHTS_CONNECTION_STRING was set and produced nothing.
-    #
-    # Spans carry metadata only. Prompt and completion content is never attached.
-    configure_telemetry(settings.applicationinsights_connection_string)
+    # Core reads this flag outside its optional observability callback.
+    # Metadata-only capture is an invariant, even with contradictory environment settings.
+    os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = "false"
+    # Hosted startup needs its own configuration, not only the CLI's setup.
+    # Foundry reserves the standard variable for project-wide content tracing;
+    # this application-owned metadata channel has no fallback to that setting.
+    configured = configure_telemetry(
+        settings.triage_telemetry_connection_string, hosted=True,
+        managed_identity_client_id=settings.azure_client_id,
+    )
+    health = telemetry_status()
+    logging.getLogger("triage.telemetry.hosted").log(
+        logging.INFO if configured else logging.WARNING,
+        "hosted_telemetry configuration=%s sdk_configured=%s ingestion=unverified",
+        health["configuration"], configured,
+    )
 
     agent = TriageControllerAgent()
     logger.info(
-        "Starting hosted triage controller (provider=%s, tools=%s, mailbox=%s)",
+        "Starting hosted triage controller (provider=%s, tools=%s, mailbox_configured=%s)",
         settings.triage_provider_mode,
         settings.triage_tool_mode,
-        settings.graph_mailbox or "(none)",
+        bool(settings.graph_mailbox),
     )
     # history_source='agent' because this is a custom SupportsAgentRun
     # implementation, not a RawAgent. The hosting library's default changed to
@@ -417,7 +491,14 @@ def main() -> None:
     # container down at startup -- the agent answered nothing for hours, and
     # only a manual invocation found it. The version is pinned in
     # requirements.txt now for the same reason.
-    ResponsesHostServer(agent, history_source="agent").run()
+    # Keep one metadata-only pipeline; the host's default configures providers
+    # again and may enable sensitive Agent Framework instrumentation.
+    host = ResponsesHostServer(agent, history_source="agent", configure_observability=None)
+    logging.getLogger("triage.telemetry.hosted").log(
+        logging.INFO if configured else logging.WARNING,
+        "hosted_telemetry_startup %s", json.dumps(_startup_telemetry_metadata(configured), sort_keys=True),
+    )
+    host.run()
 
 
 if __name__ == "__main__":

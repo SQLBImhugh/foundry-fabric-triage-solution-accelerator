@@ -27,6 +27,26 @@ jobs:
       - name: Lint
         run: python -m ruff check .
 
+      - name: Compile deployment contracts without Azure credentials
+        shell: bash
+        run: |
+          az bicep install --version v0.44.1
+          output="$RUNNER_TEMP/triage-infra"
+          mkdir -p "$output"
+          for source in infra/*.bicep; do
+            az bicep build --file "$source" --outfile "$output/$(basename "$source" .bicep).arm.json"
+          done
+          {
+            echo "PUBLIC_INFRA_COMPILED_DIRECTORY=$output"
+            echo "AZURE_SQL_INFRA_COMPILED_TEMPLATE=$output/state-sql.arm.json"
+            echo "AZURE_SQL_BOOTSTRAP_COMPILED_TEMPLATE=$output/state-sql-bootstrap.arm.json"
+            echo "MONITORING_INFRA_COMPILED_TEMPLATE=$output/monitoring-worker.arm.json"
+            echo "MONITORING_ENVIRONMENT_COMPILED_TEMPLATE=$output/monitoring-environment.arm.json"
+            echo "MONITORING_PREREQUISITES_COMPILED_TEMPLATE=$output/monitoring-prerequisites.arm.json"
+            echo "MONITORING_PROBE_JOB_COMPILED_TEMPLATE=$output/probe-job.arm.json"
+            echo "MONITORING_TRANSPORT_JOB_COMPILED_TEMPLATE=$output/transport-probe-job.arm.json"
+          } >> "$GITHUB_ENV"
+
       # The suite must pass with no credentials and no tenant. If a change makes
       # a test reach the network, it fails here rather than in front of a
       # customer -- there is nothing in this job for it to reach.

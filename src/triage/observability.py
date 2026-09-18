@@ -14,11 +14,17 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
+import re
+import threading
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("triage.observability")
+_health_logger = logging.getLogger("triage.telemetry.health")
 
 _agent_name: ContextVar[str] = ContextVar("agent_name", default="")
 
@@ -45,40 +51,150 @@ def otel_available() -> bool:
     return _OTEL_AVAILABLE
 
 
-def configure_telemetry(connection_string: str = "") -> bool:
-    """Wire Azure Monitor if the SDK and a connection string are both present.
+class _TelemetryDiagnostics(logging.Handler):
+    """Count SDK diagnostics without forwarding response text or exception content."""
 
-    Returns True when telemetry is live. Never raises — a broken telemetry
-    config must not take down the agent.
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.state_lock = threading.Lock()
+        self.configuration = "unconfigured"
+        self.export_failures = 0
+        self.export_warnings = 0
+        self.last_error_type = ""
+        self.configuration_error_source: tuple[str, str, int] = ("", "", 0)
+        self.console_enabled = False
+        self.last_report: float | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        with self.state_lock:
+            if record.levelno >= logging.ERROR:
+                self.export_failures += 1
+            else:
+                self.export_warnings += 1
+            self.last_error_type = (
+                type(record.exc_info[1]).__name__[:64] if record.exc_info and record.exc_info[1]
+                else "ExporterDiagnostic"
+            )
+            now = time.monotonic()
+            if not self.console_enabled or self.last_report is not None and now - self.last_report < 60:
+                return
+            self.last_report = now
+            failures, warnings, error_type = self.export_failures, self.export_warnings, self.last_error_type
+        # This logger never propagates to the exporter, so a failure cannot
+        # generate an export/failure feedback loop.
+        _health_logger.warning(
+            "telemetry_export_diagnostic failures=%d warnings=%d error_type=%s ingestion=unverified",
+            failures, warnings, error_type,
+        )
+
+    def snapshot(self) -> dict[str, str | int]:
+        with self.state_lock:
+            return {
+                "configuration": self.configuration, "export_failures": self.export_failures,
+                "export_warnings": self.export_warnings, "last_error_type": self.last_error_type,
+                "ingestion": "unverified",
+                "configuration_error_file": self.configuration_error_source[0],
+                "configuration_error_function": self.configuration_error_source[1],
+                "configuration_error_line": self.configuration_error_source[2],
+            }
+
+
+_diagnostics = _TelemetryDiagnostics()
+
+
+def telemetry_status() -> dict[str, str | int]:
+    """Configuration and observed export diagnostics, never an ingestion receipt."""
+    return _diagnostics.snapshot()
+
+
+def _configure_diagnostics(hosted: bool) -> None:
+    _diagnostics.console_enabled = hosted
+    _health_logger.propagate = False
+    _health_logger.setLevel(logging.WARNING)
+    if not _health_logger.handlers:
+        _health_logger.addHandler(logging.StreamHandler())
+    for name in ("azure.monitor.opentelemetry", "opentelemetry.sdk"):
+        sdk_logger = logging.getLogger(name)
+        sdk_logger.setLevel(logging.WARNING)
+        sdk_logger.propagate = False
+        if _diagnostics not in sdk_logger.handlers:
+            sdk_logger.addHandler(_diagnostics)
+
+
+def _configuration_error_source(exc: BaseException) -> tuple[str, str, int]:
+    frame = exc.__traceback__
+    if frame is None:
+        return "unavailable", "unavailable", 0
+    while frame.tb_next is not None:
+        frame = frame.tb_next
+    # Read code metadata only: no exception arguments, source lines or locals.
+    file = Path(frame.tb_frame.f_code.co_filename).name
+    function = frame.tb_frame.f_code.co_name
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", file):
+        file = "unavailable"
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}|<(?:module|lambda|listcomp|dictcomp|setcomp|genexpr)>", function):
+        function = "unavailable"
+    return file, function, frame.tb_lineno
+
+
+def configure_telemetry(
+    connection_string: str = "", *, hosted: bool = False, managed_identity_client_id: str = "",
+) -> bool:
+    """Return whether SDK configuration succeeded, not whether data was ingested.
+
+    Hosted export uses managed identity only. Diagnostics contain counts,
+    exception types and one sanitized source location, never connection strings,
+    SDK responses or stack traces. Failure does not make the controller unavailable.
     """
+    with _diagnostics.state_lock:
+        _diagnostics.configuration_error_source = ("", "", 0)
     if not connection_string:
+        _diagnostics.configuration = "disabled"
         return False
-
-    # Telemetry export failures must not appear on screen. The Azure Monitor
-    # exporter logs a full traceback when it cannot reach the service --
-    # including the live-metrics ping, which fires on a timer regardless of
-    # whether anything is being traced. On a laptop with flaky wifi, or a demo
-    # room with a captive portal, that puts a stack trace in the middle of a
-    # scenario run in front of an audience.
-    #
-    # Silenced rather than lowered: there is nothing an operator can do about a
-    # dropped span mid-demo, and the run itself is unaffected.
-    for noisy in (
-        "azure.monitor.opentelemetry.exporter",
-        "azure.monitor.opentelemetry.exporter._quickpulse",
-        "azure.core.pipeline.policies.http_logging_policy",
-        "opentelemetry.sdk.trace.export",
-    ):
-        logging.getLogger(noisy).setLevel(logging.CRITICAL)
-
-    try:  # pragma: no cover - requires the azure extra
+    _configure_diagnostics(hosted)
+    try:
+        if hosted and os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING") == "":
+            # Foundry injects an empty value when project tracing is off. The
+            # exporter parses it even when the app supplies an explicit locator.
+            os.environ.pop("APPLICATIONINSIGHTS_CONNECTION_STRING")
+            logger.info("Empty platform telemetry locator normalized")
         from azure.monitor.opentelemetry import configure_azure_monitor
 
-        configure_azure_monitor(connection_string=connection_string)
-        logger.info("Azure Monitor telemetry configured")
+        options: dict[str, Any] = {
+            "connection_string": connection_string,
+            # Only this metadata-only logger family is exported, not ordinary
+            # controller logs that may contain incident text or exceptions.
+            "logger_name": "triage.telemetry",
+            "enable_live_metrics": False,
+            "enable_performance_counters": False,
+            "disable_offline_storage": True,
+            "logging_enabled": False,
+            "instrumentation_options": {
+                name: {"enabled": False} for name in (
+                    "azure_sdk", "django", "fastapi", "flask", "psycopg2", "requests", "urllib", "urllib3",
+                )
+            },
+        }
+        if hosted:
+            from azure.identity import ManagedIdentityCredential
+
+            options["credential"] = ManagedIdentityCredential(
+                client_id=managed_identity_client_id or None,
+            )
+        configure_azure_monitor(**options)
+        _diagnostics.configuration = "configured"
+        logger.info("Azure Monitor SDK configured ingestion=unverified")
         return True
-    except Exception as exc:  # pragma: no cover
-        logger.warning("Telemetry configuration failed, continuing without it: %s", exc)
+    except Exception as exc:
+        source = _configuration_error_source(exc)
+        with _diagnostics.state_lock:
+            _diagnostics.configuration = "failed"
+            _diagnostics.configuration_error_source = source
+        logger.warning(
+            "Telemetry configuration failed error_type=%s source_file=%s source_function=%s "
+            "source_line=%d ingestion=unverified; controller continues",
+            type(exc).__name__, *source,
+        )
         return False
 
 
@@ -147,6 +263,17 @@ class _SpanHandle:
 
 
 @contextmanager
+def heartbeat_span():
+    if not _OTEL_AVAILABLE or _tracer is None:
+        yield _SpanHandle()
+        return
+    with _tracer.start_as_current_span(
+        "triage.heartbeat", record_exception=False, set_status_on_exception=False,
+    ) as span:
+        yield _SpanHandle(span)
+
+
+@contextmanager
 def gen_ai_span(
     *,
     provider: str,
@@ -162,7 +289,9 @@ def gen_ai_span(
         yield _SpanHandle(None)
         return
 
-    with _tracer.start_as_current_span(f"gen_ai.{operation}") as span:  # pragma: no cover
+    with _tracer.start_as_current_span(
+        f"gen_ai.{operation}", record_exception=False, set_status_on_exception=False,
+    ) as span:  # pragma: no cover
         handle = _SpanHandle(span)
         handle.set("gen_ai.system", _PROVIDER_GEN_AI_SYSTEM.get(provider, provider))
         handle.set("gen_ai.request.model", model)
@@ -184,7 +313,9 @@ def tool_span(tool_name: str, **attributes: Any):
         yield _SpanHandle(None)
         return
 
-    with _tracer.start_as_current_span(f"tool.{tool_name}") as span:  # pragma: no cover
+    with _tracer.start_as_current_span(
+        f"tool.{tool_name}", record_exception=False, set_status_on_exception=False,
+    ) as span:  # pragma: no cover
         handle = _SpanHandle(span)
         handle.set("tool.name", tool_name)
         handle.set("agent.name", current_agent() or "unknown")

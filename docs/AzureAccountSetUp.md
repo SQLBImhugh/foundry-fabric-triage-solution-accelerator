@@ -17,9 +17,23 @@ Scoped evaluation SQL/registry public access has been enabled and read back;
 SQL remains Entra-only with TLS/auditing/TDE, and registry admin/anonymous access
 is disabled. The public Foundry path is retained. Earlier private-network
 proofs and its managed private-endpoint error are historical, not current gates.
-The original SQL proof receipt is under recovery; completion and application
-acceptance are not established. The live app/controller remain the prior release,
-with no history migration/wipe, normal-worker rollout or hybrid cutover. See
+SQL recovery is complete through append-only adjudication; the original failed
+receipt is unchanged. Proof/application schemas are committed. The initialization
+capture of `maintenance=true`, revision `0` is historical: maintenance is now
+`false`, Command Center and the hosted controller use Azure SQL
+with the correct acting identity. Three runtime EXTERNAL SQL users have kernel
+roles and reviewed application grants.
+The collector-only worker is deployed and has durably accepted 332 workspace
+metadata records; authenticated selectors are enabled. Broader item scanning
+remains partial, including source-access 401s and budget/throttling gaps.
+Metadata is not source access or remediation authority.
+The existing one-minute scheduler was reused for `heartbeat`, with three real
+completed recurrences; alerts are portal-only. Event-mode and end-to-end
+acceptance remain open. Native Application Insights queries now contain paired
+started/completed heartbeat metadata from the app-owned Entra channel, with
+zero exporter failure/warning counters in the captured records. Project-wide
+content tracing remains disconnected; bounded ingestion is not full hybrid
+or overnight proof. See
 [release gates](DeploymentGuide.md#release-gates).
 
 ## Subscription and tenant context
@@ -228,6 +242,15 @@ owned canary can create/inspect an Eventstream without SQL or endpoint settings.
 Keep creation/inspection, isolated MI reception, SQL durable acceptance and
 normal-worker readiness as distinct gates.
 
+For initial discovery/polling, use `-CollectorOnly`, without an Eventstream
+bootstrap file. The Bicep default is `collectorOnly=true`; the helper requires
+`-CollectorOnly` or `-ConnectorBootstrapFile`, exclusively. Collector-only mode
+rejects partial event settings, creates no receiver/provisioner and cannot claim
+event transport in its heartbeat. See the
+[customer quickstart](DeploymentGuide.md#collector-only-quickstart).
+Use `caller_visible` inventory by default; `tenant_admin_preview` is an explicit
+authorized API choice, not a permission grant.
+
 The Custom Endpoint's key-returning connection API must not be called.
 Obtain only namespace, entity, consumer group and owned IDs from the
 **Microsoft Entra ID** tab and reviewed topology, then bind them to shared
@@ -250,9 +273,11 @@ inventory. Registration/capture evidence and rate budgets are preserved across
 the operational reset. No old history or target configuration is imported.
 
 Normal worker startup needs ready shared control and compatible event
-persistence. The reset leaves maintenance enabled. Release it only through the
-reviewed deployment transition, then enable the disabled one-minute controller
-heartbeat after current-release proof. See
+persistence. A future authorized reset leaves maintenance enabled until its
+reviewed release transition; this does not describe the current, released
+maintenance state or authorize reversing the completed web/controller cutover.
+The disabled-by-default scheduler still needs separate verification before
+unattended use. See
 [DeploymentGuide.md](DeploymentGuide.md#3a-hybrid-registry-and-controlled-prototype-reset).
 
 ## Optional Microsoft 365 integrations
@@ -271,6 +296,17 @@ and web approvals need neither Teams nor the legacy callback. See
 [DeploymentGuide.md](DeploymentGuide.md#2-optional-mailbox-ingestion).
 
 ## Network, quota and cost
+
+Hosted telemetry has its own boundary. Use the app-owned
+`TRIAGE_TELEMETRY_CONNECTION_STRING` locator and managed identity; the standard
+platform variable is injected from Foundry project monitoring, not an agent
+override. Keep the project tracing connection absent because linking it enables
+project-wide prompt/content traces. The separate
+[application telemetry template](../infra/application-telemetry.bicep) provisions
+public Entra-only Insights against an existing Log Analytics workspace, with
+optional resource-scoped publisher assignments and resource-ID-only output.
+No project connection or ordinary-customer MCAPS exemption is added.
+See [setup, privacy sources and unproved ingestion](DeploymentGuide.md#8-observability).
 
 All shipped Bicep uses public networking without PE/VNet/NAT/private-DNS
 prerequisites. `infra\command-center.bicep` uses public HTTPS, Entra API roles,

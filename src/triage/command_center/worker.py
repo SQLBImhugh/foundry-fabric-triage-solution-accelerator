@@ -7,6 +7,7 @@ import inspect
 import logging
 import socket
 import time
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from triage.command_center.models import ApiFailure
@@ -15,6 +16,9 @@ from triage.models import BIRequest
 from triage.monitoring.models import MonitoringTarget
 
 logger = logging.getLogger("triage.command_center.worker")
+
+if TYPE_CHECKING:
+    from triage.monitoring.controller import HeartbeatBudget
 
 
 class ExecutionUnconfirmed(RuntimeError):
@@ -66,32 +70,36 @@ async def _execute(runner, command, target: MonitoringTarget) -> tuple[str, str]
     return summary, artifacts.run_id
 
 
-async def drain_commands(runner, *, limit: int = 1) -> list[str]:
+async def drain_commands(runner, *, limit: int = 1, budget: HeartbeatBudget | None = None) -> list[str]:
+    if budget is not None and not budget.can_claim():
+        return []
     history = await asyncio.to_thread(runner.build_command_center_store)
     await asyncio.to_thread(history.expire_commands)
     claims = await asyncio.to_thread(runner._pipeline_claim_store)
     worker_id = f"{socket.gethostname()}:{uuid4().hex[:12]}"
     lines: list[str] = []
     for candidate in await asyncio.to_thread(history.eligible_commands, limit=100):
-        if len(lines) >= max(1, min(limit, 10)):
+        if len(lines) >= max(1, min(limit, 10)) or budget is not None and not budget.can_claim():
             break
         if candidate.state != "queued":
             continue
         target_key = f"command-target:{candidate.target_id.casefold()}"
-        budget = runner.settings.triage_timeout_seconds + runner.settings.approval_timeout_seconds + 30
+        execution_budget = runner.settings.triage_timeout_seconds + runner.settings.approval_timeout_seconds + 30
         began = time.monotonic()
-        if not await asyncio.to_thread(claims.claim, target_key, lease_seconds=budget + 60):
+        if not await asyncio.to_thread(claims.claim, target_key, lease_seconds=execution_budget + 60):
             continue
         try:
             if await asyncio.to_thread(history.target_blocked, candidate.target_id):
                 logger.warning("Command target requires reconciliation: %s", candidate.target_id)
                 continue
-            remaining = budget - (time.monotonic() - began)
+            if budget is not None and not budget.can_claim():
+                break
+            remaining = execution_budget - (time.monotonic() - began)
             if remaining <= 0:
                 continue
             command = await asyncio.to_thread(
                 history.claim_command,
-                candidate.id, worker_id, lease_seconds=budget + 60,
+                candidate.id, worker_id, lease_seconds=execution_budget + 60,
             )
             if command is None:
                 continue
@@ -101,7 +109,7 @@ async def drain_commands(runner, *, limit: int = 1) -> list[str]:
                 target = await asyncio.to_thread(_target, runner, command)
                 if command.kind == "pipeline_sweep":
                     _require_pipeline_selection(runner)
-                remaining = budget - (time.monotonic() - began)
+                remaining = execution_budget - (time.monotonic() - began)
                 if remaining <= 0:
                     raise TimeoutError("Command acquisition exhausted the execution budget before dispatch")
                 entered_execution = True

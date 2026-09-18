@@ -122,11 +122,27 @@ class Engine:
         self.state = {
             "receipt_table": False, "receipts": {}, "effects": [],
             "recovery_table": False, "recoveries": {},
+            "catalogue": {name: [] for name in bootstrap.EMPTY_BASELINE_SQL},
         }
+        self.state["catalogue"].update({
+            "database": [(7, False, False, 1, "01")],
+            "principals": [
+                (0, "R", "NONE", "00", False, 1, "public", None),
+                (1, "S", "INSTANCE", "01", False, 0, "dbo", "dbo"),
+                (2, "S", "NONE", "02", False, 1, "guest", "guest"),
+                (3, "S", "NONE", "03", False, 1, "INFORMATION_SCHEMA", None),
+                (4, "S", "NONE", "04", False, 1, "sys", None),
+                (16384, "R", "NONE", "05", True, 1, "db_owner", None),
+            ],
+            "permissions": [(0, 1, 0, 0, 0, "CONNECT", "G")],
+            "memberships": [(1, 16384)],
+            "schemas": [(1, "dbo", 1), (2, "guest", 2), (3, "INFORMATION_SCHEMA", 3), (4, "sys", 4)],
+        })
         self.commands = []
         self.commits = 0
         self.rollbacks = 0
         self.fail_commit = None
+        self.fail_commit_before = False
         self.fail_rollback = False
         self.fail_batch = False
         self.bad_metadata = False
@@ -136,6 +152,8 @@ class Engine:
         self.recovery_insert_count = 1
         self.other_sessions = []
         self.other_principals = []
+        self.recovery_wrong_type = False
+        self.unreadable_catalogue = None
         self.target_rows = [(
             "state-test", artifact.bundle.target.database, 5, "dbo", 1, "dbo", 42,
         )]
@@ -166,6 +184,8 @@ class Connection:
 
     def commit(self):
         self.engine.commits += 1
+        if self.engine.fail_commit == self.engine.commits and self.engine.fail_commit_before:
+            raise RuntimeError("Connection lost before native commit")
         if self.pending is not None:
             self.engine.state = self.pending
             self.pending = None
@@ -201,6 +221,11 @@ class Cursor:
         elif sql == bootstrap.CREATE_RECOVERIES:
             assert not state["recovery_table"]
             state["recovery_table"] = True
+        elif sql == bootstrap.RECOVERY_OBJECT_SQL:
+            self.rows = (
+                [(None, 124)] if engine.recovery_wrong_type else
+                [(123, 123)] if state["recovery_table"] else [(None, None)]
+            )
         elif sql.startswith("SELECT OBJECT_ID"):
             table = "receipt_table" if params[0] == bootstrap.RECEIPT_TABLE else "recovery_table"
             self.rows = [(123 if state[table] else None,)]
@@ -253,6 +278,11 @@ class Cursor:
             self.rows = [("dbo", "sample", "U")] if state["effects"] else []
         elif sql == bootstrap.EMPTY_PRINCIPALS_SQL:
             self.rows = engine.other_principals
+        elif any(sql == definition[1] for definition in bootstrap.EMPTY_BASELINE_SQL.values()):
+            name = next(name for name, definition in bootstrap.EMPTY_BASELINE_SQL.items() if sql == definition[1])
+            if engine.unreadable_catalogue == name:
+                raise RuntimeError("Native catalogue query unavailable")
+            self.rows = state["catalogue"][name]
         elif sql == DDL:
             if engine.fail_batch:
                 raise ValueError("driver text containing a token must not be printed")
@@ -668,6 +698,7 @@ def interrupted(artifact, monkeypatch, tmp_path):
         "original_fingerprint": artifact.fingerprint, "original_source_sha256": artifact.source_sha256,
         "original_started_at": STARTED_AT, "original_receipt_object_id": 123,
         "original_job_id": job, "rollback_evidence_sha256": "a" * 64,
+        "empty_baseline_sha256": bootstrap.recovery_baseline_fingerprint(engine.database(monkeypatch), replacement.bundle),
         "replacement_operation_id": str(REPLACEMENT), "replacement_fingerprint": replacement.fingerprint,
         "replacement_source_sha256": replacement.source_sha256,
         "observed_at": (now - timedelta(seconds=10)).isoformat(),
@@ -814,6 +845,514 @@ def test_quiescence_manifest_is_typed_and_bounded(change, interrupted):
         bootstrap.RecoveryRequest.model_validate_json(json.dumps(request))
 
 
+@pytest.fixture
+def cli_interrupted(interrupted, tmp_path, monkeypatch):
+    engine, _, recovery = interrupted
+    document = json.loads((tmp_path / "bundle.json").read_bytes())
+    document["operation_id"] = str(REPLACEMENT)
+    path, digest = write_bundle(tmp_path, document)
+    artifact = bootstrap.load_artifact(tmp_path, path, digest, REPLACEMENT)
+    request = recovery.request.model_dump(mode="json")
+    request.update(
+        replacement_operation_id=str(REPLACEMENT), replacement_fingerprint=artifact.fingerprint,
+        replacement_source_sha256=artifact.source_sha256,
+    )
+    raw = json.dumps(request).encode()
+    recovery_path = tmp_path / "recovery.json"
+    recovery_path.write_bytes(raw)
+    recovery = bootstrap.load_recovery(recovery_path, hashlib.sha256(raw).hexdigest(), artifact)
+    monkeypatch.setattr(bootstrap, "ROOT", tmp_path)
+    for key, value in deployed_environment(artifact).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(bootstrap, "open_database", lambda *args: engine.database(monkeypatch))
+    args = [
+        "--bundle", str(path), "--bundle-sha256", artifact.fingerprint,
+        "--operation-id", str(REPLACEMENT), "--recovery", str(recovery_path),
+        "--recovery-sha256", recovery.fingerprint,
+    ]
+    return engine, artifact, recovery, args
+
+
+def cli_recover(artifact, recovery, arguments):
+    return bootstrap.main([
+        *arguments, "--mode", "recover", "--approve-fingerprint", artifact.fingerprint,
+        "--approve-recovery-sha256", recovery.fingerprint,
+    ])
+
+
+@pytest.mark.parametrize("catalogue,row", [
+    ("permissions", (0, 1, 0, 0, 0, "CREATE TABLE", "G")),
+    ("permissions", (0, 1, 3, 1, 0, "CONTROL", "G")),
+    ("permissions", (0, 1, 1, 123, 2, "UPDATE", "G")),
+    ("permissions", (0, 1, 0, 0, 0, "CONNECT", "W")),
+    ("permissions", (0, 1, 0, 0, 0, "CONNECT", "D")),
+    ("memberships", (2, 16384)),
+    ("schemas", (20, "left_by_failed_ddl", 1)),
+    ("triggers", (900, 0, 0, "database_ddl_trigger", False, False, False, None, "a" * 64)),
+    ("credentials", (1, "leftover", "Managed Identity", "2026-09-17T10:00:00", "2026-09-17T10:00:00")),
+    ("external_data_sources", (1, "leftover", "RDBMS", "server.example.invalid", 1)),
+    ("external_file_formats", (1, "leftover", "DELIMITEDTEXT")),
+    ("assemblies", (1, "leftover", 1, 3, True, "2026-09-17T10:00:00", "assembly")),
+    ("types", (500, 1, "leftover", 56, True, False, False)),
+    ("xml_schema_collections", (5, 1, "leftover")),
+    ("certificates", (1, "leftover", 1)),
+    ("symmetric_keys", (1, "leftover", 1)),
+    ("asymmetric_keys", (1, "leftover", 1)),
+    ("column_master_keys", (1, "leftover")),
+    ("column_encryption_keys", (1, "leftover")),
+    ("module_signatures", (1, 123, "aa", "SPVC")),
+    ("queues", (200, True, True, "dbo.activation", 1, False)),
+    ("plan_guides", (1, "leftover", False, 1)),
+    ("objects", (123, 1, "triage_sql_bootstrap_receipts", "U", 0, 2, False, None, None, None)),
+    ("columns", (123, 1, "operation_id", 56, 4, 10, 0, False, False, False, None)),
+    ("indexes", (123, 1, "changed_key", 1, False, True, False, None)),
+    ("index_columns", (123, 1, 1, 2, 1, False, False)),
+    ("constraints", (125, 123, "unreviewed_receipt_check", "(1=1)", False)),
+])
+def test_cli_recovery_rejects_unrolled_security_or_catalogue_effects(
+    catalogue, row, cli_interrupted, capsys,
+):
+    engine, artifact, recovery, arguments = cli_interrupted
+    engine.state["catalogue"][catalogue].append(row)
+    before = copy.deepcopy(engine.state)
+    engine.commands.clear()
+    assert cli_recover(artifact, recovery, arguments) == 2
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output[-1]["status"] == "failed"
+    assert output[-1]["code"].startswith(("recovery_empty_baseline_changed", "recovery_empty_security_not_standard"))
+    assert engine.state == before
+    assert not engine.state["recovery_table"]
+    assert not any(sql in (bootstrap.CREATE_RECOVERIES,) or sql.startswith(
+        f"INSERT INTO {bootstrap.RECOVERY_TABLE}"
+    ) for sql, _, _ in engine.commands)
+    queries = {definition[1] for definition in bootstrap.EMPTY_BASELINE_SQL.values()}
+    assert all(not autocommit for sql, _, autocommit in engine.commands if sql in queries)
+    assert any(sql == bootstrap.EMPTY_BASELINE_SQL[catalogue][1] for sql, _, _ in engine.commands)
+
+
+@pytest.mark.parametrize("change", ["removed_public_permission", "schema_owner", "database_flags"])
+def test_cli_recovery_compares_original_approved_empty_baseline(change, cli_interrupted, capsys):
+    engine, artifact, recovery, arguments = cli_interrupted
+    if change == "removed_public_permission":
+        engine.state["catalogue"]["permissions"].clear()
+    elif change == "schema_owner":
+        engine.state["catalogue"]["schemas"][1] = (2, "guest", 1)
+    else:
+        engine.state["catalogue"]["database"][0] = (7, True, False, 1, "01")
+    before = copy.deepcopy(engine.state)
+    assert cli_recover(artifact, recovery, arguments) == 2
+    assert engine.state == before
+    assert not engine.state["recovery_table"]
+    assert "recovery_" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("catalogue", ["permissions", "memberships", "schemas", "triggers", "credentials", "assemblies"])
+def test_unreadable_native_security_catalogue_never_becomes_empty(catalogue, cli_interrupted, capsys):
+    engine, artifact, recovery, arguments = cli_interrupted
+    engine.unreadable_catalogue = catalogue
+    before = copy.deepcopy(engine.state)
+    assert cli_recover(artifact, recovery, arguments) == 2
+    assert engine.state == before
+    assert not engine.state["recovery_table"]
+    assert "bootstrap_failed" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("rows", [[(0,)], [("malformed",) * 7], [(0, 1, 0, 0, 0, object(), "G")]])
+def test_security_catalogue_shape_or_unknown_values_fail_closed(rows, interrupted, monkeypatch):
+    engine, artifact, recovery = interrupted
+    engine.state["catalogue"]["permissions"] = rows
+    with pytest.raises(bootstrap.BootstrapError, match="recovery_"):
+        recover_interrupted(engine, artifact, recovery, monkeypatch)
+    assert not engine.state["recovery_table"]
+
+
+def test_security_catalogue_budget_fails_closed(interrupted, monkeypatch):
+    engine, artifact, recovery = interrupted
+    engine.state["catalogue"]["permissions"] *= bootstrap.MAX_BASELINE_ROWS + 1
+    with pytest.raises(bootstrap.BootstrapError, match="baseline_unreadable"):
+        recover_interrupted(engine, artifact, recovery, monkeypatch)
+    assert not engine.state["recovery_table"]
+
+
+@pytest.mark.parametrize("catalogue,row", [
+    ("permissions", (0, 1, 0, 0, 0, "CREATE TABLE", "G")),
+    ("schemas", (20, "leftover", 1)),
+    ("memberships", (2, 16384)),
+    ("triggers", (900, 0, 0, "leftover", False, False, False, None, "a" * 64)),
+    ("credentials", (1, "leftover", "Managed Identity", "2026-09-17T10:00:00", "2026-09-17T10:00:00")),
+])
+def test_current_unsafe_security_cannot_be_blessed_as_an_empty_baseline(
+    catalogue, row, interrupted, monkeypatch,
+):
+    engine, artifact, _ = interrupted
+    engine.state["catalogue"][catalogue].append(row)
+    engine.commands.clear()
+    with pytest.raises(bootstrap.BootstrapError, match="empty_security_not_standard"):
+        bootstrap.recovery_baseline_fingerprint(engine.database(monkeypatch), artifact.bundle)
+    assert all(sql.lstrip().startswith("SELECT") and auto for sql, _, auto in engine.commands)
+
+
+def test_fresh_recovery_without_approved_baseline_never_writes(interrupted, monkeypatch):
+    engine, artifact, recovery = interrupted
+    recovery = replace(recovery, request=recovery.request.model_copy(update={"empty_baseline_sha256": None}))
+    before = copy.deepcopy(engine.state)
+    with pytest.raises(bootstrap.BootstrapError, match="approved_empty_baseline_required"):
+        recover_interrupted(engine, artifact, recovery, monkeypatch)
+    assert engine.state == before
+
+
+def test_empty_baseline_is_checked_under_original_lock_before_recovery_dcl(interrupted, monkeypatch):
+    engine, artifact, recovery = interrupted
+    engine.commands.clear()
+    recover_interrupted(engine, artifact, recovery, monkeypatch)
+    commands = [sql for sql, _, _ in engine.commands]
+    lock = commands.index(bootstrap.LOCK_SQL)
+    create = commands.index(bootstrap.CREATE_RECOVERIES)
+    for _, query in bootstrap.EMPTY_BASELINE_SQL.values():
+        assert lock < commands.index(query) < create
+    assert all(not auto for sql, _, auto in engine.commands if sql in {
+        query for _, query in bootstrap.EMPTY_BASELINE_SQL.values()
+    })
+
+
+@pytest.mark.parametrize("before_commit", [True, False])
+def test_cli_original_recovery_lookup_after_lost_ack_is_read_only(
+    before_commit, cli_interrupted, monkeypatch, capsys,
+):
+    engine, artifact, recovery, arguments = cli_interrupted
+    engine.fail_commit = engine.commits + 1
+    engine.fail_commit_before = before_commit
+    assert cli_recover(artifact, recovery, arguments) == 3
+    capsys.readouterr()
+    before = copy.deepcopy(engine.state)
+    commits, rollbacks = engine.commits, engine.rollbacks
+    engine.commands.clear()
+    monkeypatch.setattr(bootstrap, "datetime", SimpleNamespace(
+        now=lambda timezone: recovery.request.expires_at + timedelta(days=1),
+    ))
+    expected = "MISSING" if before_commit else "MATCHING"
+    assert bootstrap.main([*arguments, "--mode", "reconcile-recovery"]) == (2 if before_commit else 0)
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output[-1]["status"] == expected
+    assert output[-1]["read_only"] is True
+    assert output[-1]["recovery_sha256"] == recovery.fingerprint
+    assert output[-1]["original_operation_id"] == str(OPERATION)
+    assert engine.state == before
+    assert (engine.commits, engine.rollbacks) == (commits, rollbacks)
+    assert all(sql.lstrip().startswith("SELECT") and auto for sql, _, auto in engine.commands)
+
+
+@pytest.mark.parametrize("existing_table", [False, True])
+def test_recovery_lookup_missing_record_is_not_a_create_request(existing_table, interrupted, monkeypatch):
+    engine, artifact, recovery = interrupted
+    engine.state["recovery_table"] = existing_table
+    engine.commands.clear()
+    before = copy.deepcopy(engine.state)
+    result = bootstrap.run(engine.database(monkeypatch), artifact, "reconcile-recovery", recovery=recovery)
+    assert result["status"] == "MISSING"
+    assert engine.state == before
+    assert all(sql.lstrip().startswith("SELECT") and auto for sql, _, auto in engine.commands)
+
+
+@pytest.mark.parametrize("change", ["fingerprint", "source", "replacement", "object_type", "original"])
+def test_cli_recovery_lookup_reports_conflict_without_mutation(change, cli_interrupted, capsys):
+    engine, artifact, recovery, arguments = cli_interrupted
+    assert cli_recover(artifact, recovery, arguments) == 0
+    capsys.readouterr()
+    row = list(engine.state["recoveries"][str(OPERATION)])
+    if change in {"fingerprint", "source", "replacement"}:
+        index = {"fingerprint": 5, "source": 1, "replacement": 2}[change]
+        row[index] = "e" * 64 if change != "replacement" else str(UUID(int=777))
+        engine.state["recoveries"][str(OPERATION)] = tuple(row)
+    elif change == "object_type":
+        engine.recovery_wrong_type = True
+    else:
+        engine.state["receipts"][str(OPERATION)] = (recovery.request.original_fingerprint, "e" * 64, "started")
+    before = copy.deepcopy(engine.state)
+    engine.commands.clear()
+    commits, rollbacks = engine.commits, engine.rollbacks
+    assert bootstrap.main([*arguments, "--mode", "reconcile-recovery"]) == 2
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output[-1]["status"] == "CONFLICT" and output[-1]["read_only"] is True
+    assert output[-1]["code"].startswith("recovery_")
+    assert engine.state == before
+    assert (engine.commits, engine.rollbacks) == (commits, rollbacks)
+    assert all(sql.lstrip().startswith("SELECT") and auto for sql, _, auto in engine.commands)
+
+
+def test_expired_original_without_baseline_can_only_reconcile(interrupted, monkeypatch):
+    engine, artifact, recovery = interrupted
+    legacy = replace(recovery, request=recovery.request.model_copy(update={
+        "empty_baseline_sha256": None,
+        "observed_at": datetime.now(UTC) - timedelta(days=1, minutes=10),
+        "expires_at": datetime.now(UTC) - timedelta(days=1),
+    }))
+    engine.state["recovery_table"] = True
+    engine.state["recoveries"][str(OPERATION)] = bootstrap._recovery_values(legacy)
+    before = copy.deepcopy(engine.state)
+    engine.commands.clear()
+    result = bootstrap.run(engine.database(monkeypatch), artifact, "reconcile-recovery", recovery=legacy)
+    assert result["status"] == "MATCHING"
+    assert engine.state == before
+    assert all(sql.lstrip().startswith("SELECT") and auto for sql, _, auto in engine.commands)
+
+
+def test_cli_preserves_hash_binding_for_expired_pre_baseline_recovery(
+    cli_interrupted, tmp_path, capsys,
+):
+    engine, artifact, _, arguments = cli_interrupted
+    path = tmp_path / "recovery.json"
+    request = json.loads(path.read_bytes())
+    request.pop("empty_baseline_sha256")
+    request["observed_at"] = (datetime.now(UTC) - timedelta(days=1, minutes=10)).isoformat()
+    request["expires_at"] = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    raw = json.dumps(request).encode()
+    path.write_bytes(raw)
+    fingerprint = hashlib.sha256(raw).hexdigest()
+    original = bootstrap.load_recovery(path, fingerprint, artifact)
+    engine.state["recovery_table"] = True
+    engine.state["recoveries"][str(OPERATION)] = bootstrap._recovery_values(original)
+    arguments[arguments.index("--recovery-sha256") + 1] = fingerprint
+    before = copy.deepcopy(engine.state)
+    engine.commands.clear()
+    assert bootstrap.main([*arguments, "--mode", "reconcile-recovery"]) == 0
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output[-1]["status"] == "MATCHING"
+    assert output[-1]["recovery_sha256"] == fingerprint
+    assert engine.state == before
+    assert all(sql.lstrip().startswith("SELECT") and auto for sql, _, auto in engine.commands)
+    path.write_bytes(raw + b" ")
+    engine.commands.clear()
+    assert bootstrap.main([*arguments, "--mode", "reconcile-recovery"]) == 2
+    assert "recovery_hash_mismatch" in capsys.readouterr().out
+    assert not engine.commands
+    assert engine.state == before
+
+
+@pytest.mark.parametrize("field", ["approval", "recovery_approval", "missing_request"])
+def test_read_only_recovery_mode_requires_original_request_and_no_approvals(field, interrupted, monkeypatch):
+    engine, artifact, recovery = interrupted
+    engine.commands.clear()
+    with pytest.raises(bootstrap.BootstrapError, match="lookup_requires_original"):
+        bootstrap.run(
+            engine.database(monkeypatch), artifact, "reconcile-recovery",
+            approval=artifact.fingerprint if field == "approval" else "",
+            recovery=None if field == "missing_request" else recovery,
+            recovery_approval=recovery.fingerprint if field == "recovery_approval" else "",
+        )
+    assert not engine.commands
+
+
+@pytest.fixture
+def historical_recovery(interrupted, tmp_path, monkeypatch):
+    engine, _, original = interrupted
+    history = tmp_path / "historical"
+    document = json.loads((tmp_path / "bundle.json").read_bytes())
+    document["operation_id"] = str(REPLACEMENT)
+    old_runner = (
+        b"from __future__ import annotations\n"
+        b"import argparse\n"
+        b"parser = argparse.ArgumentParser()\n"
+        b"parser.add_argument('--mode', choices=('preflight', 'apply', 'recover', 'reconcile'))\n"
+        b"parser.parse_args()\n"
+        b"raise AssertionError('Historical runner must never execute')\n"
+    )
+    for name in document["source_files"]:
+        path = history.joinpath(*name.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = old_runner if name == "scripts/bootstrap_azure_sql.py" else (
+            b"raise AssertionError('Historical Python must never be imported')\n"
+        )
+        path.write_bytes(raw)
+        document["source_files"][name] = hashlib.sha256(raw).hexdigest()
+    sql = b"THROW 51079, 'Historical SQL must never execute', 1;"
+    (history / "schema.sql").write_bytes(sql)
+    document["batches"][0]["sha256"] = hashlib.sha256(sql).hexdigest()
+    bundle_path, fingerprint = write_bundle(history, document)
+    artifact = bootstrap.load_artifact(history, bundle_path, fingerprint, REPLACEMENT)
+    request = original.request.model_dump(mode="json")
+    request.pop("empty_baseline_sha256")
+    request.update(
+        replacement_fingerprint=artifact.fingerprint, replacement_source_sha256=artifact.source_sha256,
+        observed_at=(datetime.now(UTC) - timedelta(days=1, minutes=10)).isoformat(),
+        expires_at=(datetime.now(UTC) - timedelta(days=1)).isoformat(),
+    )
+    request_path = history / "recovery.json"
+    raw = json.dumps(request).encode()
+    request_path.write_bytes(raw)
+    recovery = bootstrap.load_recovery(request_path, hashlib.sha256(raw).hexdigest(), artifact)
+    assert recovery.request.empty_baseline_sha256 is None
+    assert document["source_files"]["scripts/bootstrap_azure_sql.py"] != hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
+    assert ROOT != history
+    for key, value in deployed_environment(artifact).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(bootstrap, "ROOT", ROOT)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    credential_calls = []
+
+    def credential(**kwargs):
+        credential_calls.append(kwargs)
+        return SimpleNamespace(get_token=lambda scope: SimpleNamespace(token=token_for(artifact)))
+
+    identity = ModuleType("azure.identity")
+    identity.ManagedIdentityCredential = credential
+    monkeypatch.setitem(sys.modules, "azure", ModuleType("azure"))
+    monkeypatch.setitem(sys.modules, "azure.identity", identity)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.2.3.4", 1433)),
+    ])
+    monkeypatch.setattr(AzureSqlDatabase, "_connect", lambda self: Connection(engine))
+    engine.commands.clear()
+    arguments = [
+        "--bundle", str(bundle_path), "--bundle-sha256", artifact.fingerprint,
+        "--operation-id", str(REPLACEMENT), "--recovery", str(request_path),
+        "--recovery-sha256", recovery.fingerprint, "--artifact-root", str(history),
+    ]
+    return engine, artifact, recovery, arguments, history, credential_calls
+
+
+@pytest.mark.parametrize("status", ["MATCHING", "MISSING", "CONFLICT"])
+def test_current_cli_reads_historical_recovery_with_only_trusted_code(status, historical_recovery, capsys):
+    engine, artifact, recovery, arguments, history, credential_calls = historical_recovery
+    if status != "MISSING":
+        engine.state["recovery_table"] = True
+        values = bootstrap._recovery_values(recovery)
+        engine.state["recoveries"][str(OPERATION)] = (
+            (*values[:5], "e" * 64, values[6]) if status == "CONFLICT" else values
+        )
+    before = copy.deepcopy(engine.state)
+    commits, rollbacks = engine.commits, engine.rollbacks
+    files_before = {path: path.read_bytes() for path in history.rglob("*") if path.is_file()}
+    assert bootstrap.main([*arguments, "--mode", "reconcile-recovery"]) == (0 if status == "MATCHING" else 2)
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output[-1]["status"] == status and output[-1]["read_only"] is True
+    assert output[-1]["fingerprint"] == artifact.fingerprint
+    assert output[-1]["source_sha256"] == artifact.source_sha256
+    assert output[-1]["recovery_sha256"] == recovery.fingerprint
+    assert credential_calls[0]["client_id"] == str(artifact.bundle.identity.client_id)
+    assert engine.state == before
+    assert (engine.commits, engine.rollbacks) == (commits, rollbacks)
+    assert all(sql.lstrip().startswith("SELECT") and auto for sql, _, auto in engine.commands)
+    assert sys.path[0] == str((ROOT / "src").resolve())
+    assert not any(Path(value).is_relative_to(history) for value in sys.path if value)
+    for name in ("triage", "triage.redaction", "triage.store.azure_sql"):
+        assert Path(sys.modules[name].__file__).resolve().is_relative_to(ROOT / "src")
+    assert {path: path.read_bytes() for path in history.rglob("*") if path.is_file()} == files_before
+
+
+@pytest.mark.parametrize("before_commit", [True, False])
+def test_historical_cli_lookup_after_original_lost_ack_never_retries(
+    before_commit, historical_recovery, monkeypatch, capsys,
+):
+    engine, _, recovery, arguments, _, _ = historical_recovery
+    engine.fail_commit = engine.commits + 1
+    engine.fail_commit_before = before_commit
+    database = engine.database(monkeypatch)
+    with pytest.raises(SqlCommitUncertain), database.transaction():
+        database.execute(bootstrap.CREATE_RECOVERIES)
+        database.execute(
+            f"INSERT INTO {bootstrap.RECOVERY_TABLE} (original_operation_id,"
+            "original_fingerprint,original_source_sha256,replacement_operation_id,"
+            "replacement_fingerprint,replacement_source_sha256,recovery_sha256,"
+            "original_receipt_object_id) VALUES (?,?,?,?,?,?,?,?)",
+            str(OPERATION), *bootstrap._recovery_values(recovery),
+        )
+    before = copy.deepcopy(engine.state)
+    commits, rollbacks = engine.commits, engine.rollbacks
+    engine.commands.clear()
+    assert bootstrap.main([*arguments, "--mode", "reconcile-recovery"]) == (2 if before_commit else 0)
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output[-1]["status"] == ("MISSING" if before_commit else "MATCHING")
+    assert output[-1]["recovery_sha256"] == recovery.fingerprint
+    assert engine.state == before and (engine.commits, engine.rollbacks) == (commits, rollbacks)
+    assert all(sql.lstrip().startswith("SELECT") and auto for sql, _, auto in engine.commands)
+
+
+def test_historical_root_never_authorizes_an_already_imported_historical_adapter(
+    historical_recovery, monkeypatch, capsys,
+):
+    engine, _, _, arguments, history, credential_calls = historical_recovery
+    monkeypatch.setattr(
+        sys.modules["triage.store.azure_sql"], "__file__",
+        str(history / "src" / "triage" / "store" / "azure_sql.py"),
+    )
+    assert bootstrap.main([*arguments, "--mode", "reconcile-recovery"]) == 2
+    assert "stale_application_module_refused" in capsys.readouterr().out
+    assert not credential_calls and not engine.commands
+
+
+@pytest.mark.parametrize("change,expected", [
+    ("runner", "current_source_hash_mismatch"),
+    ("source", "current_source_hash_mismatch"),
+    ("sql", "sql_batch_hash_mismatch"),
+    ("bundle", "bundle_hash_mismatch"),
+    ("request", "recovery_hash_mismatch"),
+    ("source-binding", "recovery_replacement_mismatch"),
+    ("fingerprint-binding", "recovery_replacement_mismatch"),
+    ("target-env", "deployed_target_or_identity_mismatch"),
+    ("identity-env", "deployed_target_or_identity_mismatch"),
+    ("operation", "operation_id_mismatch"),
+    ("missing-source", "incomplete_current_source"),
+])
+def test_historical_reader_refuses_changed_evidence_before_credentials_or_sql(
+    change, expected, historical_recovery, monkeypatch, capsys,
+):
+    engine, _, _, arguments, history, credential_calls = historical_recovery
+    files = {
+        "runner": history / "scripts" / "bootstrap_azure_sql.py",
+        "source": history / "src" / "triage" / "redaction.py",
+        "sql": history / "schema.sql", "bundle": history / "bundle.json", "request": history / "recovery.json",
+    }
+    if change in files:
+        path = files[change]
+        path.write_bytes(path.read_bytes() + b" ")
+    elif change in {"source-binding", "fingerprint-binding"}:
+        path = history / "recovery.json"
+        request = json.loads(path.read_bytes())
+        request["replacement_source_sha256" if change == "source-binding" else "replacement_fingerprint"] = "e" * 64
+        raw = json.dumps(request).encode()
+        path.write_bytes(raw)
+        arguments[arguments.index("--recovery-sha256") + 1] = hashlib.sha256(raw).hexdigest()
+    elif change in {"target-env", "identity-env"}:
+        monkeypatch.setenv("AZURE_SQL_DATABASE" if change == "target-env" else "AZURE_CLIENT_ID", "different")
+    elif change == "operation":
+        arguments[arguments.index("--operation-id") + 1] = str(UUID(int=999))
+    else:
+        (history / "src" / "triage" / "redaction.py").unlink()
+    before = copy.deepcopy(engine.state)
+    assert bootstrap.main([*arguments, "--mode", "reconcile-recovery"]) == 2
+    assert expected in capsys.readouterr().out
+    assert not credential_calls and not engine.commands
+    assert engine.state == before
+
+
+@pytest.mark.parametrize("mode", ["preflight", "apply", "recover", "reconcile"])
+def test_historical_artifact_root_is_rejected_in_every_other_cli_mode(mode, historical_recovery, capsys):
+    engine, artifact, recovery, arguments, _, credential_calls = historical_recovery
+    assert bootstrap.main([
+        *arguments, "--mode", mode, "--approve-fingerprint", artifact.fingerprint,
+        "--approve-recovery-sha256", recovery.fingerprint,
+    ]) == 2
+    assert "artifact_root_requires_reconcile_recovery" in capsys.readouterr().out
+    assert not credential_calls and not engine.commands
+
+
+@pytest.mark.parametrize("mode", ["apply", "recover"])
+def test_mutating_modes_still_require_this_runners_source_hash(mode, cli_interrupted, tmp_path, capsys):
+    engine, artifact, recovery, arguments = cli_interrupted
+    (tmp_path / "scripts" / "bootstrap_azure_sql.py").write_text(
+        "raise AssertionError('Different runner source')", encoding="utf-8",
+    )
+    before = copy.deepcopy(engine.state)
+    engine.commands.clear()
+    assert bootstrap.main([
+        *arguments, "--mode", mode, "--approve-fingerprint", artifact.fingerprint,
+        "--approve-recovery-sha256", recovery.fingerprint,
+    ]) == 2
+    assert "current_source_hash_mismatch" in capsys.readouterr().out
+    assert not engine.commands and engine.state == before
+
+
 def test_job_is_manual_finite_small_and_has_no_other_authority():
     text = BICEP.read_text(encoding="utf-8")
     assert "param deployJob bool = false" in text
@@ -868,3 +1407,25 @@ def test_compiled_job_contract_when_parent_supplies_local_template():
     assert containers[0]["command"] == ["python3", "-I", "-B"]
     assert "secrets" not in job["properties"]["configuration"]
     assert "ingress" not in job["properties"]["configuration"]
+    parameters = template["parameters"]
+    assert parameters["mode"]["defaultValue"] == "preflight"
+    assert parameters["mode"]["allowedValues"] == [
+        "preflight", "apply", "recover", "reconcile", "reconcile-recovery",
+    ]
+    assert parameters["bundlePath"]["defaultValue"] == "/opt/state-sql-bootstrap/bundle.json"
+    for name in ("recoveryPath", "recoverySha256", "approvedRecoverySha256", "artifactRoot"):
+        assert parameters[name]["defaultValue"] == ""
+    assert containers[0]["args"] == (
+        "[concat(createArray('/opt/state-sql-bootstrap/scripts/bootstrap_azure_sql.py', "
+        "'--bundle', parameters('bundlePath'), '--bundle-sha256', parameters('bundleSha256'), "
+        "'--operation-id', parameters('operationId'), '--mode', parameters('mode'), "
+        "'--approve-fingerprint', parameters('approvedFingerprint')), "
+        "if(contains(createArray('recover', 'reconcile-recovery'), parameters('mode')), "
+        "createArray('--recovery', parameters('recoveryPath'), '--recovery-sha256', "
+        "parameters('recoverySha256')), createArray()), "
+        "if(equals(parameters('mode'), 'recover'), createArray('--approve-recovery-sha256', "
+        "parameters('approvedRecoverySha256')), createArray()), "
+        "if(and(equals(parameters('mode'), 'reconcile-recovery'), "
+        "not(empty(parameters('artifactRoot')))), "
+        "createArray('--artifact-root', parameters('artifactRoot')), createArray()))]"
+    )

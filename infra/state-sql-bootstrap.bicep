@@ -53,7 +53,7 @@ param targetKind string = 'proof'
 @maxLength(36)
 param tenantId string
 
-@description('Original UUID from the approved bundle. New starts never imply a new operation or authorization.')
+@description('UUID of the approved bundle. Recovery identifies its replacement bundle here; the failed operation is bound inside the reviewed recovery request. A new start is not a new authorization.')
 @minLength(36)
 @maxLength(36)
 param operationId string
@@ -66,12 +66,32 @@ param bundleSha256 string
 @allowed([
   'preflight'
   'apply'
+  'recover'
   'reconcile'
+  'reconcile-recovery'
 ])
 param mode string = 'preflight'
 
-@description('Empty for preflight/reconcile. Apply refuses unless this equals the reviewed bundle fingerprint.')
+@description('Exact approved bundle file inside the execution. Application and proof bundles are distinct artifacts; do not relabel one as the other.')
+@minLength(1)
+param bundlePath string = '/opt/state-sql-bootstrap/bundle.json'
+
+@description('Empty for preflight/reconcile. Apply and recover refuse unless this equals the reviewed bundle fingerprint.')
 param approvedFingerprint string = ''
+
+@description('Operator-staged original recovery JSON path for recover or reconcile-recovery. Fresh mutations require current evidence; historical read-only lookup preserves the original request.')
+param recoveryPath string = ''
+
+@description('SHA-256 of the exact recovery request. Its evidence window must be current and at most 15 minutes.')
+@maxLength(64)
+param recoverySha256 string = ''
+
+@description('Separately approved recovery-request hash. Recover refuses unless it exactly matches recoverySha256; no schema batches execute in recover mode.')
+@maxLength(64)
+param approvedRecoverySha256 string = ''
+
+@description('Optional immutable historical artifact directory, used only by reconcile-recovery. The current trusted reader validates archived bytes as data and never executes archived code.')
+param artifactRoot string = ''
 
 @minValue(60)
 @maxValue(900)
@@ -144,10 +164,10 @@ resource job 'Microsoft.App/jobs@2025-01-01' = if (deployJob) {
             '-I'
             '-B'
           ]
-          args: [
+          args: concat([
             '/opt/state-sql-bootstrap/scripts/bootstrap_azure_sql.py'
             '--bundle'
-            '/opt/state-sql-bootstrap/bundle.json'
+            bundlePath
             '--bundle-sha256'
             bundleSha256
             '--operation-id'
@@ -156,7 +176,21 @@ resource job 'Microsoft.App/jobs@2025-01-01' = if (deployJob) {
             mode
             '--approve-fingerprint'
             approvedFingerprint
-          ]
+          ], contains([
+            'recover'
+            'reconcile-recovery'
+          ], mode) ? [
+            '--recovery'
+            recoveryPath
+            '--recovery-sha256'
+            recoverySha256
+          ] : [], mode == 'recover' ? [
+            '--approve-recovery-sha256'
+            approvedRecoverySha256
+          ] : [], mode == 'reconcile-recovery' && !empty(artifactRoot) ? [
+            '--artifact-root'
+            artifactRoot
+          ] : [])
           env: [
             { name: 'AZURE_TENANT_ID', value: tenantId }
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }

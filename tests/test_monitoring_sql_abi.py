@@ -191,10 +191,14 @@ class AbiDatabase(KernelProtocolDatabase):
     def execute(self, sql, *params):
         super().execute(sql, *params)
         if sql.startswith("INSERT"):
-            columns = sql.split("(", 1)[1].split(")", 1)[0].split(",")
-            values = dict(zip((column.strip() for column in columns), params, strict=True))
-            key = (values["record_kind"], values["full_key"])
-            if key in self.records:
+            columns = [column.strip() for column in sql.split("(", 1)[1].split(")", 1)[0].split(",")]
+            assert len(params) % len(columns) == 0
+            written = [
+                dict(zip(columns, params[offset:offset + len(columns)], strict=True))
+                for offset in range(0, len(params), len(columns))
+            ]
+            keys = [(row["record_kind"], row["full_key"]) for row in written]
+            if len(set(keys)) != len(keys) or any(key in self.records for key in keys):
                 raise RuntimeError("Duplicate record identity (51072)")
         else:
             assignments, predicates = sql.split(" SET ", 1)[1].split(" WHERE ", 1)
@@ -212,15 +216,18 @@ class AbiDatabase(KernelProtocolDatabase):
                 "work_kind": prior.work_kind, "generation_id": prior.generation_id,
                 "due_at": prior.due_at, "sequence_number": prior.sequence_number, "payload": prior.payload,
             } | changes
-        at = values.get("due_at")
-        self.records[key] = StoredRecord(
-            kind=key[0], key=key[1], context=self.context, version=values["revision"], status=values.get("status"),
-            workload=values.get("workload"), workspace_id=values.get("workspace_id"), item_id=values.get("item_id"),
-            target_key=values.get("target_key"), parent_key=values.get("parent_key"), work_kind=values.get("work_kind"),
-            generation_id=values.get("generation_id"), due_at=at.replace(tzinfo=UTC) if at else None,
-            sequence_number=values.get("sequence_number"), payload=values["payload"],
-        )
-        return 1
+            written = [values]
+        for values in written:
+            key = (values["record_kind"], values["full_key"])
+            at = values.get("due_at")
+            self.records[key] = StoredRecord(
+                kind=key[0], key=key[1], context=self.context, version=values["revision"], status=values.get("status"),
+                workload=values.get("workload"), workspace_id=values.get("workspace_id"), item_id=values.get("item_id"),
+                target_key=values.get("target_key"), parent_key=values.get("parent_key"), work_kind=values.get("work_kind"),
+                generation_id=values.get("generation_id"), due_at=at.replace(tzinfo=UTC) if at else None,
+                sequence_number=values.get("sequence_number"), payload=values["payload"],
+            )
+        return len(written)
 
     def native_put(self, kind, key, payload, **indices):
         prior = self.records.get((kind, key))
@@ -719,7 +726,8 @@ def test_native_discovery_lost_ack_recovers_only_the_original_handoff(lost_ack):
     assert len([row for row in db.records.values() if row.kind == "work"]) == 1
 
 
-def test_native_inventory_accepts_all_parts_atomically_under_one_work_fence():
+@pytest.mark.parametrize("short_insert", [False, True])
+def test_native_inventory_accepts_all_parts_atomically_under_one_work_fence(short_insert):
     h = Harness()
     db = AbiDatabase(h, principal="controller")
     controller = AzureSqlMonitoringStore(db=db, component="controller")
@@ -747,6 +755,19 @@ def test_native_inventory_accepts_all_parts_atomically_under_one_work_fence():
         commit=m.InventoryCommit(work_id=owned.work_id, lease=owned.lease, expected_work_revision=owned.revision,
                                  expected_generation_revision=0),
     )
+    if short_insert:
+        before = deepcopy((db.records, db.receipts))
+        execute = db.execute
+
+        def incomplete(sql, *params):
+            changed = execute(sql, *params)
+            return changed - 1 if sql.startswith("INSERT") and len(params) > 19 else changed
+
+        db.execute = incomplete
+        with pytest.raises(MonitoringConflict, match="every checked row"):
+            worker.record_inventory(batch)
+        assert (db.records, db.receipts) == before
+        return
     result = worker.record_inventory(batch)
     assert result.recorded_item_count == 110
     parts = [entry for (name, _), entry in db.receipts.items() if name == "worker.accept_facts"]
@@ -755,6 +776,13 @@ def test_native_inventory_accepts_all_parts_atomically_under_one_work_fence():
     assert not any(row.kind in {"target", "target_capability", "source", "source_head"} for row in db.records.values())
     assert worker.record_inventory(batch) == result
     assert len(db.receipts) == 3  # enqueue + the two atomic intake parts
+    inserts = [
+        params for method, sql, params in db.calls
+        if method == "execute" and sql.startswith("INSERT")
+        and ("worker_catalogue" in sql or "worker_evidence" in sql)
+    ]
+    assert inserts and max(map(len, inserts)) <= 50 * 19
+    assert len(inserts) < 10  # 220 catalogue rows must not cause 220 write round trips.
 
 
 def test_native_targetless_discovery_reconciles_through_owned_frontier_without_action_lease():

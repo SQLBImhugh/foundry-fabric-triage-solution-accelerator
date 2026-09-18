@@ -5,9 +5,20 @@ Power BI semantic-model refreshes, scheduled Fabric pipelines and native Fabric
 Job-event transport remain the monitored services. The Command Center is the
 operational UI; Rayfin is not a state or deployment dependency. The shipped
 infrastructure now uses public networking with Entra authentication. Scoped
-evaluation SQL/registry access is verified, while the original SQL proof receipt
-is under recovery and application/runtime acceptance remains unfinished.
-The live app/controller remain the prior release. Earlier private-network
+evaluation SQL/registry access is verified. SQL recovery and proof/application
+schema commits are complete; append-only adjudication leaves the original
+failed receipt unchanged. The initialization maintenance capture is historical.
+Current maintenance is `false`; Command Center and the hosted controller are
+live on Azure SQL with the correct acting identity, kernel roles and application
+grants. A bounded deployed heartbeat completed discovery-intent reconciliation,
+published its frontier `1/1` and queued one inventory item with no actions or
+receipt/control changes. A collector-only worker is now deployed and has durably
+accepted 332 workspace records from native metadata reads. Broader item coverage
+remains partial; enabled selectors do not prove source access or remediation
+authority. Three actual recurrences of the reused heartbeat schedule completed.
+Event-mode acceptance and sustained coverage remain open. Native paired
+heartbeat metadata is now queryable through the app-owned Entra telemetry
+channel with project content tracing disconnected. Earlier private-network
 proofs and the private Foundry preflight error are historical, not prerequisites
 or blockers for the chosen public architecture.
 See the [release gates](DeploymentGuide.md#release-gates).
@@ -58,6 +69,20 @@ that its monitoring is current or that the controller may remediate it.
 | Event receiver | Pinned managed identity, original CloudEvent receipts, partition ownership, quarantine and checkpoint-after-acceptance |
 | Controller | Fresh source verification, common admission, policy/approval checks, atomic action reservation and durable finalization |
 | Monitoring API/UI | Readable coverage, scope preview/activation, safety reviews and original-request reconciliation; no browser remediation or permission grants |
+
+The worker has an explicit collector-only mode for inventory/REST polling before
+Eventstream setup. Its connector may be absent only in that mode; partial event
+metadata is rejected. It creates no receiver/provisioner, uses a zero-write
+policy with empty action allowlists and emits a durable heartbeat with
+`connector_id=null`, which cannot assert transport or delivery. Event mode
+retains complete owned-binding checks.
+
+Inventory acceptance uses bounded checked-view inserts of at most 50 new rows/
+950 parameters under the same lease and atomic transaction; a short rowcount
+rolls back. Lease renewal re-reads the authoritative work revision. Receipt-backed
+catalogue reads retain exact accepted-fact identity, fingerprint, payload and
+row-hash evidence while avoiding repeated full-catalogue work. This changes
+metadata-read cost, not admission or permissions.
 
 Scopes can include or exclude tenant, domain, workspace or item selections.
 Exclusions take precedence; future-resource admission is explicit. Domain
@@ -1123,12 +1148,47 @@ proof as authority to reintroduce those dependencies into the public baseline.
 
 ## Observability
 
-Every LLM call emits an OTel GenAI span: `gen_ai.system`, `gen_ai.request.model`,
-`gen_ai.operation.name`, `agent.name`, token counts, finish reason. Tool calls
-emit `tool.*` spans — that is what makes the handoff visible in a trace.
+The application instruments LLM calls with OTel GenAI metadata:
+`gen_ai.system`, `gen_ai.request.model`, `gen_ai.operation.name`, `agent.name`,
+token counts and finish reason. Tool calls emit `tool.*` metadata spans.
+Instrumentation is not evidence that a cloud backend ingested them.
 
 Without the OTel SDK installed, every helper is a no-op. Telemetry is not allowed
 to be a hard dependency of the accelerator running.
+
+Foundry reserves `APPLICATIONINSIGHTS_CONNECTION_STRING` and injects it from
+project monitoring. Without that project connection, the runtime value was
+empty despite a nonempty value in the version definition. Connecting the
+project to Application Insights would enable tracing across all agents and may
+collect prompts/responses/tool content, so project tracing stays disconnected.
+See [hosted telemetry](https://learn.microsoft.com/azure/foundry/agents/how-to/configure-hosted-agent-telemetry)
+and [tracing data handling](https://learn.microsoft.com/azure/foundry/observability/concepts/trace-data).
+
+Hosted configuration instead reads `TRIAGE_TELEMETRY_CONNECTION_STRING` through
+an app-owned `repr=False` setting and uses managed identity. The azd manifest
+maps the custom variable from the operator's standard locator value; hosted
+runtime has no fallback to the platform variable. CLI handling of the standard
+setting is unchanged. The separate Entra-only public telemetry resource has
+optional resource-scoped publisher roles and no Foundry project connection.
+
+Startup forces `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false`
+before SDK configuration and agent/host construction, and disables the host's
+default callback with `configure_observability=None`. Only approved metadata
+logger families are exported. Diagnostic output is bounded to counters,
+exception types and sanitized source basename/function/line, not exception
+messages, SDK responses, prompts or completions.
+
+An empty platform locator caused SDK parsing failure even with an explicit
+custom locator. Hosted configuration requires the app-owned locator, then
+unsets only an exactly empty standard value before SDK configuration. It never
+deletes/masks a nonempty value, redeclares the platform variable or uses a hosted
+fallback; CLI handling is unchanged.
+
+Native Application Insights queries now contain both `heartbeat_started` and
+completed `heartbeat_finished` metadata, queue counts and zero captured exporter
+failure/warning counters. This proves bounded ingestion from the active build.
+Console metrics, source corrections and `configured` status alone still do not
+establish an ingestion receipt, sustained delivery or end-to-end acceptance.
 
 **Metadata only.** No prompt or completion content. In a multi-tenant system,
 content recording ingests customer data and secrets into a telemetry store with
@@ -1139,6 +1199,15 @@ poll/event freshness, checkpoint positions, queue backlog and connector drift.
 An idle stream is not proof that its source is healthy. Coverage must retain
 unknown permissions, interrupted pagination and retention gaps instead of
 subtracting them from its denominator.
+
+The controller heartbeat has an 840-second monotonic admission clock including
+lock wait, with two automatic and one human-command concurrent slots.
+Refills obey queue quotas and require enough remaining execution allowance.
+It stops new claims without cancelling a lock holder or already admitted work.
+The existing one-minute scheduler was reused, and three actual
+recurrences completed after response decoding. Portal-only missing/failed-run
+alerts are separate signals, with empty action lists and no delivery/absence
+canary claim.
 
 Service-wide and API-specific read budgets are acquired together. A denied API
 budget must not consume the service allowance when no request was sent.
@@ -1173,5 +1242,7 @@ Only the controller may append at runtime. Conditional insert and original-row
 readback preserve deterministic request/evidence identity across retries and
 reject conflicts. Both stores redact at persistence, and tools return the
 stored flag. SQL has no local fallback and refuses runtime reset; the deployment
-reset catalogue includes the flag table. The source binding is implemented,
-but native Azure SQL table/grant/identity and persistence proof remain gates.
+reset catalogue includes the flag table. The application schema, including
+this table, is committed, and the corrected controller identity has reviewed
+application grants. The discovery-intent heartbeat did not exercise flag
+append/readback or full runtime persistence; those remain separate acceptance cases.

@@ -42,6 +42,10 @@ Reuse does not rewrite its settings, even across resource groups.
 A new environment gets an own-named diagnostic setting without deleting other
 settings. The existing target resource group must carry the supplied tags.
 
+Use -CollectorOnly for initial inventory and REST polling. It requires no
+Eventstream metadata and never starts a receiver or changes connector topology.
+After owned event transport is configured, omit it and supply ConnectorBootstrapFile.
+
 ConnectorBootstrapFile is an operator-owned JSON object with exactly these
 nonsecret strings: connectorId, workspaceId, eventstreamId, destinationId,
 fullyQualifiedNamespace, eventHubName, consumerGroup. It identifies an app-owned
@@ -110,7 +114,8 @@ param(
     [Parameter(Mandatory)][string]$LogAnalyticsWorkspaceResourceId,
     [Parameter(Mandatory, ParameterSetName = 'Worker')][string]$AzureSqlServer,
     [Parameter(Mandatory, ParameterSetName = 'Worker')][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,127}$')][string]$AzureSqlDatabase,
-    [Parameter(Mandatory, ParameterSetName = 'Worker')][string]$ConnectorBootstrapFile,
+    [Parameter(ParameterSetName = 'Worker')][string]$ConnectorBootstrapFile = '',
+    [Parameter(ParameterSetName = 'Worker')][switch]$CollectorOnly,
     [Parameter(Mandatory)][string]$CostCenter,
     [Parameter(Mandatory)][string]$Owner,
     [Parameter(Mandatory)][string]$Environment,
@@ -290,6 +295,8 @@ function Confirm-WorkerProperties {
     Assert-Condition ($containers.Count -eq 1) 'The worker must contain exactly one container.'
     $container = $containers[0]
     Assert-Condition ($container.name -ceq 'monitoring' -and $container.image -ceq $Image -and ($container.command -join ' ') -ceq 'python -m triage.monitoring.worker') 'Worker image or entry point does not match.'
+    $workerArguments = @($container['args'] | Where-Object { $_ })
+    Assert-Condition (($workerArguments -join ' ') -ceq $(if ($CollectorOnly) { '--collector-only' } else { '' })) 'Worker collection mode does not match.'
     Assert-Condition ($container.resources.cpu -eq 0.5 -and $container.resources.memory -ceq '1Gi') 'Worker resources must be 0.5 vCPU and 1 GiB.'
     Assert-Condition ($properties.template.scale.minReplicas -eq $MinReplicas -and $properties.template.scale.maxReplicas -eq 2 -and @($properties.template.scale['rules'] | Where-Object { $_ }).Count -eq 0) 'Worker replica bounds or scaling rules do not match.'
     $expected = @{
@@ -300,14 +307,16 @@ function Confirm-WorkerProperties {
         MONITORING_MODE = 'live'; MONITORING_TENANT_ID = $TenantId.ToString()
         MONITORING_INVENTORY_MODE = $InventoryMode
         AZURE_SQL_SERVER = $AzureSqlServer; AZURE_SQL_DATABASE = $AzureSqlDatabase
-        MONITORING_CONNECTOR_ID = $bootstrap.connectorId
-        MONITORING_EVENTSTREAM_WORKSPACE_ID = $bootstrap.workspaceId
-        MONITORING_EVENTSTREAM_ID = $bootstrap.eventstreamId
-        MONITORING_EVENTSTREAM_DESTINATION_ID = $bootstrap.destinationId
-        MONITORING_EVENTSTREAM_NAMESPACE = $bootstrap.fullyQualifiedNamespace
-        MONITORING_EVENTSTREAM_ENTITY = $bootstrap.eventHubName
-        MONITORING_EVENTSTREAM_CONSUMER_GROUP = $bootstrap.consumerGroup
         PYTHONUNBUFFERED = '1'; PYTHONDONTWRITEBYTECODE = '1'
+    }
+    if (-not $CollectorOnly) {
+        $expected.MONITORING_CONNECTOR_ID = $bootstrap.connectorId
+        $expected.MONITORING_EVENTSTREAM_WORKSPACE_ID = $bootstrap.workspaceId
+        $expected.MONITORING_EVENTSTREAM_ID = $bootstrap.eventstreamId
+        $expected.MONITORING_EVENTSTREAM_DESTINATION_ID = $bootstrap.destinationId
+        $expected.MONITORING_EVENTSTREAM_NAMESPACE = $bootstrap.fullyQualifiedNamespace
+        $expected.MONITORING_EVENTSTREAM_ENTITY = $bootstrap.eventHubName
+        $expected.MONITORING_EVENTSTREAM_CONSUMER_GROUP = $bootstrap.consumerGroup
     }
     Assert-Condition (@($container.env).Count -eq $expected.Count) 'Unexpected or missing worker environment variables.'
     foreach ($key in $expected.Keys) {
@@ -336,19 +345,22 @@ if (-not $environmentBootstrap) {
     Assert-Condition ($Image -cmatch '^[a-z0-9.-]+/[a-z0-9]+(?:[._/-][a-z0-9]+)*@sha256:[0-9a-f]{64}$') 'Image must be a credential-free ACR image pinned by sha256 digest, not a mutable tag.'
     $imageParts = $Image.Split('/', 2)
     Assert-Hostname $imageParts[0] 'Image registry'
-    $bootstrap = Get-Content -LiteralPath $ConnectorBootstrapFile -Raw | ConvertFrom-Json -AsHashtable
-    $bootstrapKeys = @('connectorId', 'workspaceId', 'eventstreamId', 'destinationId', 'fullyQualifiedNamespace', 'eventHubName', 'consumerGroup')
-    Assert-Condition ($bootstrap -is [Collections.IDictionary] -and $bootstrap.Count -eq $bootstrapKeys.Count) 'ConnectorBootstrapFile must contain exactly the documented nonsecret fields.'
-    foreach ($key in $bootstrap.Keys) {
-        Assert-Condition ($key -cin $bootstrapKeys -and $bootstrap[$key] -is [string] -and -not [string]::IsNullOrWhiteSpace($bootstrap[$key])) 'Connector bootstrap has an unknown, blank or non-string field.'
+    Assert-Condition ([bool]$CollectorOnly -xor [bool]$ConnectorBootstrapFile) 'Select CollectorOnly or supply ConnectorBootstrapFile for event mode, not both.'
+    $bootstrap = if ($CollectorOnly) { $null } else { Get-Content -LiteralPath $ConnectorBootstrapFile -Raw | ConvertFrom-Json -AsHashtable }
+    if (-not $CollectorOnly) {
+        $bootstrapKeys = @('connectorId', 'workspaceId', 'eventstreamId', 'destinationId', 'fullyQualifiedNamespace', 'eventHubName', 'consumerGroup')
+        Assert-Condition ($bootstrap -is [Collections.IDictionary] -and $bootstrap.Count -eq $bootstrapKeys.Count) 'ConnectorBootstrapFile must contain exactly the documented nonsecret fields.'
+        foreach ($key in $bootstrap.Keys) {
+            Assert-Condition ($key -cin $bootstrapKeys -and $bootstrap[$key] -is [string] -and -not [string]::IsNullOrWhiteSpace($bootstrap[$key])) 'Connector bootstrap has an unknown, blank or non-string field.'
+        }
+        foreach ($key in @('connectorId', 'workspaceId', 'eventstreamId', 'destinationId')) {
+            $identifier = [guid]::Empty
+            Assert-Condition ([guid]::TryParseExact($bootstrap[$key], 'D', [ref]$identifier) -and $identifier -ne [guid]::Empty) "Connector bootstrap $key must be a nonempty GUID."
+        }
+        Assert-Hostname $bootstrap.fullyQualifiedNamespace 'fullyQualifiedNamespace'
+        Assert-Condition ($bootstrap.eventHubName -cmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$') 'eventHubName must be a nonsecret entity name.'
+        Assert-Condition ($bootstrap.consumerGroup -cmatch '^[A-Za-z0-9$][A-Za-z0-9$_.-]{0,49}$') 'consumerGroup must be a nonsecret group name.'
     }
-    foreach ($key in @('connectorId', 'workspaceId', 'eventstreamId', 'destinationId')) {
-        $identifier = [guid]::Empty
-        Assert-Condition ([guid]::TryParseExact($bootstrap[$key], 'D', [ref]$identifier) -and $identifier -ne [guid]::Empty) "Connector bootstrap $key must be a nonempty GUID."
-    }
-    Assert-Hostname $bootstrap.fullyQualifiedNamespace 'fullyQualifiedNamespace'
-    Assert-Condition ($bootstrap.eventHubName -cmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$') 'eventHubName must be a nonsecret entity name.'
-    Assert-Condition ($bootstrap.consumerGroup -cmatch '^[A-Za-z0-9$][A-Za-z0-9$_.-]{0,49}$') 'consumerGroup must be a nonsecret group name.'
 }
 $exceptionTags = @{}
 if ($EnvironmentExceptionTagsFile) {
@@ -408,6 +420,7 @@ if ($environmentBootstrap) {
     $values.azureSqlServer = $AzureSqlServer
     $values.azureSqlDatabase = $AzureSqlDatabase
     $values.connectorBootstrap = $bootstrap
+    $values.collectorOnly = [bool]$CollectorOnly
     $values.minReplicas = $MinReplicas
     $values.inventoryMode = $InventoryMode
 }

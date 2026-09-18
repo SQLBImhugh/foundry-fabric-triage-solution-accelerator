@@ -1,11 +1,11 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MONITORING_ACTIVATION_STORAGE_KEY, MonitoringWorkspace } from './MonitoringWorkspace'
 import type { MonitoringWorkspaceProps } from './MonitoringWorkspace'
 import { ApiError } from '../api/errors'
 import type { AppRole } from '../api/access'
-import type { MonitoringPlan, OwnedConnectorManifest, ScopePolicy } from '../api/monitoring'
+import type { MonitoringPlan, OwnedConnectorManifest, RecordPage, ScopePolicy, WorkspaceMetadata } from '../api/monitoring'
 import {
   ids, monitoringBootstrap, monitoringConnector, monitoringFixtureApi, monitoringInventory,
   monitoringPage, monitoringPreview, monitoringReceipt, monitoringSnapshot, monitoringVersion, monitoringWorkspaces,
@@ -33,6 +33,31 @@ async function preparePreview(user: ReturnType<typeof userEvent.setup>) {
 }
 
 describe('monitoring inspection and readiness', () => {
+  it('keeps the current permission-generation editor usable during a slow background catalogue read', async () => {
+    vi.useFakeTimers()
+    let finish: ((value: RecordPage<WorkspaceMetadata>) => void) | undefined
+    const api = monitoringFixtureApi()
+    const { rerender, props, unmount } = setup({ api })
+    try {
+      await act(async () => {})
+      const selector = screen.getByRole('combobox', { name: 'Include workspace' })
+      expect(selector.matches(':disabled')).toBe(false)
+      vi.mocked(api.workspaces).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(15000) })
+      expect(api.workspaces).toHaveBeenCalledTimes(2)
+      expect(selector.matches(':disabled')).toBe(false)
+      fireEvent.change(selector, { target: { value: ids.workspace } })
+      expect((selector as HTMLSelectElement).value).toBe(ids.workspace)
+      expect(api.activate).not.toHaveBeenCalled()
+      rerender(<MonitoringWorkspace {...props} fresh={false} permissionRevision={1} />)
+      expect(screen.queryByRole('combobox', { name: 'Include workspace' })?.matches(':disabled') ?? true).toBe(true)
+      await act(async () => { finish?.(monitoringPage(monitoringWorkspaces)) })
+    } finally {
+      unmount()
+      vi.useRealTimers()
+    }
+  })
+
   it.each(['reader', 'operator', 'approver'] as AppRole[])('lets %s inspect truthful coverage without setup controls', async (role) => {
     const api = monitoringFixtureApi([role])
     setup({ api, roles: [role] })

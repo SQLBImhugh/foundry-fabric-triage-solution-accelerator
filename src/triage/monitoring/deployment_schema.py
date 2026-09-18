@@ -3,6 +3,8 @@
 The two append-only tables are separate from the kernel's physical-table map.
 Discovery captures use the operator-only operation in the existing receipts
 table; the authority checker must prove that runtime code cannot forge it.
+Bootstrap deployment journals have separate, optional preserved contracts.
+Ancillary permission profiles classify reset writers, never grant runtime access.
 """
 
 from __future__ import annotations
@@ -24,6 +26,83 @@ from triage.store.azure_sql import DEFAULT_TABLES, quote_identifier
 from triage.store.azure_sql import schema_statements as application_statements
 
 READ_ONLY_RPCS = frozenset({"inspect", "lock_context", "controller.inspect_frontiers"})
+
+# These are optional deployment history, not application state. Keep the runner's
+# independent DDL contract checked in tests; runtime imports must not import it.
+DEPLOYMENT_JOURNAL_STATEMENTS = {
+    "sql_bootstrap_receipts": """CREATE TABLE [dbo].[triage_sql_bootstrap_receipts] (
+    operation_id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
+    fingerprint CHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+    source_sha256 CHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+    status VARCHAR(12) NOT NULL CHECK (status IN ('started','committed')),
+    started_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME(),
+    committed_at DATETIME2(6) NULL
+)""",
+    "sql_bootstrap_recoveries": """CREATE TABLE [dbo].[triage_sql_bootstrap_recoveries] (
+    original_operation_id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
+    original_fingerprint CHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+    original_source_sha256 CHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+    replacement_operation_id UNIQUEIDENTIFIER NOT NULL UNIQUE,
+    replacement_fingerprint CHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+    replacement_source_sha256 CHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+    recovery_sha256 CHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+    original_receipt_object_id INT NOT NULL,
+    resolved_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME()
+)""",
+}
+DEPLOYMENT_JOURNAL_NAMES = {
+    logical: "triage_" + logical for logical in DEPLOYMENT_JOURNAL_STATEMENTS
+}
+
+
+@dataclass(frozen=True)
+class AncillaryTablePermissions:
+    permissions: tuple[str, ...]
+    update_columns: tuple[str, ...] = ()
+
+
+def ancillary_table_permissions(component: str) -> dict[str, AncillaryTablePermissions]:
+    """Source-reviewed reset writer classification, never runtime authorization.
+
+    A component must still have an intact declared kernel role. Raw approval
+    mutation is deliberately excluded: only the checked approval RPCs establish
+    approval authority. This does not adopt an existing deployment's grants.
+    """
+    run_columns = ("incident_id", "signature", "state", "outcome", "finished_at", "payload")
+    profiles = {
+        "controller": {
+            "data_quality_flags": AncillaryTablePermissions(("SELECT", "INSERT")),
+            "incidents": AncillaryTablePermissions(("SELECT", "INSERT"), ("signature", "status", "updated_at", "payload")),
+            "processed": AncillaryTablePermissions(("SELECT", "INSERT"), ("received_at", "message_id")),
+            "approvals": AncillaryTablePermissions(("SELECT",)),
+            "retries": AncillaryTablePermissions(("SELECT", "INSERT"), ("status", "due_at", "attempts", "payload")),
+            "semantic_health": AncillaryTablePermissions(
+                ("SELECT", "INSERT"), ("probe_name", "report_name", "last_max_date", "last_row_count", "suspect_count", "payload"),
+            ),
+            "leases": AncillaryTablePermissions(("SELECT", "INSERT", "DELETE"), ("owner", "expires_at")),
+            "claims": AncillaryTablePermissions(("SELECT", "INSERT", "DELETE"), ("owner", "claimed_at", "expires_at")),
+            "inbox_audit": AncillaryTablePermissions(("SELECT", "INSERT", "DELETE")),
+            "pipeline_reruns": AncillaryTablePermissions(("SELECT", "INSERT"), ("state", "payload")),
+            "agent_runs": AncillaryTablePermissions(("SELECT", "INSERT"), run_columns),
+            "agent_events": AncillaryTablePermissions(("SELECT", "INSERT")),
+            "agent_commands": AncillaryTablePermissions(
+                ("SELECT",), ("state", "worker_id", "started_at", "lease_expires_at", "finished_at", "summary", "run_id"),
+            ),
+        },
+        "web": {
+            "incidents": AncillaryTablePermissions(("SELECT",)),
+            "approvals": AncillaryTablePermissions(("SELECT",)),
+            "pipeline_reruns": AncillaryTablePermissions(("SELECT",)),
+            "agent_runs": AncillaryTablePermissions(("SELECT", "INSERT"), run_columns),
+            "agent_events": AncillaryTablePermissions(("SELECT", "INSERT")),
+            "agent_commands": AncillaryTablePermissions(("SELECT", "INSERT"), ("state", "finished_at", "summary", "payload")),
+            "incident_activity": AncillaryTablePermissions(("SELECT", "INSERT")),
+        },
+        "worker": {},
+    }
+    if component not in profiles:
+        raise ValueError("Unknown SQL component")
+    return {DEFAULT_TABLES[logical]: grant for logical, grant in profiles[component].items()}
 
 
 @dataclass(frozen=True)

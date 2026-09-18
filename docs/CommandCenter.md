@@ -15,6 +15,11 @@ dark/light themes, with Ink geometry: 2px corners and 7px offset shadows.
 Font licensing is included with the frontend assets.
 The supplied triage artwork appears in the sidebar, sign-in view and favicon.
 
+Workspace choices come from the collector's accepted catalogue, not the
+signed-in user's directory access. The scope editor retains the last accepted
+snapshot during same-generation background refreshes. A permission/context
+change clears it immediately; errors or stale permissions still lock setup.
+
 ## Hybrid implementation and acceptance status
 
 The source tree includes registry-backed Monitoring setup, REST collection,
@@ -40,15 +45,51 @@ with TLS/auditing/TDE and registry admin/anonymous access remains disabled.
 The template uses one S1 application database and an optional Basic proof database
 on the same logical server, without an elastic pool or a final sizing claim.
 
-The original SQL `STARTED` proof receipt is under guarded recovery. Completion,
-full-schema bootstrap and runtime permission/effect proof remain unaccepted.
+SQL recovery is complete: append-only operator adjudication preserves the
+original failed `STARTED` receipt and binds its approved replacement.
+Proof and application schemas each committed 145 DDL batches and passed 114
+readbacks. The independent initialization capture of `maintenance=true`,
+revision `0` and its bootstrap receipt is historical. A separate no-VNet public-route job
+passed 114 application readbacks using encrypted TCP/FEDERATED bootstrap-MI
+authentication without changing maintenance at that capture time.
+
+Command Center has cut over to live monitoring and Azure SQL. The hosted
+controller uses the correct acting `ServiceIdentity`; three runtime EXTERNAL
+SQL users have kernel roles and reviewed application DML grants. Maintenance is
+now `false`. After reviewed SQL corrections, the deployed heartbeat completed
+the original discovery-intent work, published its frontier `1/1` and queued one
+inventory-worker item. It took no actions; the original receipt/control were
+unchanged. No additional controller deployment was needed for that SQL-only fix.
+
+A no-ingress collector-only worker is now deployed with its dedicated MI and
+explicit `tenant_admin_preview` selection. Native Fabric domain/workspace reads
+durably accepted 332 workspaces. Authenticated browser checks found both the
+Include and Inventory workspace selectors enabled with 333 options including
+the placeholder, without selector error alerts.
+
+The broader item scan remains partial: Power BI dataset reads returned 401
+without source permissions, and request-budget/throttling gaps remain visible.
+The API's complete flag respects the latest partial generation even when no
+scopes are configured; the corresponding web/API build is deployed and its
+existing SCM restrictions were restored. No static/fake workspaces, automatic
+scope admission, remediation or extra Fabric grants were added.
+
+Three actual recurrences of the reused one-minute heartbeat scheduler completed
+after response-envelope validation. Portal-only missing/failed-heartbeat alerts
+have empty action lists. Collector-only mode runs no Eventstream receiver or
+provisioner; neither inventory selectors nor bounded SQL cases prove full hybrid
+operation. Native Application Insights queries now contain app-owned
+`heartbeat_started` and completed `heartbeat_finished` metadata, queue counts
+and zero exporter failure/warning counters in the captured runs. Foundry project
+content tracing remains disconnected. This proves bounded ingestion, not full
+collection or overnight stability; see [Observability](DeploymentGuide.md#8-observability).
 Earlier private image and network checks remain historical, and the private
 Foundry preflight failure does not block the retained public Foundry path.
-The live app/controller remain the prior release, with no history migration/wipe,
-normal-worker rollout, hybrid release push or current-release UI screenshots.
+The completed web/controller and collector-only deployment does not imply full
+source/event coverage or turn the earlier screenshots into current end-to-end evidence.
 
 The [approved hybrid plan](./HybridMonitoringPlan.md) defines the remaining
-native SQL, durable intake/recovery, normal-worker and application-cutover
+event-enabled collection, durable intake/recovery, coverage and end-to-end acceptance
 gates. All screenshots below remain earlier-release evidence, including its
 synthetic validation. They must not be relabelled as the current release.
 
@@ -230,6 +271,20 @@ lag, backlog, next due work and gaps. A retained-history limit can leave a poll
 window incomplete despite successful HTTP pages. An idle controller heartbeat
 does not prove collection is healthy.
 
+Read readiness in layers:
+
+| Evidence | What it establishes | What it does not establish |
+|---|---|---|
+| Accepted request or queued inventory work | Durable intent | Completed collection |
+| Persisted workspace/domain metadata | Selectable IDs/names from the service | Source item/history access |
+| Successful source-access probe | That operation under the collector identity | Current full coverage or remediation permission |
+| Current complete observation window | Coverage of that bounded window | Replay safety or an approved action |
+| Current scope, review, explicit approval and reservation | Permission for one bounded action when all guards pass | Verification that the external action succeeded |
+
+The deployed collector-only heartbeat has no connector and cannot report event
+delivery. A partial latest generation remains partial with zero scopes; an
+empty target list is not evidence that the tenant is healthy.
+
 Connector records show owned source subscriptions, desired/observed topology,
 identity and delivery proof timestamps, and explicit gaps. Planned connectors
 can have unassigned topology IDs without being labelled ready. **Blocked** and
@@ -342,8 +397,9 @@ its version looks plausible. Once the original operation is confirmed, current
 review/target admission and the permission-refresh generation must be loaded
 before another edit. If the receipt contains pending intent, use the current
 review lookup to observe publication; do not mutate the receipt or issue a new
-blind request ID. The presence of these source contracts does not establish
-the outstanding native SQL recovery or full-cutover proof.
+blind request ID. These source contracts and the completed SQL bootstrap do not
+prove deployed API receipt recovery, production runtime SQL permissions or
+full-cutover acceptance.
 
 ## Local preview
 
@@ -488,14 +544,14 @@ independently. The command-center template does not create, replace or delete
 them. Require SQL public-firewall admission, Entra-only authentication, TLS,
 auditing and TDE; web reachability alone does not establish SQL access.
 
-These steps describe deployment preparation and current source requirements.
-Complete the [hybrid acceptance and cutover gates](./HybridMonitoringPlan.md)
-before claiming the new application ready. Do not run old and new writers
-concurrently or use an older target/schema loader as a rollback path.
-The current gates above remain closed: the steps below are not authorization
-to apply runtime grants, initialize/reset shared state or deploy/push this
-release. Final release validation follows the native-adapter and orchestration
-handoff; an earlier frontend pass is not validation of that final artifact.
+These steps are a reference for separately reviewed deployments and updates.
+The current web/controller cutover is complete; do not repeat initialization,
+restore historical maintenance/grants or redeploy merely because older proof
+captures differ. Do not run old and new writers against shared state or use an
+older target/schema loader as a rollback path. The remaining
+[hybrid acceptance gates](./HybridMonitoringPlan.md) cover event-enabled operation,
+full source collection/recovery, coverage and observability; a web deployment or
+earlier frontend pass does not close them.
 
 ### 1. Register the SPA/API
 
@@ -604,8 +660,10 @@ checked views and static guarded procedures:
 | Controller | Deterministic publication and guarded controller work, action and finalization state |
 | Deployment operator | Approved schema, component grants, maintenance and separately authorized bootstrap/reset |
 
-Runtime identities must not receive base-table DML, broad database roles,
-schema ALTER or impersonation permission. Human app roles remain authoritative
+Runtime identities must not receive unrestricted monitoring-base-table DML,
+broad database roles, schema ALTER or impersonation permission. Ancillary
+application tables receive only the reviewed object/column grants required by
+their current callers. Human app roles remain authoritative
 in Entra; this SQL separation is for service components, not a human ACL table.
 Use the reviewed component-specific permission contract and prove its allowed
 and denied operations under the actual managed identities on an approved
@@ -629,8 +687,11 @@ role assignments use the **principal object ID** instead.
 See the public [CREATE USER documentation](https://learn.microsoft.com/sql/t-sql/statements/create-user-transact-sql#arguments).
 Do not treat these IDs as interchangeable. Verify each runtime component's
 native Azure SQL SID and actual MI sign-in before accepting its binding.
-Earlier bootstrap-MI login and authority checks are bounded evidence, but runtime users,
-memberships and permission/effect proof remain outstanding.
+The current runtime mappings, kernel roles and ancillary grants are installed,
+and web/controller SQL paths have been exercised with the correct identities.
+The normal-worker path and broader allowed/denied operation coverage remain
+separate proof obligations; a generic monitoring role does not cover all
+application-store calls.
 Azure SQL supports database-scoped `WITHOUT LOGIN`/`EXECUTE AS USER` tests, but
 those do not prove the deployed identity or network/firewall admission.
 
@@ -684,7 +745,10 @@ Local prompt edits alone do not change a registered Foundry agent.
 
 The monitoring worker is a separate outbound service using an explicitly
 selected managed identity. Its live configuration binds the Azure/monitoring
-tenant, identity, SQL database and app-owned Eventstream endpoint metadata.
+tenant, identity and SQL database. Start with `-CollectorOnly` for workspace
+inventory and REST polling, without event metadata; see the
+[collector-only quickstart](DeploymentGuide.md#collector-only-quickstart).
+Event mode instead requires the complete app-owned endpoint binding.
 Provide nonsecret namespace/entity/consumer-group identifiers, never keys or
 credential-bearing connection strings. The
 [worker source](../src/triage/monitoring/worker.py) defines its required settings.
@@ -747,17 +811,25 @@ collects inventory, REST history and events; the web process does not do those
 scans or execute production investigations. `command sweep` remains available
 when only human-command draining is wanted.
 
-The scheduler template has a 15-minute timeout. The command-only worker's
-default combined deadline is 630 seconds: 300 seconds of triage, 300 seconds
-awaiting approval and 30 seconds of overhead. A heartbeat can process multiple
-bounded rounds; measure its total budget and keep caller timeout/scheduling
-consistent with that work. These defaults are not proof of a complete heartbeat
-under load. A missing response is not evidence that no work executed.
+The scheduler template has a 15-minute timeout. Heartbeat admission has an
+840-second monotonic budget including lock acquisition, with two automatic and
+one human-command concurrent slots. Refills obey queue limits and the remaining
+execution allowance. Insufficient allowance stops new claims;
+lock-wait timeout does not cancel the lock holder, and already admitted work
+settles under its own fences. This is not a guarantee that a whole backlog fits
+one invocation. A missing response is not evidence that no work executed.
 The scheduler also validates the Responses body: HTTP 200 is insufficient when
 `status` is failed or an error is present. Those runs remain failed even without
 a Teams failure webhook.
 Logic Apps' binary `$content` wrapper is decoded first when present, including
 responses carrying `Content-Encoding: identity`.
+
+The existing one-minute command scheduler was reused by changing only its
+command to `heartbeat`; no second timer or mailbox path was enabled, and the
+separate silent schedule was unchanged. Three real recurrence responses were
+verified completed. The deployed missing/failed-heartbeat alerts are portal-only:
+`RunsSucceeded < 1` over 15 minutes and `RunsFailed > 0` over 5 minutes.
+No Action Group/email/webhook delivery or absence canary is claimed.
 
 Without the controller drain, admitted work remains queued. Without the
 collector/receiver, no fresh collection is implied by a successful heartbeat.
@@ -813,12 +885,13 @@ real Fabric job/activity correlation. `/api/health` proves only process
 liveness. SQL errors and failed model calls must remain explicit errors, never
 invented healthy state or a silent mock fallback.
 
-For this release, final native integration handoff must precede a new full
-frontend test/lint/build run and deployed acceptance. The isolated transport
-receipts and offline kernel closure above do not prove native SQL durability
-or the normal worker. New screenshots must come from the accepted current
-deployment, after its baseline, runtime permissions, workers and application
-cutover have been explicitly authorized and verified.
+The current web/controller cutover, collector-only workspace inventory and
+recorded heartbeat recurrences and native paired-heartbeat telemetry are verified.
+Event intake, full source collection/recovery and sustained operation remain
+separate acceptance work. Validate each final artifact after integration; an
+earlier frontend pass does not validate later source changes. Screenshots must
+identify the actual deployment and scope they show, rather than implying
+worker or end-to-end acceptance from a successful web page.
 
 Foundry validation consumes the model deployment's rate limits. If a batch
 reports 429, pace cases rather than increasing controller policy budgets.

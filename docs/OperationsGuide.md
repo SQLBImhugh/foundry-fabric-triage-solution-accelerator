@@ -14,16 +14,31 @@ event types across manual failure, scheduled failure, success and cancellation.
 It did not prove SQL durable handling or normal-worker readiness. The current
 network baseline is public with Entra authentication; scoped SQL/registry
 evaluation access is enabled and verified. The worker still has no ingress.
-The original SQL `STARTED` proof receipt is under guarded recovery; completion,
-full bootstrap commit and runtime permissions remain gates. Do not clear that
-receipt or start a new operation to bypass uncertainty.
+SQL recovery is complete through append-only adjudication; the original failed
+`STARTED` receipt remains unchanged. Schema and bootstrap proof captures are
+historical. Current maintenance is `false`: the web app and hosted controller
+use Azure SQL with correct acting-identity mappings, kernel roles
+and application grants. Do not restore historical maintenance or grant state.
+
+The no-ingress worker is deployed in explicit collector-only mode. Native
+Fabric domain/workspace reads accepted 332 workspaces into SQL; authenticated
+Include and Inventory selectors show 333 enabled options including the
+placeholder. Item scanning remains partial, with source-permission 401s and
+budget/throttling gaps. This is real metadata collection, not source-access or
+remediation proof. No scope or action was automatically admitted.
+
+Use `reconcile` for schema receipts and SELECT-only `reconcile-recovery` for
+recovery acknowledgements. Historical recovery lookup keeps the original request,
+hashes and, when needed, staged artifact data. `MISSING` or `CONFLICT` is not
+permission to restart. Never clear a receipt or invent a new ID to bypass uncertainty.
 
 The public Foundry path is retained. The earlier private Foundry service error
-is historical and does not block this architecture. The live app/controller
-have not been cut over; no history migration/wipe, normal-worker rollout,
-hybrid application push or current-release UI screenshots are complete.
+is historical and does not block this architecture. Event-enabled collection,
+full RPC/source-access/restart coverage and sustained operation remain
+separate acceptance work. The bounded collector/heartbeat evidence does not
+prove those paths.
 Earlier private-network and Fabric SQL proof remains historical.
-Keep the normal worker and controller heartbeat gated; see
+Do not infer unattended monitoring from a successful controller invocation; see
 [native proof status](DeploymentGuide.md#native-proof-and-bootstrap-status).
 
 ## What runs, and when
@@ -46,15 +61,30 @@ disabled and grant its managed identity the reviewed Foundry invocation scope.
 Only after current-release proof, enable the same reviewed deployment and verify
 actual responses and durable work. Do not run overlapping old and new timers.
 
-The heartbeat gives each queue bounded opportunities rather than allowing a busy
-workspace or human-command backlog to consume every slot. Target poll cadence
+The current deployment reused its existing one-minute command scheduler, changing
+only its command to `heartbeat`. It created no second timer, enabled no mailbox
+path and left the separate silent-sweep schedule unchanged. Three actual
+recurrence responses were decoded and verified completed, not inferred from
+HTTP status or CLI exit code.
+
+The heartbeat uses two automatic and one human-command concurrent slots under
+an 840-second monotonic clock beginning before lock acquisition. Slots refill
+within bounded queue quotas while the remaining window covers the execution
+allowance. Lock-wait expiry defers only that caller; it never cancels the holder.
+Insufficient remaining allowance prevents a new claim; admitted work settles
+under its existing policy and fences. Target poll cadence
 belongs to the registry. The collector uses durable continuations, leases and
 service/API budgets across replicas; a local semaphore is not a shared limit.
 
-The scheduler's `PT15M` caller timeout exceeds the default combined
-triage/approval/worker allowance (`300 + 300 + 30` seconds). A shorter timeout can
-abandon a caller while an approval remains valid. HTTP invocation retries are
+The scheduler's `PT15M` caller timeout exceeds the admission window, but is not
+permission to cancel an effect already admitted. HTTP invocation retries are
 disabled: an ambiguous POST must not create overlapping work.
+
+The deployed portal-only health alerts evaluate `RunsSucceeded < 1` over
+15 minutes and `RunsFailed > 0` over 5 minutes, every minute. Their action lists
+are empty. Inspect Azure Monitor and scheduler history directly; no Action
+Group/email/webhook delivery or absence canary is established. See
+[controller-health-alerts.bicep](../infra/controller-health-alerts.bicep).
 
 The permitted scheduler commands are `heartbeat`, `sweep`, `silent sweep`,
 `pipeline sweep` and `command sweep`. Do not substitute free text; unrecognized
@@ -97,18 +127,26 @@ Admin Items adapters; the deploy helper exposes the same choice as
 `-InventoryMode`. This is API selection, not a grant or proof of complete
 tenant-wide operational visibility.
 
-The MI consumer is a separate live-only process:
+Start the live-only MI worker without Eventstream dependencies when inventory
+and REST collection are the intended mode:
 
 ```powershell
-.\.venv\Scripts\python.exe -m triage.monitoring.worker
+.\.venv\Scripts\python.exe -m triage.monitoring.worker --collector-only
 ```
 
-It requires the explicit identity, owned connector, nonsecret endpoint and SQL
-environment listed in
+It requires the explicit identity and SQL environment listed in
 [DeploymentGuide.md](DeploymentGuide.md#worker-configuration-and-checks).
 It does not read `.env`, accept a developer/secret fallback or expose an inbound
-HTTP health endpoint. A blocked startup must remain visible, not silently become
-a transport probe.
+HTTP health endpoint. Collector-only mode rejects partial/residual event settings,
+constructs no receiver/provisioner and writes a non-transport heartbeat with
+`connector_id=null`. It cannot claim deliveries or connector readiness.
+The deployment helper requires `-CollectorOnly` or `-ConnectorBootstrapFile`
+exclusively; Bicep defaults to `collectorOnly=true`.
+
+For event mode, omit `--collector-only` and supply the entire owned connector
+and nonsecret endpoint binding. Missing settings must fail, not silently select
+collector-only, fixture state or a transport probe. See the
+[collector-only quickstart](DeploymentGuide.md#collector-only-quickstart).
 
 ### SQL component and publication boundaries
 
@@ -282,6 +320,36 @@ as operational requests, not read-only diagnostics. The first two can execute
 eligible work, live pipelines queue observations, and accepting a health
 baseline changes what future scans consider normal.
 
+### Local SQL candidate checks
+
+`scripts\prepare_azure_sql.py --request <request.json> --output <new-directory>`
+prepares current source, ordered SQL, a bundle, Dockerfile and strict manifest
+without credentials, network access, SQL or a build. Its separate
+`--verify <candidate-directory>` mode checks local hashes and the readback model
+only. The result remains `candidate_not_authorized`, with
+`native_sql_proven=false` and `image_built=false`.
+
+Verification also binds the candidate to the current trusted preparation
+sources and regenerated source/SQL/check/ABI expectations, not merely to a
+self-consistent manifest. Payload Python is never executed. Preserve a
+historical artifact rather than rehashing it to fit current verification.
+
+The current complete export includes 19 tenant-bound static service/API/
+provisioning budget seed batches and the fixed `budget_policies` readback:
+164 batches and 115 checks at this revision. Matching existing policies preserve
+usage, window and cooldown state; policy-definition drift refuses. The readback
+excludes those mutable counters and refuses missing, changed or extra policies.
+Do not replay bootstrap or reset counters to repair a running deployment's
+missing policies; use a separately reviewed one-off policy installation.
+Earlier 145-batch/114-readback native evidence is not proof of this new candidate.
+
+Use a new output directory and the explicitly reviewed target/bootstrap-MI
+request; preserve existing candidates. Preparation does not grant runtime
+access, initialize control, register writers or approve a recovery baseline.
+Do not mistake a local verification result for fresh native evidence or
+approval of current live grants. See
+[local SQL candidate preparation](DeploymentGuide.md#local-sql-candidate-preparation).
+
 ## Access and incident collaboration
 
 The command-center Incidents page retains evidence, run history, append-only
@@ -336,9 +404,35 @@ refuse. Reset receipts, registration/capture evidence and API rate budgets
 survive; unrelated objects, Entra groups, infrastructure, endpoint namespaces
 and business data do not belong to the wipe.
 
+The optional `dbo.triage_sql_bootstrap_receipts` and
+`dbo.triage_sql_bootstrap_recoveries` journals are retained in place.
+Reset validates their exact supported structure and rejects foreign keys or
+runtime mutation authority when they exist; it neither creates absent journals
+nor deletes their rows. They may appear only in reset `retained_counts`, never
+`deleted_counts`. Unknown/lookalike accelerator objects are not exempted.
+
+Ancillary-writer classification and writer quiescence are reset-only controls,
+not routine startup requirements or approval of current runtime grants.
+The reset classifier requires the declared role's actual transitive membership,
+anchor-RPC grant and verified module/ownership boundary, not a matching principal
+name. Approval-table SELECT is the reviewed surface; raw approval writes remain
+unsafe. Do not stop or reconfigure an active service merely to make a reset-only
+profile look empty.
+
 Retain original manifests, operation IDs and receipts after a timeout. A repeat
 must reconcile the prior receipt, not wipe new-epoch rows. The tool leaves
 maintenance enabled and starts no services. `bi-triage reset` refuses live mode.
+
+For failed bootstrap rollback adjudication, collect and independently review
+the full empty/security baseline using the current trusted
+`bootstrap.recovery_baseline_fingerprint(db, artifact.bundle)` reader.
+Preserve target/receipt identity, source hash, collected evidence and its digest
+separately; do not derive the expected baseline from unreviewed failed-target
+metadata or a generic empty database. Local export does not supply that approval.
+Fresh recovery checks the separately approved `empty_baseline_sha256` inside
+the transaction before writing, with a current request window of at most
+15 minutes. See
+[empty rollback baseline evidence](DeploymentGuide.md#empty-rollback-baseline-evidence).
 
 ## Failure investigation
 
@@ -386,10 +480,34 @@ receipts are different signals. Configure alerting for stale workers, missing
 inventory deadlines, denied/throttled reads, checkpoint lag, backlog and failed
 finalization rather than relying on recent incidents alone.
 
-The existing telemetry helper consumes `APPLICATIONINSIGHTS_CONNECTION_STRING`
-without explicitly configuring an Entra exporter. A portal Insights link does
-not establish secretless telemetry. Use the separately reviewed exporter/network
-path; do not add a credential to make a dashboard appear healthy.
+**Hosted metadata telemetry is application-owned.**
+`TRIAGE_TELEMETRY_CONNECTION_STRING` supplies the locator and hosted export uses
+managed identity. The standard `APPLICATIONINSIGHTS_CONNECTION_STRING` is
+reserved for Foundry project monitoring; it was empty in the actual runtime
+without a project connection even when a version definition displayed a value.
+The CLI standard setting is unchanged and is not a hosted fallback.
+
+Keep Foundry project tracing disconnected: connecting Application Insights
+enables project-wide traces that can contain prompts/responses/tool content.
+The app-owned public Insights resource is Entra-only and has optional
+resource-scoped publisher assignments, with no project connection.
+Hosted startup forces content capture off, disables the host's default
+observability callback and exports only allowlisted metadata loggers.
+Diagnostics retain counts, error types and sanitized source locations, not raw
+exception text or SDK payloads.
+
+The SDK also parsed an empty platform locator despite an explicit custom value.
+Hosted configuration requires the explicit app-owned locator, then removes only
+an exact empty platform value before SDK configuration. A nonempty value is
+never removed/masked, the reserved variable is never redeclared and there is no
+hosted fallback. CLI behavior is unchanged.
+
+Native Application Insights queries now contain paired `heartbeat_started` and
+`heartbeat_finished` records with completed status, elapsed times approximately
+6,000-26,000 ms, queue counts and zero exporter failure/warning counters in the
+captured runs. Console output, configuration and portal links alone still are
+not ingestion receipts. Preserve this as bounded evidence, not a guarantee of
+all future delivery. See [telemetry setup and public sources](DeploymentGuide.md#8-observability).
 
 Budget for continuously allocated worker compute, the hosted controller, model
 usage, Azure SQL compute/storage/backups/auditing, Fabric workload capacity,

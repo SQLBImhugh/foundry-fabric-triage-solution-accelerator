@@ -26,7 +26,8 @@ COPY scripts/hybrid_platform_probe.py ./scripts/hybrid_platform_probe.py
 RUN python -c "import tomllib; assert 'monitoring' in tomllib.load(open('pyproject.toml', 'rb'))['project']['optional-dependencies'], 'The monitoring extra is required'" \
     && python -m pip install --no-cache-dir ".[azure,monitoring]" \
     && python -m pip check \
-    && python -c "import importlib.util; import mssql_python; import azure.eventhub; import scripts.hybrid_platform_probe; assert importlib.util.find_spec('triage.monitoring.worker') is not None, 'The monitoring worker entry point is required'"
+    && python -c "import importlib.util; import mssql_python; import azure.eventhub; import scripts.hybrid_platform_probe; assert importlib.util.find_spec('triage.monitoring.worker') is not None, 'The monitoring worker entry point is required'" \
+    && python -m triage.monitoring.worker --help
 
 USER 10001:10001
 STOPSIGNAL SIGTERM

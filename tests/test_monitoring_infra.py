@@ -128,6 +128,10 @@ def test_compiled_template_contract_when_supplied() -> None:
     }
     assert template["parameters"]["minReplicas"]["defaultValue"] == 1
     assert template["parameters"]["environmentExceptionTags"]["defaultValue"] == {}
+    assert template["parameters"]["collectorOnly"]["defaultValue"] is True
+    assert properties["template"]["containers"][0]["args"] == (
+        "[if(parameters('collectorOnly'), createArray('--collector-only'), createArray())]"
+    )
 
 
 def _deployed_resources(template: dict) -> list[dict]:
@@ -446,12 +450,30 @@ def test_prepare_is_local_and_persists_nonsecret_parameters(tmp_path: Path) -> N
     assert generated["parameters"]["connectorBootstrap"]["value"] == bootstrap
     assert generated["parameters"]["environmentExceptionTags"]["value"] == {}
     assert generated["parameters"]["minReplicas"]["value"] == 1
+    assert generated["parameters"]["collectorOnly"]["value"] is False
     assert "NatGatewayResourceId" not in generated["parameters"]
     assert "workerSubnetResourceId" not in generated["parameters"]
     assert all(
         not any("/Microsoft.Network/" in str(part) for part in call["arguments"])
         for call in calls
     )
+
+
+def test_collector_only_prepare_requires_no_eventstream_file(tmp_path: Path) -> None:
+    parameters, bootstrap, responses = _fixture(tmp_path)
+    parameters.pop("ConnectorBootstrapFile")
+    parameters["CollectorOnly"] = True
+    result, calls, report = _run(tmp_path, parameters, bootstrap, responses)
+    assert result.returncode == 0, result.stderr
+    generated = json.loads(
+        (Path(parameters["OutputDirectory"]) / "monitoring-worker.parameters.json").read_text(
+            encoding="utf-8-sig",
+        )
+    )
+    assert generated["parameters"]["collectorOnly"]["value"] is True
+    assert generated["parameters"]["connectorBootstrap"]["value"] is None
+    assert report["status"] == "Prepared"
+    assert [call["arguments"][:2] for call in calls] == [["bicep", "build"]]
 
 
 @pytest.mark.parametrize(

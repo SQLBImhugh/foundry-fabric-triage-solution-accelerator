@@ -25,7 +25,12 @@ from test_monitoring_events import (
 )
 
 from triage.monitoring.contracts import MonitoringUnavailable
-from triage.monitoring.events import EventContractError, EventProtocolError, SqlCheckpointStore
+from triage.monitoring.events import (
+    EventContractError,
+    EventProtocolError,
+    ReceiverHeartbeat,
+    SqlCheckpointStore,
+)
 from triage.monitoring.models import ConnectorSourceProposal, PendingSourceRemoval
 from triage.monitoring.provisioning import ReconcileResult, ReconcileRun
 from triage.monitoring.worker import (
@@ -256,6 +261,53 @@ def test_inventory_api_mode_is_explicit_and_defaults_to_caller_visible():
     assert options.powerbi_datasets
 
 
+def test_collector_only_configuration_needs_no_eventstream_but_still_requires_sql():
+    values = {
+        key: value for key, value in environment().items()
+        if key != "MONITORING_CONNECTOR_ID" and not key.startswith("MONITORING_EVENTSTREAM_")
+    }
+    config = WorkerConfig.from_environment(values, collector_only=True)
+    assert config.connector is None and config.monitoring_mode == "live"
+    with pytest.raises(EventContractError):
+        WorkerConfig.from_environment(values)
+    with pytest.raises(EventContractError):
+        WorkerConfig.from_environment(environment(), collector_only=True)
+    with pytest.raises(EventContractError):
+        WorkerConfig.from_environment({**values, "AZURE_SQL_SERVER": ""}, collector_only=True)
+
+
+def test_worker_store_factory_does_not_require_reasoning_settings(monkeypatch):
+    from triage.monitoring import runtime, sql_store
+    from triage.policy import TriagePolicy
+
+    config = replace(worker_config(), connector=None)
+    created = {}
+    marker = object()
+
+    def store(**kwargs):
+        created.update(kwargs)
+        return marker
+
+    monkeypatch.setattr(sql_store, "AzureSqlMonitoringStore", store)
+    monkeypatch.setattr(runtime, "inspect_context", lambda *args: None)
+    policy = TriagePolicy(max_write_actions=0, allowed_actions=frozenset())
+    assert runtime.build_monitoring_store(
+        config, db=object(), component="worker", policy=policy,
+    ) is marker
+    assert created["policy"] is policy and created["component"] == "worker"
+
+
+@pytest.mark.parametrize("fields", [
+    {"transport_connected": True}, {"accepted_positions": 1}, {"last_delivery_at": NOW},
+])
+def test_collector_health_never_claims_event_delivery(fields):
+    with pytest.raises(ValueError, match="cannot assert event"):
+        ReceiverHeartbeat(
+            **MemoryBackend().context.model_dump(), worker_id=OWNER, connector_id=None,
+            observed_at=NOW, state="running", **fields,
+        )
+
+
 @pytest.mark.parametrize("mode", ["", "all", "tenant", "tenant_admin", "true", True, None, []])
 def test_invalid_inventory_mode_does_not_silently_select_admin_or_partial_mode(mode):
     with pytest.raises(EventContractError, match="MONITORING_INVENTORY_MODE"):
@@ -287,11 +339,12 @@ async def test_live_worker_factory_wires_the_selected_inventory_adapter(
         def close(self):
             pass
 
-    def build_store(settings, *, db, fixture, component):
+    def build_store(settings, *, db, fixture, component, policy):
         assert settings.inventory_mode == mode
         assert settings.monitoring_mode == "live"
         assert fixture is False and db is not None
         assert component == "worker"
+        assert policy.max_write_actions == 0 and not policy.allowed_actions
         return backend
 
     azure = ModuleType("azure")
@@ -439,6 +492,46 @@ async def test_worker_runs_independent_maintenance_and_durable_heartbeat_without
     assert backend.heartbeats[-1].state == "stopped"
     assert credentials[0].closed
     assert consumers[0].partition.checkpoint_calls == 0
+
+
+async def test_collector_runs_on_an_empty_registry_without_creating_a_receiver():
+    backend = MemoryBackend()
+    collector = FakeCollector()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Initial inventory must not require event transport")
+
+    worker = MonitoringWorker(
+        backend, backend, collector, replace(worker_config(backend), connector=None),
+        backend.context, worker_id=OWNER, client_factory=forbidden,
+        credential_factory=forbidden, clock=lambda: backend.now,
+    )
+    stop = asyncio.Event()
+    running = asyncio.create_task(worker.run(stop))
+    await wait_until(lambda: collector.calls >= 2 and len(backend.heartbeats) >= 2)
+    stop.set()
+    await asyncio.wait_for(running, 2)
+    assert worker.receiver is None and worker.checkpoints is None
+    assert backend.heartbeats[-1].state == "stopped"
+    assert all(
+        row.connector_id is None and not row.transport_connected and row.accepted_positions == 0
+        for row in backend.heartbeats
+    )
+
+
+def test_collector_health_persists_without_a_connector_in_the_shared_memory_store():
+    from test_monitoring_store import Harness
+
+    from triage.monitoring.memory import InMemoryMonitoringStore
+
+    h = Harness()
+    store = InMemoryMonitoringStore(clock=h.clock, state=h.state, component="worker")
+    heartbeat = ReceiverHeartbeat(
+        **h.context(), worker_id=h.owner, connector_id=None,
+        observed_at=h.clock(), state="running", last_maintenance_at=h.clock(),
+    )
+    assert store.record_receiver_heartbeat(heartbeat) == heartbeat
+    assert all(record.kind != "connector" for record in h.state.records.values())
 
 
 async def test_worker_maintenance_provisions_initial_sources_without_delivery_gate():

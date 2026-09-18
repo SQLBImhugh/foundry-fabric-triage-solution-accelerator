@@ -185,7 +185,10 @@ class Settings(BaseSettings):
     teams_mode: Literal["webhook", "graph"] = "webhook"
 
     # --- Observability -----------------------------------------------------
+    # The standard setting remains for CLI telemetry. Hosted metadata uses an
+    # application-owned locator without enabling Foundry project content tracing.
     applicationinsights_connection_string: str = Field(default="", repr=False)
+    triage_telemetry_connection_string: str = Field(default="", repr=False)
 
     # --- Policy ------------------------------------------------------------
     # Shared across every agent in a run, not per agent. See TriagePolicy.

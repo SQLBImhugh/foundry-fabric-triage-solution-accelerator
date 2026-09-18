@@ -93,7 +93,7 @@ class TransactionalSqlFake(AzureSqlDatabase):
         self.actual_database, self.server_identity, self.database_id = TARGET.database, "fixture-sql-server", 7
         self.clock = Clock()
         self.catalogue = reset.build_catalogue()
-        self.tables = {table.name: [] for table in self.catalogue.tables}
+        self.tables = {table.name: [] for table in self.catalogue.tables if not table.optional}
         self.tables["business_orders"] = [{"order_id": 1, "description": "retain unrelated data"}]
         self.columns = {
             table.name: [
@@ -327,8 +327,8 @@ class TransactionalSqlFake(AzureSqlDatabase):
             ]
         if "deployment-authority:columns" in sql:
             return [
-                ("dbo", name, *row[:5], *row[6:], row[5]) for name in sorted(self.tables)
-                if name in self.columns for row in self.columns[name]
+                ("dbo", name, *row[:5], *row[6:], row[5], column_id) for name in sorted(self.tables)
+                if name in self.columns for column_id, row in enumerate(self.columns[name], 1)
             ]
         if "deployment-authority:triggers" in sql:
             return self.sql_triggers

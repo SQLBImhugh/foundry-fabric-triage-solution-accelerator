@@ -13,7 +13,10 @@ does not clear, copy or migrate existing application rows.
 
 Operational rows, the epoch replacement and a terminal metadata-only reset
 receipt commit together. Reset receipts, service budgets, deployment registration
-and protected operator discovery captures survive resets.
+and protected operator discovery captures survive resets. The optional public
+SQL bootstrap receipt and recovery journals also survive unchanged. Their exact
+layout, ownership and operator-only mutation authority are checked when present;
+this tool never creates or deletes them.
 initialize_monitoring_schema owns its transaction, so it is called AFTER that
 commit to verify the identical bootstrap ID/control, never nested inside it.
 An ambiguous commit is reconciled by receipt/control reads, never an automatic
@@ -78,7 +81,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from triage.monitoring import models as m
 from triage.monitoring import schema as monitoring_schema
-from triage.monitoring.deployment_authority import read_authority
+from triage.monitoring.deployment_authority import read_authority, read_journal_layout
 from triage.monitoring.deployment_contracts import (
     CAPTURE_OPERATION,
     ActionTarget,
@@ -92,6 +95,8 @@ from triage.monitoring.deployment_contracts import (
 from triage.monitoring.deployment_discovery import GRAPH_SCOPE, AzureDeploymentDiscovery
 from triage.monitoring.deployment_schema import (
     DEFAULT_REGISTRATION_NAMES,
+    DEPLOYMENT_JOURNAL_NAMES,
+    DEPLOYMENT_JOURNAL_STATEMENTS,
     RegistrationNames,
     kernel_contract_hash,
     native_module_hash,
@@ -188,7 +193,11 @@ class TableSpec(FrozenModel):
     name: str
     columns: tuple[ColumnSpec, ...]
     primary_key: tuple[str, ...]
-    operation: Literal["clear", "replace_control", "preserve_reset_receipts", "preserve_service_budget", "preserve_registration"]
+    operation: Literal[
+        "clear", "replace_control", "preserve_reset_receipts", "preserve_service_budget",
+        "preserve_registration", "preserve_deployment_journal",
+    ]
+    optional: bool = False
 
 
 class ModuleSpec(FrozenModel):
@@ -283,7 +292,10 @@ def build_catalogue(registration_names: RegistrationNames = DEFAULT_REGISTRATION
         "monitoring_control", "monitoring_records", "monitoring_leases", "monitoring_receipts",
     }:
         raise ResetRefused("Declared state categories changed; review reset/hazard coverage before execution")
-    names = DEFAULT_TABLES | monitoring_schema.DEFAULT_MONITORING_TABLES | {"rate_budget": DEFAULT_RATE_TABLE} | registration_names.tables
+    names = (
+        DEFAULT_TABLES | monitoring_schema.DEFAULT_MONITORING_TABLES
+        | {"rate_budget": DEFAULT_RATE_TABLE} | registration_names.tables | DEPLOYMENT_JOURNAL_NAMES
+    )
     if len(names.values()) != len({value.casefold() for value in names.values()}):
         raise ResetRefused("Declared state table names collide")
     for name in names.values():
@@ -293,6 +305,7 @@ def build_catalogue(registration_names: RegistrationNames = DEFAULT_REGISTRATION
         *monitoring_schema.schema_statements(),
         *rate_schema_statements(),
         *registration_statements(registration_names),
+        *DEPLOYMENT_JOURNAL_STATEMENTS.values(),
     )
     tables, modules, foreign_keys = [], [], []
     for statement in statements:
@@ -366,10 +379,11 @@ def build_catalogue(registration_names: RegistrationNames = DEFAULT_REGISTRATION
             "rate_budget": "preserve_service_budget",
             "deployment_registration": "preserve_registration",
             "deployment_writers": "preserve_registration",
+            **{key: "preserve_deployment_journal" for key in DEPLOYMENT_JOURNAL_NAMES},
         }.get(logical, "clear")
         tables.append(TableSpec(
             logical_name=logical, name=name, columns=tuple(columns), primary_key=tuple(primary_key),
-            operation=operation,
+            operation=operation, optional=logical in DEPLOYMENT_JOURNAL_NAMES,
         ))
     if sorted(table.name for table in tables) != sorted(names.values()):
         raise ResetRefused("Declared tables and deployment DDL differ; no state may be skipped")
@@ -863,7 +877,8 @@ class ResetReceipt(FrozenModel):
                 *self.registration_names.tables.values(),
             )
         }
-        if not self.deleted_counts.keys() <= allowed or not self.retained_counts.keys() <= allowed:
+        retained_allowed = allowed | {f"dbo.{name}" for name in DEPLOYMENT_JOURNAL_NAMES.values()}
+        if not self.deleted_counts.keys() <= allowed or not self.retained_counts.keys() <= retained_allowed:
             raise ValueError("Reset receipt counts must name declared state objects only")
         if (
             self.new_control.tenant_id != self.target.tenant_id
@@ -1006,9 +1021,16 @@ class SqlResetOperator:
             "JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id "
             "WHERE i.object_id=? ORDER BY i.index_id,ic.index_column_id", object_id,
         )
+        journal = None
+        if table.operation == "preserve_deployment_journal":
+            try:
+                journal, journal_valid = read_journal_layout(self.db, table.name)
+            except DeploymentError as exc:
+                raise ResetRefused(str(exc)) from exc
+            compatible &= journal_valid
         return _hash({
             "columns": actual, "primary_key": primary, "safety": modifiers,
-            "constraints": constraints, "indexes": indexes,
+            "constraints": constraints, "indexes": indexes, "deployment_journal": journal,
         }), bool(compatible)
 
     def _contents(self, table: TableSpec) -> tuple[int, str, int]:
@@ -1023,7 +1045,9 @@ class SqlResetOperator:
         )
         if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 0:
             raise ResetRefused("An exact owned-table count could not be read")
-        retained = rows[0][0] if table.operation in {"preserve_service_budget", "preserve_registration"} else 0
+        retained = rows[0][0] if table.operation in {
+            "preserve_service_budget", "preserve_registration", "preserve_deployment_journal",
+        } else 0
         if table.operation == "preserve_reset_receipts":
             keep = self.db.query(
                 f"/* monitoring-reset:retained:{table.name} */ SELECT COUNT_BIG(*) FROM {quoted} "
@@ -1279,7 +1303,7 @@ class SqlResetOperator:
             if len(row) != 8:
                 raise ResetRefused("SQL object inventory has an unexpected shape")
             schema, name, kind, *_ = row
-            if name.startswith("triage_") and (schema != "dbo" or name not in expected_names):
+            if name.casefold().startswith("triage_") and (schema != "dbo" or name not in expected_names):
                 blockers.append(f"unexpected_accelerator_object:{schema}.{name}")
             if schema == "dbo":
                 if name in by_name:
@@ -1290,7 +1314,8 @@ class SqlResetOperator:
         for table in self.catalogue.tables:
             row = by_name.get(table.name)
             if row is None:
-                blockers.append(f"missing_table:{table.name}")
+                if not table.optional:
+                    blockers.append(f"missing_table:{table.name}")
             elif row[2] != "U":
                 blockers.append(f"wrong_object_type:{table.name}")
             else:
@@ -1335,6 +1360,8 @@ class SqlResetOperator:
             # Lock all owned tables in one consistent order before the final
             # inventory/count read. Foreign/unrelated objects are never locked.
             for table in self.catalogue.tables:
+                if table.name not in compatible:
+                    continue
                 self.db.query(
                     f"/* monitoring-reset:lock:{table.name} */ SELECT COUNT_BIG(*) "
                     f"FROM {quote_identifier(table.name)} WITH (TABLOCKX,HOLDLOCK)",
@@ -1389,7 +1416,7 @@ class SqlResetOperator:
         )
         role_map = {row[0]: row for row in roles}
         for name in role_map:
-            if name.startswith("triage_") and name not in self.catalogue.roles:
+            if name.casefold().startswith("triage_") and name not in self.catalogue.roles:
                 blockers.append(f"unexpected_accelerator_role:{name}")
         for name in self.catalogue.roles:
             row = role_map.get(name)
@@ -1401,12 +1428,14 @@ class SqlResetOperator:
                 name=name, kind="role", object_id=row[1] if row else None,
                 schema_hash=_hash(list(row)) if row else None, operation="retain_definition",
             ))
-        hazards = self._hazards() if len(compatible) == len(self.catalogue.tables) else ()
+        required_tables = {table.name for table in self.catalogue.tables if not table.optional or table.name in by_name}
+        hazards_complete = required_tables <= compatible
+        hazards = self._hazards() if hazards_complete else ()
         required_targets = self._registered_targets(compatible, hazards)
         return ResetSnapshot(
             target=self.target, server_identity=server, database_id=database_id, inspected_at=now,
             control=control, bootstrap_id=bootstrap_id, bootstrap_hash=bootstrap_hash,
-            objects=tuple(snapshots), hazards=hazards, hazards_complete=len(compatible) == len(self.catalogue.tables),
+            objects=tuple(snapshots), hazards=hazards, hazards_complete=hazards_complete,
             required_action_targets=required_targets,
             blockers=tuple(sorted(set(blockers))),
         )
@@ -1448,8 +1477,12 @@ class SqlResetOperator:
         authority = read_authority(
             self.db, self.target, self.catalogue, names=self.catalogue.registration_names,
         )
-        if set(authority.gaps) & {"unreviewed_trigger_authority", "autonomous_sql_writer"}:
-            raise ResetRefused("Unreviewed SQL triggers/activation prevent a schema-only initial bootstrap")
+        if set(authority.gaps) & {
+            "unreviewed_trigger_authority", "autonomous_sql_writer",
+            "deployment_journal_mutation_path", "deployment_journal_layout_changed",
+            "deployment_journal_authority_unproved",
+        }:
+            raise ResetRefused("Unreviewed SQL triggers/activation or deployment journal authority prevent initial bootstrap")
         new_names = (
             set(monitoring_schema.DEFAULT_MONITORING_TABLES.values()) | {DEFAULT_RATE_TABLE}
             | set(self.catalogue.registration_names.tables.values())
@@ -1469,6 +1502,10 @@ class SqlResetOperator:
                 approved = original[item.name]
                 if (item.object_id, item.schema_hash) != (approved.object_id, approved.schema_hash):
                     raise ResetRefused("Application object ownership/schema changed before initial bootstrap")
+                if item.operation == "preserve_deployment_journal" and (
+                    item.row_count, item.content_hash,
+                ) != (approved.row_count, approved.content_hash):
+                    raise ResetRefused("Deployment journal changed before initial bootstrap")
             elif item.name != f"dbo.{DEFAULT_RATE_TABLE}" and item.row_count not in (None, 0):
                 raise ResetRefused("An uninitialized monitoring baseline contains state; no import or upgrade is permitted")
 
@@ -1708,8 +1745,10 @@ class SqlResetOperator:
                 rate_table = self.catalogue.table("rate_budget")
                 retained[f"dbo.{rate_table.name}"] = counts[f"dbo.{rate_table.name}"].row_count
                 for table in self.catalogue.tables:
-                    if table.operation == "preserve_registration":
-                        retained[f"dbo.{table.name}"] = counts[f"dbo.{table.name}"].row_count
+                    if table.operation in {"preserve_registration", "preserve_deployment_journal"}:
+                        count = counts[f"dbo.{table.name}"].row_count
+                        if count is not None:
+                            retained[f"dbo.{table.name}"] = count
                 server, database_id, cutoff = self._identity()
                 if (server, database_id) != (current.server_identity, current.database_id):
                     raise ResetRefused("Connected server/database changed during the reset transaction")

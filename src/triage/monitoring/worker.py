@@ -5,6 +5,8 @@ EventPersistence operations, and the inventory/polling and connector-observation
 maintenance handlers. Only the controller publishes desired topology. Intake
 waits, visibly degraded, while that publication or an observed binding is pending;
 delivery proof is not a provisioning gate.
+--collector-only runs durable inventory/polling and non-transport health before
+an Eventstream exists. It never creates a receiver or fabricates connector ownership.
 --reconcile-once drains durable connector work without requiring intake hooks.
 Missing contracts never select fixture state. The transport probe deliberately
 bypasses SQL and reports that distinction.
@@ -23,10 +25,12 @@ import logging
 import os
 import re
 import signal
+import traceback
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import UUID, uuid4
 
@@ -70,6 +74,7 @@ SHUTDOWN_SECONDS = 60
 
 if TYPE_CHECKING:
     from triage.monitoring.inventory import InventoryApiOptions
+    from triage.monitoring.polling import CollectorRunResult
     from triage.monitoring.provisioning import ReconcileRun
 
 
@@ -97,7 +102,7 @@ class PinnedSyncCredential:
 @dataclass(frozen=True)
 class WorkerConfig:
     identity: IdentityBinding
-    connector: ConnectorBinding
+    connector: ConnectorBinding | None
     azure_sql_server: str = ""
     azure_sql_database: str = ""
     heartbeat_seconds: float = 30
@@ -115,7 +120,7 @@ class WorkerConfig:
             raise EventContractError(
                 "MONITORING_INVENTORY_MODE must be caller_visible or tenant_admin_preview"
             )
-        if self.identity.tenant_id != self.connector.tenant_id:
+        if self.connector is not None and self.identity.tenant_id != self.connector.tenant_id:
             raise EventContractError("Managed identity and connector tenant bindings differ")
         if (bool(self.azure_sql_server) != bool(self.azure_sql_database)) or (
             self.azure_sql_server
@@ -161,6 +166,7 @@ class WorkerConfig:
         environment: Mapping[str, str] | None = None,
         *,
         transport_probe: bool = False,
+        collector_only: bool = False,
     ) -> WorkerConfig:
         values = os.environ if environment is None else environment
         if values.get("MONITORING_MODE", "live") != "live":
@@ -190,30 +196,38 @@ class WorkerConfig:
                 subscription_id=required("AZURE_SUBSCRIPTION_ID"),
                 resource_id=required("MONITORING_IDENTITY_RESOURCE_ID"),
             )
-            endpoint = EndpointMetadata(
-                namespace=required("MONITORING_EVENTSTREAM_NAMESPACE"),
-                entity=required("MONITORING_EVENTSTREAM_ENTITY"),
-                consumer_group=required("MONITORING_EVENTSTREAM_CONSUMER_GROUP"),
-            )
-            connector = ConnectorBinding(
-                tenant_id=tenant,
-                connector_id=required("MONITORING_CONNECTOR_ID"),
-                workspace_id=required("MONITORING_EVENTSTREAM_WORKSPACE_ID"),
-                eventstream_id=required("MONITORING_EVENTSTREAM_ID"),
-                destination_id=required("MONITORING_EVENTSTREAM_DESTINATION_ID"),
-                endpoint=endpoint,
-            )
-            probe_helpers().Endpoint.from_document(
-                {
-                    "type": "CustomEndpoint",
-                    "fullyQualifiedNamespace": endpoint.namespace,
-                    "eventHubName": endpoint.entity,
-                    "consumerGroupName": endpoint.consumer_group,
-                    "workspaceId": connector.workspace_id,
-                    "eventstreamId": connector.eventstream_id,
-                    "destinationId": connector.destination_id,
-                }
-            )
+            connector = None
+            if collector_only:
+                if transport_probe or any(
+                    value for key, value in values.items()
+                    if key == "MONITORING_CONNECTOR_ID" or key.startswith("MONITORING_EVENTSTREAM_")
+                ):
+                    raise EventContractError("Collector-only mode cannot carry event transport configuration")
+            else:
+                endpoint = EndpointMetadata(
+                    namespace=required("MONITORING_EVENTSTREAM_NAMESPACE"),
+                    entity=required("MONITORING_EVENTSTREAM_ENTITY"),
+                    consumer_group=required("MONITORING_EVENTSTREAM_CONSUMER_GROUP"),
+                )
+                connector = ConnectorBinding(
+                    tenant_id=tenant,
+                    connector_id=required("MONITORING_CONNECTOR_ID"),
+                    workspace_id=required("MONITORING_EVENTSTREAM_WORKSPACE_ID"),
+                    eventstream_id=required("MONITORING_EVENTSTREAM_ID"),
+                    destination_id=required("MONITORING_EVENTSTREAM_DESTINATION_ID"),
+                    endpoint=endpoint,
+                )
+                probe_helpers().Endpoint.from_document(
+                    {
+                        "type": "CustomEndpoint",
+                        "fullyQualifiedNamespace": endpoint.namespace,
+                        "eventHubName": endpoint.entity,
+                        "consumerGroupName": endpoint.consumer_group,
+                        "workspaceId": connector.workspace_id,
+                        "eventstreamId": connector.eventstream_id,
+                        "destinationId": connector.destination_id,
+                    }
+                )
         except (ValueError, ValidationError):
             raise EventContractError("Worker identity or connector metadata is invalid") from None
         server = "" if transport_probe else required("AZURE_SQL_SERVER")
@@ -259,7 +273,7 @@ class Consumer(Protocol):
 
 
 class Collector(Protocol):
-    async def run_once(self) -> object: ...
+    async def run_once(self) -> CollectorRunResult: ...
 
 
 class ConnectorMaintenance(Protocol):
@@ -515,18 +529,16 @@ class MonitoringWorker:
         self.context = context
         self.worker_id = str(UUID(worker_id)) if worker_id else str(uuid4())
         self.clock = clock
-        self.checkpoints = SqlCheckpointStore(
-            store,
-            persistence=persistence,
-            binding=config.connector,
-            context=context,
-            clock=clock,
+        self.checkpoints = (
+            SqlCheckpointStore(
+                store, persistence=persistence, binding=config.connector, context=context, clock=clock,
+            ) if config.connector is not None else None
         )
-        self.receiver = EventReceiver(
-            self.checkpoints,
-            config.identity,
-            client_factory=client_factory,
-            credential_factory=credential_factory,
+        self.receiver = (
+            EventReceiver(
+                self.checkpoints, config.identity, client_factory=client_factory,
+                credential_factory=credential_factory,
+            ) if self.checkpoints is not None else None
         )
         self.last_maintenance_at: datetime | None = None
         self.errors: dict[str, str] = {}
@@ -535,12 +547,12 @@ class MonitoringWorker:
         report = ReceiverHeartbeat(
             **self.context.model_dump(),
             worker_id=self.worker_id,
-            connector_id=self.config.connector.connector_id,
+            connector_id=self.config.connector.connector_id if self.config.connector else None,
             observed_at=self.clock(),
             state="degraded" if self.errors and state == "running" else state,
-            transport_connected=self.receiver.connected,
-            accepted_positions=self.checkpoints.accepted_positions,
-            last_delivery_at=self.checkpoints.last_delivery_at,
+            transport_connected=self.receiver.connected if self.receiver else False,
+            accepted_positions=self.checkpoints.accepted_positions if self.checkpoints else 0,
+            last_delivery_at=self.checkpoints.last_delivery_at if self.checkpoints else None,
             last_maintenance_at=self.last_maintenance_at,
             error_code=next(iter(self.errors.values()), None),
         )
@@ -561,7 +573,11 @@ class MonitoringWorker:
         )
 
     async def _maintain(self) -> None:
-        await self.collector.run_once()
+        collected = await self.collector.run_once()
+        if any(result.state == "lease_lost" for result in collected.results):
+            self.errors["collection"] = "CollectorWorkFenced"
+        elif collected.claimed:
+            self.errors.pop("collection", None)
         if self.provisioner is not None:
             report = await self.provisioner.run_once()
             pending = [result for result in report.results if result.state != "completed"]
@@ -581,6 +597,8 @@ class MonitoringWorker:
         self.last_maintenance_at = self.clock()
 
     async def _receive_when_configured(self, stop: asyncio.Event) -> None:
+        if self.receiver is None or self.config.connector is None:
+            raise EventContractError("Collector-only mode has no event receiver")
         if self.provisioner is None:
             await self.receiver.run(stop)
             return
@@ -655,18 +673,10 @@ class MonitoringWorker:
             )
         if inspection.control.epoch != self.context.epoch:
             raise MonitoringConflict("The worker context no longer matches the deployed epoch")
-        if self.provisioner is None:
+        if self.provisioner is None and self.config.connector is not None:
             await current_connector(self.store, self.config.connector, self.context)
         await self._heartbeat("starting")
         tasks = [
-            asyncio.create_task(
-                self._supervise(
-                    "events",
-                    lambda: self._receive_when_configured(stop),
-                    stop,
-                    interval=None,
-                )
-            ),
             asyncio.create_task(
                 self._supervise(
                     "maintenance",
@@ -684,6 +694,12 @@ class MonitoringWorker:
                 )
             ),
         ]
+        if self.receiver is not None:
+            tasks.append(asyncio.create_task(
+                self._supervise(
+                    "events", lambda: self._receive_when_configured(stop), stop, interval=None,
+                )
+            ))
         stopped = asyncio.create_task(stop.wait())
         successful_stop = False
         try:
@@ -718,7 +734,7 @@ class MaintenanceServices:
     store: MonitoringStore
     context: MonitoringContext
     collector: Collector
-    provisioner: ConnectorMaintenance
+    provisioner: ConnectorMaintenance | None
     owner_id: str
 
 
@@ -740,6 +756,7 @@ async def live_maintenance(config: WorkerConfig):
     from triage.monitoring.provisioning import ConnectorReconciler, ProvisioningRestClient
     from triage.monitoring.runtime import build_monitoring_store
     from triage.monitoring.sql_store import KernelRateBudget
+    from triage.policy import TriagePolicy
     from triage.store.azure_sql import AzureSqlDatabase
 
     credential = PinnedSyncCredential(
@@ -755,6 +772,8 @@ async def live_maintenance(config: WorkerConfig):
         )
         store = await asyncio.to_thread(
             build_monitoring_store, config, db=database, fixture=False, component="worker",
+            # This component has no model/settings or remediation authority.
+            policy=TriagePolicy(max_write_actions=0, allowed_actions=frozenset()),
         )
         inspection = await asyncio.to_thread(
             store.inspect_bootstrap,
@@ -790,13 +809,10 @@ async def live_maintenance(config: WorkerConfig):
             config.identity.object_id,
             owner,
         )
-        provisioner = ConnectorReconciler(
-            store,
-            context,
-            rest,
-            pipeline,
-            owner,
-            config.connector.connector_id,
+        provisioner = (
+            ConnectorReconciler(
+                store, context, rest, pipeline, owner, config.connector.connector_id,
+            ) if config.connector is not None else None
         )
         yield MaintenanceServices(store, context, collector, provisioner, owner)
     finally:
@@ -987,6 +1003,8 @@ async def _run_command(args, config: WorkerConfig) -> int:
             return result.exit_code
         if args.reconcile_once:
             async with live_maintenance(config) as services:
+                if services.provisioner is None:
+                    raise EventContractError("Connector reconciliation requires explicit event configuration")
                 result = await services.provisioner.run_once()
             records = [
                 {"work_id": item.work_id, "state": item.state, "code": item.code}
@@ -1029,6 +1047,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Drain a bounded connector_reconcile batch using shared SQL work; not worker readiness",
     )
+    modes.add_argument(
+        "--collector-only",
+        action="store_true",
+        help="Run durable inventory and REST polling without requiring an Eventstream connector",
+    )
     parser.add_argument(
         "--probe-workspace-id",
         help="Owned source canary workspace, distinct from the transport workspace",
@@ -1049,7 +1072,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("Probe arguments require --transport-probe")
     logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s %(message)s")
     try:
-        config = WorkerConfig.from_environment(transport_probe=args.transport_probe)
+        config = WorkerConfig.from_environment(
+            transport_probe=args.transport_probe, collector_only=args.collector_only,
+        )
         return asyncio.run(_run_command(args, config))
     except KeyboardInterrupt:
         return 130
@@ -1065,6 +1090,12 @@ def main(argv: list[str] | None = None) -> int:
         }
         if isinstance(exc, EventContractError):
             error["detail"] = str(exc)
+        frames = traceback.extract_tb(exc.__traceback__)
+        if frames:
+            frame = frames[-1]
+            error["location"] = {
+                "file": Path(frame.filename).name, "function": frame.name, "line": frame.lineno,
+            }
         LOG.error("worker_blocked error_class=%s", type(exc).__name__)
         print(json.dumps(error), flush=True)
         return 2

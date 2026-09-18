@@ -27,6 +27,7 @@ import binascii
 import hashlib
 import json
 import logging
+import traceback
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -769,7 +770,9 @@ class MonitoringCollector:
             self.store.renew_lease,
             LeaseRenewal(lease=work.lease, lease_seconds=self._claim.lease_seconds),
         )
-        return work.model_copy(update={"lease": lease})
+        # The guarded SQL renewal also advances the work revision. Reusing the
+        # pre-renewal revision fences the first inventory commit before any GET.
+        return await self._fresh_work(work.model_copy(update={"lease": lease}))
 
     async def _fresh_work(self, work: MonitoringWork) -> MonitoringWork:
         current = await asyncio.to_thread(self.store.get_work, self.context, work.work_id)
@@ -1147,7 +1150,9 @@ class MonitoringCollector:
                 return await self._capability(work)
             return await self._poll(work)
         except (MonitoringConflict, MonitoringLeaseLost) as exc:
-            logger.warning("Collector work fenced (%s, %s)", work.work_id, type(exc).__name__)
+            frames = traceback.extract_tb(exc.__traceback__)
+            location = f"{frames[-1].name}:{frames[-1].lineno}" if frames else "unknown"
+            logger.warning("Collector work fenced (%s, %s, %s)", work.work_id, type(exc).__name__, location)
             return CollectorWorkResult(work.work_id, "lease_lost", gaps=(CoverageGap(
                 code="collector_work_fenced", detail="Current shared ownership or policy changed; work was not finalized",
             ),))

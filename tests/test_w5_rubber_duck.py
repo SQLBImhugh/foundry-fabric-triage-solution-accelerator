@@ -348,7 +348,7 @@ async def test_cancelled_rerun_is_terminal_non_success_without_budget_refund(pip
     assert sum(name == "rerun" for name, _ in client.calls) == 1
 
 
-async def test_approval_wait_does_not_block_other_bounded_heartbeat_slots() -> None:
+async def test_approval_wait_does_not_block_other_bounded_heartbeat_slots(test_settings) -> None:
     held = asyncio.Event()
     entered = asyncio.Event()
     automatic_progress = asyncio.Event()
@@ -380,12 +380,16 @@ async def test_approval_wait_does_not_block_other_bounded_heartbeat_slots() -> N
             active[kind] -= 1
 
     class Runner:
-        async def drain_monitoring_work(self, *, limit):
+        settings = test_settings
+
+        async def drain_monitoring_work(self, *, limit, budget):
             assert limit == 1
+            assert budget.can_claim()
             return await drain("automatic")
 
-    async def human(_runner, *, limit):
+    async def human(_runner, *, limit, budget):
         assert limit == 1
+        assert budget.can_claim()
         return await drain("human")
 
     heartbeat = asyncio.create_task(controller_heartbeat(Runner(), rounds=8, command_drain=human))

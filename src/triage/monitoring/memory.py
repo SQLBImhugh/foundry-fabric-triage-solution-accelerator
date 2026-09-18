@@ -2766,7 +2766,9 @@ class MonitoringEngine:
             gap for generation in latest_generations.values()
             if generation.completeness != "complete" for gap in generation.gaps
         ]
-        complete = self._inventory_complete(scopes, generations)
+        complete = self._inventory_complete(scopes, generations) and all(
+            generation.completeness == "complete" for generation in latest_generations.values()
+        )
         if discovered > SCAN_BUDGET:
             complete = False
             gaps.append(m.CoverageGap(code="coverage_budget", detail="Coverage counters below are a bounded verified subset; page through remaining inventory."))
@@ -4163,27 +4165,31 @@ class MonitoringEngine:
         request_id = stable_id(heartbeat, f"heartbeat:{key_digest(heartbeat.model_dump_json())}")
         def apply() -> ReceiverHeartbeat:
             self._control(heartbeat)
-            connector = self._get("connector", heartbeat.connector_id, heartbeat, m.OwnedConnectorManifest)
-            if connector is None:
+            connector = (
+                self._get("connector", heartbeat.connector_id, heartbeat, m.OwnedConnectorManifest)
+                if heartbeat.connector_id is not None else None
+            )
+            if heartbeat.connector_id is not None and connector is None:
                 raise MonitoringConflict("Receiver heartbeat requires an owned connector record")
             if heartbeat.observed_at > self._now() or any(
                 value is not None and value > heartbeat.observed_at
                 for value in (heartbeat.last_delivery_at, heartbeat.last_maintenance_at)
             ):
                 raise MonitoringConflict("Receiver heartbeat timestamps are inconsistent")
-            key = f"{heartbeat.connector_id}:{heartbeat.worker_id}"
+            key = f"{heartbeat.connector_id or 'collector'}:{heartbeat.worker_id}"
             prior = self._get("receiver_heartbeat", key, heartbeat, ReceiverHeartbeat)
             if prior is not None and prior.observed_at > heartbeat.observed_at:
                 raise MonitoringConflict("An older heartbeat cannot replace newer receiver health")
             saved = self._put(
                 "receiver_heartbeat", key, heartbeat, heartbeat,
-                parent_key=connector.connector_id, status=heartbeat.state, due_at=self._now(),
+                parent_key=heartbeat.connector_id, status=heartbeat.state, due_at=self._now(),
             )
             # Process/transport health is not a source-delivery or provisioning proof.
-            self._put("connector", connector.connector_id, heartbeat, _update(
-                connector, last_receiver_activity_at=self._now(), updated_at=self._now(),
-                revision=connector.revision + 1,
-            ), status=connector.state)
+            if connector is not None:
+                self._put("connector", connector.connector_id, heartbeat, _update(
+                    connector, last_receiver_activity_at=self._now(), updated_at=self._now(),
+                    revision=connector.revision + 1,
+                ), status=connector.state)
             return saved
         return self._idempotent(
             "receiver_heartbeat", request_id, heartbeat, heartbeat, ReceiverHeartbeat, apply,

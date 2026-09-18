@@ -353,3 +353,69 @@ async def test_unrelated_command_progresses_behind_100_blocked_target_commands(
     assert store.get_command(eligible.id).state == "completed"
     assert store.target_blocked(blocked.target_id)
     assert len(store.queued_commands()) == 100
+
+
+async def test_heartbeat_deadline_leaves_second_long_command_queued(runner, command_target, monkeypatch):
+    import triage.command_center.worker as worker
+    from triage.monitoring.controller import controller_heartbeat
+    from triage.store.command_center import CommandRecord, InMemoryCommandCenterStore
+
+    store = InMemoryCommandCenterStore()
+    runner._command_center_store = store
+    for _ in range(2):
+        store.enqueue(CommandRecord(
+            id=str(uuid4()), kind="powerbi_triage", target_id=command_target.key, actor_id="operator",
+        ))
+    elapsed, executed = [0.0], []
+    monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=lambda: elapsed[0]))
+
+    async def automatic(*, limit, budget):
+        return []
+
+    async def execute(request):
+        executed.append(request.request_id)
+        elapsed[0] += 500
+        return SimpleNamespace(
+            result=SimpleNamespace(outcome="needs_human", summary="Recorded", write_actions=0),
+            run_id=str(uuid4()),
+        )
+
+    monkeypatch.setattr(runner, "drain_monitoring_work", automatic)
+    monkeypatch.setattr(runner, "run_request", execute)
+    assert len(await controller_heartbeat(runner, clock=lambda: elapsed[0])) == 1
+    assert len(executed) == 1
+    assert sorted(command.state for command in store.commands()) == ["completed", "queued"]
+    assert not store.target_blocked(command_target.key)
+
+
+async def test_heartbeat_budget_rechecked_before_command_claim(runner, command_target, monkeypatch):
+    from triage.command_center.worker import drain_commands
+    from triage.monitoring.controller import HeartbeatBudget
+    from triage.store.command_center import CommandRecord, InMemoryCommandCenterStore
+
+    store = InMemoryCommandCenterStore()
+    runner._command_center_store = store
+    command = CommandRecord(
+        id=str(uuid4()), kind="powerbi_triage", target_id=command_target.key, actor_id="operator",
+    )
+    store.enqueue(command)
+    elapsed = [0.0]
+    claims = runner._pipeline_claim_store()
+    claim = claims.claim
+    released = []
+    release = claims.release
+
+    def slow_target_claim(*args, **kwargs):
+        result = claim(*args, **kwargs)
+        elapsed[0] = 200
+        return result
+
+    def target_release(key):
+        released.append(key)
+        release(key)
+
+    monkeypatch.setattr(claims, "claim", slow_target_claim)
+    monkeypatch.setattr(claims, "release", target_release)
+    assert await drain_commands(runner, budget=HeartbeatBudget(840, 690, lambda: elapsed[0])) == []
+    assert store.get_command(command.id).state == "queued"
+    assert len(released) == 1

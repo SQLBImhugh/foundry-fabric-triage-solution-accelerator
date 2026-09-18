@@ -9,6 +9,7 @@ SELECT reaches views, functions and synonyms, not stored procedures.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -17,8 +18,10 @@ from uuid import UUID
 from triage.monitoring.deployment_contracts import DeploymentError, ResetTarget, fingerprint
 from triage.monitoring.deployment_schema import (
     DEFAULT_REGISTRATION_NAMES,
+    DEPLOYMENT_JOURNAL_NAMES,
     READ_ONLY_RPCS,
     RegistrationNames,
+    ancillary_table_permissions,
     kernel_contract_hash,
     native_module_hash,
     schema_statements,
@@ -77,6 +80,75 @@ def _plain(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return bytes(value).hex()
     return value
+
+
+def read_journal_layout(database: AzureSqlDatabase, name: str) -> tuple[dict, bool]:
+    """Exact optional journal keys, constraints and table features, without DDL."""
+    if name not in DEPLOYMENT_JOURNAL_NAMES.values():
+        raise DeploymentError("Not a declared deployment journal")
+    argument = f"dbo.{name}"
+    keys = database.query("""/* deployment-journal:keys */
+SELECT i.index_id,i.is_primary_key,i.is_unique_constraint,i.type,i.is_unique,
+ i.is_disabled,i.has_filter,c.name,ic.key_ordinal,ic.is_descending_key,ic.is_included_column
+FROM sys.indexes i
+JOIN sys.index_columns ic ON ic.object_id=i.object_id AND ic.index_id=i.index_id
+JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+WHERE i.object_id=OBJECT_ID(?) AND i.index_id>0 ORDER BY i.index_id,ic.index_column_id
+""", argument)
+    constraints = database.query("""/* deployment-journal:constraints */
+SELECT 'C',COL_NAME(parent_object_id,parent_column_id),definition,is_disabled,is_not_trusted
+FROM sys.check_constraints WHERE parent_object_id=OBJECT_ID(?)
+UNION ALL
+SELECT 'D',COL_NAME(parent_object_id,parent_column_id),definition,0,0
+FROM sys.default_constraints WHERE parent_object_id=OBJECT_ID(?)
+ORDER BY 1,2,3
+""", argument, argument)
+    safety = database.query("""/* deployment-journal:safety */
+SELECT temporal_type,is_tracked_by_cdc,is_memory_optimized,
+ (SELECT COUNT_BIG(*) FROM sys.triggers WHERE parent_id=OBJECT_ID(?) AND is_disabled=0)
+FROM sys.tables WHERE object_id=OBJECT_ID(?)
+""", argument, argument)
+    if (
+        len(keys) > 4 or any(len(row) != 11 for row in keys)
+        or len(constraints) > 4 or any(len(row) != 5 for row in constraints)
+        or len(safety) != 1 or len(safety[0]) != 4
+    ):
+        raise DeploymentError("Deployment journal metadata is incomplete or outside its exact contract")
+    recovery = name == DEPLOYMENT_JOURNAL_NAMES["sql_bootstrap_recoveries"]
+    expected_keys = {
+        (True, False, 1, True, False, False, "original_operation_id" if recovery else "operation_id", 1, False, False),
+    }
+    if recovery:
+        expected_keys.add((False, True, 2, True, False, False, "replacement_operation_id", 1, False, False))
+    actual_constraints = []
+    for kind, column, definition, disabled, untrusted in constraints:
+        if not isinstance(definition, str):
+            raise DeploymentError("Deployment journal constraint definition is unreadable")
+        normalized = "".join(
+            token if token.startswith("'") else token.lower()
+            for token in re.findall(r"'(?:''|[^'])*'|[A-Za-z_][A-Za-z_0-9]*|[^\s\[\]()]", definition)
+        )
+        # SQL expands a two-value IN check to OR when storing its definition.
+        if normalized in {
+            "statusin'started','committed'",
+            "status='started'orstatus='committed'",
+            "status='committed'orstatus='started'",
+        }:
+            normalized = "bootstrap_status"
+        actual_constraints.append((kind, column, normalized, disabled, untrusted))
+    expected_constraints = {
+        ("D", "resolved_at" if recovery else "started_at", "sysutcdatetime", False, False),
+    }
+    if not recovery:
+        expected_constraints.add(("C", "status", "bootstrap_status", False, False))
+    valid = (
+        len(keys) == len(expected_keys) and len({row[0] for row in keys}) == len(keys)
+        and {tuple(row[1:]) for row in keys} == expected_keys
+        and len(actual_constraints) == len(expected_constraints)
+        and set(actual_constraints) == expected_constraints
+        and tuple(safety[0]) == (0, False, False, 0)
+    )
+    return {"keys": keys, "constraints": constraints, "safety": safety}, valid
 
 
 def expected_modules(names: RegistrationNames = DEFAULT_REGISTRATION_NAMES) -> dict[str, tuple[str, str]]:
@@ -164,11 +236,11 @@ WHERE o.is_ms_shipped=0 ORDER BY o.object_id
 """, 8)
     columns = _rows(database, """/* deployment-authority:columns */
 SELECT s.name,o.name,c.name,t.name,c.max_length,c.scale,c.is_nullable,
- c.is_identity,c.is_computed,c.generated_always_type,c.encryption_type,c.collation_name
+ c.is_identity,c.is_computed,c.generated_always_type,c.encryption_type,c.collation_name,c.column_id
 FROM sys.tables o JOIN sys.schemas s ON s.schema_id=o.schema_id
 JOIN sys.columns c ON c.object_id=o.object_id JOIN sys.types t ON t.user_type_id=c.user_type_id
 WHERE o.is_ms_shipped=0 ORDER BY s.name,o.name,c.column_id
-""", 12)
+""", 13)
     triggers = _rows(database, """/* deployment-authority:triggers */
 SELECT object_id,parent_class,parent_id,is_disabled FROM sys.triggers
 WHERE is_ms_shipped=0 ORDER BY object_id
@@ -241,13 +313,23 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
             or on_delete not in {0, 1, 2, 3} or on_update not in {0, 1, 2, 3}
         ):
             raise DeploymentError("SQL referential-action authority has an unresolved object or operation")
+        if any(
+            by_object[object_id][1] == "dbo" and by_object[object_id][2] in DEPLOYMENT_JOURNAL_NAMES.values()
+            for object_id in (child_id, parent_id)
+        ):
+            gaps.add("deployment_journal_layout_changed")
         if not disabled and (on_delete or on_update):
             cascades.setdefault(parent_id, []).append((child_id, on_delete, on_update))
             # A reviewed RPC's table effects also change when a new cascade is
             # attached. No current owned table declaration authorizes one.
             if parent_id in owned_ids:
                 gaps.add("unreviewed_owned_cascade_authority")
-    protected_names = {*names.tables.values(), names.read_projection, catalogue.table("monitoring_receipts").name}
+    journal_names = set(DEPLOYMENT_JOURNAL_NAMES.values())
+    present_journals = journal_names & {name for schema, name in by_name if schema == "dbo"}
+    protected_names = {
+        *names.tables.values(), names.read_projection, catalogue.table("monitoring_receipts").name,
+        *journal_names,
+    }
     dbo = [row for row in schemas if row[1] == "dbo"]
     if len(dbo) != 1 or dbo[0][2] != 1:
         gaps.add("unsupported_schema_ownership")
@@ -260,7 +342,11 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
             or row[4] != 1 or row[6] is not None or row[7] != 0
         ):
             gaps.add("module_definition_or_authority_changed")
+    journal_layouts = {}
     for table in catalogue.tables:
+        obj = by_name.get(("dbo", table.name))
+        if table.optional and obj is None:
+            continue
         actual = [row[2:] for row in columns if row[:2] == ("dbo", table.name)]
         expected = [
             (c.name, c.data_type, c.max_length, c.scale, c.nullable, False, False, 0, None)
@@ -274,16 +360,39 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
             for a, e, column in zip(actual, expected, table.columns, strict=False)
         ):
             gaps.add("declared_table_missing_or_incompatible")
-        obj = by_name.get(("dbo", table.name))
         if obj is None or obj[3] != "U" or obj[4] != 1:
             gaps.add("table_ownership_or_type_changed")
+        if table.name in present_journals and obj[3] == "U":
+            layout, valid = read_journal_layout(database, table.name)
+            journal_layouts[table.name] = layout
+            if not valid:
+                gaps.add("deployment_journal_layout_changed")
     kernel = build_permission_kernel()
     expected_roles = {kernel.names.role(component) for component in kernel.grants}
     present_roles = {row[5] for row in principals if row[1] == "R"}
     if not expected_roles <= present_roles:
         gaps.add("kernel_roles_missing")
+    component_roles = {}
+    anchors = {
+        "controller": "controller.reserve_action", "web": "web.commit_intent",
+        "worker": "worker.record_heartbeat",
+    }
+    for component, anchor in anchors.items():
+        role = next((row for row in principals if row[5] == kernel.names.role(component)), None)
+        rpc = by_name.get(("dbo", unqualified(kernel.rpcs[anchor].object_name)))
+        if (
+            role is not None and role[1] == "R" and not role[3] and role[4] == 1
+            and rpc is not None and any(
+                row[0] == role[0] and tuple(row[2:]) == (1, rpc[0], 0, "EXECUTE", "G")
+                for row in permissions
+            )
+        ):
+            component_roles[role[0]] = component
+    column_names = {
+        (by_name[row[:2]][0], row[12]): row[2] for row in columns if row[:2] in by_name
+    }
     for row in objects:
-        if row[2].startswith("triage_") and (row[1] != "dbo" or row[2] not in owned_names) and row[3] not in {
+        if row[2].casefold().startswith("triage_") and (row[1] != "dbo" or row[2] not in owned_names) and row[3] not in {
             "PK", "UQ", "C", "D", "F",
         }:
             gaps.add("undeclared_accelerator_object")
@@ -312,10 +421,14 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
             continue
         reachable = closure[principal_id]
         role_names = {by_id[key][5] for key in reachable}
+        components = {component for role, component in component_roles.items() if role in reachable}
+        ancillary = ancillary_table_permissions(next(iter(components))) if len(components) == 1 else {}
         persistent = False
-        mutations: set[tuple[int, str]] = set()
+        mutations: set[tuple[int, str, bool]] = set()
         if role_names & {"db_owner", "db_ddladmin", "db_securityadmin", "db_accessadmin", "db_datawriter"}:
             gaps.add("legacy_or_privileged_role")
+            if present_journals:
+                gaps.add("deployment_journal_mutation_path")
             persistent = True
         if any(row[2] in reachable for row in schemas) or any(
             row[4] in reachable for row in objects
@@ -326,13 +439,13 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
             if obj[4] not in reachable:
                 continue
             if obj[3] in {"U", "V"}:
-                mutations.update((obj[0], operation) for operation in DML_PERMISSIONS)
+                mutations.update((obj[0], operation, False) for operation in DML_PERMISSIONS)
             if obj[3] in CALLABLE_TYPES and (
                 reviewed_module(obj) is None or obj[6] is not None or obj[7]
             ):
                 gaps.add("unreviewed_owned_module_authority")
                 persistent = True
-        for grantee, _grantor, permission_class, major, _minor, permission, state in permissions:
+        for grantee, _grantor, permission_class, major, minor, permission, state in permissions:
             if state not in {"G", "W", "D", "R"}:
                 gaps.add("unsupported_permission_state")
             if grantee not in reachable or state not in {"G", "W"}:
@@ -350,6 +463,8 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
             )
             if privilege and permission_class in {0, 1, 3, 4}:
                 gaps.add("runtime_ddl_control_or_impersonation")
+                if present_journals:
+                    gaps.add("deployment_journal_mutation_path")
                 persistent = True
             if state == "W" and permission_class in {0, 1, 3}:
                 gaps.add("runtime_grant_option")
@@ -369,7 +484,16 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
                 gaps.add("public_write_authority")
             for obj in targets:
                 if permission in DML_PERMISSIONS:
-                    mutations.add((obj[0], permission))
+                    grant = ancillary.get(obj[2]) if obj[1] == "dbo" and obj[3] == "U" else None
+                    reviewed = bool(
+                        grant and permission_class == 1 and state == "G" and grantee not in public_ids
+                        and (
+                            minor == 0 and permission in grant.permissions
+                            or permission == "UPDATE" and minor > 0
+                            and column_names.get((obj[0], minor)) in grant.update_columns
+                        )
+                    )
+                    mutations.add((obj[0], permission, reviewed))
                 elif permission == "EXECUTE" or permission == "SELECT" and obj[3] in SELECT_CALLABLE_TYPES:
                     category = reviewed_module(obj)
                     if category is None:
@@ -380,19 +504,22 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
 
         visited = set()
         while mutations:
-            object_id, operation = mutations.pop()
-            if (object_id, operation) in visited:
+            object_id, operation, reviewed_ancillary = mutations.pop()
+            if (object_id, operation, reviewed_ancillary) in visited:
                 continue
-            visited.add((object_id, operation))
+            visited.add((object_id, operation, reviewed_ancillary))
             obj = by_object[object_id]
             if object_id in trigger_parents:
                 gaps.add("unreviewed_trigger_authority")
                 persistent = True
             if object_id in owned_ids and obj[2] in protected_names:
                 gaps.add("registration_or_capture_mutation_path")
+                if obj[2] in journal_names:
+                    gaps.add("deployment_journal_mutation_path")
                 persistent = True
             elif object_id in owned_ids and obj[3] == "U":
-                gaps.add("raw_operational_table_write")
+                if not reviewed_ancillary:
+                    gaps.add("raw_operational_table_write")
                 persistent = True
             elif obj[3] != "U":
                 category = reviewed_module(obj)
@@ -406,9 +533,29 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
                     action = on_delete if operation == "DELETE" else on_update
                     if action:
                         child_operation = "DELETE" if operation == "DELETE" and action == 1 else "UPDATE"
-                        mutations.add((child_id, child_operation))
+                        mutations.add((child_id, child_operation, False))
         if persistent:
             candidates.add(principal_id)
+
+    if present_journals and (
+        gaps & {
+            "runtime_ownership_path", "runtime_ddl_control_or_impersonation",
+            "legacy_or_privileged_role", "unreviewed_module_authority",
+            "unreviewed_owned_module_authority", "module_definition_or_authority_changed",
+            "unmodelled_permission_authority", "unmodelled_permission_class",
+            "uninspectable_permission_target", "unsupported_permission_state", "runtime_grant_option",
+        } or any(
+            grantee in public_ids and state in {"G", "W"} and permission not in READ_PERMISSIONS
+            and (
+                permission_class in {0, 3}
+                or permission_class == 1 and major in {
+                    by_name[("dbo", name)][0] for name in present_journals
+                }
+            )
+            for grantee, _grantor, permission_class, major, _minor, permission, state in permissions
+        )
+    ):
+        gaps.add("deployment_journal_authority_unproved")
 
     # Convert to the collector identity universe only after every permission,
     # implicit owner and reachable DML side effect has been classified.
@@ -430,6 +577,7 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
         "principals": [[_plain(cell) for cell in row] for row in principals],
         "roles": roles, "permissions": permissions, "schemas": schemas, "objects": objects,
         "columns": columns, "triggers": triggers, "queues": queues,
+        "deployment_journals": journal_layouts,
         "foreign_keys": foreign_keys, "catalogue": catalogue.declaration_hash,
         "kernel": kernel_contract_hash(),
     }

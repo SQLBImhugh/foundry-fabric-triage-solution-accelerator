@@ -31,6 +31,8 @@ services:
             # agent you cannot interrogate is a hosted agent you cannot trust.
             - name: TRIAGE_LOG_LEVEL
               value: INFO
+            - name: OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT
+              value: "false"
             # The controller reasons through the Foundry prompt agents and acts
             # through real tools. Mock stays available for offline evaluation by
             # overriding these, but the deployed default is the real thing.
@@ -123,7 +125,10 @@ services:
             # incident. It was missing from this file for exactly that reason:
             # the deployment guide said to set it, nothing here passed it in,
             # and the deployed agent had no telemetry while appearing to.
-            - name: APPLICATIONINSIGHTS_CONNECTION_STRING
+            # Foundry owns APPLICATIONINSIGHTS_CONNECTION_STRING and injects it
+            # from project-wide tracing. Use our own metadata-only channel so
+            # enabling application health never enables project content traces.
+            - name: TRIAGE_TELEMETRY_CONNECTION_STRING
               value: ${APPLICATIONINSIGHTS_CONNECTION_STRING}
             # Approval requests wait here and human decisions land here. It has
             # to be shared, durable state: the agent writes the request in one

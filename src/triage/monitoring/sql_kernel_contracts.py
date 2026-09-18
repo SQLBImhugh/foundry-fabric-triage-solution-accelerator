@@ -363,7 +363,7 @@ def rpc_contracts(tables: Mapping[str, str] | None = None) -> dict[str, RpcContr
         parameter("bucket", "nvarchar(128)"), parameter("delay_seconds", "int", nullable=True),
     ), ("worker",), "Acquire/defer only an already provisioned budget policy; never reset/configure a limit.")
     add("worker.record_heartbeat", CONTEXT + REQUEST + (
-        parameter("worker_id", "nvarchar(128)"), parameter("connector_id", "nvarchar(128)"),
+        parameter("worker_id", "nvarchar(128)"), parameter("connector_id", "nvarchar(128)", nullable=True),
         parameter("state", "varchar(16)"), parameter("transport_connected", "bit"),
         parameter("accepted_positions", "bigint"),
         parameter("last_delivery_at", "datetime2(6)", nullable=True),

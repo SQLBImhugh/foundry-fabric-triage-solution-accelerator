@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -50,11 +51,16 @@ from triage.monitoring.models import (
     SourceRunObservation,
 )
 from triage.monitoring.runtime import fixture_id, stable_id, target_signature
+from triage.observability import heartbeat_span, telemetry_status
 
 if TYPE_CHECKING:
     from triage.tools.powerbi import PowerBIClient, RefreshOutcome
 
 logger = logging.getLogger("triage.monitoring.controller")
+heartbeat_logger = logging.getLogger("triage.telemetry.heartbeat")
+# The scheduled invocation has a 900-second HTTP limit. Leave time to return
+# and persist completion; reaching this deadline never cancels a claimed effect.
+HEARTBEAT_BUDGET_SECONDS = 840
 _CURRENT: ContextVar[MonitoringExecution | None] = ContextVar("monitoring_execution", default=None)
 ACTION_KINDS: dict[str, ActionKind] = {
     "refresh_powerbi_dataset": "powerbi_refresh",
@@ -115,41 +121,106 @@ def reconcile_monitoring_work(store: MonitoringStore, work: MonitoringWork) -> R
     return store.reconcile_work(work, connector_publisher=publish_reconciliation_connector)
 
 
-async def controller_heartbeat(runner: Any, *, rounds: int = 10, command_drain: Any = None) -> list[str]:
-    """Refill two automatic slots and one human slot independently, within fixed budgets."""
+@dataclass(frozen=True)
+class HeartbeatBudget:
+    deadline: float
+    work_seconds: float
+    clock: Callable[[], float] = time.monotonic
+
+    def can_claim(self) -> bool:
+        return self.deadline - self.clock() >= self.work_seconds
+
+
+async def controller_heartbeat(
+    runner: Any, *, rounds: int = 10, command_drain: Any = None,
+    started_at: float | None = None, clock: Callable[[], float] | None = None,
+) -> list[str]:
+    """Refill two automatic slots and one human slot before the shared admission deadline."""
     if command_drain is None:
         from triage.command_center.worker import drain_commands
 
         command_drain = drain_commands
+    clock = clock or time.monotonic
+    began = clock() if started_at is None else started_at
+    # Existing per-command execution bound plus its lease/finalization allowance.
+    work_seconds = runner.settings.triage_timeout_seconds + runner.settings.approval_timeout_seconds + 90
+    if work_seconds <= 0:
+        raise ValueError("Heartbeat work requires a positive execution budget")
+    budget = HeartbeatBudget(began + HEARTBEAT_BUDGET_SECONDS, work_seconds, clock)
     lines: list[str] = []
     remaining = {"automatic": max(1, min(rounds, 100)), "human": max(1, min(rounds, 100))}
+    started = {"automatic": 0, "human": 0}
+    completed = {"automatic": 0, "human": 0}
+    failed = False
 
     async def worker(queue: str) -> None:
-        while remaining[queue]:
-            # Ticket allocation contains no await. Both automatic workers share
-            # one total budget, rather than each spawning another full batch.
-            remaining[queue] -= 1
-            result = (
-                await runner.drain_monitoring_work(limit=1) if queue == "automatic"
-                else await command_drain(runner, limit=1)
-            )
-            lines.extend(result)
-            if not result:
-                return
-            await asyncio.sleep(0)
+        nonlocal failed
+        try:
+            while remaining[queue] and not failed and budget.can_claim():
+                # Both automatic workers share one quota. The drain rechecks
+                # the deadline immediately before its durable claim.
+                remaining[queue] -= 1
+                started[queue] += 1
+                result = (
+                    await runner.drain_monitoring_work(limit=1, budget=budget) if queue == "automatic"
+                    else await command_drain(runner, limit=1, budget=budget)
+                )
+                completed[queue] += len(result)
+                lines.extend(result)
+                if not result:
+                    return
+                await asyncio.sleep(0)
+        except BaseException:
+            failed = True
+            raise
 
-    workers = [
-        asyncio.create_task(worker("automatic")),
-        asyncio.create_task(worker("human")),
-        asyncio.create_task(worker("automatic")),
-    ]
-    try:
-        await asyncio.gather(*workers)
-    finally:
-        for task in workers:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+    heartbeat_logger.info(
+        "heartbeat_started budget_seconds=%d per_queue_limit=%d work_budget_seconds=%s",
+        HEARTBEAT_BUDGET_SECONDS, remaining["human"], work_seconds,
+    )
+    with heartbeat_span() as span:
+        status, error_type = "completed", ""
+        workers = [
+            asyncio.create_task(worker("automatic")),
+            asyncio.create_task(worker("human")),
+            asyncio.create_task(worker("automatic")),
+        ]
+        try:
+            # A sibling's SQL failure stops new claims, not an in-flight action.
+            results = await asyncio.gather(*workers, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+        except BaseException as exc:
+            status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+            error_type = type(exc).__name__
+            raise
+        finally:
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            elapsed_ms = max(0, int((clock() - began) * 1000))
+            exhausted = not budget.can_claim()
+            for key, value in {
+                "heartbeat.status": status, "heartbeat.elapsed_ms": elapsed_ms,
+                "heartbeat.automatic_calls": started["automatic"], "heartbeat.human_calls": started["human"],
+                "heartbeat.automatic_results": completed["automatic"], "heartbeat.human_results": completed["human"],
+                "heartbeat.budget_exhausted": exhausted, "error.type": error_type,
+            }.items():
+                span.set(key, value)
+            health = telemetry_status()
+            heartbeat_logger.log(
+                logging.INFO if status == "completed" else logging.WARNING,
+                "heartbeat_finished status=%s elapsed_ms=%d automatic_calls=%d human_calls=%d "
+                "automatic_results=%d human_results=%d budget_exhausted=%s error_type=%s "
+                "telemetry_configuration=%s export_failures=%d export_warnings=%d ingestion=unverified",
+                status, elapsed_ms, started["automatic"], started["human"],
+                completed["automatic"], completed["human"], exhausted, error_type,
+                health["configuration"], health["export_failures"], health["export_warnings"],
+            )
+    if not lines and not budget.can_claim():
+        return ["Heartbeat admission budget exhausted; no new work was claimed. Any queued work remains pending."]
     return lines
 
 

@@ -47,10 +47,37 @@ Azure-services firewall rule; registry admin/anonymous access remains disabled.
 The public Foundry controller path is retained. Its earlier private replacement's
 preflight error is not a blocker for this public architecture.
 
-The original SQL `STARTED` proof receipt is under guarded recovery; completion,
-full-schema commit, runtime permissions and worker recovery remain gates.
-The live app/controller remain the prior release, with no history migration/wipe,
-normal-worker rollout, hybrid push or current-release UI screenshots.
+SQL recovery is complete through append-only adjudication, with the original
+failed `STARTED` receipt unchanged. Proof and application schemas each committed
+145 DDL batches and passed 114 readbacks. The independent initialization capture
+of `maintenance=true`, revision `0` and its bootstrap receipt is historical.
+A separate no-VNet public-route bootstrap-MI check passed 114 application
+readbacks without changing maintenance at that capture time.
+
+Current web/controller cutover is complete: Command Center and the hosted
+controller use Azure SQL with the correct acting identity; three runtime
+EXTERNAL users have kernel roles plus application DML, and maintenance is
+`false`. A deployed heartbeat completed the original discovery-intent work,
+published its frontier `1/1` and queued one inventory-worker item, with zero
+actions and unchanged original receipt/control.
+
+A no-ingress collector-only worker is now deployed. Native Fabric metadata
+reads durably accepted 332 workspaces; authenticated workspace selectors expose
+333 enabled options including the placeholder. Item scanning remains partial,
+with source-permission 401s and request-budget/throttling gaps. Latest partial
+coverage is not converted to complete when zero scopes are configured.
+No scopes or actions were automatically admitted.
+
+The existing one-minute command scheduler was reused for `heartbeat`; three
+actual recurrence responses completed. Portal-only missing/failed-heartbeat
+alerts have no delivery destination. Collector-only mode runs no receiver or
+provisioner; event-enabled and sustained hybrid acceptance remain open.
+Eight native role cases and 19 SELECT controls are not the full 27-RPC matrix.
+Metadata-only hosted telemetry is now application-owned, with project tracing
+kept disconnected. Native Application Insights queries contain paired
+started/completed heartbeat metadata, queue counts and zero exporter
+failure/warning counters in the captured runs. This establishes bounded ingestion,
+not overnight stability, every telemetry path or end-to-end hybrid acceptance.
 Earlier private SQL/image checks, Fabric SQL checks and transport receipts remain
 historical bounded evidence, not acceptance of the new public deployment.
 See [release gates](DeploymentGuide.md#release-gates).
@@ -130,6 +157,14 @@ Retain the existing App Service and Foundry controller. Do not add a separate
 Azure Event Hubs namespace merely because the Fabric endpoint uses the Event Hubs
 protocol. Use its nonsecret namespace, entity and consumer-group metadata. [S2]
 No Eventhouse is included in the selected public transport.
+
+Start with explicit `--collector-only` for inventory and REST collection before
+an Eventstream exists. The deployment helper requires `-CollectorOnly` or a
+complete `-ConnectorBootstrapFile`, exclusively; the Bicep default is
+`collectorOnly=true`. Collector-only mode rejects partial event settings,
+creates no receiver/provisioner and records `connector_id=null` in non-transport
+health. Event mode retains its complete owned binding. This staged setup is
+not a silent fallback or a substitute for the plan's event-delivery acceptance.
 
 ## Platform proof before committing the event implementation
 
@@ -272,8 +307,9 @@ Use static, ownership-chained procedures for cross-role transitions, control
 locking, work and partition leases, typed intent/intake commits, connector
 patches, budgets and approval decisions. Derive permission from the SQL
 principal and its grants, not a supplied role string or session flag. No
-runtime principal receives base-table DML, broad database roles, schema ALTER
-or impersonation permissions.
+runtime principal receives unrestricted monitoring-base-table DML, broad
+database roles, schema ALTER or impersonation permissions. Separately reviewed
+ancillary application-store grants remain object/column scoped.
 
 | Component | Write authority |
 |---|---|
@@ -413,6 +449,21 @@ The existing controller heartbeat is the initial wake mechanism. The consumer
 does not need a new public webhook or a human API token. The heartbeat drains
 durable work after consumer/controller restarts. Coalesced wake-up calls are not
 required for the first release.
+
+The current heartbeat admission clock is 840 seconds, monotonic and started
+before lock acquisition, with two automatic and one human-command concurrent
+slots. Refill only within queue quotas and sufficient remaining execution
+allowance. Do not acquire a new claim when that allowance is insufficient or cancel
+the lock holder/admitted work when a waiter times out. The deployment reused
+the existing one-minute command scheduler rather than adding a second timer;
+the mailbox was not enabled and the separate silent schedule was unchanged.
+
+Portal-only alerts cover no successful heartbeat in 15 minutes and any failed
+heartbeat in 5 minutes, evaluated each minute. Empty action lists are intentional;
+no email/webhook/Action Group delivery or absence canary has been proved.
+Application-health telemetry must not enable Foundry project-wide content
+tracing; use the app-owned metadata-only channel described in
+[Observability](DeploymentGuide.md#8-observability).
 
 Deferred Power BI retries are another effectful entry point, not a separate
 exception. Persist their canonical target/source identity and originating policy

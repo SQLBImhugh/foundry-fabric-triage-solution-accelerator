@@ -328,7 +328,7 @@ class UnidentifiedReceiptBatch(MonitoringModel):
 
 class ReceiverHeartbeat(MonitoringContext):
     worker_id: CanonicalId
-    connector_id: CanonicalId
+    connector_id: CanonicalId | None
     observed_at: UtcDateTime
     state: Literal["starting", "running", "degraded", "blocked", "stopping", "stopped"]
     transport_connected: bool = False
@@ -336,6 +336,14 @@ class ReceiverHeartbeat(MonitoringContext):
     last_delivery_at: UtcDateTime | None = None
     last_maintenance_at: UtcDateTime | None = None
     error_code: OpaqueId | None = None
+
+    @model_validator(mode="after")
+    def collector_cannot_assert_event_delivery(self) -> ReceiverHeartbeat:
+        if self.connector_id is None and (
+            self.transport_connected or self.accepted_positions or self.last_delivery_at is not None
+        ):
+            raise ValueError("Collector-only health cannot assert event transport or delivery")
+        return self
 
 
 @runtime_checkable

@@ -546,8 +546,10 @@ export function MonitoringWorkspace({ api, roles, userId, fresh, permissionRevis
   const catalog = useResource(`monitoring-catalog:${securityKey}:${refreshRevision}:${expected ? contextKey(expected) : 'unavailable'}`,
     loadCatalog, 15000, active && Boolean(expected) && !records.error)
   const data = catalog.data
+  // Same-generation background reads keep the last accepted snapshot usable.
+  // Permission/context key changes hide that data immediately in useResource.
   const baseAdmin = Boolean(active && fresh && roles.includes('admin') && current?.can_admin && current.user.id === userId
-    && expected && !current.control.maintenance && !records.error && !records.loading && data && !catalog.error && !catalog.loading && !recoveryError)
+    && expected && !current.control.maintenance && !records.error && data && !catalog.error && !recoveryError)
   const generations = data ? [...new Set([
     ...data.inventory.map((item) => item.generation_id), ...data.workspaces.map((item) => item.generation_id),
     ...data.domains.map((item) => item.generation_id),

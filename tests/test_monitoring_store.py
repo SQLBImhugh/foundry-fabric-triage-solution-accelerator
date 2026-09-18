@@ -513,6 +513,24 @@ def test_unfinished_inventory_never_becomes_complete_empty_or_deletes_known_item
         ))
 
 
+def test_initial_discovery_is_partial_before_any_scope_is_configured() -> None:
+    h = Harness()
+    generation = m.InventoryGeneration(
+        **h.context(), generation_id=h.next_id(),
+        selector=m.ScopeSelector(tenant_id=uid(1), kind="tenant"),
+        adapter="fixture", authority="tenant_admin", completeness="partial",
+        started_at=h.clock(), continuation="next-page",
+        gaps=(m.CoverageGap(code="inventory_in_progress", detail="First tenant discovery is running."),),
+    )
+    h.store.record_inventory(m.InventoryBatch(
+        request_id=h.next_id(), expected=h.version, generation=generation, items=(),
+    ))
+    coverage = h.store.coverage(m.MonitoringContext(**h.context()))
+    assert coverage.inventory_completeness == "partial"
+    assert coverage.scope_item_count is None
+    assert any(gap.code == "inventory_incomplete" for gap in coverage.gaps)
+
+
 def test_scope_exclusions_win_and_names_do_not_alias() -> None:
     h = Harness()
     h.seed(count=2, workspaces=2)

@@ -582,6 +582,18 @@ def claim_poll(store):
     ))[0]
 
 
+async def test_renewal_reads_the_sql_advanced_work_revision(rest_factory, monkeypatch):
+    store, _, clock = make_store()
+    work = claim_poll(store)
+    lease = work.lease.model_copy(update={"expires_at": work.lease.expires_at + timedelta(seconds=30)})
+    refreshed = work.model_copy(update={"lease": lease, "revision": work.revision + 1})
+    monkeypatch.setattr(store, "renew_lease", lambda request: lease)
+    monkeypatch.setattr(store, "get_work", lambda context, work_id: refreshed)
+    service = collector(store, rest_factory(lambda request: httpx.Response(200, json={})), clock)
+    result = await service._renew(work)
+    assert result == refreshed and result.revision == work.revision + 1
+
+
 def commit_history_page(store, work, page, *, request_id, checkpoint=None):
     return store.record_rest_page(m.RestPageRequest(
         page_id=request_id, target=work.target, policy_revision=work.policy_revision,

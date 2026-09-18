@@ -35,7 +35,11 @@ from triage.detectors.silent_failures import (
 )
 from triage.models import BIRequest, Incident, TriageResult
 from triage.monitoring.contracts import MonitoringConflict, MonitoringStore, MonitoringStoreError
-from triage.monitoring.controller import MonitoringExecution, reconcile_monitoring_work
+from triage.monitoring.controller import (
+    HeartbeatBudget,
+    MonitoringExecution,
+    reconcile_monitoring_work,
+)
 from triage.monitoring.models import (
     IncidentIdentity,
     LeaseRenewal,
@@ -2014,11 +2018,15 @@ class TriageRunner:
             reason="An operator or mail reference requires exact REST verification before reasoning or action.",
         ))
 
-    async def drain_monitoring_work(self, *, limit: int = 20) -> list[str]:
+    async def drain_monitoring_work(self, *, limit: int = 20, budget: HeartbeatBudget | None = None) -> list[str]:
+        if budget is not None and not budget.can_claim():
+            return []
         context = self.monitoring_context
         owner = str(uuid4())
         lines: list[str] = []
         for _ in range(max(1, min(limit, 100))):
+            if budget is not None and not budget.can_claim():
+                break
             # Claim only what can start now. Leasing a whole batch before slow
             # model/approval calls would let later leases expire in our hands.
             work = self.monitoring.claim_work(WorkClaimRequest(

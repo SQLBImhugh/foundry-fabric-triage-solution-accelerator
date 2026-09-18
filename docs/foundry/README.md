@@ -17,14 +17,38 @@ SQL remains Entra-only with TLS/auditing/TDE, and registry admin/anonymous
 access is disabled. The public Foundry controller path is retained with local
 authentication disabled.
 
-The original SQL `STARTED` proof receipt is under guarded recovery; completion,
-runtime users/memberships and permission/effect proof remain gates. Earlier
-private bootstrap/image/metadata checks and the private Foundry service
+SQL recovery is complete through append-only operator adjudication; the original
+failed `STARTED` receipt is unchanged. Proof and application schemas each
+committed 145 DDL batches and passed 114 readbacks. The independent initialization
+capture of `maintenance=true`, revision `0` and its bootstrap receipt is
+historical. A separate no-VNet public-route job used encrypted TCP/FEDERATED
+bootstrap-MI authentication and passed 114 application readbacks without
+changing maintenance at that capture time. Proof jobs were quiesced and human
+SQL administration restored afterward.
+
+Command Center and the hosted controller have cut over to Azure SQL.
+The controller uses the correct acting `ServiceIdentity`; three runtime EXTERNAL
+users have kernel roles and reviewed application DML. Maintenance is `false`.
+After reviewed SQL-only corrections, a deployed heartbeat completed the original
+discovery-intent work, published its frontier `1/1` and queued one inventory
+item, with zero actions and unchanged original receipt/control.
+No further controller deployment was needed for that SQL fix.
+
+The collector-only worker is deployed with its dedicated MI and no ingress.
+Native Fabric metadata reads durably accepted 332 workspaces; authenticated
+selectors are enabled. Broader item coverage remains partial, including dataset
+401s without source permissions and budget/throttling gaps. No scopes or
+remediation were auto-admitted. Three actual recurrences of the reused
+one-minute heartbeat scheduler completed; portal-only alerts have no configured
+delivery destination.
+Eight bounded role cases and 19 SELECT controls remain distinct from full
+27-RPC/event/restart acceptance. Earlier private bootstrap/image/metadata checks and the private Foundry service
 preflight failure are historical. Microsoft tracing of that private attempt
 is not a prerequisite for this public path, nor does the error establish
 categorical lack of private-hosting support.
-The live app/controller remain the prior release, with no history migration/wipe,
-normal-worker rollout, hybrid application push or current-release UI screenshots.
+The completed collector-only and web/controller deployment does not establish
+event delivery, complete source access or sustained recovery. Native paired
+heartbeat metadata is now queryable in the app-owned telemetry resource.
 Earlier Fabric SQL checks remain historical.
 See the [release gates](../DeploymentGuide.md#release-gates).
 
@@ -49,7 +73,7 @@ Fabric Job events --> owned Eventstream Custom Endpoint
                               |-- owned connector reconciliation
                               `-- raw SQL observations/receipts/work
 
-Disabled-by-default scheduler -- MI --> Foundry controller "heartbeat"
+One reviewed scheduler -- MI --> Foundry controller "heartbeat"
                                                 |
                                                 |-- monitoring + human queues
                                                 |-- deterministic reconcile_state publication
@@ -156,8 +180,10 @@ ID** in little-endian GUID bytes; users/groups use object IDs. Azure RBAC uses
 the **principal object ID**, not that SQL client-ID encoding.
 `CREATE USER ... WITH SID` avoids directory name lookup but does not verify
 identity for the operator. Prove each runtime component's native stored SID
-and actual MI sign-in on Azure SQL. Bootstrap-MI login and authority are proved;
-runtime users, memberships and permission/effect proof remain gates. See
+and actual MI sign-in on Azure SQL. Correct runtime mappings and grants are
+installed, and web/controller plus bounded collector-only SQL paths have been
+exercised. Event-mode and broader permission/effect coverage still require
+their own proof. See
 [CREATE USER](https://learn.microsoft.com/sql/t-sql/statements/create-user-transact-sql#arguments).
 
 ## Optional mailbox boundary
@@ -265,6 +291,15 @@ change automated budgets, approvals, claims or notification counts.
 
 ## Eventstream and network constraints
 
+The deployed starting mode is `--collector-only`: durable inventory and REST
+polling without an Eventstream receiver/provisioner. It rejects partial or
+residual event metadata and records non-transport health with `connector_id=null`,
+not an event-delivery assertion. The deployment helper requires `-CollectorOnly`
+or a complete `-ConnectorBootstrapFile`, exclusively; Bicep defaults to
+`collectorOnly=true`. See the [quickstart](../DeploymentGuide.md#collector-only-quickstart).
+The worker's explicit zero-write/empty-allowlist policy is separate from controller
+settings. Event mode omits the flag and retains the strict owned connector binding.
+
 Azure SQL uses a public endpoint with Entra-only authentication, TLS 1.2 minimum,
 Proxy/TCP 1433, auditing and TDE. `allowAzureServices=true` defaults to SQL's
 special start/end `0.0.0.0` firewall rule. It admits Azure-hosted callers,
@@ -319,11 +354,12 @@ before an immutable retirement record is published. A null
 cannot prove absence or create readiness for a changed source set.
 
 Environment-only deployment requires no worker image, SQL or endpoint metadata.
-After that stage, use a finite UAMI canary to create/inspect the owned definition;
-then bind the nonsecret endpoint and perform separate reception/durable
-acceptance checks. A create/readback result is not managed-identity consumption.
-Normal worker startup requires ready shared control and compatible event
-persistence; no transport-only fallback is permitted.
+After that stage, collector-only startup needs the selected identity and ready
+SQL/collector contracts, but no event endpoint. For a later event-mode deployment,
+use a finite UAMI canary to create/inspect the owned definition, then bind the
+nonsecret endpoint and perform separate reception/durable acceptance checks.
+A create/readback result is not managed-identity consumption. No missing
+contract may silently select a transport-only probe or another execution mode.
 
 `--transport-probe` is a bounded, read-only worker mode with no SQL checkpoint
 or normal-health claim. `--reconcile-once` can update owned monitoring definitions
@@ -353,6 +389,19 @@ the Responses body. Enable only after proving the current controller and
 durable execution path. Do not run overlapping old/new timers or treat an
 HTTP/deployment acknowledgement as schedule readiness.
 
+The existing one-minute command scheduler was reused by changing only its command
+to `heartbeat`; no second timer or mailbox path was enabled, and the silent
+schedule was unchanged. Three actual recurrence responses were decoded and
+verified completed. Controller admission is 840 monotonic seconds including
+lock acquisition, with two automatic and one human-command concurrent slots.
+Refills obey queue quotas and need sufficient remaining execution allowance.
+Insufficient allowance prevents new claims; it does not cancel the lock holder
+or already admitted work.
+
+Portal alerts cover `RunsSucceeded < 1` over 15 minutes and `RunsFailed > 0`
+over 5 minutes at one-minute evaluation. Empty action lists mean no Action
+Group/email/webhook delivery; no missing-heartbeat canary is claimed.
+
 ## Hosting and deployment checks
 
 Keep `agent-framework-foundry-hosting` pinned exactly. Its date-stamped beta
@@ -375,6 +424,29 @@ from web liveness.
 Keep optional telemetry metadata-only; a portal Insights link is not an
 Entra-authenticated exporter or verified ingestion configuration.
 
+Foundry injects the reserved `APPLICATIONINSIGHTS_CONNECTION_STRING` from project
+monitoring; it was empty in the actual container without that connection.
+Project tracing would collect potentially sensitive content across project
+agents, so keep it disconnected. Hosted code instead uses app-owned
+`TRIAGE_TELEMETRY_CONNECTION_STRING` with managed identity, metadata-only logger
+allowlists, forced message-content capture off and the host default observability
+callback disabled. The CLI standard variable remains separate, not a hosted fallback.
+
+The public [application telemetry template](../../infra/application-telemetry.bicep)
+creates Entra-only Insights against an existing workspace and optional publisher
+roles, outputs only a resource ID and makes no project connection.
+After requiring the explicit app-owned locator, the SDK correction unsets only
+an exactly empty platform value, never a nonempty value. It adds no standard
+variable redeclaration or hosted fallback. Native Application Insights queries
+now contain started/completed heartbeat metadata with queue counts and zero
+captured exporter failure/warning counters. Diagnostics expose only metadata,
+not raw content. This is bounded ingestion proof, not full hybrid or overnight
+acceptance. See the authoritative
+[hosted variable](https://learn.microsoft.com/azure/foundry/agents/how-to/configure-hosted-agent-telemetry)
+and [trace-privacy](https://learn.microsoft.com/azure/foundry/observability/concepts/trace-data)
+documentation, plus
+[Entra-authenticated Insights ingestion](https://learn.microsoft.com/azure/azure-monitor/app/azure-ad-authentication).
+
 Deployment-only initialization/reset is separate from normal startup. Initial
 maintenance bootstrap initializes the new Azure SQL target; it does not copy
 history from the prior Fabric SQL store. Old-store disposal is separately
@@ -384,6 +456,28 @@ atomic receipts; ordinary releases do not erase operational state. Retain the
 original operation after an ambiguous reply and never reset new-epoch rows.
 Protected deployment registration and its capture receipts remain separate
 from the resettable operational records and the kernel's physical-table map.
+
+The bootstrap job remains read-only by default. The accepted multi-bundle image
+keeps proof and application files distinct; select the exact `bundlePath`,
+matching target, operation ID and SHA-256 rather than relabelling a bundle.
+`recover` appends adjudication only; a separately approved `apply` follows.
+Fresh mutation requires current runner/source, both approvals, a current
+timezone-aware window of at most 15 minutes and `empty_baseline_sha256` binding
+the full native empty/security catalogue. Approval does not waive unexpected
+object/role/trigger checks.
+
+`reconcile` reads schema receipts only. `reconcile-recovery` uses fixed SELECTs
+with the original recovery request/hash, no mutation approvals, and returns
+`MATCHING`/exit `0` or `MISSING`/`CONFLICT`/exit `2`. Historical expired requests
+remain readable; missing/conflicting evidence does not authorize restart.
+Only this read-only mode accepts `artifactRoot`/`--artifact-root`: stage the
+original archive/request outside the new image and point `bundlePath` inside
+the archive. The current trusted reader verifies original bundle/source/SQL
+bytes as data; it never imports or executes archived code/SQL or rehashes an
+original bundle to fit a newer runner. All other modes reject that flag.
+Recovery files are operator-staged, not image-baked or environment payloads.
+See the
+[bootstrap operator interface](../DeploymentGuide.md#sql-bootstrap-operator-interface).
 
 Native permission/updatability proof must use actual Entra MIs on an approved
 isolated Azure SQL target. `WITHOUT LOGIN` and `EXECUTE AS USER` are supported
@@ -397,5 +491,7 @@ does not establish runtime-component users, memberships or permissions.
 
 Follow [DeploymentGuide.md](../DeploymentGuide.md) for concrete operator flags,
 worker preparation, endpoint binding and the controlled clean-start sequence.
-Enable the heartbeat only after actual MI receipt, durable acceptance,
-correlated controller behavior and restart recovery are proved for that release.
+The deployed collector and heartbeat have proved bounded metadata acceptance
+and recurrence behavior. Event receipt, full source access, correlated executions,
+restart and sustained recovery still need separate acceptance before full
+unattended hybrid coverage is claimed.

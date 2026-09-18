@@ -17,13 +17,23 @@ scheduled failure, success and cancellation; that does not prove SQL durable
 handling or normal-worker readiness. The shipped network baseline is public,
 with scoped evaluation SQL/registry access enabled and verified and the public
 Foundry path retained. It requires no VNet, NAT or private endpoint; the worker
-still has no ingress. The original SQL proof receipt is under recovery, so
-bootstrap completion and runtime permissions remain gated. The earlier private
-Foundry preflight error does not block this public architecture.
-The live app/controller remain the prior release, with no history migration/wipe,
-normal worker, hybrid cutover or current-release UI screenshots.
+still has no ingress. SQL recovery and proof/application schema commits are
+complete; append-only adjudication preserves the original failed receipt.
+The initialization maintenance capture is historical: current maintenance is
+`false`, Command Center and the hosted controller use Azure SQL with
+the correct acting-identity grants. The deployed heartbeat completed bounded
+discovery-intent reconciliation, published its frontier `1/1` and queued one
+inventory item without actions or receipt/control changes.
+The earlier private Foundry preflight error does not block this public architecture.
+The deployed collector-only worker has durably accepted 332 workspace metadata
+records. Item/source-access coverage is partial, including permission and
+request-budget/throttling gaps; no scope or remediation was auto-admitted.
+This mode runs no Eventstream receiver/provisioner. Three real recurrences of
+the reused heartbeat schedule completed, and paired started/completed heartbeat
+metadata is now queryable in Application Insights. Full event/source-access/
+restart/sustained coverage remains separate acceptance work.
 Earlier private-network and Fabric SQL checks remain historical.
-Keep normal collection and the controller heartbeat gated as described in
+Keep those boundaries distinct from the successful controller invocation as described in
 [DeploymentGuide.md](DeploymentGuide.md#12-hybrid-monitoring-worker-and-eventstream).
 
 ## Monitoring contract
@@ -184,6 +194,19 @@ Any MCAPS public-access exception is resource-scoped; the SQL exception's single
 14-day period is not restarted by re-adding its tag. Longer tests need an
 approved exclusion. See [governed evaluation exceptions](DeploymentGuide.md#governed-evaluation-exceptions).
 
+Inventory and REST polling can start before native event transport:
+
+```powershell
+.\.venv\Scripts\python.exe -m triage.monitoring.worker --collector-only
+```
+
+Supply the selected MI and SQL environment; omit all connector/eventstream
+settings. This explicit mode records non-transport health only and cannot
+claim event delivery. Use the [deployment quickstart](DeploymentGuide.md#collector-only-quickstart)
+for the full helper parameters. Event mode omits the flag and requires the
+complete owned connector binding. Workspace metadata is not proof of pipeline
+history access or replay permission.
+
 Remove `FABRIC_PIPELINE_TARGETS` from live configuration. Static targets and
 compatibility loaders are retired; there is no import or alternate target format.
 `PIPELINE_SWEEP_ENABLED`, `PIPELINE_LOOKBACK_HOURS` and
@@ -290,7 +313,10 @@ separately:
 azd deploy bi-triage-controller --no-prompt
 ```
 
-Prepare the common heartbeat schedule disabled:
+For a new deployment, prepare the common heartbeat schedule disabled. If the
+one-minute command scheduler already exists, update its reviewed command to
+`heartbeat` rather than creating a second timer; that is the current deployed
+pattern. It does not enable mailbox ingestion or change a silent-sweep schedule:
 
 ```powershell
 az account set --subscription "<subscription-name-or-id>"

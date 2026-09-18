@@ -58,8 +58,11 @@ param environmentExceptionTags object = {}
 param azureSqlServer string
 param azureSqlDatabase string
 
-@description('Nonsecret bootstrap metadata for an app-owned Eventstream destination. The worker must reconcile ownership and the active SQL manifest before consuming; this is not a monitored-target list.')
-param connectorBootstrap ConnectorBootstrap
+@description('Start inventory and REST polling without Eventstream prerequisites. Event mode requires the complete owned connector metadata and explicit false.')
+param collectorOnly bool = true
+
+@description('Required only for event mode. Nonsecret metadata for an app-owned Eventstream destination; it grants neither ownership nor remediation authority.')
+param connectorBootstrap ConnectorBootstrap?
 
 @description('API selection, not a permission grant. tenant_admin_preview explicitly enables admin workspaces/domains and preview Admin Items; source telemetry and remediation still require separate admission/probes.')
 @allowed([
@@ -97,7 +100,7 @@ module newEnvironment './monitoring-environment.bicep' = if (empty(existingEnvir
 
 var environmentId = empty(existingEnvironmentResourceId) ? newEnvironment!.outputs.environmentResourceId : existingEnvironmentResourceId
 
-var workerEnvironment = {
+var workerEnvironment = union({
   AZURE_SUBSCRIPTION_ID: subscription().subscriptionId
   AZURE_TENANT_ID: tenantId
   AZURE_CLIENT_ID: workerIdentity.properties.clientId
@@ -108,16 +111,17 @@ var workerEnvironment = {
   MONITORING_TENANT_ID: tenantId
   AZURE_SQL_SERVER: azureSqlServer
   AZURE_SQL_DATABASE: azureSqlDatabase
-  MONITORING_CONNECTOR_ID: connectorBootstrap.connectorId
-  MONITORING_EVENTSTREAM_WORKSPACE_ID: connectorBootstrap.workspaceId
-  MONITORING_EVENTSTREAM_ID: connectorBootstrap.eventstreamId
-  MONITORING_EVENTSTREAM_DESTINATION_ID: connectorBootstrap.destinationId
-  MONITORING_EVENTSTREAM_NAMESPACE: connectorBootstrap.fullyQualifiedNamespace
-  MONITORING_EVENTSTREAM_ENTITY: connectorBootstrap.eventHubName
-  MONITORING_EVENTSTREAM_CONSUMER_GROUP: connectorBootstrap.consumerGroup
   PYTHONUNBUFFERED: '1'
   PYTHONDONTWRITEBYTECODE: '1'
-}
+}, collectorOnly ? {} : {
+  MONITORING_CONNECTOR_ID: connectorBootstrap!.connectorId
+  MONITORING_EVENTSTREAM_WORKSPACE_ID: connectorBootstrap!.workspaceId
+  MONITORING_EVENTSTREAM_ID: connectorBootstrap!.eventstreamId
+  MONITORING_EVENTSTREAM_DESTINATION_ID: connectorBootstrap!.destinationId
+  MONITORING_EVENTSTREAM_NAMESPACE: connectorBootstrap!.fullyQualifiedNamespace
+  MONITORING_EVENTSTREAM_ENTITY: connectorBootstrap!.eventHubName
+  MONITORING_EVENTSTREAM_CONSUMER_GROUP: connectorBootstrap!.consumerGroup
+})
 
 resource worker 'Microsoft.App/containerApps@2025-01-01' = {
   name: workerName
@@ -154,6 +158,9 @@ resource worker 'Microsoft.App/containerApps@2025-01-01' = {
             '-m'
             'triage.monitoring.worker'
           ]
+          args: collectorOnly ? [
+            '--collector-only'
+          ] : []
           env: map(items(workerEnvironment), setting => {
             name: setting.key
             value: setting.value
@@ -183,4 +190,5 @@ output workerIdentityClientId string = workerIdentity.properties.clientId
 output workerIdentityPrincipalId string = workerIdentity.properties.principalId
 output registryLoginServer string = registry.properties.loginServer
 output deployedImage string = image
+output collectorOnly bool = collectorOnly
 output configuredWorkerEnvironment object = workerEnvironment
