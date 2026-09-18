@@ -155,12 +155,37 @@ those timestamps.
 
 ### Eventstream source publication
 
+Already-created app-owned transport uses the
+[operator metadata registrar](DeploymentGuide.md#register-existing-app-owned-connector-metadata).
+Its reviewed original create and fresh complete item/definition/topology capture
+bind physical ownership; hashes do not establish collector identity, network
+access or delivery. It publishes neither protected desired state nor admission
+or readiness, and does not queue controller work.
+
+Before first protected desired publication, retained physical sources remain
+dormant without current admitted read/event-capable targets. They are not
+automatically removed because that admission set is empty. Once current
+admission and capability exist, first publication can occur at the same policy
+revision when desired state was absent; no artificial scope edit is required.
+Fresh same-collector-MI topology/source-Running and read probes establish event
+capability only, leaving action capability unchanged.
+
 Source additions begin as logical proposals without caller-invented physical
 component IDs. The controller publishes desired topology while holding its
 work lease. The worker applies only that published intent and records the
 original remote operation and observed definition. The controller then binds
 the observed physical IDs through the original observation receipt; a worker's
 successful API call alone cannot publish effective readiness.
+
+A degraded receiver can collect first-delivery proof only against the matching
+current protected publication, ownership, policy, definition, source and endpoint.
+Publication-identity change requires re-verification. Identity-check time and
+subsequent receive time are separate facts. Controller Ready requires the exact
+original durable stream receipt/position and accepted hash, bound to actual
+work/context, owner, fence and revision; a heartbeat, empty/quarantined stream,
+stale receipt, connector equality or inferred global lease is insufficient.
+These requirements do not constitute new native registration/apply or
+event-runtime acceptance.
 
 Desired removal immediately fences intake but retains physical ownership.
 Only a current, complete, original definition observation proving exact absence
@@ -1206,8 +1231,11 @@ Refills obey queue quotas and require enough remaining execution allowance.
 It stops new claims without cancelling a lock holder or already admitted work.
 The existing one-minute scheduler was reused, and three actual
 recurrences completed after response decoding. Portal-only missing/failed-run
-alerts are separate signals, with empty action lists and no delivery/absence
-canary claim.
+alerts are separate signals with empty action lists. The optional runtime
+log-absence rule summarizes to one zero-count row for an empty window rather
+than treating metric no-data as zero. An isolated query canary fired and
+resolved, then was disabled; production log-absence remains enabled.
+No real controller-stop or external notification test is claimed.
 
 Service-wide and API-specific read budgets are acquired together. A denied API
 budget must not consume the service allowance when no request was sent.

@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 from collections import Counter
+from copy import deepcopy
 from datetime import timedelta
 from uuid import UUID
 
@@ -592,6 +593,64 @@ async def test_renewal_reads_the_sql_advanced_work_revision(rest_factory, monkey
     service = collector(store, rest_factory(lambda request: httpx.Response(200, json={})), clock)
     result = await service._renew(work)
     assert result == refreshed and result.revision == work.revision + 1
+
+
+@pytest.mark.parametrize("kind", ["inventory", "capability_probe", "poll"])
+async def test_obsolete_collection_policy_is_dispositioned_before_service_reads(rest_factory, kind):
+    store, state, clock = make_store()
+    if kind == "poll":
+        work = claim_poll(store)
+    else:
+        draft = store.enqueue_work(m.MonitoringWorkDraft(
+            **CONTEXT.model_dump(), work_id=str(UUID(int=31_001 if kind == "inventory" else 31_002)),
+            kind=kind, policy_revision=store.snapshot(CONTEXT).control.revision,
+            target=target() if kind == "capability_probe" else None,
+            discovery_selector=m.ScopeSelector(tenant_id=TENANT, kind="tenant") if kind == "inventory" else None,
+            created_at=clock(), due_at=clock(), reason="Original read-only collection policy",
+        ))
+        work, = store.claim_work(m.WorkClaimRequest(
+            **CONTEXT.model_dump(), owner_id=OWNER, kinds=(kind,), limit=1, per_workspace_limit=1,
+        ))
+        assert work.work_id == draft.work_id
+    policy = store.list_scopes(m.PageQuery(**CONTEXT.model_dump())).items[0]
+    scope = m.ScopeDefinition.model_validate({
+        **policy.model_dump(exclude={"revision", "updated_at"}), "name": "Updated observation policy",
+    })
+    expected = m.RegistryVersion(**CONTEXT.model_dump(), revision=policy.revision)
+    preview = store.preview_scope(m.ScopePreviewRequest(
+        expected=expected, idempotency_id=str(UUID(int=31_100)), scope=scope,
+    ))
+    store.activate_scope(m.ActivateScopeRequest(
+        expected=expected, plan_id=preview.plan_id, idempotency_id=preview.idempotency_id,
+    ))
+    records = deepcopy({key: value for key, value in state.records.items() if value.kind != "work"})
+    receipts = deepcopy(state.receipts)
+    control = store.snapshot(CONTEXT).control
+    service = collector(store, rest_factory(lambda request: pytest.fail("Obsolete work attempted a service read")), clock)
+    result = await service._collect(work)
+    assert result.state == "superseded" and result.gaps == ()
+    assert store.get_work(CONTEXT, work.work_id).state == "dispositioned"
+    assert store.snapshot(CONTEXT).control == control
+    assert {key: value for key, value in state.records.items() if value.kind != "work"} == records
+    assert all(state.receipts[key] == value for key, value in receipts.items())
+    assert all(value.work_id != work.work_id for value in store.claim_work(m.WorkClaimRequest(
+        **CONTEXT.model_dump(), owner_id=OWNER, kinds=(kind,), limit=20, per_workspace_limit=20,
+    )))
+
+
+async def test_unpublished_collection_policy_is_not_reported_as_successful_supersession(rest_factory, monkeypatch):
+    store, _, clock = make_store()
+    work = claim_poll(store)
+    service = collector(store, rest_factory(lambda request: pytest.fail("Invalid work attempted a service read")), clock)
+
+    async def future(_work):
+        return work.model_copy(update={"policy_revision": work.policy_revision + 1})
+
+    monkeypatch.setattr(service, "_renew", future)
+    result = await service._collect(work)
+    assert result.state == "lease_lost"
+    assert [gap.code for gap in result.gaps] == ["collector_work_fenced"]
+    assert store.get_work(CONTEXT, work.work_id).state == "leased"
 
 
 def commit_history_page(store, work, page, *, request_id, checkpoint=None):

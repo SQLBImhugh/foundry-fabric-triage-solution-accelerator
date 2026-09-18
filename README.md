@@ -55,7 +55,9 @@ services, including native Fabric Eventstream delivery.
 >
 > The existing one-minute scheduler now calls `heartbeat`, with three actual
 > recurrence responses verified completed. Portal-only missing/failed-heartbeat
-> alerts have no configured delivery destination. Collector-only mode runs no
+> alerts have no configured delivery destination. The runtime log-absence rule
+> was tested with an isolated query canary that fired and resolved, not by
+> stopping the controller. Collector-only mode runs no
 > Eventstream receiver/provisioner, so event and end-to-end acceptance remain
 > open. Eight bounded role cases and 19 SELECT controls are not the full 27-RPC
 > matrix. Hosted metadata telemetry now uses an app-owned channel, with Foundry
@@ -396,8 +398,12 @@ responses. The controller's 840-second monotonic admission budget includes lock
 wait, runs two automatic and one human-command concurrent slots, and refills
 them only within queue limits and the remaining execution allowance. It stops
 new claims without cancelling admitted work when insufficient time remains.
-Portal-only heartbeat health alerts are configured, but no email/webhook/Action
-Group delivery or missing-heartbeat canary has been proved.
+Portal-only heartbeat health alerts include an optional runtime log query that
+returns a zero-count row when no completed heartbeat is present; absent platform
+metric samples are not assumed to be zero. An isolated validation rule fired
+and resolved and is now disabled. The production runtime-absence rule is enabled
+with no actions; no actual controller stop or email/webhook/Action Group delivery
+was tested.
 
 Re-test routines in your own tenant before enabling them; the observed behavior
 may be regional or fixed in a later preview release. An enabled declaration is

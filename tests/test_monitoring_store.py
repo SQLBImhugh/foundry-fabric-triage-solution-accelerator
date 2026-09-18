@@ -531,6 +531,48 @@ def test_initial_discovery_is_partial_before_any_scope_is_configured() -> None:
     assert any(gap.code == "inventory_incomplete" for gap in coverage.gaps)
 
 
+def test_complete_workspace_preview_does_not_certify_partial_estate_coverage() -> None:
+    h = Harness()
+    h.seed()
+    selector = m.ScopeSelector(tenant_id=uid(1), kind="workspace", workspace_id=h.targets[0].workspace_id)
+    h.activate(m.ScopeDefinition(
+        **h.context(), scope_id=h.next_id(), name="One reviewed workspace",
+        rules=(m.ScopeRule(rule_id=h.next_id(), selector=selector, effect="include"),),
+    ))
+    h.clock.advance(1)
+    h.store.record_inventory(m.InventoryBatch(
+        request_id=h.next_id(), expected=h.version, items=(),
+        generation=m.InventoryGeneration(
+            **h.context(), generation_id=h.next_id(),
+            selector=m.ScopeSelector(tenant_id=uid(1), kind="tenant"),
+            adapter="fixture", authority="tenant_admin", completeness="partial",
+            started_at=h.clock(), continuation="more-workspaces",
+            gaps=(m.CoverageGap(code="inventory_in_progress", detail="Other workspaces remain."),),
+        ),
+    ))
+    h.clock.advance(1)
+    generation_id = h.next_id()
+    item = h.store.list_inventory(m.TargetQuery(**h.context())).items[0]
+    h.store.record_inventory(m.InventoryBatch(
+        request_id=h.next_id(), expected=h.version,
+        items=(item.model_copy(update={"generation_id": generation_id, "observed_at": h.clock()}),),
+        generation=m.InventoryGeneration(
+            **h.context(), generation_id=generation_id, selector=selector,
+            adapter="fixture", authority="tenant_admin", completeness="complete",
+            started_at=h.clock(), completed_at=h.clock(), completed_pages=1, discovered_count=1,
+        ),
+    ))
+    coverage = h.store.coverage(m.MonitoringContext(**h.context()))
+    assert coverage.inventory_completeness == "partial"
+    assert coverage.scope_item_count is None
+    assert coverage.discovered_count == 1
+    preview = h.store.preview_scope(m.ScopePreviewRequest(
+        expected=h.version, idempotency_id=h.next_id(), scope=h.scope,
+    ))
+    assert preview.status == "ready"
+    assert preview.inventory_completeness == "complete"
+
+
 def test_scope_exclusions_win_and_names_do_not_alias() -> None:
     h = Harness()
     h.seed(count=2, workspaces=2)

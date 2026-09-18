@@ -207,6 +207,13 @@ for the full helper parameters. Event mode omits the flag and requires the
 complete owned connector binding. Workspace metadata is not proof of pipeline
 history access or replay permission.
 
+Previously created app-owned transport must also pass the
+[metadata registration and readiness sequence](DeploymentGuide.md#registration-to-event-mode-readiness).
+Registration is planned physical ownership, not admission. Current read/event
+capability under the collector MI permits first controller desired publication;
+it does not grant full-pipeline action capability or replace approval/replay
+safety. Durable original event receipt proof is still required before Ready.
+
 Remove `FABRIC_PIPELINE_TARGETS` from live configuration. Static targets and
 compatibility loaders are retired; there is no import or alternate target format.
 `PIPELINE_SWEEP_ENABLED`, `PIPELINE_LOOKBACK_HOURS` and

@@ -43,6 +43,7 @@ from triage.monitoring.contracts import (
     MonitoringUnavailable,
 )
 from triage.monitoring.events import (
+    WIRE_TO_SUBSCRIPTION_TYPE,
     ConnectorScope,
     OwnershipChange,
     PartitionOwnership,
@@ -78,7 +79,7 @@ CONTROLLER_OPERATIONS = frozenset({
 SHARED_WORK_OPERATIONS = frozenset({"claim_work", "renew_lease", "disposition_work"})
 CONNECTOR_PUBLICATION_OPERATIONS = frozenset({
     "snapshot", "get_work", "get_reconciliation_request", "get_validation_frontier",
-    "list_connectors", "list_targets", "resolve_target", "get_connector_publication",
+    "list_connectors", "get_connector_desired", "list_targets", "resolve_target", "get_connector_publication",
     "get_operation_receipt", "publish_connector", "enqueue_work",
 })
 
@@ -251,6 +252,29 @@ def _matches(record: StoredRecord, filters: dict[str, object]) -> bool:
     return True
 
 
+def _reconciliation_workspace(record: StoredRecord, work: m.MonitoringWork) -> str:
+    workspace = work.target.workspace_id if work.target is not None else None
+    if record.workspace_id is not None and record.workspace_id != workspace:
+        logger.error("Reconciliation workspace promotion contradicts its canonical target key_hash=%s", key_digest(record.key))
+        raise MonitoringUnavailable("Reconciliation workspace promotion contradicts its canonical target")
+    return workspace or ""
+
+
+def _reconciliation_policy_revision(backend: RecordBackend, context: m.MonitoringContext) -> int:
+    if not backend.transaction_active:
+        logger.error("Reconciliation scheduling attempted outside its operation transaction")
+        raise MonitoringUnavailable("Reconciliation scheduling requires its operation transaction")
+    try:
+        control = m.DeploymentControl.model_validate(backend.control())
+    except ValidationError as exc:
+        logger.error("Reconciliation scheduling has no valid authoritative deployment control")
+        raise MonitoringUnavailable("Reconciliation scheduling requires authoritative deployment control") from exc
+    if _stamp(control) != _stamp(context):
+        logger.error("Reconciliation scheduling control belongs to another tenant or epoch")
+        raise MonitoringUnavailable("Reconciliation scheduling control context changed")
+    return control.revision
+
+
 class MemoryBackend:
     fixture = True
 
@@ -351,29 +375,64 @@ class MemoryBackend:
         if self.component != "fixture":
             kinds = m.WORKER_WORK_KINDS if self.component == "worker" else m.CONTROLLER_WORK_KINDS
             rows = [row for row in rows if row.work_kind in kinds]
+        current_policy = (
+            _reconciliation_policy_revision(self, request)
+            if self.component != "worker" and "reconcile_state" in request.kinds else None
+        )
+        decoded: dict[str, m.MonitoringWork] = {}
+
+        def work(record: StoredRecord) -> m.MonitoringWork:
+            if record.key not in decoded:
+                try:
+                    decoded[record.key] = m.MonitoringWork.model_validate_json(record.payload)
+                except ValidationError as exc:
+                    logger.error("Invalid persisted monitoring record kind=%s key_hash=%s", record.kind, key_digest(record.key))
+                    raise MonitoringUnavailable("A persisted monitoring record is unreadable") from exc
+            result = decoded[record.key]
+            if current_policy is not None and result.policy_revision > current_policy:
+                logger.error("Reconciliation work refers to an unpublished policy key_hash=%s", key_digest(record.key))
+                raise MonitoringUnavailable("Reconciliation work refers to an unpublished policy")
+            return result
+
+        def priority(record: StoredRecord) -> int:
+            return 0 if record.work_kind == "reconcile_state" and work(record).reconcile_producer == "web" else 1
+
+        def obsolete(record: StoredRecord) -> bool:
+            return (
+                current_policy is not None and record.work_kind == "reconcile_state"
+                and work(record).policy_revision < current_policy
+            )
+
         def group(record: StoredRecord) -> tuple[str, str]:
-            return record.workspace_id or "", "publication" if record.work_kind == "reconcile_state" else "ordinary"
+            if record.work_kind == "reconcile_state":
+                return _reconciliation_workspace(record, work(record)), "publication"
+            return record.workspace_id or "", "ordinary"
+
         active = Counter(
             group(record) for record in rows
             if record.status in {"leased", "finalizing"} and record.due_at and record.due_at > now
         )
         grouped: dict[tuple[str, str], list[StoredRecord]] = {}
         for record in rows:
-            workspace = group(record)
             if (
                 record.work_kind in request.kinds
                 and record.status in {"queued", "waiting", "leased", "finalizing"}
                 and record.due_at is not None and record.due_at <= now
-                and active[workspace] < request.per_workspace_limit
             ):
-                grouped.setdefault(workspace, []).append(record)
+                workspace = group(record)
+                if active[workspace] < request.per_workspace_limit:
+                    grouped.setdefault(workspace, []).append(record)
         ranked = []
         for workspace_group, records in grouped.items():
             workspace, pool = workspace_group
-            for rank, record in enumerate(sorted(records, key=lambda row: (row.due_at, key_digest(row.key)))):
+            # Native reconciliation preserves its target in the protected payload
+            # even when the optional promoted workspace column is absent.
+            # Prefer current publication inside its existing share, without
+            # promoting metadata ahead of ordinary verification/finalization.
+            for rank, record in enumerate(sorted(records, key=lambda row: (priority(row), obsolete(row), row.due_at, key_digest(row.key)))):
                 if rank < request.per_workspace_limit - active[workspace_group]:
-                    ranked.append((rank, workspace <= after_workspace, workspace, pool, record))
-        return [row[4] for row in sorted(ranked, key=lambda row: row[:4])[:request.limit]]
+                    ranked.append((priority(record), rank, workspace <= after_workspace, workspace, pool, record))
+        return [row[5] for row in sorted(ranked, key=lambda row: row[:5])[:request.limit]]
 
     def get_receipt(
         self, operation: str, request_id: str, context: m.MonitoringContext,
@@ -1083,6 +1142,14 @@ class MonitoringEngine:
                     raise MonitoringUnavailable("Accepted broker position lost its original signal")
                 if signal.status == "accepted":
                     self._ingest(signal.observation, control)
+                    if signal.transport is not None:
+                        connector = self._get(
+                            "connector", signal.delivery.connector_id, control, m.OwnedConnectorManifest,
+                        )
+                        if connector is not None and connector.state != "ready" and self._connector_delivery(
+                            control, connector.connector_id, signal.transport.collector_identity_id,
+                        ) is not None:
+                            self._connector_followup(connector, control)
         else:
             raise MonitoringConflict("Unknown deterministic reconciliation topic")
         if request.topic in {"inventory", "capability", "scope", "discovery"}:
@@ -1141,6 +1208,16 @@ class MonitoringEngine:
             targets.append(current)
         if len(targets) > 100:
             raise MonitoringKernelUnsupported("Additional connector shards require explicit approved metadata")
+        desired = self._get("connector_desired", connector.connector_id, control, m.ConnectorDesiredState)
+        if desired is None and (
+            not targets or not {
+                source.target.key for source in (*connector.sources, *connector.source_proposals)
+            }.issubset({target.key for target in targets})
+        ):
+            # Registration retains physical ownership, not an empty desired
+            # intake policy. Later revocation still publishes removals normally.
+            logger.info("registered_connector_dormant connector_id=%s", connector.connector_id)
+            return
         work = self._get("work", producer.work_id, control, m.MonitoringWork)
         frontier = self._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
         if work is None or work.lease is None or frontier is None:
@@ -1857,110 +1934,115 @@ class MonitoringEngine:
         self._put("target_capability", observation.target.key, control, observation, target_key=observation.target.key)
         self._reconcile_item(item, control, self._all("scope", control, m.ScopePolicy, budget=1_000))
 
+    def _evaluate_scope_plan(
+        self, request: m.ScopePreviewRequest, control: m.DeploymentControl,
+    ) -> m.ActivationPlan:
+        """Read current reviewed effects without persisting a replacement plan."""
+        scopes: list[m.ScopeDefinition] = [
+            scope for scope in self._all("scope", control, m.ScopePolicy, budget=1_000)
+            if scope.scope_id != request.scope.scope_id
+        ] + [request.scope]
+        generations = self._all("generation", control, m.InventoryGeneration)
+        latest: dict[str, m.InventoryGeneration] = {}
+        for generation in generations:
+            key = generation.enumeration + ":" + _json(generation.selector.model_dump(mode="json"))
+            if key not in latest or latest[key].started_at < generation.started_at:
+                latest[key] = generation
+        disabling = not request.scope.enabled
+        complete = self._inventory_complete(scopes, list(latest.values())) and all(
+            generation.completeness == "complete"
+            for generation in latest.values() if generation.enumeration != "items"
+        )
+        changes = []
+        gaps = []
+        permissions = set()
+        poll_delta = 0
+        desired_subscriptions = set()
+        current_subscriptions = {
+            source.target.key for connector in self._all("connector", control, m.OwnedConnectorManifest)
+            if connector.state != "deleted" for source in connector.sources
+        }
+        if disabling:
+            contracted = self._scope_disable_targets(control, scopes)
+            retained = {target.key for _, target in contracted if target.observation.enabled}
+            desired_subscriptions = current_subscriptions & retained
+            for prior, target in contracted:
+                changes.append(m.TargetChange(
+                    identity=target.identity,
+                    change="retain" if target.state == prior.state else "pause",
+                    reason=target.reason, basis="explicit_policy",
+                ))
+                poll_delta += int(target.observation.enabled) - int(prior.observation.enabled)
+        for item in (() if disabling else self._all("inventory", control, m.InventoryItem)):
+            matches, excluded = self._scope_matches(scopes, item)
+            if item.target is None:
+                if any(
+                    policy.enabled and any(
+                        rule.effect == "include" and self._selector_matches(rule.selector, item)
+                        for rule in policy.rules
+                    ) for policy in scopes
+                ):
+                    gaps.append(m.CoverageGap(
+                        code="unsupported", detail=item.unsupported_reason,
+                        workspace_id=item.workspace_id, item_id=item.item_id,
+                    ))
+                continue
+            prior = self._get("target", item.target.key, control, m.MonitoringTarget)
+            wanted = bool(matches) and not excluded and item.state == "present"
+            if wanted:
+                change = "retain" if prior and prior.state == "current" else "admit"
+                poll_delta += int(change == "admit")
+                probe = self._get("target_capability", item.target.key, control, m.CapabilityObservation)
+                if probe is not None:
+                    permissions.update(probe.required_permissions)
+                    if probe.event_status == "verified":
+                        desired_subscriptions.add(item.target.key)
+                    elif item.workload == "fabric_pipeline":
+                        gaps.append(m.CoverageGap(
+                            code="event_capability_unverified", detail="Event provisioning remains gated by its platform/service proof.",
+                            workspace_id=item.workspace_id, item_id=item.item_id,
+                        ))
+                if probe is None or probe.read_status != "verified" or probe.expires_at <= self._now():
+                    gaps.append(m.CoverageGap(
+                        code="access_unverified", detail="A current service-identity read probe is required.",
+                        workspace_id=item.workspace_id, item_id=item.item_id,
+                    ))
+                changes.append(m.TargetChange(
+                    identity=item.target, change=change, reason="Effective proposed inclusion.",
+                    basis="explicit_policy",
+                ))
+            elif prior is not None and prior.state != "removed":
+                changes.append(m.TargetChange(
+                    identity=item.target, change="remove", reason="The proposed policy excludes this target.",
+                    basis="explicit_policy",
+                ))
+                poll_delta -= int(prior.observation.enabled)
+        if not complete:
+            gaps.append(m.CoverageGap(
+                code="inventory_incomplete",
+                detail=(
+                    "Inventory remains incomplete; this explicit disable only contracts stored admissions."
+                    if disabling else "Finish the required inventory before activating this scope."
+                ),
+            ))
+        return m.ActivationPlan(
+            **request.model_dump(), plan_id=stable_id(control, f"plan:{request.idempotency_id}"),
+            created_at=self._now(), expires_at=self._now() + timedelta(seconds=PLAN_TTL_SECONDS),
+            inventory_generations=tuple(sorted(generation.generation_id for generation in latest.values())),
+            inventory_completeness="complete" if complete else "partial",
+            inventory_revision=self._inventory_revision(control),
+            status="ready" if complete or disabling else "blocked", changes=tuple(changes),
+            required_permissions=tuple(sorted(permissions)), poll_count_delta=poll_delta,
+            subscription_count_delta=len(desired_subscriptions - current_subscriptions) - len(current_subscriptions - desired_subscriptions),
+            gaps=self._bounded_gaps(gaps),
+        )
+
     @atomic(write=True)
     def preview_scope(self, request: m.ScopePreviewRequest) -> m.ActivationPlan:
         def apply() -> m.ActivationPlan:
             control = self._current(request.expected)
-            scopes: list[m.ScopeDefinition] = [
-                scope for scope in self._all("scope", control, m.ScopePolicy, budget=1_000)
-                if scope.scope_id != request.scope.scope_id
-            ] + [request.scope]
-            generations = self._all("generation", control, m.InventoryGeneration)
-            latest: dict[str, m.InventoryGeneration] = {}
-            for generation in generations:
-                key = generation.enumeration + ":" + _json(generation.selector.model_dump(mode="json"))
-                if key not in latest or latest[key].started_at < generation.started_at:
-                    latest[key] = generation
-            disabling = not request.scope.enabled
-            complete = self._inventory_complete(scopes, list(latest.values())) and all(
-                generation.completeness == "complete" for generation in latest.values()
-            )
-            changes = []
-            gaps = []
-            permissions = set()
-            poll_delta = 0
-            desired_subscriptions = set()
-            current_subscriptions = {
-                source.target.key for connector in self._all("connector", control, m.OwnedConnectorManifest)
-                if connector.state != "deleted" for source in connector.sources
-            }
-            if disabling:
-                contracted = self._scope_disable_targets(control, scopes)
-                retained = {target.key for _, target in contracted if target.observation.enabled}
-                desired_subscriptions = current_subscriptions & retained
-                for prior, target in contracted:
-                    changes.append(m.TargetChange(
-                        identity=target.identity,
-                        change="retain" if target.state == prior.state else "pause",
-                        reason=target.reason, basis="explicit_policy",
-                    ))
-                    poll_delta += int(target.observation.enabled) - int(prior.observation.enabled)
-            for item in (() if disabling else self._all("inventory", control, m.InventoryItem)):
-                matches, excluded = self._scope_matches(scopes, item)
-                if item.target is None:
-                    if any(
-                        policy.enabled and any(
-                            rule.effect == "include" and self._selector_matches(rule.selector, item)
-                            for rule in policy.rules
-                        ) for policy in scopes
-                    ):
-                        gaps.append(m.CoverageGap(
-                            code="unsupported", detail=item.unsupported_reason,
-                            workspace_id=item.workspace_id, item_id=item.item_id,
-                        ))
-                    continue
-                prior = self._get("target", item.target.key, control, m.MonitoringTarget)
-                wanted = bool(matches) and not excluded and item.state == "present"
-                if wanted:
-                    change = "retain" if prior and prior.state == "current" else "admit"
-                    poll_delta += int(change == "admit")
-                    probe = self._get("target_capability", item.target.key, control, m.CapabilityObservation)
-                    if probe is not None:
-                        permissions.update(probe.required_permissions)
-                        if probe.event_status == "verified":
-                            desired_subscriptions.add(item.target.key)
-                        elif item.workload == "fabric_pipeline":
-                            gaps.append(m.CoverageGap(
-                                code="event_capability_unverified", detail="Event provisioning remains gated by its platform/service proof.",
-                                workspace_id=item.workspace_id, item_id=item.item_id,
-                            ))
-                    if probe is None or probe.read_status != "verified" or probe.expires_at <= self._now():
-                        gaps.append(m.CoverageGap(
-                            code="access_unverified", detail="A current service-identity read probe is required.",
-                            workspace_id=item.workspace_id, item_id=item.item_id,
-                        ))
-                    changes.append(m.TargetChange(
-                        identity=item.target, change=change, reason="Effective proposed inclusion.",
-                        basis="explicit_policy",
-                    ))
-                elif prior is not None and prior.state != "removed":
-                    changes.append(m.TargetChange(
-                        identity=item.target, change="remove", reason="The proposed policy excludes this target.",
-                        basis="explicit_policy",
-                    ))
-                    poll_delta -= int(prior.observation.enabled)
-            if not complete:
-                gaps.append(m.CoverageGap(
-                    code="inventory_incomplete",
-                    detail=(
-                        "Inventory remains incomplete; this explicit disable only contracts stored admissions."
-                        if disabling else "Finish the required inventory before activating this scope."
-                    ),
-                ))
-            return self._put(
-                "plan", stable_id(control, f"plan:{request.idempotency_id}"), control,
-                m.ActivationPlan(
-                    **request.model_dump(), plan_id=stable_id(control, f"plan:{request.idempotency_id}"),
-                    created_at=self._now(), expires_at=self._now() + timedelta(seconds=PLAN_TTL_SECONDS),
-                    inventory_generations=tuple(sorted(generation.generation_id for generation in latest.values())),
-                    inventory_completeness="complete" if complete else "partial",
-                    inventory_revision=self._inventory_revision(control),
-                    status="ready" if complete or disabling else "blocked", changes=tuple(changes),
-                    required_permissions=tuple(sorted(permissions)), poll_count_delta=poll_delta,
-                    subscription_count_delta=len(desired_subscriptions - current_subscriptions) - len(current_subscriptions - desired_subscriptions),
-                    gaps=self._bounded_gaps(gaps),
-                ),
-            )
+            plan = self._evaluate_scope_plan(request, control)
+            return self._put("plan", plan.plan_id, control, plan)
         return self._idempotent("preview", request.idempotency_id, request.expected, request, m.ActivationPlan, apply)
 
     @atomic()
@@ -1990,16 +2072,21 @@ class MonitoringEngine:
                 # disable, including targets enrolled since its preview.
                 contracted = self._scope_disable_targets(control, proposed)
             else:
-                if plan.inventory_revision != self._inventory_revision(control):
+                current = self._persisted(self._evaluate_scope_plan(m.ScopePreviewRequest(
+                    expected=plan.expected, idempotency_id=plan.idempotency_id,
+                    scope=plan.scope, requested_by=plan.requested_by,
+                ), control))
+                # Global collection metadata can advance outside the reviewed
+                # scope. Compare scoped effects once under the existing operation
+                # lock, including expiry and subscriptions absent from that counter.
+                metadata = {"created_at", "expires_at", "inventory_generations", "inventory_revision"}
+                if (
+                    current.model_dump(exclude=metadata) != plan.model_dump(exclude=metadata)
+                    # Truncated gaps cannot prove unchanged effects after an update.
+                    or current.inventory_revision != plan.inventory_revision
+                    and any(gap.code == "additional_gaps" for gap in plan.gaps)
+                ):
                     raise MonitoringConflict("Inventory or service capabilities changed after the dry run")
-                for generation_id in plan.inventory_generations:
-                    generation = self._get("generation", generation_id, control, m.InventoryGeneration)
-                    if generation is None or generation.completeness != "complete":
-                        raise MonitoringConflict("The plan's completed inventory is no longer available")
-                # Expanding changes require a fresh preview after any inventory update.
-                for item in self._all("inventory", control, m.InventoryItem):
-                    if item.observed_at > plan.created_at:
-                        raise MonitoringConflict("Inventory changed after this activation preview")
             updated, scope = self._commit_scope_intent(control, plan.scope)
             if self.component == "fixture":
                 queued, configuring = self._publish_scope(plan, updated, contracted)
@@ -2080,6 +2167,127 @@ class MonitoringEngine:
     def get_activation(self, context: m.MonitoringContext, idempotency_id: str) -> m.ActivationReceipt | None:
         return self._receipt("activation", m.canonical_id(idempotency_id), context, m.ActivationReceipt)
 
+    def _delivery_candidates(self, context, connector, collector_identity_id):
+        return [signal for signal in self._all(
+            "signal", context, m.SignalReceipt,
+            filters={"parent_key": connector.connector_id, "status": "accepted"},
+        ) if signal.transport is not None]
+
+    def _delivery_original(self, signal: m.SignalReceipt, control: m.DeploymentControl) -> None:
+        transport = signal.transport
+        original = self._receipt("stream_intake", transport.request_id, control, m.IntakeReceipt)
+        journal = self._get(
+            "stream_position", f"{signal.partition.key}:position:{signal.position.sequence_number}",
+            control, PositionJournal,
+        )
+        if (
+            original is None or signal.delivery.key not in original.receipt_keys
+            or journal is None or journal.receipt_kind != "identified"
+            or journal.receipt_key != signal.delivery.key or journal.partition != signal.partition
+            or journal.position != signal.position
+        ):
+            raise MonitoringUnavailable("Delivery proof lost its original accepted receipt or broker position")
+
+    def _verified_delivery(self, signal, connector, control, desired, collector_identity_id):
+        transport = signal.transport
+        if (
+            signal.status != "accepted" or signal.observation is None or transport is None
+            or _stamp(signal.partition) != _stamp(control)
+            or signal.delivery.connector_id != connector.connector_id
+            or desired is None or desired.policy_revision != control.revision
+            or desired.ownership_id != connector.ownership_id
+            or connector.policy_revision != control.revision
+            or connector.source_proposals or connector.source_removals
+            or connector.state in {"blocked", "deleting", "deleted"}
+            or connector.observed_definition != connector.desired_definition
+            or not transport.matches_connector(connector, control.revision)
+            or transport.collector_identity_id != collector_identity_id
+            or not desired.published_at <= transport.identity_verified_at <= signal.received_at <= self._now()
+            or not desired.published_at <= signal.position.enqueued_at <= signal.received_at
+        ):
+            return None
+        source = next((source for source in connector.sources if (
+            source.source_id == transport.source_id and source.target == signal.observation.execution.target
+        )), None)
+        capability = self._get("target_capability", signal.observation.execution.target.key, control, m.CapabilityObservation)
+        wire = signal.event_type or signal.observation.evidence.get("native_event_type")
+        subscription = WIRE_TO_SUBSCRIPTION_TYPE.get(wire) if isinstance(wire, str) else None
+        if (
+            source is None or source.event_source != signal.delivery.event_source
+            or subscription not in source.event_types
+            or self._target(signal.observation.execution.target) is None
+            or capability is None or capability.collector_identity_id != collector_identity_id
+            or capability.read_status != "verified" or capability.event_status != "verified"
+            or capability.expires_at <= self._now()
+        ):
+            return None
+        self._delivery_original(signal, control)
+        return m.ConnectorDeliveryProof(
+            request_id=transport.request_id, receipt_key=signal.delivery.key,
+            collector_identity_id=collector_identity_id, received_at=signal.received_at,
+            identity_verified_at=transport.identity_verified_at,
+        )
+
+    def _connector_delivery(self, context, connector_id, collector_identity_id):
+        control = self._control(context)
+        connector = self._get("connector", m.canonical_id(connector_id), control, m.OwnedConnectorManifest)
+        if (
+            connector is None or control.maintenance or connector.state not in {"ready", "degraded"}
+            or connector.source_proposals or connector.source_removals
+            or connector.observed_definition != connector.desired_definition
+        ):
+            return None
+        candidates = self._delivery_candidates(control, connector, m.canonical_id(collector_identity_id))
+        if not candidates:
+            return None
+        desired = self._get("connector_desired", connector.connector_id, control, m.ConnectorDesiredState)
+        proofs = [
+            proof for signal in candidates
+            if (proof := self._verified_delivery(signal, connector, control, desired, collector_identity_id)) is not None
+        ]
+        return max(proofs, key=lambda proof: (proof.received_at, proof.receipt_key)) if proofs else None
+
+    @atomic()
+    def get_connector_delivery(self, context, connector_id, collector_identity_id):
+        return self._connector_delivery(context, connector_id, collector_identity_id)
+
+    def _require_connector_delivery(self, observed, control):
+        proof = observed.delivery_proof
+        signal = self._get("signal", proof.receipt_key, control, m.SignalReceipt) if proof else None
+        connector = self._get("connector", observed.connector_id, control, m.OwnedConnectorManifest)
+        desired = self._get("connector_desired", observed.connector_id, control, m.ConnectorDesiredState)
+        if (
+            proof is None or signal is None or connector is None
+            or self._verified_delivery(signal, connector, control, desired, proof.collector_identity_id) != proof
+            or observed.delivery_verified_at != proof.received_at
+            or observed.identity_verified_at != signal.transport.identity_verified_at
+        ):
+            raise MonitoringConflict("Readiness requires the original current accepted transport receipt")
+
+    @atomic()
+    def get_connector_desired(self, context, connector_id):
+        self._control(context)
+        return self._get("connector_desired", m.canonical_id(connector_id), context, m.ConnectorDesiredState)
+
+    @staticmethod
+    def _validate_initial_connector_publication(prior, desired, request):
+        if prior is not None and desired is None and (
+            prior.state != "planned"
+            or any(getattr(prior, key) is None for key in (
+                "workspace_id", "eventstream_id", "destination_id", "endpoint", "observed_definition",
+            ))
+            or prior.observed_definition != prior.desired_definition
+            or prior.source_proposals or prior.source_removals
+            or any(getattr(prior, key) is not None for key in (
+                "operation_id", "identity_verified_at", "delivery_verified_at",
+                "delivery_proof", "last_receiver_activity_at",
+            ))
+            or request.source_removals or request.observation_receipt_id is not None
+            or request.readiness_receipt_id is not None
+            or not (request.sources or request.source_proposals)
+        ):
+            raise MonitoringConflict("Initial connector publication requires a proof-free registered baseline and admitted sources")
+
     @atomic(write=True)
     def record_connector(
         self, expected: m.RegistryVersion, manifest: m.OwnedConnectorManifest,
@@ -2133,6 +2341,8 @@ class MonitoringEngine:
                 or (prior.endpoint is not None and prior.endpoint != manifest.endpoint)
             ):
                 raise MonitoringConflict("A connector cannot adopt a different owner or Eventstream")
+            if manifest.state == "ready" and self.component != "fixture":
+                self._require_connector_delivery(manifest, control)
             for source in manifest.sources:
                 inventory = self._get(
                     "inventory", f"{source.target.workspace_id}:{source.target.item_id}", control, m.InventoryItem,
@@ -2150,6 +2360,7 @@ class MonitoringEngine:
                 effective = _update(
                     observation, identity_verified_at=prior.identity_verified_at,
                     delivery_verified_at=prior.delivery_verified_at,
+                    delivery_proof=prior.delivery_proof,
                     state="provisioning" if observation.state == "ready" and prior.state != "ready" else observation.state,
                 )
             saved = self._put("connector", manifest.connector_id, control, effective, status=effective.state)
@@ -2212,10 +2423,12 @@ class MonitoringEngine:
             ):
                 raise MonitoringConflict("Connector publication lost its current intent/frontier binding")
             prior = self._get("connector", request.connector_id, control, m.OwnedConnectorManifest)
+            desired = self._get("connector_desired", request.connector_id, control, m.ConnectorDesiredState)
             if (prior.revision if prior else 0) != request.expected_connector_revision:
                 raise MonitoringConflict("Connector publication revision changed")
             if prior is not None and (prior.ownership_id != request.ownership_id or prior.state in {"deleting", "deleted"}):
                 raise MonitoringConflict("An established connector cannot change owner or be revived")
+            self._validate_initial_connector_publication(prior, desired, request)
             removed_sources = {removal.source_id for removal in request.source_removals if removal.source_id is not None}
             removed_proposals = {removal.proposal_id for removal in request.source_removals if removal.proposal_id is not None}
             desired_sources = (
@@ -2246,7 +2459,7 @@ class MonitoringEngine:
                 observed = self._get("connector_observation", producer.request_id, control, m.OwnedConnectorManifest)
             sources, proposals, definition = self._connector_desired_values(request, prior, observed)
             removals, retirements = self._connector_removal_records(request, prior, observed, work, control)
-            changed = prior is None or any((
+            changed = prior is None or desired is None or any((
                 prior.policy_revision != control.revision, prior.name != request.name,
                 prior.sources != sources, prior.source_proposals != proposals, prior.desired_definition != definition,
                 prior.source_removals != removals,
@@ -2266,6 +2479,7 @@ class MonitoringEngine:
                     state="provisioning" if changed else prior.state,
                     identity_verified_at=None if changed else prior.identity_verified_at,
                     delivery_verified_at=None if changed else prior.delivery_verified_at,
+                    delivery_proof=None if changed else prior.delivery_proof,
                 )
             if request.readiness_receipt_id is not None:
                 if changed or prior is None or request.readiness_receipt_id != producer.request_id:
@@ -2285,9 +2499,11 @@ class MonitoringEngine:
                     or not desired.published_at <= observed.delivery_verified_at <= self._now()
                 ):
                     raise MonitoringConflict("The observation does not prove current owned topology readiness")
+                self._require_connector_delivery(observed, control)
                 candidate = _update(
                     candidate, state="ready", identity_verified_at=observed.identity_verified_at,
                     delivery_verified_at=observed.delivery_verified_at,
+                    delivery_proof=observed.delivery_proof,
                 )
             saved = self._put("connector", candidate.connector_id, control, candidate, status=candidate.state)
             if changed:
@@ -2766,6 +2982,8 @@ class MonitoringEngine:
             gap for generation in latest_generations.values()
             if generation.completeness != "complete" for gap in generation.gaps
         ]
+        # These counters cover the deployment's inventory, not just enabled
+        # scopes. A complete scope preview cannot certify an unfinished estate.
         complete = self._inventory_complete(scopes, generations) and all(
             generation.completeness == "complete" for generation in latest_generations.values()
         )
@@ -4030,10 +4248,17 @@ class MonitoringEngine:
                         source for source in connector.sources if source.target == receipt.observation.execution.target
                     ), None)
                     target = self._target(receipt.observation.execution.target)
+                    if receipt.transport is not None and (
+                        not receipt.transport.matches_connector(connector, control.revision)
+                        or source is None or source.source_id != receipt.transport.source_id
+                    ):
+                        raise MonitoringConflict("Transport evidence differs from its current pinned connector")
                     reason = None
                     if source is None or source.event_source != receipt.delivery.event_source:
                         reason = "unverified_provenance"
-                    elif receipt.event_type not in source.event_types:
+                    elif receipt.event_type not in source.event_types and WIRE_TO_SUBSCRIPTION_TYPE.get(
+                        receipt.event_type or "",
+                    ) not in source.event_types:
                         reason = "unsupported"
                     elif target is None and self._get(
                         "submitted_action", receipt.observation.key, control, ActionOwner,

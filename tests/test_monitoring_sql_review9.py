@@ -265,7 +265,10 @@ def test_sql_procedures_enforce_review9_boundaries_and_receipt_replay():
     assert "Connector revision/ownership changed" in publish
     assert "Current policy revision differs" in publish
     assert publish.index("IF @prior_payload IS NOT NULL") < publish.index("Connector revision/ownership changed")
-    assert "Existing connector has no protected desired-publication provenance" in publish
+    assert "@prior IS NOT NULL AND @desired IS NULL" in publish
+    assert "Initial connector publication requires a proof-free registered baseline and admitted sources" in publish
+    assert "FROM OPENJSON(@prior) WHERE type<>0 AND [key] IN (" in publish
+    assert "'delivery_verified_at','delivery_proof','last_receiver_activity_at'" in publish
     assert "Readiness lacks current matched ownership/topology/identity/delivery evidence" in publish
     assert not {"state", "workspace_id", "eventstream_id", "destination_id", "endpoint",
                 "identity_verified_at", "delivery_verified_at"} & set(PUBLICATION_FIELDS)

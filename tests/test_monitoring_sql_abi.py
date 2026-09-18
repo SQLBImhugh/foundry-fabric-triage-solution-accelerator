@@ -170,6 +170,7 @@ class AbiDatabase(KernelProtocolDatabase):
                 translated = SqliteConnection.translate(translated)
                 translated = translated.replace("JSON_VALUE(", "json_extract(")
                 translated = translated.replace("TRY_CONVERT(datetime2(6), ", "READ_UTC(")
+                translated = self._policy_sql(connection, translated)
                 bound = tuple(
                     value.replace(tzinfo=None).isoformat(timespec="microseconds") if isinstance(value, datetime) else value
                     for value in params

@@ -211,6 +211,7 @@ executable IDs.
 | Future resources | Default to review required. An administrator can explicitly enable automatic detection-only admission within a selected scope. |
 | Unsupported items | Keep them visible with the unsupported workload reason; do not include them in the monitored count. |
 | Partial enumeration | Preserve known inventory and expose gaps. A failed page, denied workspace or unavailable domain API is not evidence of deletion. |
+| Scoped completeness | A complete chosen workspace is evaluated independently of an unrelated partial tenant generation. Initial partial tenant inventory with zero scopes is still not complete. |
 | Removal or movement | Recompute eligibility using completed inventory and explicit policy changes. Pause uncertain admissions rather than granting broader access. |
 | Access checks | Perform required read probes with the execution/collection identity, not just the signed-in administrator. |
 | Visibility | Existing application Readers can see admitted incident records. Tenant-wide monitoring broadens this dataset; it does not introduce per-workspace human ACLs. Review that exposure before activation. |
@@ -218,6 +219,12 @@ executable IDs.
 Exhaust valid continuation tokens within a controlled workload budget. When a
 budget is reached, persist continuation state and show incomplete coverage; do
 not return a successful empty or silently truncated list.
+
+A bounded priority correction processed an original fresh web-discovery request
+on attempt 1 without manual requeue behind a 579-waiting/207-queued snapshot.
+The chosen workspace completed ten pages and three items, including one
+unsupported Eventstream. This does not close first-scope activation or the
+remaining partial-window replay churn.
 
 Reuse the previously examined resource-picker behavior: display names with
 ID-backed selection, clear dependent choices, cancel stale requests and save
@@ -460,7 +467,11 @@ the mailbox was not enabled and the separate silent schedule was unchanged.
 
 Portal-only alerts cover no successful heartbeat in 15 minutes and any failed
 heartbeat in 5 minutes, evaluated each minute. Empty action lists are intentional;
-no email/webhook/Action Group delivery or absence canary has been proved.
+no email/webhook/Action Group delivery has been configured. Optional app-owned
+Insights parameters add a completed-heartbeat log count that returns one zero
+row on an empty window. An isolated query canary fired and resolved and is
+now disabled; the production log-absence alert is enabled without actions.
+This is not a real controller-stop test, and metric no-data is not assumed zero.
 Application-health telemetry must not enable Foundry project-wide content
 tracing; use the app-owned metadata-only channel described in
 [Observability](DeploymentGuide.md#8-observability).

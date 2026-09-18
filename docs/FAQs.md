@@ -310,7 +310,10 @@ Broader item/source-access coverage remains partial and the mode runs no
 Eventstream receiver/provisioner. Three actual recurrences of the reused
 one-minute heartbeat scheduler completed after response decoding. Portal-only
 missing/failed-heartbeat alerts were deployed, but no notification delivery or
-absence canary is claimed. Earlier screenshots remain historical.
+real controller-stop test is claimed. An additional runtime log-absence rule
+returns one zero-count row for an empty heartbeat window; its isolated query
+canary fired and resolved and was then disabled. The production log rule remains
+enabled with no actions. Earlier screenshots remain historical.
 
 Hosted telemetry's reserved platform locator was empty without a project
 tracing connection. The source now uses a separate metadata-only app channel
@@ -509,8 +512,12 @@ Inspect scheduler run history, controller responses, durable worker/SQL
 heartbeats and coverage separately. The deployed Azure Monitor alerts use
 `RunsSucceeded < 1` over 15 minutes and `RunsFailed > 0` over 5 minutes, evaluated
 every minute. Their empty action lists create portal alerts only: no Action
-Group, email or webhook delivery destination has been configured. No
-missing-heartbeat canary or external notification delivery is claimed.
+Group, email or webhook delivery destination has been configured.
+An optional runtime log-absence rule counts completed heartbeat traces and
+returns a single zero row when none exist; missing platform metric samples
+are not assumed to be zero. Its isolated validation rule fired and resolved,
+then was verified disabled. The production log rule remains enabled with no
+actions. This did not stop the real controller or test external notification delivery.
 The legacy `alertWebhookUrl` is not a prerequisite or the current alert route.
 
 This is not hypothetical. An unpinned dependency once crash-looped the container
@@ -532,6 +539,15 @@ bi-triage incidents
 A quiet incident list or an idle heartbeat is not proof of health. There may
 be no failures, no configured targets, incomplete inventory or a disconnected
 collector; coverage and its explicit gaps distinguish those cases.
+
+Registering owned Eventstream metadata also does not make event intake ready.
+The [operator registrar](DeploymentGuide.md#register-existing-app-owned-connector-metadata)
+stores planned physical ownership and an immutable receipt only. Current
+admission/read/event capability, first controller desired publication and an
+actual durable original event receipt must follow before controller Ready.
+An initially dormant source is not removed just because it has no admitted
+target; later revocation after publication still fences intake and retains
+ownership until exact complete absence is proved.
 
 The existing one-minute command schedule was changed to `heartbeat`, not
 duplicated. Three real recurrences were decoded as completed. The controller

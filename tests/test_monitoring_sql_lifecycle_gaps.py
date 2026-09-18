@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 from test_monitoring_connector_retirement_store import scoped_connector
 from test_monitoring_controller_publication_integration import ProvisioningSqlDatabase
+from test_monitoring_sql_receiver_bindings import record_delivery_evidence
 from test_monitoring_sql_removals import (
     _adapt,
     _evaluate,
@@ -428,12 +429,13 @@ def test_emitted_completion_uses_only_original_current_work_fenced_observation(d
     assert not db.execute(query, params).fetchone()
 
 
-def _record_disposition(h, db, worker, connector, commit, *, state="blocked"):
+def _record_disposition(h, db, worker, connector, commit, *, state="blocked", delivery_proof=None):
     observation = m.OwnedConnectorManifest.model_validate({
         **connector.model_dump(), "revision": connector.revision + 1, "state": state,
         "observed_definition": connector.desired_definition,
         "identity_verified_at": h.clock() if state == "ready" else None,
         "delivery_verified_at": h.clock() if state == "ready" else None,
+        "delivery_proof": delivery_proof,
         "gaps": () if state == "ready" else (m.CoverageGap(code="review_required", detail="Durable original disposition."),),
         "updated_at": h.clock(),
     })
@@ -451,8 +453,13 @@ def _record_disposition(h, db, worker, connector, commit, *, state="blocked"):
 @pytest.mark.parametrize("state", ["ready", "blocked", "degraded"])
 def test_collection_completion_survives_same_fence_renewal_and_never_uses_latest_connector(backend, state):
     h, db, _, _, worker, connector = scoped_connector(backend, database_type=ProvisioningSqlDatabase)
+    proof = None
+    if state == "ready":
+        connector, proof = record_delivery_evidence(h, worker, connector, db=db)
     commit = connector_commit(h, worker, connector.connector_id, db=db)
-    effective, _, receipt = _record_disposition(h, db, worker, connector, commit, state=state)
+    effective, _, receipt = _record_disposition(
+        h, db, worker, connector, commit, state=state, delivery_proof=proof,
+    )
     original = m.ConnectorObservationResult.model_validate(receipt.result)
     assert original.collection_completion_eligible
     assert (original.work_id, original.work_owner_id, original.work_fence, original.work_revision) == (

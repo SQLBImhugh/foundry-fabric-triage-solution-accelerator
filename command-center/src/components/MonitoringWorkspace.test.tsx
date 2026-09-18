@@ -66,7 +66,7 @@ describe('monitoring inspection and readiness', () => {
     for (const [label, value] of [['Discovered', '4'], ['Access verified', '1'], ['Admitted', '2'], ['Current', '1'], ['Action enabled', '0']]) {
       expect(coverage.getByText(label!).parentElement?.querySelector('dd')?.textContent).toBe(value)
     }
-    expect(coverage.getByText('Scope denominator: Unknown')).toBeTruthy()
+    expect(coverage.getByText('Inventory total: Unknown')).toBeTruthy()
     expect(coverage.getByText(/Known inventory is retained/)).toBeTruthy()
     expect(screen.getByText('Example User')).toBeTruthy()
     expect(screen.queryByRole('textbox', { name: 'Scope name' })).toBeNull()
@@ -177,7 +177,7 @@ describe('monitoring inspection and readiness', () => {
     setup({ api, roles: ['reader'] })
     const inventory = within(await screen.findByRole('region', { name: 'Discovered monitoring inventory' }))
     expect(inventory.getByText(complete ? /No returned inventory items/ : /not proof of an empty scope/)).toBeTruthy()
-    expect(screen.getByText(`Scope denominator: ${complete ? '0' : 'Unknown'}`)).toBeTruthy()
+    expect(screen.getByText(`Inventory total: ${complete ? '0' : 'Unknown'}`)).toBeTruthy()
     expect(screen.getByText(complete ? 'Not configured' : 'Partial', { selector: '.badge' })).toBeTruthy()
   })
 

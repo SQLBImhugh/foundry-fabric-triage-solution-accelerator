@@ -238,6 +238,23 @@ adopt an unrecorded user-owned Eventstream or authorize a workload remediation.
 
 ### Connector proposals, observations and retirement
 
+The public metadata registrar is a deployment/operator boundary, not an event
+readiness shortcut. Its reviewed original create and fresh complete readbacks
+may establish planned physical ownership only; it must not install schema,
+grant roles, change maintenance, queue work or publish admission/desired/Ready.
+Hash equality does not prove network origin or actual collector-MI access.
+Keep its original plan/receipt after uncertainty and use SELECT-only reconcile.
+
+Before first protected desired publication, retained metadata-only sources
+without admitted current read/event capability stay dormant, not removed.
+Existing admission/capability may permit first publication at the same policy
+revision; do not demand a meaningless scope change when desired state is absent.
+Fresh same-collector-MI event probes must not change action capability.
+A receiver must reverify a changed protected publication, and controller Ready
+must bind actual work/context/owner/fence/revision to an eligible original
+durable stream receipt/position/hash. Heartbeats, stale receipts, current-connector
+equality and inferred global lease state are not substitutes.
+
 Additions use a typed logical `ConnectorSourceProposal`: `proposal_id`,
 `node_name`, target and event types, with `source_id=null`. An unresolved
 proposal, including one already stored, cannot supply an invented physical ID.

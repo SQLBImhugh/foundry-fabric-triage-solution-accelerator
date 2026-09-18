@@ -20,7 +20,7 @@ from test_monitoring_provisioning import (
     target,
     wire_definition,
 )
-from test_monitoring_sql_receiver_bindings import ReceiverAbiDatabase
+from test_monitoring_sql_receiver_bindings import ReceiverAbiDatabase, record_delivery_evidence
 from test_monitoring_sql_review9_bindings import connector_commit
 from test_monitoring_store import Harness, uid
 
@@ -67,7 +67,7 @@ def publication_calls(monkeypatch):
 
 
 class PublicationHarness:
-    def __init__(self, backend, tmp_path):
+    def __init__(self, backend, tmp_path, *, register_transport=True):
         self.h = Harness()
         assert self.h.context() == CONTEXT.model_dump()
         assert self.h.state.records == {}
@@ -76,16 +76,17 @@ class PublicationHarness:
         definition = decode_snapshot(wire_definition(self.remote.graph), self.remote.topology())
         # Explicit deployer-fixture bootstrap records the observed empty baseline
         # and endpoint, never a runtime-created binding or pre-admitted target.
-        self.h.store.record_connector(self.h.version, m.OwnedConnectorManifest(
-            **CONTEXT.model_dump(), connector_id=CONNECTOR, ownership_id=CONTEXT.epoch,
-            revision=1, policy_revision=0, name="Registered source-empty transport",
-            workspace_id=TRANSPORT_WORKSPACE, eventstream_id=EVENTSTREAM, destination_id=DESTINATION,
-            endpoint=m.EndpointMetadata(
-                namespace="fixture.servicebus.windows.net", entity="owned-events", consumer_group="$Default",
-            ),
-            sources=(), desired_definition=definition, observed_definition=definition,
-            state="planned", updated_at=self.h.clock(),
-        ), expected_connector_revision=0)
+        if register_transport:
+            self.h.store.record_connector(self.h.version, m.OwnedConnectorManifest(
+                **CONTEXT.model_dump(), connector_id=CONNECTOR, ownership_id=CONTEXT.epoch,
+                revision=1, policy_revision=0, name="Registered source-empty transport",
+                workspace_id=TRANSPORT_WORKSPACE, eventstream_id=EVENTSTREAM, destination_id=DESTINATION,
+                endpoint=m.EndpointMetadata(
+                    namespace="fixture.servicebus.windows.net", entity="owned-events", consumer_group="$Default",
+                ),
+                sources=(), desired_definition=definition, observed_definition=definition,
+                state="planned", updated_at=self.h.clock(),
+            ), expected_connector_revision=0)
         self.db = ProvisioningSqlDatabase(self.h) if backend == "sql" else None
         self.stores = {
             component: AzureSqlMonitoringStore(db=self.db, component=component) if self.db else InMemoryMonitoringStore(
@@ -142,7 +143,7 @@ class PublicationHarness:
             CONTEXT, work_id=current.work_id, lease=current.lease, expected_work_revision=current.revision,
         )
 
-    async def collect(self):
+    async def collect(self, *, event_status="verified"):
         web = self.use("web")
         web.request_discovery(
             self.version("web"), m.ScopeSelector(tenant_id=CONTEXT.tenant_id, kind="tenant"),
@@ -176,7 +177,7 @@ class PublicationHarness:
             self.version("worker"),
             m.CapabilityObservation(
                 capability_id=self.h.next_id(), target=self.identity, inventory_generation=generation.generation_id,
-                collector_identity_id=IDENTITY, read_status="verified", event_status="verified",
+                collector_identity_id=IDENTITY, read_status="verified", event_status=event_status,
                 checked_at=self.h.clock(), expires_at=self.h.clock() + timedelta(hours=1),
             ),
             commit=m.CollectionCommit(
@@ -186,7 +187,10 @@ class PublicationHarness:
         self.complete_collection(probe)
         await self.drain()
         assert self.use("controller").list_targets(m.TargetQuery(**CONTEXT.model_dump())).items == ()
-        assert self.connector().sources == () and self.connector().source_proposals == ()
+        assert all(
+            value.source_proposals == ()
+            for value in self.use("controller").list_connectors(m.PageQuery(**CONTEXT.model_dump())).items
+        )
 
     def activate(self):
         web = self.use("web")
@@ -235,7 +239,7 @@ class ProvisioningSqlDatabase(ReceiverAbiDatabase):
         return super().query(sql, *params)
 
     def apply_rpc(self, operation, args):
-        if operation != "worker.transition_work" or args["transition"] not in {"renew", "retry"}:
+        if operation != "worker.transition_work" or args["transition"] not in {"renew", "retry", "disposition"}:
             return super().apply_rpc(operation, args)
         prior = self.receipts.get((operation, args["request_id"]))
         if prior is not None:
@@ -258,10 +262,17 @@ class ProvisioningSqlDatabase(ReceiverAbiDatabase):
             changes = {
                 "lease": {**work.lease.model_dump(), "expires_at": self.clock() + timedelta(seconds=args["lease_seconds"])},
             }
-        else:
+        elif args["transition"] == "retry":
             if args["retry_at"] is None or args["retry_at"].replace(tzinfo=UTC) <= self.clock():
                 raise RuntimeError("Worker retry requires its bounded future due time (51073)")
             changes = {"lease": None, "state": "waiting", "due_at": args["retry_at"].replace(tzinfo=UTC)}
+        else:
+            if not args["detail"] or work.action_reservation_id is not None:
+                raise RuntimeError("Worker disposition needs a reason and cannot abandon an action (51073)")
+            changes = {
+                "lease": None, "state": "dispositioned", "disposition": args["detail"],
+                "completed_at": self.clock(),
+            }
         updated = m.MonitoringWork.model_validate({**work.model_dump(), "revision": work.revision + 1, **changes})
         self.save_work(updated)
         return self.reply(operation, args, {"work_id": updated.work_id, "work": updated.model_dump(mode="json")})
@@ -318,14 +329,16 @@ async def test_empty_registry_runs_real_controller_store_and_worker_to_receipt_b
     assert fixture.use("controller").get_work(CONTEXT, scope_work.work_id).state == "completed"
     fixture.h.clock.advance(1)
     worker = fixture.use("worker")
-    # Identity/delivery proof is separate fixture evidence, not manufactured by
-    # the successful topology update or source-binding publication.
+    bound, proof = record_delivery_evidence(
+        fixture.h, worker, bound, db=fixture.db, collector_identity_id=IDENTITY,
+    )
     effective = worker.record_connector(
         fixture.version("worker"),
         m.OwnedConnectorManifest.model_validate({
             **bound.model_dump(), "revision": bound.revision + 1, "state": "ready", "gaps": (),
             "observed_definition": bound.desired_definition,
             "identity_verified_at": fixture.h.clock(), "delivery_verified_at": fixture.h.clock(),
+            "delivery_proof": proof,
             "updated_at": fixture.h.clock(),
         }),
         expected_connector_revision=bound.revision,

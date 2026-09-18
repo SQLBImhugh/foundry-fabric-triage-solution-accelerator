@@ -103,7 +103,8 @@ def publish_reconciliation_connector(
                 request_id=context.request_id,
             )
         if (
-            connector.policy_revision == context.expected.revision and request.sources == connector.sources
+            store.get_connector_desired(context.expected, connector.connector_id) is not None
+            and connector.policy_revision == context.expected.revision and request.sources == connector.sources
             and request.source_proposals == connector.source_proposals
             and request.source_removals == tuple(removal.intent() for removal in connector.source_removals)
             and request.desired_definition == connector.desired_definition

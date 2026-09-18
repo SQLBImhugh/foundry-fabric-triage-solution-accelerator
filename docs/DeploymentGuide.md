@@ -34,7 +34,7 @@ activation/cutover gates are distinguished below.
 |---|---|---|
 | SQL ownership contract | Independent review, eight bounded native `EXECUTE AS` role/effect cases and 19 native SELECT-predicate controls passed. Three correctly mapped EXTERNAL users have kernel roles and reviewed application DML grants | These bounded cases are not the full 27-RPC matrix or normal-worker execution proof |
 | Event transport | A historical isolated MI canary received all four observed wire event types across manual failure, scheduled failure, success and cancellation | Azure SQL durable handling, normal-worker recovery or application cutover |
-| Controller reconciliation | The deployed controller completed the original discovery-intent work without actions or changes to its original receipt/control; the existing one-minute scheduler now invokes `heartbeat` | A completed invocation is not full collection, access or remediation proof |
+| Controller reconciliation | A bounded priority correction processed the original fresh web-discovery request on attempt 1 without manual requeue despite an existing partial-inventory backlog; one selected workspace completed a ten-page, three-item scan, including one unsupported Eventstream | This does not resolve partial-window replay churn, complete tenant inventory or prove first-scope activation/event readiness |
 | Collector-only inventory | A no-ingress worker is deployed in a public Consumption environment with its dedicated MI and explicit `tenant_admin_preview` selection. Fabric domain/workspace reads succeeded and 332 workspaces were durably accepted; authenticated workspace selectors show 333 options including the placeholder | Broader item enumeration is partial. Power BI dataset reads returned 401 without source permissions, and request-budget/throttling gaps remain visible. No scopes or remediation were automatically admitted |
 | Data-quality flag persistence | Source selects `AzureSqlFlagTable` for live runs; its table is included in the committed application schema | Actual controller-MI append/readback and runtime persistence acceptance remain outstanding |
 | Public SQL/registry access | Approved resource-scoped evaluation exceptions and public access were read back on 2026-09-17. SQL remains Entra-only with TLS 1.2 and the special Azure-services firewall rule; registry access is public with default Allow, bypass None and admin/anonymous access disabled | Network access does not establish SQL schema, runtime permissions, application acceptance or an indefinite governance exemption |
@@ -43,7 +43,8 @@ activation/cutover gates are distinguished below.
 | Bootstrap control and public route | Historical initialization readback captured `maintenance=true`, revision `0` and a bootstrap receipt; a separate no-VNet bootstrap-MI job passed 114 application readbacks over encrypted TCP/FEDERATED authentication | This capture is not current maintenance state or authority to restore old settings/grants |
 | Public Foundry path | The retained Foundry account/controller path is public with local authentication disabled; `infra/foundry.bicep` implements that baseline | The earlier managed private-endpoint preflight failure is historical and does not block the selected public architecture |
 | Current web/controller cutover | Command Center and the hosted controller use Azure SQL and the reviewed acting-identity grants; maintenance is released (`false`). The API preserves latest-generation partial coverage even with no configured scopes | Event receiver/provisioner operation, full inventory/source access, restart recovery and end-to-end hybrid acceptance remain open |
-| Scheduler and alerts | The existing one-minute command scheduler was changed to `heartbeat`; three actual recurrence responses were decoded and confirmed completed. Missing/failed-heartbeat Azure Monitor alerts are deployed with empty action lists | No second timer, mailbox enablement, alert delivery destination or missing-heartbeat canary is implied |
+| Scheduler and alerts | The existing one-minute scheduler runs `heartbeat`. Platform metric alerts remain in place; the optional runtime log-absence alert is enabled with no actions. An isolated query canary fired and resolved, and its rule was then disabled | Not a real controller-stop test, notification delivery proof or permission to retry workload effects |
+| Owned connector registration | Public prepare/apply/reconcile tooling is implemented; native SQL SELECT-only preflight passed | No native registration apply or new event-runtime readiness/durable-delivery proof is accepted yet; earlier transport canaries do not establish it |
 | Application telemetry | The active controller's app-owned Entra channel has native Application Insights `heartbeat_started` and completed `heartbeat_finished` records with queue counts and zero captured exporter failure/warning counters; project tracing remains disconnected | Bounded ingestion is not proof of every span, future delivery, an alert destination, overnight stability or end-to-end hybrid operation |
 
 Do not undo the completed web/controller cutover or restore maintenance from a
@@ -1373,9 +1374,35 @@ the existing heartbeat workflow, not a second schedule:
 | Failed heartbeat | `RunsFailed > 0` | 5 minutes |
 
 Both use one-minute evaluation. `actionGroupResourceIds` defaults to an empty
-array, so the deployed alerts are portal-only. Deployment/readback does not prove
-an absence canary or notification delivery. No Action Group, email address or
-webhook destination has been configured or inferred.
+array, so alerts are portal-only. No Action Group, email address or webhook
+destination has been configured or inferred.
+
+Platform metric no-data is not assumed to mean zero successful runs. The
+template also accepts optional `applicationInsightsResourceId` and
+`applicationInsightsLocation` (defaulting to the workflow region). When the
+resource ID is supplied, it adds a runtime log-absence alert scoped to the
+application-owned Insights resource:
+
+```kusto
+traces
+| where timestamp > ago(15m)
+| where message startswith "heartbeat_finished status=completed "
+| summarize completed_heartbeats=count()
+```
+
+`summarize` returns one zero-count row when no matching heartbeat exists.
+The rule tests `completed_heartbeats < 1` over 15 minutes, evaluated each minute;
+it does not rely on an absent metric sample being treated as zero.
+The native healthy query returned 14 and the isolated empty query returned 0.
+An isolated validation rule reached **Fired** at 09:02:23 UTC on 2026-09-18,
+then **Resolved** at 09:13:23 UTC after its healthy query was restored.
+The validation rule was verified disabled afterward; the production log-absence
+rule remains enabled with no actions, and the existing platform alerts are unchanged.
+
+This proves the isolated query/alert transition, not an actual controller
+shutdown, external notification or end-to-end monitoring outage response.
+Runtime absence can reflect scheduler, controller or telemetry failure; inspect
+those boundaries rather than replaying an uncertain workload action.
 
 Live pipeline eligibility and cadence come from the monitoring registry, not
 `PIPELINE_SWEEP_ENABLED` or `FABRIC_PIPELINE_TARGETS`. Discovery may identify
@@ -2072,9 +2099,27 @@ source-access probes, configured/admitted scopes and action authority.
 The verified snapshot accepted 332 workspaces and enabled both authenticated
 workspace selectors with 333 options including the placeholder. Broader item
 coverage is partial; dataset 401s and request-budget/throttling gaps remain
-visible. A latest partial generation must not become `complete` because zero
-scopes happen to be configured. No fake workspace list, automatic scope admission
-or extra Fabric grants are part of this quickstart.
+visible. Snapshot counts are deployment/estate-wide, and **Inventory total**
+must remain Unknown until all latest discovery generations are complete.
+Zero scopes do not make partial inventory complete. No fake workspace list,
+automatic scope admission or extra Fabric grants are part of this quickstart.
+
+Selector-aware scope preview is separate: complete workspace A can be ready for
+review while partial B keeps the estate snapshot Partial/Unknown. Do not report
+A's three items plus B's five as a complete inventory total of eight.
+Workspace/domain metadata outages still block expansion; explicit disable/
+contraction can operate on stored admissions. The source revalidation helper
+permits unrelated data-revision drift only when the original scope is evaluated
+inside the locked activation transaction and its reviewed material effects are
+identical. Target, capability, subscription, gap, permission, TTL, epoch and
+policy changes refuse. Combined source/UI review and new native activation
+acceptance remain pending.
+
+The bounded priority proof processed an original fresh web-discovery request
+on attempt 1 without manual requeue behind a snapshot of 579 waiting and 207
+queued items. Its selected workspace scan completed ten pages and three items,
+including one unsupported Eventstream. Partial-window replay churn remains
+unoptimized; this is not a general backlog/SLA or scope-activation acceptance.
 
 ### Owned canary and nonsecret endpoint binding
 
@@ -2116,6 +2161,130 @@ repository. The reviewed initial definition/topology and endpoint must also
 cross the controller's guarded publication/observation contract. Supplying
 environment strings alone does not create an `OwnedConnectorManifest`, bind
 physical source IDs or establish readiness.
+
+### Register existing app-owned connector metadata
+
+[`scripts\register_monitoring_connector.py`](../scripts/register_monitoring_connector.py)
+is a separate **SQL-connected operator workflow**, not local candidate export.
+It registers reviewed physical ownership for an already-created app-owned
+Eventstream. It never calls Fabric or a key-returning endpoint, creates schema,
+grants roles, changes maintenance, queues work, admits targets or publishes
+protected desired state/readiness.
+
+| Mode | Contract |
+|---|---|
+| `--prepare --capture ...` | SELECT-only SQL checks against the explicit target/identity, then an original hash-bound plan |
+| `--apply --plan ... --confirm-manifest-hash ...` | Atomic metadata-only registration and immutable receipt, using the exact prepared target/deployer and reviewed plan hash |
+| `--reconcile --plan ...` | SELECT-only original-receipt lookup after uncertainty; no write is retried |
+
+The operator-owned capture is a closed, explicitly reviewed input. Extra or
+duplicate JSON fields and credential-bearing data are refused. It must bind:
+
+| Capture evidence | Required meaning |
+|---|---|
+| `version`, `provenance`, `review` | Version `1`, exactly `operator_reviewed_capture` and `original_creation_and_complete_current_readbacks_reviewed` |
+| `request_id`, `expected`, `expected_maintenance`, `expected_connector_revision`, `connector_id`, `ownership_id`, `name` | Original request plus current tenant/epoch/policy and exact prior connector state |
+| `creation_request`, `creation_request_sha256`, `creation_receipt`, `creation_receipt_sha256` | The actual app-owned create intent, completion and ownership marker, not adoption by display name |
+| `item`, `definition_response`, `topology_response`, `observed_at`, `readback_sha256` | Fresh complete readbacks bound to that same item and component identities, within the 15-minute preparation/apply window |
+| `sources`, `endpoint` | Exact retained physical source IDs/current pipeline target identities and explicit nonsecret namespace/entity/consumer-group metadata |
+
+The current capture contract supports pipeline sources; it does not make native
+semantic-model event support an assumption. Hashes bind reviewed evidence but
+do not prove its network origin, the collector MI's service access or delivery.
+The seven-field event worker bootstrap file alone is not this ownership capture.
+Only an absent connector or the exact current unbound planned connector without
+desired-publication/work/effect history is eligible. An established or conflicting
+binding requires reconciliation, not replacement.
+
+Use the same explicit target and identity flags for all operations. This example
+selects an already-authorized Azure CLI operator; Broker selection instead needs
+`--operator-domain`, and managed-identity selection needs
+`--managed-identity-client-id`. No credential is created:
+
+```powershell
+az account set --subscription "<subscription-id>"
+$connectorArgs = @(
+  "--server", "<server>.database.windows.net",
+  "--database", "<application-database>",
+  "--tenant-id", "<tenant-id>",
+  "--deployer-object-id", "<operator-object-id>",
+  "--credential", "azure-cli",
+  "--subscription-id", "<subscription-id>"
+)
+$capture = "<operator-owned-directory>\connector-capture.json"
+$plan = "<operator-owned-directory>\connector-plan.json"
+
+.\.venv\Scripts\python.exe scripts\register_monitoring_connector.py @connectorArgs `
+  --prepare --capture $capture --output $plan
+```
+
+After reviewing the exact plan and while its capture is still current:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\register_monitoring_connector.py @connectorArgs `
+  --apply --plan $plan --confirm-manifest-hash "<reviewed-plan-hash>" `
+  --output "<operator-owned-directory>\registration-result.json"
+```
+
+After an uncertain acknowledgement or failed result-file publication, retain
+the original plan and request identity:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\register_monitoring_connector.py @connectorArgs `
+  --reconcile --plan $plan
+```
+
+An absent or conflicting receipt leaves registration unestablished; do not
+mint a new request ID or repeat an unconfirmed write. Existing output paths
+are refused; use an existing operator-owned parent directory and a new filename.
+Output publication writes and fsyncs a temporary file, then uses
+an exclusive hard link to publish complete bytes without overwriting another
+result: the final name is complete or absent under a process interruption.
+This is not a directory-entry power-loss durability guarantee.
+
+A successful receipt says `registered_metadata_only`, requires controller
+publication and retains `identity_verified=false`/`delivery_verified=false`.
+The connector remains planned/gated. Native read-only preflight has passed;
+that is not native `--apply`, runtime transport or readiness acceptance.
+The older preflight plan was never applied, expired and is retained as evidence.
+Use a fresh complete capture and newly prepared plan from the current source;
+do not rewrite or reuse that historical plan as current authorization.
+
+### Registration to event-mode readiness
+
+Registration and event readiness are separate gates:
+
+1. Register the exact owned physical metadata with the original creation and
+   fresh complete readbacks. It grants no scope admission or capability.
+2. Establish a reviewed admitted scope and current read/event capability.
+   Fresh topology/source-Running and read probes must use the same collector MI.
+   They establish only event capability; remediation/action capability is unchanged.
+3. Let ordinary controller reconciliation publish the first protected desired
+   state. If current admission/capability already exists and desired publication
+   is absent, it can publish at the **same policy revision**. Do not make a
+   meaningless scope edit just to force publication.
+4. An event-mode receiver may collect proof while degraded only when current
+   ownership, policy, definition, source and endpoint bindings match the protected
+   publication. Reverify when that publication identity changes; matching a cached
+   connector object is not sufficient.
+5. Accept an actual original stream receipt and position durably, preserving the
+   accepted payload hash and full provenance. Actual identity-check time and later
+   receive time are distinct evidence; do not replace one with the other.
+6. Only the controller publishes readiness after those checks. Work completion
+   and publication bind the actual work/context, owner, fence, revision and
+   eligible original receipt. Heartbeats, an empty stream, quarantine or stale
+   proof cannot establish Ready.
+
+Before the first protected desired publication, registered physical sources
+without current admitted read/event-capable targets remain **dormant**.
+They are not automatically removed merely because admission is empty.
+After desired state has been published, later revocation still immediately
+fences new intake and retains physical ownership until complete original
+observation proves exact remote absence.
+
+The current handoff has no accepted native registrar apply or new event-runtime
+durable-delivery/Ready proof. The earlier transport-only canary and read-only
+registrar preflight do not close these gates.
 
 ### Controller publication and source lifecycle
 

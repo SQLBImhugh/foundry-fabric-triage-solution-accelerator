@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import sqlite3
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
-from test_monitoring_sql_store import DriverRow
+from test_monitoring_sql_frontiers import _try_convert
+from test_monitoring_sql_store import DriverRow, SqliteConnection
 from test_monitoring_store import Harness, uid
 
 from triage.monitoring import models as m
@@ -37,6 +40,7 @@ class KernelProtocolDatabase:
         self.contracts = rpc_contracts(self._tables)
         self.principal = principal
         self.control = h.control
+        self.context = m.MonitoringContext(tenant_id=h.control.tenant_id, epoch=h.control.epoch)
         self.clock = h.clock
         self.calls = []
         self.records = {}
@@ -104,6 +108,11 @@ class KernelProtocolDatabase:
             return [DriverRow((
                 request_id, receipt["fingerprint"], receipt["recorded_at"], json.dumps(receipt["payload"]),
             )) for request_id, receipt in matches]
+        if sql.startswith("WITH recent AS") or (
+            sql.startswith("SELECT TOP (1) record_kind")
+            and ("workspace_id IS NOT NULL" in sql or "OPENJSON(payload)" in sql)
+        ):
+            return self._query_work_progress(sql, params)
         if "ROW_NUMBER()" in sql:
             result = []
             for (kind, _), record in self.records.items():
@@ -131,6 +140,51 @@ class KernelProtocolDatabase:
             return self.bad_result if self.bad_result is not None else [DriverRow((json.dumps(reply),))]
         raise AssertionError(f"Unexpected SQL route: {sql}")
 
+    def _query_work_progress(self, sql, params):
+        def time_value(value):
+            return value.replace(tzinfo=None).isoformat(timespec="microseconds") if isinstance(value, datetime) else value
+
+        with sqlite3.connect(":memory:") as connection:
+            connection.execute(
+                "CREATE TABLE records (record_kind,full_key,revision,status,workload,workspace_id,item_id,"
+                "target_key,parent_key,work_kind,generation_id,due_at,sequence_number,payload,key_hash,tenant_id,epoch)"
+            )
+            connection.execute("CREATE TABLE receipts (tenant_id,epoch,operation,request_id,recorded_at,payload)")
+            connection.create_function("READ_UTC", 1, SqliteConnection.utc_time)
+            connection.executemany("INSERT INTO records VALUES (" + ",".join("?" for _ in range(17)) + ")", [
+                (*map(time_value, self.record_row(row)), row.context.tenant_id, row.context.epoch)
+                for row in self.records.values()
+            ])
+            connection.executemany("INSERT INTO receipts VALUES (?,?,?,?,?,?)", [
+                (
+                    self.context.tenant_id, self.context.epoch, operation, request_id,
+                    time_value(receipt["recorded_at"]), json.dumps(receipt["payload"]),
+                ) for (operation, request_id), receipt in self.receipts.items()
+            ])
+            translated = sql.replace(self.names.object("controller_read"), "records")
+            translated = translated.replace(self.names.object("receipts_controller"), "receipts")
+            translated = SqliteConnection.translate(translated)
+            translated = translated.replace("JSON_VALUE(", "json_extract(")
+            translated = translated.replace("TRY_CONVERT(datetime2(6), ", "READ_UTC(")
+            translated = self._policy_sql(connection, translated)
+            return [DriverRow(tuple(row)) for row in connection.execute(translated, params).fetchall()]
+
+    @staticmethod
+    def _policy_sql(connection, sql):
+        connection.create_function("TRY_BIGINT", 1, lambda value: _try_convert("bigint", value))
+        connection.create_function(
+            "DIGITS_ONLY", 1,
+            lambda value: bool(re.fullmatch(r"[0-9]+", str(value))) if value is not None else False,
+        )
+        return (
+            sql.replace("OPENJSON(payload) AS field", "json_each(payload) AS field")
+            .replace("field.[type] = 2", "field.type IN ('integer', 'real')")
+            .replace("field.[value] NOT LIKE '%[^0-9]%'", "DIGITS_ONLY(CAST(field.value AS TEXT))")
+            .replace("field.[value]", "CAST(field.value AS TEXT)")
+            .replace("field.[key]", "field.key")
+            .replace("TRY_CONVERT(bigint, ", "TRY_BIGINT(")
+        )
+
     @staticmethod
     def record_row(row):
         return (
@@ -144,9 +198,10 @@ class KernelProtocolDatabase:
             kind="work", key=work.work_id, context=m.MonitoringContext(
                 tenant_id=work.tenant_id, epoch=work.epoch,
             ), payload=work.model_dump_json(), version=work.revision, status=work.state,
-            work_kind=work.kind, due_at=work.due_at,
+            work_kind=work.kind, due_at=work.lease.expires_at if work.lease else work.due_at,
             target_key=work.target.key if work.target else None,
-            workspace_id=work.target.workspace_id if work.target else None,
+            # Native producer handoffs retain the target only in their payload.
+            workspace_id=work.target.workspace_id if work.target and work.kind != "reconcile_state" else None,
         )
 
     def apply_rpc(self, operation, arguments):

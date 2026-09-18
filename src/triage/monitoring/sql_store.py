@@ -46,11 +46,14 @@ from triage.monitoring.events import (
     UnidentifiedSignal,
 )
 from triage.monitoring.memory import (
+    SCAN_BUDGET,
     ActionOwner,
     MonitoringEngine,
     StoredReceipt,
     StoredRecord,
     _json,
+    _reconciliation_policy_revision,
+    _reconciliation_workspace,
     _stamp,
     _update,
     canonical_incident_id,
@@ -531,11 +534,108 @@ class SqlBackend:
             raise MonitoringUnavailable("SQL cursor revision did not return one value")
         return rows[0][0]
 
+    def _fair_workspace(self, request: m.WorkClaimRequest) -> str:
+        """Read a scheduling hint from guarded work progress, not a new authority."""
+        table = self.tables["monitoring_records"]
+        receipts = self.tables["monitoring_receipts"]
+        family = sorted(m.CONTROLLER_WORK_KINDS)
+        kinds = ", ".join("?" for _ in family)
+        # SQL has no writable scheduler route. Active leases and original
+        # transition receipts retain progress across controller reconstruction.
+        rows = self.db.query(
+            f"""WITH recent AS (
+    SELECT w.*, COALESCE(
+        TRY_CONVERT(datetime2(6), JSON_VALUE(w.payload, '$.lease.acquired_at')),
+        TRY_CONVERT(datetime2(6), JSON_VALUE(w.payload, '$.completed_at'))
+    ) AS served_at
+    FROM {table} AS w
+    WHERE w.tenant_id = ? AND w.epoch = ? AND w.record_kind = 'work'
+      AND w.work_kind IN ({kinds})
+    UNION ALL
+    SELECT w.*, receipt.recorded_at AS served_at
+    FROM {table} AS w
+    JOIN {receipts} AS receipt ON receipt.tenant_id = w.tenant_id AND receipt.epoch = w.epoch
+        AND receipt.operation = 'controller.transition_work'
+        AND JSON_VALUE(receipt.payload, '$.result.work_id') = w.full_key
+        AND JSON_VALUE(receipt.payload, '$.result.work.work_id') = w.full_key
+    WHERE w.tenant_id = ? AND w.epoch = ? AND w.record_kind = 'work'
+      AND w.work_kind IN ({kinds})
+)
+SELECT TOP (1) {RECORD_COLUMNS}
+FROM recent WHERE served_at IS NOT NULL
+ORDER BY served_at DESC, key_hash DESC""",
+            request.tenant_id, request.epoch, *family, request.tenant_id, request.epoch, *family,
+        )
+        if not rows:
+            return ""
+        if len(rows) != 1:
+            raise MonitoringUnavailable("SQL work progress returned an ambiguous scheduling cursor")
+        record = self._record(rows[0], request)
+        work = _kernel_model(m.MonitoringWork, json.loads(record.payload))
+        if work.work_id != record.key or _stamp(work) != _stamp(request):
+            raise MonitoringUnavailable("SQL work progress lost its exact work context")
+        if work.kind == "reconcile_state":
+            return _reconciliation_workspace(record, work)
+        return record.workspace_id or ""
+
     def due(self, request: m.WorkClaimRequest, *, after_workspace: str) -> list[StoredRecord]:
         kinds = ", ".join("?" for _ in request.kinds)
         family = sorted(m.WORKER_WORK_KINDS if self.component == "worker" else m.CONTROLLER_WORK_KINDS)
         family_params = ", ".join("?" for _ in family)
         table = self.tables["monitoring_records"]
+        if self.component == "controller":
+            # Validate before active counts and TOP: a conflicting active row
+            # could otherwise charge another workspace and exceed the real cap.
+            conflicts = self.db.query(
+                f"SELECT TOP (1) {RECORD_COLUMNS} FROM {table} "
+                "WHERE tenant_id = ? AND epoch = ? AND record_kind = 'work' "
+                "AND work_kind = 'reconcile_state' AND workspace_id IS NOT NULL "
+                "AND status IN ('queued', 'waiting', 'leased', 'finalizing') "
+                "AND (JSON_VALUE(payload, '$.target.workspace_id') IS NULL "
+                "OR workspace_id <> JSON_VALUE(payload, '$.target.workspace_id')) ORDER BY key_hash",
+                request.tenant_id, request.epoch,
+            )
+            if conflicts:
+                record = self._record(conflicts[0], request)
+                logger.error(
+                    "Reconciliation workspace promotion contradicts its canonical target key_hash=%s",
+                    key_digest(record.key),
+                )
+                raise MonitoringUnavailable("Reconciliation workspace promotion contradicts its canonical target")
+        current_policy = None
+        if self.component == "controller" and "reconcile_state" in request.kinds:
+            current_policy = _reconciliation_policy_revision(self, request)
+            invalid = self.db.query(
+                f"""SELECT TOP (1) {RECORD_COLUMNS} FROM {table}
+WHERE tenant_id = ? AND epoch = ? AND record_kind = 'work'
+  AND work_kind = 'reconcile_state' AND status IN ('queued', 'waiting', 'leased', 'finalizing')
+  AND (
+      (SELECT COUNT(*) FROM OPENJSON(payload) AS field WHERE field.[key] = 'policy_revision') <> 1
+      OR NOT EXISTS (
+          SELECT 1 FROM OPENJSON(payload) AS field
+          WHERE field.[key] = 'policy_revision' AND field.[type] = 2
+            AND field.[value] NOT LIKE '%[^0-9]%'
+            AND TRY_CONVERT(bigint, field.[value]) BETWEEN 0 AND ?
+      )
+  )
+ORDER BY key_hash""",
+                request.tenant_id, request.epoch, current_policy,
+            )
+            if invalid:
+                record = self._record(invalid[0], request)
+                logger.error("Reconciliation policy is malformed or unpublished key_hash=%s", key_digest(record.key))
+                raise MonitoringUnavailable("Reconciliation policy is malformed or unpublished")
+        # This key changes only order within a publication partition; global
+        # web priority, workspace rotation and ordinary work slots are unchanged.
+        policy_order = (
+            "CASE WHEN r.work_kind = 'reconcile_state' AND "
+            "TRY_CONVERT(bigint, JSON_VALUE(r.payload, '$.policy_revision')) < ? THEN 1 ELSE 0 END, "
+            if current_policy is not None else ""
+        )
+        priority = (
+            "CASE WHEN r.work_kind = 'reconcile_state' "
+            "AND JSON_VALUE(r.payload, '$.reconcile_producer') = 'web' THEN 0 ELSE 1 END"
+        ) if self.component == "controller" else ""
         verification_due = f"""
       AND NOT EXISTS (
           SELECT 1 FROM {table} AS effect
@@ -545,36 +645,44 @@ class SqlBackend:
             AND effect.status IN ('reserved','submitted','uncertain')
             AND TRY_CONVERT(datetime2(6), JSON_VALUE(effect.payload, '$.next_verification_at'))>SYSUTCDATETIME()
       )""" if self.component == "controller" else ""
+        workspace_order = (
+            "CASE WHEN workspace <= ? THEN 1 ELSE 0 END, workspace, publication_pool, due_at, key_hash"
+            if self.component == "controller" else "due_at, workspace"
+        )
+        # Project one scheduling bucket for active counts, rank and controller
+        # rotation. Return original records; never rewrite promoted history.
         rows = self.db.query(
-            f"""WITH active AS (
-    SELECT COALESCE(workspace_id, '') AS workspace,
-        CASE WHEN work_kind = 'reconcile_state' THEN 1 ELSE 0 END AS publication_pool,
-        COUNT(*) AS active_count
-    FROM {table}
-    WHERE tenant_id = ? AND epoch = ? AND record_kind = 'work'
-      AND work_kind IN ({family_params})
-      AND status IN ('leased', 'finalizing') AND due_at > SYSUTCDATETIME()
-    GROUP BY COALESCE(workspace_id, ''), CASE WHEN work_kind = 'reconcile_state' THEN 1 ELSE 0 END
-), candidates AS (
-    SELECT r.*, COALESCE(a.active_count, 0) AS active_count,
-        ROW_NUMBER() OVER (
-            PARTITION BY COALESCE(r.workspace_id, ''),
-                CASE WHEN r.work_kind = 'reconcile_state' THEN 1 ELSE 0 END
-            ORDER BY r.due_at, r.key_hash
-        ) AS workspace_rank
+            f"""WITH projected AS (
+    SELECT r.*, COALESCE(r.workspace_id,
+        CASE WHEN r.work_kind = 'reconcile_state'
+            THEN JSON_VALUE(r.payload, '$.target.workspace_id') END, '') AS workspace,
+        CASE WHEN r.work_kind = 'reconcile_state' THEN 1 ELSE 0 END AS publication_pool
     FROM {table} AS r
-    LEFT JOIN active AS a ON a.workspace = COALESCE(r.workspace_id, '')
-        AND a.publication_pool = CASE WHEN r.work_kind = 'reconcile_state' THEN 1 ELSE 0 END
     WHERE r.tenant_id = ? AND r.epoch = ? AND r.record_kind = 'work'
-      AND r.status IN ('queued', 'waiting', 'leased', 'finalizing')
+), active AS (
+    SELECT workspace, publication_pool, COUNT(*) AS active_count
+    FROM projected
+    WHERE work_kind IN ({family_params})
+      AND status IN ('leased', 'finalizing') AND due_at > SYSUTCDATETIME()
+    GROUP BY workspace, publication_pool
+), candidates AS (
+    SELECT r.*, {priority + " AS intent_priority, " if priority else ""}COALESCE(a.active_count, 0) AS active_count,
+        ROW_NUMBER() OVER (
+            PARTITION BY r.workspace, r.publication_pool
+            ORDER BY {priority + ", " if priority else ""}{policy_order}r.due_at, r.key_hash
+        ) AS workspace_rank
+    FROM projected AS r
+    LEFT JOIN active AS a ON a.workspace = r.workspace AND a.publication_pool = r.publication_pool
+    WHERE r.status IN ('queued', 'waiting', 'leased', 'finalizing')
       AND r.due_at <= SYSUTCDATETIME() AND r.work_kind IN ({kinds}){verification_due}
 )
 SELECT TOP ({request.limit}) {RECORD_COLUMNS}
 FROM candidates WHERE workspace_rank <= ? - active_count
-ORDER BY workspace_rank, due_at,
-    COALESCE(workspace_id, '')""",
-            request.tenant_id, request.epoch, *family, request.tenant_id, request.epoch, *request.kinds,
-            request.per_workspace_limit,
+ORDER BY {"intent_priority, " if priority else ""}workspace_rank,
+    {workspace_order}""",
+            request.tenant_id, request.epoch, *family,
+            *((current_policy,) if current_policy is not None else ()), *request.kinds,
+            request.per_workspace_limit, *((after_workspace,) if self.component == "controller" else ()),
         )
         return [self._record(row, request) for row in rows]
 
@@ -1314,10 +1422,12 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             or manifest.policy_revision != control.revision or _stamp(manifest) != _stamp(control)
         ):
             raise MonitoringConflict("Connector observation lost its current revision or context")
+        if manifest.state == "ready":
+            self._require_connector_delivery(manifest, control)
         observed = self._persisted(manifest)
         values = observed.model_dump(mode="json", include={
             "workspace_id", "eventstream_id", "destination_id", "observed_definition", "endpoint", "operation_id",
-            "state", "identity_verified_at", "delivery_verified_at", "gaps",
+            "state", "identity_verified_at", "delivery_verified_at", "delivery_proof", "gaps",
         })
         observation_json = _json(values)
         expected_definition_hash = self._sql.explicit_definition_hash(observation_json)
@@ -1334,6 +1444,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             saved.connector_id != prior.connector_id or saved.connector.revision != prior.revision + 1
             or saved.connector.identity_verified_at != prior.identity_verified_at
             or saved.connector.delivery_verified_at != prior.delivery_verified_at
+            or saved.connector.delivery_proof != prior.delivery_proof
             or saved.connector.state == "ready" and prior.state != "ready"
             or saved.observed_definition_hash != expected_definition_hash
         ):
@@ -1374,8 +1485,10 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         ):
             raise MonitoringConflict("Desired connector publication lost its current producer/frontier binding")
         prior = self._get("connector", request.connector_id, control, m.OwnedConnectorManifest)
+        desired = self._get("connector_desired", request.connector_id, control, m.ConnectorDesiredState)
         if (prior.revision if prior else 0) != request.expected_connector_revision:
             raise MonitoringConflict("Desired connector revision changed")
+        self._validate_initial_connector_publication(prior, desired, request)
         persisted = self._persisted(request)
         if persisted.sources != request.sources or persisted.source_proposals != request.source_proposals or (
             persisted.source_removals != request.source_removals
@@ -1385,6 +1498,15 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             raise MonitoringConflict("Redacted desired topology cannot become an executable configuration")
         observed = None
         observed_definition_hash = None
+        if request.readiness_receipt_id is not None:
+            if (
+                prior is None or work.reconcile_producer != "worker" or document["topic"] != "connector"
+                or work.reconcile_request_id != request.readiness_receipt_id
+                or document["reference_id"] != request.connector_id
+            ):
+                raise MonitoringConflict("Readiness requires the exact original owned worker observation")
+            readiness = self._connector_observation_from_handoff(prior, document)
+            self._require_connector_delivery(readiness, control)
         if request.observation_receipt_id is not None:
             if (
                 prior is None or work.reconcile_producer != "worker" or document["topic"] != "connector"
@@ -1431,6 +1553,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             or result.connector.source_proposals != expected_proposals
             or result.connector.desired_definition != expected_definition
             or result.observation_receipt_id != request.observation_receipt_id
+            or desired is None and not result.desired_changed
             or result.state == "ready" and request.readiness_receipt_id is None and (prior is None or prior.state != "ready")
         ):
             raise MonitoringUnavailable("Guarded connector publication returned a different identity, definition or readiness")
@@ -2429,8 +2552,9 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         for kind in request.kinds:
             self._authorize_work(kind)
         self._sql.lock_context(request)
+        after_workspace = self._sql._fair_workspace(request) if self.component == "controller" else ""
         claimed = []
-        for record in self._sql.due(request, after_workspace=""):
+        for record in self._sql.due(request, after_workspace=after_workspace):
             candidate = self._decode(record, m.MonitoringWork)
             if candidate.action_reservation_id is not None:
                 action = self._get("action", candidate.action_reservation_id, request, m.ActionReservation)
@@ -2782,6 +2906,97 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         if receipt is None or hashlib.sha256(receipt.payload.encode("utf-16-le")).hexdigest() != value.payload_hash:
             raise MonitoringUnavailable("Native position lost its exact durable receipt payload")
         return value
+
+    def _delivery_candidates(self, context, connector, collector_identity_id):
+        desired = self._get("connector_desired", connector.connector_id, context, m.ConnectorDesiredState)
+        if desired is None:
+            return []
+        parameters = (
+            context.tenant_id, context.epoch, _digest(connector.connector_id), connector.connector_id,
+            collector_identity_id, connector.ownership_id, connector.policy_revision,
+            m.connector_definition_hash(connector.desired_definition),
+            desired.published_at.isoformat(), desired.published_at.isoformat(),
+        )
+        candidates = []
+        after = None
+        while True:
+            limit = min(200, SCAN_BUDGET + 1 - len(candidates))
+            rows = self._sql.db.query(
+                f"SELECT TOP ({limit}) payload, full_key FROM {self._sql.tables['monitoring_records']} "
+                "WHERE tenant_id=? AND epoch=? AND record_kind='signal' AND status='accepted' "
+                "AND parent_hash=? AND parent_key=? "
+                "AND JSON_VALUE(payload,'$.transport.collector_identity_id')=? "
+                "AND JSON_VALUE(payload,'$.transport.ownership_id')=? "
+                "AND TRY_CONVERT(bigint,JSON_VALUE(payload,'$.transport.policy_revision'))=? "
+                "AND JSON_VALUE(payload,'$.transport.definition_hash')=? "
+                "AND TRY_CONVERT(datetimeoffset,JSON_VALUE(payload,'$.position.enqueued_at'))>=TRY_CONVERT(datetimeoffset,?) "
+                "AND TRY_CONVERT(datetimeoffset,JSON_VALUE(payload,'$.transport.identity_verified_at'))>=TRY_CONVERT(datetimeoffset,?) "
+                + ("AND key_hash>? " if after is not None else "")
+                + "ORDER BY key_hash",
+                *parameters, *((after,) if after is not None else ()),
+            )
+            if len(rows) > limit or any(
+                len(row) != 2 or not all(isinstance(value, str) for value in row) for row in rows
+            ):
+                raise MonitoringUnavailable("Original connector delivery query returned an invalid shape")
+            for payload, key in rows:
+                signal = _kernel_model(m.SignalReceipt, json.loads(payload))
+                cursor = _digest(key)
+                if signal.delivery.key != key or after is not None and cursor <= after:
+                    raise MonitoringUnavailable("Original connector delivery pagination changed identity or did not advance")
+                after = cursor
+                candidates.append(signal)
+            if len(candidates) > SCAN_BUDGET:
+                raise MonitoringConflict("Connector delivery verification exceeds its bounded candidate budget")
+            if len(rows) < limit:
+                return candidates
+
+    def _delivery_original(self, signal, control):
+        transport = signal.transport
+        journal = self._stream_position(signal.partition, signal.position.sequence_number)
+        if journal is None or journal.batch_id != transport.request_id or journal.receipt_key != signal.delivery.key:
+            raise MonitoringUnavailable("Delivery proof lost its original native acceptance or broker position")
+        if self.component == "controller":
+            # The checked fact view requires an immutable accepted receipt.
+            # Planning uses its original protected handoff; the publication RPC
+            # rechecks the exact private receipt without granting cross-role reads.
+            document, handoff = self._native_reconciliation(control, transport.request_id, "worker")
+            if (
+                document is None or handoff is None or document["topic"] != "stream_intake"
+                or handoff.producer_operation != "worker.commit_positions"
+                or handoff.policy_revision != transport.policy_revision
+            ):
+                raise MonitoringUnavailable("Delivery proof lost its protected original stream handoff")
+            positions = self._stream_positions(document["request_payload"]["positions_json"])
+            originals = [entry for entry in positions if (
+                entry.receipt_key == signal.delivery.key and entry.receipt.position == signal.position
+                and entry.receipt.partition == signal.partition
+                and isinstance(entry.receipt, m.SignalReceipt) and entry.receipt.status == "accepted"
+                and entry.receipt.transport == transport
+            )]
+            bindings = [binding for binding in document["evidence"] if (
+                binding["kind"] == "signal" and binding["key"] == signal.delivery.key
+                and binding["payload_hash"].lower() == journal.payload_hash
+            )]
+            if len(originals) != 1 or len(bindings) != 1:
+                raise MonitoringUnavailable("Delivery proof differs from its original protected stream evidence")
+            return
+        original = self._sql.get_receipt("worker.commit_positions", transport.request_id, control)
+        if original is None:
+            raise MonitoringUnavailable("Delivery proof lost its original native acceptance receipt")
+        accepted = _kernel_model(m.StreamAcceptanceResult, self._receipt_result(original))
+        positions = [value for value in accepted.positions if value.sequence_number == signal.position.sequence_number]
+        if (
+            accepted.batch_id != transport.request_id or accepted.partition != signal.partition
+            or signal.delivery.key not in accepted.receipt_keys or len(positions) != 1
+            or positions[0].receipt_kind != "identified" or positions[0].receipt_key != signal.delivery.key
+            or positions[0].offset != signal.position.offset
+            or positions[0].enqueued_at != signal.position.enqueued_at
+            or positions[0].first_committed_batch_id != transport.request_id
+            or positions[0].original_payload_hash != journal.payload_hash
+            or journal.batch_id != transport.request_id
+        ):
+            raise MonitoringUnavailable("Delivery proof differs from its immutable native stream acceptance")
 
     def _stream_acceptance(self, context, request_id, native, *, positions=None):
         value = _kernel_model(m.StreamAcceptanceResult, native)

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -51,6 +52,29 @@ class ReceiverAbiDatabase(Review9Database):
         self.guards.create_function(
             "DATALENGTH", 1, lambda value: None if value is None else len(value.encode("utf-16-le")),
         )
+
+    def query(self, sql, *params):
+        if sql.startswith("SELECT TOP (") and "$.transport.collector_identity_id" in sql:
+            limit = int(re.match(r"SELECT TOP \((\d+)\) payload, full_key FROM ", sql)[1])
+            _, _, _, connector_id, identity, ownership_id, revision, definition_hash, enqueued_since, identity_since = params[:10]
+            after = params[10] if len(params) == 11 else None
+            matches = []
+            for row in self.records.values():
+                if row.kind != "signal" or row.status != "accepted" or row.parent_key != connector_id:
+                    continue
+                signal = m.SignalReceipt.model_validate_json(row.payload)
+                proof = signal.transport
+                key_hash = hashlib.sha256(row.key.encode()).digest()
+                if proof is not None and (
+                    proof.collector_identity_id == identity and proof.ownership_id == ownership_id
+                    and proof.policy_revision == revision and proof.definition_hash == definition_hash
+                    and signal.position.enqueued_at >= datetime.fromisoformat(enqueued_since)
+                    and proof.identity_verified_at >= datetime.fromisoformat(identity_since)
+                    and (after is None or key_hash > after)
+                ):
+                    matches.append((key_hash, row.payload, row.key))
+            return [(payload, key) for _, payload, key in sorted(matches)[:limit]]
+        return super().query(sql, *params)
 
     @contextmanager
     def transaction(self):
@@ -206,6 +230,7 @@ class ReceiverAbiDatabase(Review9Database):
             raise RuntimeError("Native partition lease lost (51074)")
 
     def content(self, document):
+        document = {key: value for key, value in document.items() if key != "transport"}
         return self.guards.execute(
             "SELECT " + receipt_content_expression("@document"), {"document": json.dumps(document)},
         ).fetchone()[0]
@@ -316,6 +341,75 @@ class ReceiverAbiDatabase(Review9Database):
         }
         self.native_put("stream_checkpoint", partition.key, result, sequence_number=last, parent_key=partition.connector_id)
         return result
+
+
+def record_delivery_evidence(
+    h, worker, connector, *, db=None, collector_identity_id=None, reconcile_intake=True,
+):
+    """Explicit receiver-boundary fixture; this does not prove a live connection."""
+    collector_identity_id = collector_identity_id or uid(4)
+    connector = m.OwnedConnectorManifest.model_validate({
+        **connector.model_dump(), "state": "degraded",
+        "observed_definition": connector.desired_definition,
+        "identity_verified_at": None, "delivery_verified_at": None, "delivery_proof": None,
+        "gaps": (m.CoverageGap(code="awaiting_source_delivery_proof", detail="Awaiting original receipt"),),
+    })
+    if db:
+        db.native_put("connector", connector.connector_id, connector.model_dump(mode="json"), status="degraded")
+        db.principal = "worker"
+    else:
+        from triage.monitoring.memory import key_digest
+
+        key = (connector.tenant_id, connector.epoch, "connector", key_digest(connector.connector_id))
+        h.state.records[key] = replace(h.state.records[key], payload=connector.model_dump_json(), status="degraded")
+    partition = m.PartitionIdentity(
+        **h.context(), connector_id=connector.connector_id,
+        consumer_group=connector.endpoint.consumer_group, partition_id="0",
+    )
+    ownership = worker.change_partition_ownership(OwnershipChange(
+        partition=partition, expected_etag=None,
+        claim=m.PartitionClaimRequest(partition=partition, owner_id=h.owner, initial_sequence_number=100),
+    ))
+    worker.ensure_stream_start(StreamStartRequest(
+        partition=partition, lease=ownership.lease, first_available_sequence_number=100, observed_at=h.clock(),
+    ))
+    source = connector.sources[0]
+    request_id = h.next_id()
+    receipt = m.SignalReceipt(
+        delivery=m.TransportDeliveryIdentity(
+            **h.context(), connector_id=connector.connector_id, event_source=source.event_source, event_id=request_id,
+        ),
+        partition=partition, position=m.StreamPosition(offset="1000", sequence_number=100, enqueued_at=h.clock()),
+        event_type=source.event_types[0], received_at=h.clock(), status="accepted",
+        observation=h.observation(source.target, origin="event", authority="transport", status="running"),
+        transport=m.EventTransportEvidence(
+            request_id=request_id, ownership_id=connector.ownership_id, policy_revision=connector.policy_revision,
+            workspace_id=connector.workspace_id, eventstream_id=connector.eventstream_id,
+            destination_id=connector.destination_id, endpoint=connector.endpoint,
+            definition_hash=m.connector_definition_hash(connector.desired_definition), source_id=source.source_id,
+            collector_identity_id=collector_identity_id, identity_verified_at=h.clock(),
+        ),
+    )
+    worker.record_stream_receipts(m.StreamReceiptBatch(
+        request_id=request_id, partition=partition, lease=ownership.lease, receipts=(receipt,),
+    ))
+    if db:
+        db.principal = "controller"
+        controller = AzureSqlMonitoringStore(db=db, component="controller")
+    else:
+        controller = InMemoryMonitoringStore(state=h.state, clock=h.clock, component="controller")
+    work_items = controller.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(90_014), kinds=("reconcile_state",), limit=200, per_workspace_limit=200,
+    )) if reconcile_intake else ()
+    for work in work_items:
+        controller.reconcile_work(work)
+    if db:
+        db.principal = "worker"
+    current = next(value for value in worker.list_connectors(m.PageQuery(**h.context())).items
+                   if value.connector_id == connector.connector_id)
+    proof = worker.get_connector_delivery(m.MonitoringContext(**h.context()), connector.connector_id, collector_identity_id)
+    assert proof is not None
+    return current, proof
 
 
 @pytest.fixture

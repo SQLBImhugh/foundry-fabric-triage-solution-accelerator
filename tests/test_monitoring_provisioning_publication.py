@@ -35,7 +35,9 @@ class NoSourceCalls:
 
 
 def setup_sql():
-    h, db, store, work, frontier = original_setup_sql()
+    from test_monitoring_sql_receiver_bindings import ReceiverAbiDatabase
+
+    h, db, store, work, frontier = original_setup_sql(database_type=ReceiverAbiDatabase)
     current_result_fields(db)
     request = publication(h, work, frontier)
     # Explicit pre-observed fixture ownership, not a new caller-assigned ID.
@@ -46,7 +48,12 @@ def setup_sql():
         state="planned", updated_at=h.clock(),
     )
     db.native_put("connector", prior.connector_id, prior.model_dump(mode="json"), status=prior.state)
-    db.native_put("connector_desired", prior.connector_id, {"published_at": h.clock().isoformat()})
+    db.native_put("connector_desired", prior.connector_id, m.ConnectorDesiredState(
+        connector_id=prior.connector_id, ownership_id=prior.ownership_id,
+        publication_id=h.next_id(), policy_revision=prior.policy_revision,
+        sources_hash=m._digest([value.model_dump(mode="json") for value in prior.sources]),
+        definition_hash=m.connector_definition_hash(prior.desired_definition), published_at=h.clock(),
+    ).model_dump(mode="json"))
     return h, db, store, work, frontier
 
 
@@ -126,6 +133,8 @@ def publication(h, work, frontier):
 
 
 def bound_worker():
+    from test_monitoring_sql_receiver_bindings import record_delivery_evidence
+
     h, db, controller, work, frontier = setup_sql()
     request = publication(h, work, frontier)
     created = controller.publish_connector(request).connector
@@ -149,6 +158,7 @@ def bound_worker():
         expected_connector_revision=created.revision,
         commit=commit,
     )
+    bound, _ = record_delivery_evidence(h, worker, bound, db=db, reconcile_intake=False)
     context = m.MonitoringContext(**h.context())
     reconciler = ConnectorReconciler(
         worker, context, SimpleNamespace(context=context), NoSourceCalls(),
@@ -158,9 +168,10 @@ def bound_worker():
 
 
 async def report_ready(reconciler, prior, clock, work):
+    proof = reconciler.store.get_connector_delivery(reconciler.context, prior.connector_id, uid(4))
     return await reconciler._save(
         work, prior, state="ready", observed_definition=prior.desired_definition,
-        identity_verified_at=clock(), delivery_verified_at=clock(), gaps=(),
+        identity_verified_at=clock(), delivery_verified_at=clock(), delivery_proof=proof, gaps=(),
     )
 
 

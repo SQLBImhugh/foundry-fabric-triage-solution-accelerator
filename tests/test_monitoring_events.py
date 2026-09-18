@@ -32,6 +32,7 @@ from triage.monitoring.events import (
 )
 from triage.monitoring.models import (
     BootstrapInspection,
+    ConnectorDesiredState,
     ConnectorSource,
     CoverageGap,
     CoverageView,
@@ -153,6 +154,11 @@ class MemoryBackend:
                 CoverageGap(code="transport_unverified", detail="Explicit offline test connector"),
             ),
         )
+        self.publication = ConnectorDesiredState(
+            connector_id=CONNECTOR, ownership_id=OWNER, publication_id=OTHER_OWNER,
+            policy_revision=1, definition_hash="f" * 64, sources_hash="e" * 64,
+            published_at=NOW - timedelta(minutes=1),
+        )
         self.binding = ConnectorBinding(
             tenant_id=TENANT,
             connector_id=CONNECTOR,
@@ -216,6 +222,12 @@ class MemoryBackend:
             as_of=self.now,
             items=(self.manifest,),
         )
+
+    def get_connector_desired(self, context, connector_id):
+        self._called()
+        if (context.tenant_id, context.epoch) != (self.context.tenant_id, self.context.epoch):
+            raise MonitoringConflict("Changed publication epoch")
+        return self.publication if connector_id == self.manifest.connector_id else None
 
     def _row(self, partition):
         return self.owners.get(partition.key)

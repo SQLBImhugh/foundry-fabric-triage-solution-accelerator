@@ -80,10 +80,19 @@ The scheduler's `PT15M` caller timeout exceeds the admission window, but is not
 permission to cancel an effect already admitted. HTTP invocation retries are
 disabled: an ambiguous POST must not create overlapping work.
 
-The deployed portal-only health alerts evaluate `RunsSucceeded < 1` over
-15 minutes and `RunsFailed > 0` over 5 minutes, every minute. Their action lists
-are empty. Inspect Azure Monitor and scheduler history directly; no Action
-Group/email/webhook delivery or absence canary is established. See
+The existing platform alerts evaluate `RunsSucceeded < 1` over 15 minutes and
+`RunsFailed > 0` over 5 minutes, every minute. Do not assume absent metric
+samples become zero. Optional `applicationInsightsResourceId` and
+`applicationInsightsLocation` add a runtime log-absence alert: completed-heartbeat
+traces in 15 minutes are summarized into one count row, including zero when
+none match, and `<1` triggers the alert.
+
+The native healthy query returned 14 and the isolated empty query 0.
+The isolated validation alert fired, then resolved after restoring its healthy
+query; that validation rule is now disabled. The production runtime-absence
+rule is enabled with no actions, and the platform alerts are unchanged.
+No actual controller stop or Action Group/email/webhook delivery was tested.
+Inspect Azure Monitor and scheduler history directly. See
 [controller-health-alerts.bicep](../infra/controller-health-alerts.bicep).
 
 The permitted scheduler commands are `heartbeat`, `sweep`, `silent sweep`,
@@ -203,6 +212,54 @@ readback; do not create another connector or repeat POST blindly.
 
 ### Adding and removing Eventstream sources
 
+For a previously created app-owned Eventstream, first use the separate
+[metadata registrar](DeploymentGuide.md#register-existing-app-owned-connector-metadata).
+It is SQL-connected, not local export: `--prepare --capture ... --output ...`
+performs read-only checks, `--apply --plan ... --confirm-manifest-hash ...`
+registers planned physical metadata with an immutable receipt, and
+`--reconcile --plan ...` only reads that original receipt. Use the same explicit
+server/database/tenant/deployer/credential flags throughout.
+
+Capture the reviewed original create/ownership evidence and fresh complete
+item/definition/topology with exact source IDs and nonsecret endpoint metadata.
+The 15-minute capture window and hashes do not prove collector-MI access or
+event delivery. Registration creates no schema or roles, changes no maintenance,
+queues no work and publishes no admission, protected desired state or Ready.
+Its receipt remains `registered_metadata_only` with identity/delivery unverified.
+Native read-only preflight is not native registration-apply acceptance.
+
+Retain the original plan after SQL or result-file uncertainty. The output writer
+publishes a fully written/fsynced temporary file by exclusive hard link, so it
+does not expose a partial final file or overwrite another result. This is not
+a directory-entry power-loss guarantee. Missing/conflicting receipt evidence
+does not license a new request or another blind write.
+
+### First desired publication and delivery proof
+
+Metadata-only physical ownership with no protected desired publication is
+dormant when its sources have no current admitted read/event capability; ordinary
+reconciliation must not remove those retained sources just because admission
+is empty. Once a reviewed scope and fresh same-collector-MI read/event probes
+are available, controller reconciliation can publish first desired state at
+the same policy revision if desired state was absent. Do not manufacture a
+new scope edit solely to force that first publication.
+
+Fresh owned topology, source-Running and read probes establish event capability
+only, never action capability. A degraded event receiver may collect delivery
+proof only against the matching current protected publication, ownership,
+policy, definition, source and endpoint. Reverify on publication-identity
+change. Record actual identity-check time separately from later receive time.
+
+Only a matching original durable stream receipt/position and accepted payload
+hash can support controller readiness publication. Bind actual work/context,
+owner/fence/revision and eligible original observation evidence; neither
+connector equality nor inferred global lease state is proof. Heartbeats,
+empty streams, quarantine and stale proof do not establish Ready.
+Native registrar apply and new event-runtime readiness/durable-delivery
+acceptance remain open.
+
+### Source additions and revocations
+
 Controller publication first records a logical source proposal with
 `source_id=null`; no unresolved proposal may invent a physical ID. The worker
 applies only the owned definition and records the actual observation. A later
@@ -236,6 +293,28 @@ Keep these observations distinct:
 | A complete returned history page | The requested lookback survived count-limited retention |
 | A submitted refresh/rerun | Completion of the controller's own exact job |
 | A human tracking closure | Verified repair, reset budget or released action fence |
+
+Distinguish estate coverage from scoped preview readiness. Snapshot counts are
+deployment/estate-wide; **Inventory total** remains Unknown until all latest
+discovery generations are complete. Complete A with three items plus partial B
+with five does not establish a complete total of eight. A preview for A may be
+ready while estate coverage remains Partial/Unknown because of B.
+Workspace/domain metadata outages still block expansion, but explicit
+disable/contraction can use stored admissions.
+
+Activation revalidation may tolerate only unrelated data-revision drift after
+the original scope is re-evaluated under the transaction lock with identical
+reviewed material effects. New targets, capabilities, subscriptions, gaps,
+permissions, TTL, epoch or policy changes refuse. A conflict or missing original
+operation lookup does not license blind replay; native activation acceptance
+for this source/UI correction remains pending.
+
+A bounded priority proof
+processed an original fresh discovery request on attempt 1 without manual
+requeue behind 579 waiting/207 queued items. The selected workspace completed
+ten pages with three items, including one unsupported Eventstream.
+This does not prove first-scope activation or eliminate partial-window replay
+churn, which remains unoptimized.
 
 Fabric histories generally retain 100 completed jobs; Power BI refresh history
 uses the explicit 60-entry request window. Retention exhaustion, interrupted

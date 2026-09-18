@@ -546,6 +546,18 @@ class InventoryBatch(MonitoringModel):
         return self
 
 
+class EventCapabilityEvidence(MonitoringModel):
+    connector_id: CanonicalId
+    ownership_id: CanonicalId
+    source_id: OpaqueId
+    eventstream_id: CanonicalId
+    destination_id: OpaqueId
+    definition_hash: Fingerprint
+    endpoint_hash: Fingerprint
+    event_types: Annotated[tuple[OpaqueId, ...], Field(min_length=1, max_length=20)]
+    observed_at: UtcDateTime
+
+
 class CapabilityObservation(MonitoringModel):
     capability_id: CanonicalId
     target: TargetIdentity
@@ -553,6 +565,7 @@ class CapabilityObservation(MonitoringModel):
     collector_identity_id: CanonicalId
     read_status: CapabilityStatus
     event_status: CapabilityStatus = "unknown"
+    event_evidence: EventCapabilityEvidence | None = None
     action_status: CapabilityStatus = "unknown"
     exact_action_correlation: StrictBool = False
     configuration_verification: StrictBool = False
@@ -566,6 +579,11 @@ class CapabilityObservation(MonitoringModel):
     def validate_probe(self) -> CapabilityObservation:
         if self.expires_at <= self.checked_at:
             raise ValueError("Capability evidence must expire after the probe")
+        if self.event_evidence is not None and (
+            self.event_status != "verified" or self.read_status != "verified"
+            or not self.checked_at <= self.event_evidence.observed_at < self.expires_at
+        ):
+            raise ValueError("Event evidence requires a fresh source read and bounded transport inspection")
         if self.action_status == "verified" and (
             self.read_status != "verified"
             or not (
@@ -725,6 +743,8 @@ class ActivationReceipt(MonitoringModel):
 
 
 class CoverageView(RegistryVersion):
+    """Deployment-wide inventory counters; scope-preview readiness is separate."""
+
     as_of: UtcDateTime
     inventory_completeness: Completeness
     capability_completeness: Completeness
@@ -934,6 +954,54 @@ class EndpointMetadata(MonitoringModel):
         return value.lower()
 
 
+def connector_definition_hash(definition: JsonObject) -> str:
+    """Match the canonical NVARCHAR definition fragment persisted by the store."""
+    document = json.dumps(definition, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(document.encode("utf-16-le")).hexdigest().upper()
+
+
+class EventTransportEvidence(MonitoringModel):
+    """Receiver evidence, bound to the original intake request, not readiness authority."""
+
+    request_id: CanonicalId
+    ownership_id: CanonicalId
+    policy_revision: Revision
+    workspace_id: CanonicalId
+    eventstream_id: CanonicalId
+    destination_id: OpaqueId
+    endpoint: EndpointMetadata
+    definition_hash: SqlPayloadHash
+    source_id: OpaqueId
+    collector_identity_id: CanonicalId
+    identity_verified_at: UtcDateTime
+
+    def matches_connector(self, connector: OwnedConnectorManifest, policy_revision: int) -> bool:
+        return (
+            self.ownership_id == connector.ownership_id
+            and self.policy_revision == connector.policy_revision == policy_revision
+            and (self.workspace_id, self.eventstream_id, self.destination_id)
+            == (connector.workspace_id, connector.eventstream_id, connector.destination_id)
+            and self.endpoint == connector.endpoint
+            and self.definition_hash == connector_definition_hash(connector.desired_definition)
+        )
+
+
+class ConnectorDeliveryProof(MonitoringModel):
+    """A reference to immutable accepted transport evidence, never a heartbeat."""
+
+    request_id: CanonicalId
+    receipt_key: StateKey
+    collector_identity_id: CanonicalId
+    received_at: UtcDateTime
+    identity_verified_at: UtcDateTime
+
+    @model_validator(mode="after")
+    def validate_identity_time(self) -> ConnectorDeliveryProof:
+        if self.identity_verified_at > self.received_at:
+            raise ValueError("Delivery identity evidence cannot follow its original received event")
+        return self
+
+
 class OwnedConnectorManifest(MonitoringContext):
     """Retained physical/logical ownership, separate from the effective desired graph."""
 
@@ -956,6 +1024,7 @@ class OwnedConnectorManifest(MonitoringContext):
     updated_at: UtcDateTime
     identity_verified_at: UtcDateTime | None = None
     delivery_verified_at: UtcDateTime | None = None
+    delivery_proof: ConnectorDeliveryProof | None = None
     last_receiver_activity_at: UtcDateTime | None = None
     gaps: Annotated[tuple[CoverageGap, ...], Field(max_length=200)] = ()
 
@@ -989,6 +1058,12 @@ class OwnedConnectorManifest(MonitoringContext):
             raise ValueError("Ready requires round-tripped topology and identity/delivery proof")
         if self.state in {"blocked", "degraded"} and not self.gaps:
             raise ValueError("Blocked or degraded connectors must expose their gaps")
+        if self.delivery_proof is not None and (
+            self.delivery_verified_at != self.delivery_proof.received_at
+            or self.identity_verified_at != self.delivery_proof.identity_verified_at
+            or self.identity_verified_at > self.delivery_proof.received_at
+        ):
+            raise ValueError("Delivery proof must retain its original receive and identity times")
         return self
 
 
@@ -1329,6 +1404,7 @@ class SignalReceipt(MonitoringModel):
     status: Literal["accepted", "quarantined"]
     observation: SourceRunObservation | None = None
     quarantine: QuarantineDisposition | None = None
+    transport: EventTransportEvidence | None = None
 
     @model_validator(mode="after")
     def validate_receipt(self) -> SignalReceipt:
@@ -1343,6 +1419,11 @@ class SignalReceipt(MonitoringModel):
                 raise ValueError("A stream receipt must retain event provenance")
         elif self.quarantine is None:
             raise ValueError("Quarantined receipts require a bounded disposition")
+        if self.transport is not None and (
+            self.transport.endpoint.consumer_group != self.partition.consumer_group
+            or self.transport.identity_verified_at > self.received_at
+        ):
+            raise ValueError("Transport evidence must match the receiving group and original identity time")
         return self
 
 
@@ -1690,6 +1771,8 @@ class StreamReceiptBatch(MonitoringModel):
         for receipt in self.receipts:
             if receipt.partition != self.partition:
                 raise ValueError("Stream batch contains a different partition")
+            if receipt.transport is not None and receipt.transport.request_id != self.request_id:
+                raise ValueError("Transport evidence belongs to another original intake request")
             positions.append(receipt.position.sequence_number)
         if positions != sorted(set(positions)):
             raise ValueError("Stream positions must be distinct and ordered")

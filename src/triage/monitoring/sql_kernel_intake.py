@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from triage.monitoring.models import CONNECTOR_PENDING_GAP_CODES
 from triage.monitoring.sql_kernel_common import (
+    canonical_guid,
     current_work,
     exact_text_equal,
     key_hash,
@@ -18,6 +19,7 @@ from triage.monitoring.sql_kernel_common import (
     save_receipt,
 )
 from triage.monitoring.sql_kernel_connectors import (
+    require_delivery_proof_sql,
     restore_worker_proof_expression,
     subscription_type_sql,
     worker_ready_upgrade_sql,
@@ -34,6 +36,11 @@ from triage.monitoring.sql_kernel_contracts import (
 )
 from triage.monitoring.sql_kernel_intents import handoff_sql
 from triage.monitoring.sql_kernel_removals import source_is_pending_removal_sql
+
+
+def _event_content_hash(expression: str) -> str:
+    # A redelivery cannot replace the first receipt's transport proof.
+    return receipt_content_hash(f"JSON_MODIFY({expression},'$.transport',NULL)")
 
 
 def _accept_facts(names: SqlNames, contract: RpcContract) -> KernelObject:
@@ -218,6 +225,26 @@ IF EXISTS (
     )
 ) THROW 51072, 'Accepted event is outside the owned desired source; quarantine explicitly', 1;
 IF EXISTS (
+    SELECT 1 FROM @positions AS p WHERE p.disposition='accepted'
+      AND JSON_QUERY(p.payload,'$.transport') IS NOT NULL AND (
+        COALESCE(JSON_VALUE(p.payload,'$.transport.request_id'),'')<>@request_id
+        OR COALESCE(JSON_VALUE(p.payload,'$.transport.ownership_id'),'')<>COALESCE(JSON_VALUE(@connector,'$.ownership_id'),'missing')
+        OR COALESCE(TRY_CONVERT(bigint,JSON_VALUE(p.payload,'$.transport.policy_revision')),-1)<>@current_revision
+        OR COALESCE(TRY_CONVERT(bigint,JSON_VALUE(@connector,'$.policy_revision')),-1)<>@current_revision
+        OR COALESCE(JSON_VALUE(p.payload,'$.transport.definition_hash'),'')<>{payload_hash("JSON_QUERY(@connector,'$.desired_definition')")}
+        OR NOT ({canonical_guid("JSON_VALUE(p.payload,'$.transport.collector_identity_id')")})
+        OR NOT {exact_text_equal("JSON_VALUE(p.payload,'$.transport.workspace_id')", "JSON_VALUE(@connector,'$.workspace_id')")}
+        OR NOT {exact_text_equal("JSON_VALUE(p.payload,'$.transport.eventstream_id')", "JSON_VALUE(@connector,'$.eventstream_id')")}
+        OR NOT {exact_text_equal("JSON_VALUE(p.payload,'$.transport.destination_id')", "JSON_VALUE(@connector,'$.destination_id')")}
+        OR {names.object('json_equal')}(JSON_QUERY(p.payload,'$.transport.endpoint'),JSON_QUERY(@connector,'$.endpoint'))<>1
+        OR TRY_CONVERT(datetimeoffset,JSON_VALUE(p.payload,'$.transport.identity_verified_at')) IS NULL
+        OR TRY_CONVERT(datetimeoffset,JSON_VALUE(p.payload,'$.transport.identity_verified_at'))>TRY_CONVERT(datetimeoffset,JSON_VALUE(p.payload,'$.received_at'))
+        OR NOT EXISTS (SELECT 1 FROM OPENJSON(@connector,'$.sources') AS s
+            WHERE JSON_VALUE(s.value,'$.source_id')=JSON_VALUE(p.payload,'$.transport.source_id')
+              AND {names.object('json_equal')}(JSON_QUERY(s.value,'$.target'),JSON_QUERY(p.payload,'$.observation.execution.target'))=1)
+    )
+) THROW 51072, 'Transport evidence differs from its current pinned connector and intake request', 1;
+IF EXISTS (
     SELECT 1 FROM @positions AS p JOIN {records} AS prior
       ON prior.tenant_id=@tenant_id AND prior.epoch=@epoch AND prior.record_kind='signal'
      AND JSON_VALUE(prior.payload,'$.delivery.connector_id')=@connector_id
@@ -225,18 +252,18 @@ IF EXISTS (
      AND {exact_text_equal("JSON_VALUE(prior.payload,'$.delivery.event_id')", "JSON_VALUE(p.payload,'$.delivery.event_id')")}
     WHERE p.receipt_kind='identified' AND
        (NOT {exact_text_equal('prior.full_key', 'p.receipt_key')}
-        OR {receipt_content_hash('prior.payload')}<>{receipt_content_hash('p.payload')})
+        OR {_event_content_hash('prior.payload')}<>{_event_content_hash('p.payload')})
 ) THROW 51072, 'Original event source/id cannot be rebound', 1;
 IF EXISTS (
     SELECT 1 FROM @positions AS p JOIN @positions AS other
       ON p.fact_kind=other.fact_kind AND {exact_text_equal('p.receipt_key', 'other.receipt_key')}
-    WHERE {receipt_content_hash('p.payload')}<>{receipt_content_hash('other.payload')}
+    WHERE {_event_content_hash('p.payload')}<>{_event_content_hash('other.payload')}
 ) THROW 51072, 'One delivery identity has conflicting event content in this batch', 1;
 IF EXISTS (
     SELECT 1 FROM @positions AS p JOIN {records} AS r
       ON r.tenant_id=@tenant_id AND r.epoch=@epoch AND r.record_kind=p.fact_kind
      AND {exact_text_equal('r.full_key', 'p.receipt_key')}
-    WHERE {receipt_content_hash('r.payload')}<>{receipt_content_hash('p.payload')}
+    WHERE {_event_content_hash('r.payload')}<>{_event_content_hash('p.payload')}
 ) THROW 51072, 'Receipt key belongs to different event evidence', 1;
 -- Preserve the first event receipt; each broker position retains its own original offset/time.
 UPDATE p SET payload=COALESCE(prior.payload,first_delivery.payload)
@@ -426,7 +453,7 @@ IF ISJSON(@observation_json)<>1 OR LEFT(LTRIM(@observation_json),1)<>N'{{'
    OR DATALENGTH(@observation_json)>1048576 OR EXISTS (
     SELECT 1 FROM OPENJSON(@observation_json) WHERE [key] NOT IN
        ('workspace_id','eventstream_id','destination_id','observed_definition','endpoint','operation_id',
-        'state','identity_verified_at','delivery_verified_at','gaps'))
+        'state','identity_verified_at','delivery_verified_at','delivery_proof','gaps'))
     THROW 51073, 'Connector observation includes an unauthorized field', 1;
 DECLARE @prior nvarchar(max),@version bigint;
 SELECT @prior=payload,@version=revision FROM {records}
@@ -458,7 +485,7 @@ IF JSON_QUERY(@prior,'$.endpoint') IS NOT NULL
            <>{payload_hash("JSON_QUERY(@observation_json,'$.endpoint')")})
     THROW 51072, 'Established endpoint metadata cannot be replaced or cleared', 1;
 IF EXISTS (SELECT 1 FROM OPENJSON(@observation_json) WHERE
-    ([key] IN ('endpoint','observed_definition') AND type NOT IN (0,5))
+    ([key] IN ('endpoint','observed_definition','delivery_proof') AND type NOT IN (0,5))
     OR ([key]='gaps' AND type<>4))
     THROW 51073, 'Connector observation field has the wrong JSON type', 1;
 IF JSON_QUERY(@observation_json,'$.endpoint') IS NOT NULL AND (
@@ -498,6 +525,10 @@ IF JSON_VALUE(@next,'$.state')='ready' AND (
     OR TRY_CONVERT(datetime2(6),JSON_VALUE(@next,'$.identity_verified_at'))>@now
     OR TRY_CONVERT(datetime2(6),JSON_VALUE(@next,'$.delivery_verified_at'))>@now)
     THROW 51072, 'Ready requires matched topology and nonfuture identity/delivery evidence', 1;
+IF JSON_VALUE(@next,'$.state')='ready'
+BEGIN
+    {require_delivery_proof_sql(names, '@next')}
+END;
 IF JSON_VALUE(@next,'$.state') IN ('blocked','degraded')
    AND (SELECT COUNT(*) FROM OPENJSON(@next,'$.gaps'))=0
     THROW 51073, 'A blocked or degraded connector observation requires explicit gaps', 1;

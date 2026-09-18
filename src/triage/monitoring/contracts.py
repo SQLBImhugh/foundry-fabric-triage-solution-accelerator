@@ -33,6 +33,8 @@ from triage.monitoring.models import (
     CanonicalId,
     CapabilityObservation,
     CollectionCommit,
+    ConnectorDeliveryProof,
+    ConnectorDesiredState,
     ConnectorPublicationContext,
     ConnectorPublicationRequest,
     ConnectorPublicationResult,
@@ -259,6 +261,23 @@ class MonitoringStore(Protocol):
 
     def list_connectors(self, query: PageQuery) -> RecordPage[OwnedConnectorManifest]: ...
 
+    def get_connector_desired(
+        self, context: MonitoringContext, connector_id: CanonicalId,
+    ) -> ConnectorDesiredState | None:
+        """Read protected controller publication, distinct from registered metadata."""
+        ...
+
+    def get_connector_delivery(
+        self, context: MonitoringContext, connector_id: CanonicalId, collector_identity_id: CanonicalId,
+    ) -> ConnectorDeliveryProof | None:
+        """Read original accepted stream evidence for this current owned definition.
+
+        Revalidate the immutable intake, broker position, source, endpoint, pinned
+        identity and current desired-publication boundary. Quarantine, old policy,
+        cache counters and receiver heartbeats never establish delivery.
+        """
+        ...
+
     def publish_connector(self, request: ConnectorPublicationRequest) -> ConnectorPublicationResult:
         """Controller-only desired-manifest CAS under the reconciliation work lease.
 
@@ -270,6 +289,9 @@ class MonitoringStore(Protocol):
         Its result can therefore differ from the requested source collections.
         Readiness is a separate original-receipt publication against the current
         desired definition; worker observations alone never create new readiness.
+        Metadata-only registration stays dormant until its first nonempty,
+        admitted event-source publication. That first publication is never an
+        unchanged no-op and cannot retire retained physical sources.
         """
         ...
 

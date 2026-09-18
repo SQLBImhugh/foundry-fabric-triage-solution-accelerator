@@ -39,6 +39,58 @@ def reopened(h):
     return InMemoryMonitoringStore(state=h.state, clock=h.clock)
 
 
+@pytest.mark.parametrize("storage", ["memory", "sql"])
+def test_complete_selected_workspace_does_not_certify_partially_discovered_other_items(storage, tmp_path):
+    h = SqlHarness(tmp_path / "coverage.sqlite") if storage == "sql" else Harness()
+    h.seed(count=3, workspaces=1)
+    selector = m.ScopeSelector(tenant_id=uid(1), kind="workspace", workspace_id=uid(100))
+    h.activate(m.ScopeDefinition(
+        **h.context(), scope_id=h.next_id(), name="Selected workspace",
+        rules=(m.ScopeRule(rule_id=h.next_id(), selector=selector, effect="include"),),
+    ))
+    h.clock.advance(1)
+    generation = h.next_id()
+    selected = h.store.list_inventory(m.TargetQuery(**h.context())).items
+    h.record_inventory(m.InventoryBatch(
+        request_id=h.next_id(), expected=h.version,
+        generation=m.InventoryGeneration(
+            **h.context(), generation_id=generation, selector=selector,
+            adapter="fixture", authority="tenant_admin", completeness="complete",
+            started_at=h.clock(), completed_at=h.clock(), completed_pages=1, discovered_count=3,
+        ),
+        items=tuple(item.model_copy(update={
+            "generation_id": generation, "observed_at": h.clock(),
+        }) for item in selected),
+    ))
+    h.clock.advance(1)
+    other_generation = h.next_id()
+    h.record_inventory(m.InventoryBatch(
+        request_id=h.next_id(), expected=h.version,
+        generation=m.InventoryGeneration(
+            **h.context(), generation_id=other_generation,
+            selector=m.ScopeSelector(tenant_id=uid(1), kind="workspace", workspace_id=uid(101)),
+            adapter="fixture", authority="tenant_admin", completeness="partial",
+            started_at=h.clock(), continuation="more-items", completed_pages=1,
+            discovered_count=5,
+            gaps=(m.CoverageGap(code="inventory_in_progress", detail="Other items remain."),),
+        ),
+        items=tuple(m.InventoryItem(
+            **h.context(), generation_id=other_generation, workspace_id=uid(101),
+            item_id=uid(2_000 + index), workload="fabric_pipeline", item_type="DataPipeline",
+            name=f"Other item {index}", observed_at=h.clock(),
+        ) for index in range(5)),
+    ))
+    coverage = reopened(h).coverage(m.MonitoringContext(**h.context()))
+    assert coverage.discovered_count == 8
+    assert coverage.inventory_completeness == "partial"
+    assert coverage.scope_item_count is None
+    preview = h.store.preview_scope(m.ScopePreviewRequest(
+        expected=h.version, idempotency_id=h.next_id(), scope=h.scope,
+    ))
+    assert preview.status == "ready" and preview.inventory_completeness == "complete"
+    assert {change.identity.workspace_id for change in preview.changes} == {uid(100)}
+
+
 def review_request(h, prior=None, *, revoked=False, parameters=None):
     fields = prior.model_dump() if prior is not None else {
         "review_id": h.next_id(), "target": h.targets[0], "action": "pipeline_rerun",

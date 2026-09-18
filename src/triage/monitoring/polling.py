@@ -28,7 +28,7 @@ import hashlib
 import json
 import logging
 import traceback
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol, TypeVar
@@ -708,6 +708,12 @@ class CollectorRunResult:
     gaps: tuple[CoverageGap, ...] = ()
 
 
+class EventCapabilityProbe(Protocol):
+    async def verify(
+        self, observation: CapabilityObservation, renew: Callable[[], Awaitable[None]],
+    ) -> CapabilityObservation: ...
+
+
 class MonitoringCollector:
     """Bounded async worker tick; the store arbitrates cross-replica work shares.
 
@@ -727,6 +733,7 @@ class MonitoringCollector:
         pages_per_work: int = 4, lease_seconds: int = 120,
         inventory_seconds: int = 3_600, retry_seconds: int = 60,
         lookback_seconds: int = 86_400,
+        event_probe: EventCapabilityProbe | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.store = store
@@ -734,6 +741,7 @@ class MonitoringCollector:
         self.inventory_client = inventory_client
         self.pipeline_client = pipeline_client
         self.powerbi_client = powerbi_client
+        self.event_probe = event_probe
         self.collector_identity_id = canonical_id(collector_identity_id)
         self.owner_id = canonical_id(owner_id)
         self._claim = WorkClaimRequest(
@@ -997,17 +1005,26 @@ class MonitoringCollector:
         probe = await self._history(work.target).probe(
             work.target, inventory_generation=item.generation_id, checked_at=self._clock(),
         )
+        if self.event_probe is not None and probe.read_status == "verified":
+            async def renew() -> None:
+                nonlocal work
+                work = await self._renew(work)
+
+            probe = await self.event_probe.verify(probe, renew)
         work = await self._renew(work)
         await asyncio.to_thread(
             self.store.record_capability, await self._version(), probe,
             commit=CollectionCommit(work_id=work.work_id, lease=work.lease, expected_work_revision=work.revision),
         )
-        if probe.read_status != "verified":
+        if probe.read_status != "verified" or (
+            self.event_probe is not None and probe.event_status != "verified"
+            and any(gap.retry_at is not None for gap in probe.gaps)
+        ):
             retry_at = max(
                 [self._clock() + timedelta(seconds=self._retry_seconds)]
                 + [gap.retry_at for gap in probe.gaps if gap.retry_at is not None],
             )
-            await self._disposition(work, "Collector source capability remains unverified", retry_at=retry_at)
+            await self._disposition(work, "Collector source or owned event capability remains unverified", retry_at=retry_at)
             return CollectorWorkResult(work.work_id, "deferred", gaps=probe.gaps)
         await self._disposition(work, "Collector source evidence is durable; only the controller publishes capability")
         return CollectorWorkResult(work.work_id, "recorded", gaps=probe.gaps)
@@ -1144,6 +1161,12 @@ class MonitoringCollector:
     async def _collect(self, work: MonitoringWork) -> CollectorWorkResult:
         try:
             work = await self._renew(work)
+            current = await self._version()
+            if work.policy_revision > current.revision:
+                raise MonitoringConflict("Collection work refers to an unpublished monitoring policy")
+            if work.policy_revision < current.revision:
+                await self._disposition(work, "Read-only collection work belongs to a superseded monitoring policy")
+                return CollectorWorkResult(work.work_id, "superseded")
             if work.kind == "inventory":
                 return await self._inventory(work)
             if work.kind == "capability_probe":

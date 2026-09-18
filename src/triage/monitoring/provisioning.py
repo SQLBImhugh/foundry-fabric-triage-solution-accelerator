@@ -43,7 +43,11 @@ from triage.monitoring.contracts import (
     MonitoringStoreError,
     MonitoringUnavailable,
 )
-from triage.monitoring.events import WIRE_TO_SUBSCRIPTION_TYPE
+from triage.monitoring.events import (
+    WIRE_TO_SUBSCRIPTION_TYPE,
+    ConnectorBinding,
+    EventContractError,
+)
 from triage.monitoring.inventory import (
     RestReadError,
     RestRoute,
@@ -61,6 +65,7 @@ from triage.monitoring.models import (
     ConnectorSource,
     ConnectorSourceProposal,
     CoverageGap,
+    EventCapabilityEvidence,
     JsonObject,
     LeaseRenewal,
     MonitoringContext,
@@ -79,6 +84,7 @@ from triage.monitoring.models import (
     WorkDispositionRequest,
     _digest,
     connector_collection_eligible,
+    validate_connector_definition,
 )
 from triage.monitoring.rate_limit import RatePolicy
 from triage.pipeline_models import canonical_id
@@ -762,6 +768,112 @@ def _owned_connectors(
     raise ProvisioningReview("connector_pagination_budget_exhausted")
 
 
+class OwnedEventCapabilityProbe:
+    """Read the registered source through the collector identity, without receiving."""
+
+    def __init__(
+        self, store: MonitoringStore, context: MonitoringContext,
+        rest: ProvisioningRestClient, binding: ConnectorBinding, *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        if rest.context != context or binding.tenant_id != context.tenant_id:
+            raise ValueError("Event capability must use the collector's pinned context")
+        self.store, self.context, self.rest, self.binding = store, context, rest, binding
+        self.clock = clock
+
+    async def verify(
+        self, observation: CapabilityObservation, renew: Callable[[], Awaitable[None]],
+    ) -> CapabilityObservation:
+        if (
+            observation.target.tenant_id != self.context.tenant_id
+            or observation.target.epoch != self.context.epoch
+            or observation.collector_identity_id != self.rest.collector_identity_id
+        ):
+            raise MonitoringConflict("Event capability belongs to another collector or deployment")
+        if observation.target.workload != "fabric_pipeline" or observation.read_status != "verified":
+            return observation
+        owned_source = False
+        try:
+            before = await asyncio.to_thread(self.store.snapshot, self.context)
+            connectors = await asyncio.to_thread(_owned_connectors, self.store, self.context)
+            matches = [value for value in connectors if value.connector_id == self.binding.connector_id]
+            if len(matches) != 1:
+                raise ProvisioningReview("registered_event_connector_required")
+            connector = matches[0]
+            self.binding.check_resource(connector, before.control)
+            if (
+                connector.state in {"blocked", "deleting", "deleted"}
+                or connector.source_proposals or connector.source_removals
+                or connector.observed_definition is None
+            ):
+                raise ProvisioningReview("owned_event_baseline_unverified")
+            sources = [source for source in connector.sources if source.target == observation.target]
+            if len(sources) != 1:
+                raise ProvisioningReview("owned_event_source_unverified")
+            source = sources[0]
+            owned_source = True
+            if source.event_source != self.context.tenant_id:
+                raise ProvisioningReview("owned_event_source_tenant_mismatch")
+            validate_connector_definition(connector.sources, connector.desired_definition)
+            _complete_component_map(connector.desired_definition)
+            if not matches_update(connector.observed_definition, connector.desired_definition):
+                raise ProvisioningReview("owned_event_baseline_unverified")
+            await renew()
+            observed, topology = await self.rest.inspect(connector, renew)
+            observed = binding_observation(observed, connector.desired_definition)
+            graph = observed["parts"]["eventstream.json"]
+            nodes = [
+                node for name, node in _nodes(graph, "sources").items()
+                if observed["component_ids"][f"sources/{name}"] == source.source_id
+            ]
+            if len(nodes) != 1:
+                raise ProvisioningReview("owned_event_source_id_mismatch")
+            properties = nodes[0].get("properties", {})
+            destination = next(iter(_nodes(graph, "destinations").values()))
+            if (
+                properties.get("workspaceId") != observation.target.workspace_id
+                or properties.get("itemId") != observation.target.item_id
+                or set(properties.get("includedEventTypes", ())) != set(source.event_types)
+                or observed["component_ids"][f"destinations/{destination['name']}"]
+                != self.binding.destination_id
+                or any(
+                    node.get("status") != "Running"
+                    for kind in ("sources", "streams", "destinations")
+                    for node in _nodes(topology, kind).values()
+                )
+            ):
+                raise ProvisioningReview("owned_event_path_not_verified_running")
+            after = await asyncio.to_thread(self.store.snapshot, self.context)
+            current = await asyncio.to_thread(_owned_connectors, self.store, self.context)
+            if after.control != before.control or not any(value == connector for value in current):
+                raise MonitoringConflict("Owned event capability changed during its read probe")
+            return CapabilityObservation.model_validate({
+                **observation.model_dump(),
+                "event_status": "verified",
+                "event_evidence": EventCapabilityEvidence(
+                    connector_id=connector.connector_id, ownership_id=connector.ownership_id,
+                    source_id=source.source_id, eventstream_id=self.binding.eventstream_id,
+                    destination_id=self.binding.destination_id,
+                    definition_hash=_digest(observed),
+                    endpoint_hash=_digest(self.binding.endpoint.model_dump(mode="json")),
+                    event_types=source.event_types, observed_at=self.clock(),
+                ),
+            })
+        except (ProvisioningReview, EventContractError, RestReadError, ValueError) as exc:
+            code = exc.code if isinstance(exc, (ProvisioningReview, RestReadError)) else "owned_event_binding_unverified"
+            LOG.warning("event_capability_unverified code=%s", code)
+            return CapabilityObservation.model_validate({
+                **observation.model_dump(), "event_status": "unknown", "event_evidence": None,
+                "gaps": (*observation.gaps[:199], CoverageGap(
+                    code=code, detail="The current registered source and running event path could not be verified",
+                    retry_at=(
+                        exc.retry_at if isinstance(exc, RestReadError) and exc.retry_at is not None
+                        else self.clock() + timedelta(seconds=60) if owned_source else None
+                    ),
+                )),
+            })
+
+
 def _publication_state(
     store: MonitoringStore,
     work: MonitoringWork,
@@ -1193,7 +1305,7 @@ class ConnectorReconciler:
     ) -> OwnedConnectorManifest:
         allowed = {
             "observed_definition", "operation_id", "state", "identity_verified_at",
-            "delivery_verified_at", "gaps",
+            "delivery_verified_at", "delivery_proof", "gaps",
         }
         if changes.keys() - allowed:
             raise ProvisioningReview("worker_cannot_publish_connector_intent")
@@ -1271,6 +1383,7 @@ class ConnectorReconciler:
             or effective.state == "ready" and prior.state != "ready"
             or effective.identity_verified_at != prior.identity_verified_at
             or effective.delivery_verified_at != prior.delivery_verified_at
+            or effective.delivery_proof != prior.delivery_proof
             or any(
                 getattr(effective, name) != getattr(prior, name)
                 for name in (
@@ -1524,10 +1637,14 @@ class ConnectorReconciler:
             for source in observed_sources
         }
         intent_changed = not matches_update(observed, connector.desired_definition)
+        delivery = await asyncio.to_thread(
+            self.store.get_connector_delivery, self.context, connector.connector_id,
+            self.rest.collector_identity_id,
+        )
         ready = bool(
             observed_sources and not changed_scope and not bindings_changed and not intent_changed
             and not connector.source_removals
-            and connector.delivery_verified_at is not None and connector.identity_verified_at is not None
+            and delivery is not None
         )
         code = (
             "controller_source_retirement_required" if connector.source_removals and not intent_changed
@@ -1541,6 +1658,9 @@ class ConnectorReconciler:
             expected_policy_revision=verified_version.revision,
             observed_definition=observed,
             state="ready" if ready else "degraded",
+            identity_verified_at=delivery.identity_verified_at if ready else connector.identity_verified_at,
+            delivery_verified_at=delivery.received_at if ready else connector.delivery_verified_at,
+            delivery_proof=delivery if ready else connector.delivery_proof,
             gaps=() if ready else (CoverageGap(code=code, detail=code),),
         )
         waiting = (

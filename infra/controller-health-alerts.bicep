@@ -16,6 +16,12 @@ param tags GovernanceTags
 @description('Optional approved notification routes. Empty means Azure Monitor portal alerts only; no email or webhook is inferred.')
 param actionGroupResourceIds string[] = []
 
+@description('Optional application-owned Insights resource. Its log alert detects zero completed heartbeats even when the platform metric emits no samples.')
+param applicationInsightsResourceId string = ''
+
+@description('Region of the selected Application Insights resource.')
+param applicationInsightsLocation string = heartbeatWorkflowLocation
+
 var checks = [
   {
     suffix: 'heartbeat-missing'
@@ -71,5 +77,50 @@ resource alerts 'Microsoft.Insights/metricAlerts@2018-03-01' = [for check in che
   }
 }]
 
+resource absentTelemetry 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if (!empty(applicationInsightsResourceId)) {
+  name: '${namePrefix}-heartbeat-telemetry-missing'
+  location: applicationInsightsLocation
+  kind: 'LogAlert'
+  tags: tags
+  properties: {
+    displayName: 'Controller heartbeat telemetry missing'
+    description: 'No completed application heartbeat was ingested for 15 minutes. Check the timer, controller and telemetry; this does not authorize retrying a workload effect.'
+    severity: 2
+    enabled: true
+    autoMitigate: true
+    evaluationFrequency: 'PT1M'
+    windowSize: 'PT15M'
+    scopes: [
+      applicationInsightsResourceId
+    ]
+    skipQueryValidation: false
+    criteria: {
+      allOf: [
+        {
+          // summarize returns one zero-count row when no heartbeat exists.
+          query: '''
+traces
+| where timestamp > ago(15m)
+| where message startswith "heartbeat_finished status=completed "
+| summarize completed_heartbeats=count()
+'''
+          metricMeasureColumn: 'completed_heartbeats'
+          timeAggregation: 'Total'
+          operator: 'LessThan'
+          threshold: 1
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: actionGroupResourceIds
+    }
+  }
+}
+
 output alertResourceIds array = [for (check, index) in checks: alerts[index].id]
+output telemetryAbsenceAlertResourceId string = !empty(applicationInsightsResourceId) ? absentTelemetry!.id : ''
 output externalNotificationsConfigured bool = !empty(actionGroupResourceIds)

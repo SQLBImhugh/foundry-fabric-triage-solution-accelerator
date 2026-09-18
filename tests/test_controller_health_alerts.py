@@ -30,8 +30,12 @@ def test_compiled_controller_alerts_use_only_the_selected_workflow():
     template = json.loads((Path(folder) / "controller-health-alerts.arm.json").read_text(encoding="utf-8-sig"))
     resources = template["resources"]
     resources = list(resources.values()) if isinstance(resources, dict) else resources
-    assert len(resources) == 1 and resources[0]["type"] == "Microsoft.Insights/metricAlerts"
-    properties = resources[0]["properties"]
+    assert {resource["type"] for resource in resources} == {
+        "Microsoft.Insights/metricAlerts", "Microsoft.Insights/scheduledQueryRules",
+    }
+    properties = next(
+        resource for resource in resources if resource["type"] == "Microsoft.Insights/metricAlerts"
+    )["properties"]
     assert properties["scopes"] == ["[parameters('heartbeatWorkflowResourceId')]"]
     assert properties["targetResourceType"] == "Microsoft.Logic/workflows"
     assert properties["evaluationFrequency"] == "PT1M"
@@ -41,3 +45,14 @@ def test_compiled_controller_alerts_use_only_the_selected_workflow():
     assert {(row["metric"], row["operator"], row["threshold"], row["window"]) for row in checks} == {
         ("RunsSucceeded", "LessThan", 1, "PT15M"), ("RunsFailed", "GreaterThan", 0, "PT5M"),
     }
+    absence = next(
+        resource for resource in resources if resource["type"] == "Microsoft.Insights/scheduledQueryRules"
+    )
+    assert absence["condition"] == "[not(empty(parameters('applicationInsightsResourceId')))]"
+    assert absence["properties"]["scopes"] == ["[parameters('applicationInsightsResourceId')]"]
+    assert absence["properties"]["skipQueryValidation"] is False
+    rule = absence["properties"]["criteria"]["allOf"][0]
+    assert "| summarize completed_heartbeats=count()" in rule["query"]
+    assert rule["metricMeasureColumn"] == "completed_heartbeats"
+    assert rule["operator"] == "LessThan" and rule["threshold"] == 1
+    assert absence["properties"]["actions"]["actionGroups"] == "[parameters('actionGroupResourceIds')]"

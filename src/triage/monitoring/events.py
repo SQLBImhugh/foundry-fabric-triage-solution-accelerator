@@ -41,10 +41,12 @@ from triage.monitoring.contracts import (
 from triage.monitoring.models import (
     MAX_JSON_BYTES,
     CanonicalId,
+    ConnectorDesiredState,
     Count,
     CoverageGap,
     DeploymentControl,
     EndpointMetadata,
+    EventTransportEvidence,
     IntakeReceipt,
     JsonObject,
     LeaseRenewal,
@@ -66,6 +68,7 @@ from triage.monitoring.models import (
     TargetIdentity,
     TransportDeliveryIdentity,
     UtcDateTime,
+    connector_definition_hash,
 )
 
 LOG = logging.getLogger("triage.monitoring.events")
@@ -191,7 +194,7 @@ class ConnectorBinding(MonitoringModel):
     destination_id: OpaqueId
     endpoint: EndpointMetadata
 
-    def check(self, manifest: OwnedConnectorManifest, control: DeploymentControl) -> None:
+    def check_resource(self, manifest: OwnedConnectorManifest, control: DeploymentControl) -> None:
         if control.maintenance:
             raise EventContractError("Monitoring is in maintenance")
         if (
@@ -207,17 +210,6 @@ class ConnectorBinding(MonitoringModel):
             raise EventContractError(
                 "The current owned connector does not match its bootstrap binding"
             )
-        if manifest.state not in {"ready", "degraded"}:
-            raise EventContractError("The owned connector is not enabled for reception")
-        if (
-            manifest.observed_definition is None
-            or manifest.observed_definition != manifest.desired_definition
-        ):
-            raise EventContractError(
-                "The owned connector topology has not been round-trip verified"
-            )
-        if not manifest.sources:
-            raise EventContractError("The owned connector has no configured source subscriptions")
         # Reuse the public probe's strict nonsecret public-endpoint validation.
         probe_helpers().Endpoint.from_document(
             {
@@ -230,6 +222,20 @@ class ConnectorBinding(MonitoringModel):
                 "destinationId": self.destination_id,
             }
         )
+
+    def check(self, manifest: OwnedConnectorManifest, control: DeploymentControl) -> None:
+        self.check_resource(manifest, control)
+        if manifest.state not in {"ready", "degraded"}:
+            raise EventContractError("The owned connector is not enabled for reception")
+        if (
+            manifest.observed_definition is None
+            or manifest.observed_definition != manifest.desired_definition
+        ):
+            raise EventContractError(
+                "The owned connector topology has not been round-trip verified"
+            )
+        if not manifest.sources:
+            raise EventContractError("The owned connector has no configured source subscriptions")
 
 
 class ConnectorScope(MonitoringContext):
@@ -631,6 +637,7 @@ def parse_native_job_event(
         partition=partition,
         position=position,
         received_at=received_at,
+        event_type=subscription_type,
         status="accepted",
         observation=observation,
     )
@@ -737,6 +744,9 @@ class SqlCheckpointStore:
         self._pending: dict[str, AcceptedPosition] = {}
         self.accepted_positions = 0
         self.last_delivery_at: datetime | None = None
+        self.receiver_identity: IdentityBinding | None = None
+        self.receiver_identity_verified_at: datetime | None = None
+        self.receiver_publication_id: str | None = None
 
     async def _call(self, operation: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
         try:
@@ -819,6 +829,19 @@ class SqlCheckpointStore:
             if self.on_failure is not None:
                 self.on_failure(exc)
             raise
+
+    async def _publication(self, manifest: OwnedConnectorManifest) -> ConnectorDesiredState:
+        desired = await self._call(
+            self.store.get_connector_desired, self.context, manifest.connector_id,
+        )
+        if desired is None:
+            raise EventContractError("Event reception requires a protected connector publication")
+        if not isinstance(desired, ConnectorDesiredState) or (
+            desired.connector_id != manifest.connector_id or desired.ownership_id != manifest.ownership_id
+            or desired.policy_revision != manifest.policy_revision
+        ):
+            raise MonitoringConflict("Protected connector publication no longer matches the observed connector")
+        return desired
 
     async def list_ownership(
         self,
@@ -1007,6 +1030,35 @@ class SqlCheckpointStore:
             manifest=manifest,
         )
         request_id = _request_id(partition, position, body.sha256)
+        if (
+            isinstance(receipt, SignalReceipt) and receipt.status == "accepted"
+            and self.receiver_identity is not None
+        ):
+            if self.receiver_identity_verified_at is None:
+                raise EventContractError("Receiver identity has no successful transport-verification time")
+            publication = await self._publication(manifest)
+            if self.receiver_publication_id != publication.publication_id:
+                raise MonitoringConflict("Connector publication changed after transport identity verification")
+            source = next(
+                source for source in manifest.sources
+                if source.target == receipt.observation.execution.target
+            )
+            receipt = SignalReceipt.model_validate({
+                **receipt.model_dump(),
+                "transport": EventTransportEvidence(
+                    request_id=request_id,
+                    ownership_id=manifest.ownership_id,
+                    policy_revision=control.revision,
+                    workspace_id=self.binding.workspace_id,
+                    eventstream_id=self.binding.eventstream_id,
+                    destination_id=self.binding.destination_id,
+                    endpoint=self.binding.endpoint,
+                    definition_hash=connector_definition_hash(manifest.desired_definition),
+                    source_id=source.source_id,
+                    collector_identity_id=self.receiver_identity.object_id,
+                    identity_verified_at=self.receiver_identity_verified_at,
+                ),
+            })
         # The deterministic request ID survives restart. Read it BEFORE rebuilding
         # a request with a new receive time or lease, so replay cannot change content.
         intake = await self._call(self.store.get_stream_acceptance, self.context, request_id)

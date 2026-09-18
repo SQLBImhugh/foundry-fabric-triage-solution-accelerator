@@ -341,6 +341,23 @@ bootstrap/publication path; environment strings alone are not a connector
 record. Key-free endpoint automation remains unproved, and another application's
 Eventstream cannot be adopted as a fallback.
 
+The [owned metadata registrar](../DeploymentGuide.md#register-existing-app-owned-connector-metadata)
+uses explicit target/deployer flags for read-only prepare, exact-hash apply and
+SELECT-only original-plan reconciliation. It records only planned physical
+ownership and an immutable receipt, not scope admission, desired publication,
+collector-MI verification or delivery. A fresh complete operator capture is
+hash-bound evidence, not network proof; native read-only preflight does not
+establish native registration apply.
+
+Metadata-only sources without admitted current read/event-capable targets are
+dormant before first protected desired publication, not automatically removed.
+With current admission and fresh same-collector-MI event probes, first desired
+can be published at the same policy revision when absent. A degraded receiver
+then needs matching protected publication/ownership/policy/definition/source/
+endpoint bindings and actual original durable receipt/position/hash evidence.
+Keep identity-check and receive times distinct. Only the controller can publish
+Ready; the new native event-mode/delivery gate remains open.
+
 Sources start as logical proposals with `source_id=null`. Only controller
 publication bound to the original complete worker observation may assign
 returned physical IDs. The caller supplies `observation_receipt_id`; SQL
@@ -400,7 +417,12 @@ or already admitted work.
 
 Portal alerts cover `RunsSucceeded < 1` over 15 minutes and `RunsFailed > 0`
 over 5 minutes at one-minute evaluation. Empty action lists mean no Action
-Group/email/webhook delivery; no missing-heartbeat canary is claimed.
+Group/email/webhook delivery. Optional `applicationInsightsResourceId` and
+`applicationInsightsLocation` add a runtime log-absence rule whose summarizing
+query returns one zero-count row when no completed heartbeat exists.
+Metric no-data is not assumed zero. An isolated query canary fired and resolved,
+then was disabled; production log-absence stays enabled with no actions.
+This did not stop the actual controller or test external delivery.
 
 ## Hosting and deployment checks
 

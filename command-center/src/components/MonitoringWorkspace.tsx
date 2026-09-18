@@ -178,7 +178,7 @@ function CoverageOverview({ snapshot, catalog }: { snapshot: MonitoringSnapshot;
       ] as const).map(([label, count]) => <div key={label}><dt>{label}</dt><dd>{count}</dd></div>)}
     </dl>
     <div className="monitoring-panel-body">
-      <p><strong>Scope denominator: {value.scope_item_count === null ? 'Unknown' : value.scope_item_count}</strong>.
+      <p><strong>Inventory total: {value.scope_item_count === null ? 'Unknown' : value.scope_item_count}</strong>.
         {' '}Inventory {humanize(value.inventory_completeness).toLowerCase()}; capability checks {humanize(value.capability_completeness).toLowerCase()}.
         {value.scope_item_count === null && ' Discovered items are not a complete tenant count.'}</p>
       <dl className="monitoring-facts">

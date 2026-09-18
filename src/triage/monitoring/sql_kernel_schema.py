@@ -83,7 +83,7 @@ def _views(names: SqlNames) -> list[KernelObject]:
         _view(names, "controller_immutable", f"r.record_kind IN ({literals(CONTROLLER_IMMUTABLE_KINDS)})", writable=True, deny_maintenance=False),
         _view(
             names, "worker_read",
-            f"r.record_kind IN ({literals((*facts, 'scope', 'target', 'target_capability', 'connector', 'partition_ownership', 'stream_start', 'stream_position', 'stream_checkpoint', 'stream_gap', 'validation_frontier', 'validation_window'))}) "
+            f"r.record_kind IN ({literals((*facts, 'scope', 'target', 'target_capability', 'connector', 'connector_desired', 'partition_ownership', 'stream_start', 'stream_position', 'stream_checkpoint', 'stream_gap', 'validation_frontier', 'validation_window'))}) "
             f"OR (r.record_kind='work' AND r.work_kind IN ({literals(WORKER_WORK_KINDS)}))",
         ),
         _view(

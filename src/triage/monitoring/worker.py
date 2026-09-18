@@ -51,6 +51,7 @@ from triage.monitoring.events import (
     EventPersistence,
     EventProtocolError,
     IdentityBinding,
+    PinnedAsyncCredential,
     ReceiverHeartbeat,
     SqlCheckpointStore,
     StreamHistoryGap,
@@ -67,6 +68,7 @@ from triage.monitoring.models import (
     MonitoringContext,
     SignalReceipt,
     StreamPosition,
+    connector_definition_hash,
 )
 
 LOG = logging.getLogger("triage.monitoring.worker")
@@ -351,6 +353,8 @@ class EventReceiver:
             [IdentityBinding], AsyncCredential
         ] = managed_identity_credential,
     ) -> None:
+        if identity.tenant_id != checkpoints.binding.tenant_id:
+            raise EventContractError("Receiver identity belongs to another connector tenant")
         self.checkpoints = checkpoints
         self.identity = identity
         self.client_factory = client_factory
@@ -367,7 +371,7 @@ class EventReceiver:
                 failure.set_result(exc)
 
         self.checkpoints.on_failure = failed
-        credential = self.credential_factory(self.identity)
+        credential = PinnedAsyncCredential(self.credential_factory(self.identity), self.identity)
         try:
             client = self.client_factory(
                 self.checkpoints.binding,
@@ -380,6 +384,7 @@ class EventReceiver:
             raise
         receive_task: asyncio.Task | None = None
         stop_task: asyncio.Task | None = None
+        verified_context: tuple[int, int, str, str, str] | None = None
 
         async def on_error(partition: PartitionContext | None, exc: Exception) -> None:
             failed(exc)
@@ -393,6 +398,7 @@ class EventReceiver:
                 raise
 
         async def on_event(partition: PartitionContext, event: EventData | None) -> None:
+            nonlocal verified_context
             if event is None:
                 return
             if stop.is_set():
@@ -408,6 +414,20 @@ class EventReceiver:
                     partition.eventhub_name,
                     partition.consumer_group,
                 )
+                control, manifest = await self.checkpoints._current()
+                publication = await self.checkpoints._publication(manifest)
+                current_context = (
+                    control.revision, manifest.policy_revision, manifest.ownership_id,
+                    connector_definition_hash(manifest.desired_definition), publication.publication_id,
+                )
+                if current_context != verified_context:
+                    await credential.get_token("https://eventhubs.azure.net/.default")
+                    self.checkpoints.set_partition_properties(
+                        partition.partition_id, await client.get_partition_properties(partition.partition_id),
+                    )
+                    self.checkpoints.receiver_identity_verified_at = self.checkpoints.clock()
+                    self.checkpoints.receiver_publication_id = publication.publication_id
+                    verified_context = current_context
                 summary = summarize_body(event.body)
                 receipt = await self.checkpoints.accept(
                     partition.partition_id,
@@ -430,6 +450,9 @@ class EventReceiver:
                 raise
 
         try:
+            await credential.get_token("https://eventhubs.azure.net/.default")
+            control, manifest = await self.checkpoints._current()
+            publication = await self.checkpoints._publication(manifest)
             partitions = await client.get_partition_ids()
             self.checkpoints.bind_partitions(partitions)
             for partition_id in partitions:
@@ -438,6 +461,13 @@ class EventReceiver:
                     await client.get_partition_properties(partition_id),
                 )
             self.connected = True
+            self.checkpoints.receiver_identity = self.identity
+            self.checkpoints.receiver_identity_verified_at = self.checkpoints.clock()
+            self.checkpoints.receiver_publication_id = publication.publication_id
+            verified_context = (
+                control.revision, manifest.policy_revision, manifest.ownership_id,
+                connector_definition_hash(manifest.desired_definition), publication.publication_id,
+            )
             receive_task = asyncio.create_task(
                 client.receive(
                     on_event=on_event,
@@ -461,6 +491,9 @@ class EventReceiver:
                     raise EventProtocolError("The event consumer returned without a stop request")
         finally:
             self.connected = False
+            self.checkpoints.receiver_identity = None
+            self.checkpoints.receiver_identity_verified_at = None
+            self.checkpoints.receiver_publication_id = None
             try:
                 async with asyncio.timeout(SHUTDOWN_SECONDS):
                     await client.close()
@@ -753,7 +786,11 @@ async def live_maintenance(config: WorkerConfig):
         MonitoringCollector,
         PowerBIPollingClient,
     )
-    from triage.monitoring.provisioning import ConnectorReconciler, ProvisioningRestClient
+    from triage.monitoring.provisioning import (
+        ConnectorReconciler,
+        OwnedEventCapabilityProbe,
+        ProvisioningRestClient,
+    )
     from triage.monitoring.runtime import build_monitoring_store
     from triage.monitoring.sql_store import KernelRateBudget
     from triage.policy import TriagePolicy
@@ -808,6 +845,10 @@ async def live_maintenance(config: WorkerConfig):
             PowerBIPollingClient(rest),
             config.identity.object_id,
             owner,
+            event_probe=(
+                OwnedEventCapabilityProbe(store, context, rest, config.connector)
+                if config.connector is not None else None
+            ),
         )
         provisioner = (
             ConnectorReconciler(

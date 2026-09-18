@@ -257,6 +257,14 @@ Obtain only namespace, entity, consumer group and owned IDs from the
 connector state. Manual nonsecret endpoint bootstrap remains required.
 Key-free automatic endpoint discovery is not a proved deployment capability.
 
+For an already-created app-owned Eventstream, use the
+[metadata registrar](DeploymentGuide.md#register-existing-app-owned-connector-metadata)
+with the original creation evidence and fresh complete readbacks. This
+SQL-connected operator step establishes planned physical ownership only; it
+does not grant scope admission, event capability, desired publication or Ready.
+Fresh same-collector-MI probes, current admitted scope, first controller desired
+publication and an actual original durable stream receipt are separate gates.
+
 For the approved prototype clean start, provision the Azure SQL application
 schema and initialize empty maintenance/control/receipt state through the
 deployer. Do not import earlier Fabric SQL history or target settings. Old

@@ -6,6 +6,7 @@ scope or promote a matched, receipt-bound observation into readiness proof.
 
 from __future__ import annotations
 
+from triage.monitoring.events import WIRE_TO_SUBSCRIPTION_TYPE
 from triage.monitoring.sql_kernel_common import (
     canonical_guid,
     current_work,
@@ -14,6 +15,7 @@ from triage.monitoring.sql_kernel_common import (
     literals,
     payload_hash,
     procedure,
+    record_hash,
     record_insert,
     save_receipt,
 )
@@ -44,12 +46,9 @@ def subscription_type_sql(receipt: str) -> str:
         f"JSON_VALUE({receipt},'$.observation.evidence.native_event_type'),"
         f"JSON_VALUE({receipt},'$.observation.evidence.subscription_event_type'))"
     )
-    mappings = {
-        value.replace(".JobEvents.", "."): value for value in SUBSCRIPTION_TYPES
-    } | {value: value for value in SUBSCRIPTION_TYPES if value.endswith(("ItemJobCreated", "ItemJobFailed"))}
     clauses = " ".join(
         f"WHEN {exact_text_equal(wire, literals((source,)))} THEN N'{target}'"
-        for source, target in mappings.items()
+        for source, target in WIRE_TO_SUBSCRIPTION_TYPE.items()
     )
     return f"CASE {clauses} ELSE NULL END"
 
@@ -81,18 +80,131 @@ def desired_update_expression() -> str:
 
 
 def invalidate_readiness_expression() -> str:
-    return """JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(@next,'$.state','provisioning'),
-    '$.identity_verified_at',NULL),'$.delivery_verified_at',NULL)"""
+    return """JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(@next,'$.state','provisioning'),
+    '$.identity_verified_at',NULL),'$.delivery_verified_at',NULL),'$.delivery_proof',NULL)"""
 
 
 def restore_worker_proof_expression() -> str:
-    return """JSON_MODIFY(JSON_MODIFY(@next,
+    return """JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(@next,
     '$.identity_verified_at',JSON_VALUE(@prior,'$.identity_verified_at')),
-    '$.delivery_verified_at',JSON_VALUE(@prior,'$.delivery_verified_at'))"""
+    '$.delivery_verified_at',JSON_VALUE(@prior,'$.delivery_verified_at')),
+    '$.delivery_proof',JSON_QUERY(@prior,'$.delivery_proof'))"""
 
 
 def worker_ready_upgrade_sql() -> str:
     return "JSON_VALUE(@next,'$.state')='ready' AND COALESCE(JSON_VALUE(@prior,'$.state'),'')<>'ready'"
+
+
+def initial_publication_invalid_sql(names: SqlNames) -> str:
+    return f"""@prior IS NOT NULL AND @desired IS NULL AND (
+    COALESCE(JSON_VALUE(@prior,'$.state'),'')<>'planned'
+    OR NULLIF(JSON_VALUE(@prior,'$.workspace_id'),'') IS NULL
+    OR NULLIF(JSON_VALUE(@prior,'$.eventstream_id'),'') IS NULL
+    OR NULLIF(JSON_VALUE(@prior,'$.destination_id'),'') IS NULL
+    OR JSON_QUERY(@prior,'$.endpoint') IS NULL
+    OR JSON_QUERY(@prior,'$.observed_definition') IS NULL
+    OR {names.object('json_equal')}(JSON_QUERY(@prior,'$.observed_definition'),JSON_QUERY(@prior,'$.desired_definition'))<>1
+    OR (SELECT COUNT(*) FROM OPENJSON(@prior,'$.source_proposals'))<>0
+    OR (SELECT COUNT(*) FROM OPENJSON(@prior,'$.source_removals'))<>0
+    OR EXISTS (SELECT 1 FROM OPENJSON(@prior) WHERE type<>0 AND [key] IN (
+        'operation_id','identity_verified_at','delivery_verified_at','delivery_proof','last_receiver_activity_at'))
+    OR (SELECT COUNT(*) FROM OPENJSON(@plan,'$.source_removals'))<>0
+    OR JSON_VALUE(@plan,'$.observation_receipt_id') IS NOT NULL
+    OR JSON_VALUE(@plan,'$.readiness_receipt_id') IS NOT NULL
+    OR (SELECT COUNT(*) FROM OPENJSON(@plan,'$.sources'))
+       +(SELECT COUNT(*) FROM OPENJSON(@plan,'$.source_proposals'))=0)"""
+
+
+def require_delivery_proof_sql(names: SqlNames, observation: str) -> str:
+    """Bind readiness to the original RPC receipt, accepted signal and broker journal."""
+    records, receipts = names.table("monitoring_records"), names.table("monitoring_receipts")
+    equal = names.object("json_equal")
+    return f"""
+DECLARE @delivery_proof nvarchar(max)=JSON_QUERY({observation},'$.delivery_proof'),
+    @delivery_signal nvarchar(max),@delivery_batch nvarchar(max),@delivery_desired nvarchar(max);
+SELECT @delivery_signal=payload FROM {records}
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='signal' AND status='accepted'
+  AND full_key=JSON_VALUE(@delivery_proof,'$.receipt_key')
+  AND key_hash={key_hash("JSON_VALUE(@delivery_proof,'$.receipt_key')")};
+SELECT @delivery_batch=payload FROM {receipts}
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND operation='worker.commit_positions'
+  AND request_id=JSON_VALUE(@delivery_proof,'$.request_id');
+SELECT @delivery_desired=payload FROM {records}
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='connector_desired'
+  AND full_key=@connector_id AND key_hash={key_hash('@connector_id')};
+IF @delivery_proof IS NULL OR @delivery_signal IS NULL OR @delivery_batch IS NULL OR @delivery_desired IS NULL
+   OR COALESCE(JSON_VALUE(@delivery_signal,'$.status'),'')<>'accepted'
+   OR COALESCE(JSON_VALUE(@delivery_signal,'$.delivery.connector_id'),'')<>@connector_id
+   OR COALESCE(JSON_VALUE(@delivery_signal,'$.delivery.tenant_id'),'')<>@tenant_id
+   OR COALESCE(JSON_VALUE(@delivery_signal,'$.delivery.epoch'),'')<>@epoch
+   OR COALESCE(JSON_VALUE(@delivery_signal,'$.transport.request_id'),'')<>JSON_VALUE(@delivery_proof,'$.request_id')
+   OR COALESCE(JSON_VALUE(@delivery_batch,'$.result.batch_id'),'')<>JSON_VALUE(@delivery_proof,'$.request_id')
+   OR COALESCE(JSON_VALUE(@delivery_signal,'$.transport.ownership_id'),'')<>@ownership_id
+   OR COALESCE(JSON_VALUE(@delivery_desired,'$.ownership_id'),'')<>@ownership_id
+   OR COALESCE(TRY_CONVERT(bigint,JSON_VALUE(@delivery_signal,'$.transport.policy_revision')),-1)<>@current_revision
+   OR COALESCE(TRY_CONVERT(bigint,JSON_VALUE(@delivery_desired,'$.policy_revision')),-1)<>@current_revision
+   OR COALESCE(JSON_VALUE(@delivery_signal,'$.transport.definition_hash'),'')<>{payload_hash("JSON_QUERY(@prior,'$.desired_definition')")}
+   OR COALESCE(JSON_VALUE(@delivery_signal,'$.transport.collector_identity_id'),'')<>COALESCE(JSON_VALUE(@delivery_proof,'$.collector_identity_id'),'missing')
+   OR NOT {exact_text_equal("JSON_VALUE(@delivery_signal,'$.transport.workspace_id')", "JSON_VALUE(@prior,'$.workspace_id')")}
+   OR NOT {exact_text_equal("JSON_VALUE(@delivery_signal,'$.transport.eventstream_id')", "JSON_VALUE(@prior,'$.eventstream_id')")}
+   OR NOT {exact_text_equal("JSON_VALUE(@delivery_signal,'$.transport.destination_id')", "JSON_VALUE(@prior,'$.destination_id')")}
+   OR {equal}(JSON_QUERY(@delivery_signal,'$.transport.endpoint'),JSON_QUERY(@prior,'$.endpoint'))<>1
+   OR {equal}(JSON_QUERY(@delivery_signal,'$.partition'),JSON_QUERY(@delivery_batch,'$.result.partition'))<>1
+   OR COALESCE(JSON_VALUE(@delivery_signal,'$.partition.consumer_group'),'')<>COALESCE(JSON_VALUE(@prior,'$.endpoint.consumer_group'),'missing')
+   OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.received_at')) IS NULL
+   OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.transport.identity_verified_at')) IS NULL
+   OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.position.enqueued_at')) IS NULL
+   OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_desired,'$.published_at')) IS NULL
+   OR NOT {exact_text_equal("JSON_VALUE(@delivery_proof,'$.received_at')", "JSON_VALUE(@delivery_signal,'$.received_at')")}
+   OR NOT {exact_text_equal("JSON_VALUE(@delivery_proof,'$.identity_verified_at')", "JSON_VALUE(@delivery_signal,'$.transport.identity_verified_at')")}
+   OR TRY_CONVERT(datetimeoffset,JSON_VALUE({observation},'$.delivery_verified_at'))<>TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.received_at'))
+   OR TRY_CONVERT(datetimeoffset,JSON_VALUE({observation},'$.identity_verified_at'))<>TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.transport.identity_verified_at'))
+   OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.received_at'))>TODATETIMEOFFSET(@now,'+00:00')
+   OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.transport.identity_verified_at'))>TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.received_at'))
+   OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.transport.identity_verified_at'))<TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_desired,'$.published_at'))
+   OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.position.enqueued_at'))<TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_desired,'$.published_at'))
+   OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.position.enqueued_at'))>TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.received_at'))
+   OR NOT EXISTS (
+       SELECT 1 FROM OPENJSON(@delivery_batch,'$.result.positions') AS p
+       JOIN {records} AS j ON j.tenant_id=@tenant_id AND j.epoch=@epoch AND j.record_kind='stream_position'
+         AND j.parent_key=JSON_VALUE(@delivery_batch,'$.result.partition_key')
+         AND j.sequence_number=TRY_CONVERT(bigint,JSON_VALUE(p.value,'$.sequence_number')) AND j.status='accepted'
+       WHERE TRY_CONVERT(bigint,JSON_VALUE(p.value,'$.sequence_number'))=TRY_CONVERT(bigint,JSON_VALUE(@delivery_signal,'$.position.sequence_number'))
+         AND JSON_VALUE(p.value,'$.receipt_kind')='identified'
+         AND {exact_text_equal("JSON_VALUE(p.value,'$.receipt_key')", "JSON_VALUE(@delivery_proof,'$.receipt_key')")}
+         AND {exact_text_equal("JSON_VALUE(p.value,'$.offset')", "JSON_VALUE(@delivery_signal,'$.position.offset')")}
+         AND JSON_VALUE(p.value,'$.enqueued_at')=JSON_VALUE(@delivery_signal,'$.position.enqueued_at')
+         AND JSON_VALUE(p.value,'$.first_committed_batch_id')=JSON_VALUE(@delivery_proof,'$.request_id')
+         AND JSON_VALUE(p.value,'$.original_payload_hash')={payload_hash('@delivery_signal')}
+         AND JSON_VALUE(j.payload,'$.batch_id')=JSON_VALUE(@delivery_proof,'$.request_id')
+         AND JSON_VALUE(j.payload,'$.payload_hash')={payload_hash('@delivery_signal')})
+   OR NOT EXISTS (
+       SELECT 1 FROM {records} AS accepted JOIN {records} AS fact
+         ON fact.tenant_id=accepted.tenant_id AND fact.epoch=accepted.epoch AND fact.record_kind='signal'
+         AND fact.full_key=JSON_VALUE(@delivery_proof,'$.receipt_key')
+       WHERE accepted.tenant_id=@tenant_id AND accepted.epoch=@epoch AND accepted.record_kind='accepted_fact'
+         AND JSON_VALUE(accepted.payload,'$.batch_id')=JSON_VALUE(@delivery_proof,'$.request_id')
+         AND JSON_VALUE(accepted.payload,'$.fact_key')=fact.full_key
+         AND JSON_VALUE(accepted.payload,'$.fact_kind')='signal'
+         AND TRY_CONVERT(bigint,JSON_VALUE(accepted.payload,'$.fact_revision'))=fact.revision
+         AND JSON_VALUE(accepted.payload,'$.payload_hash')={payload_hash('fact.payload')}
+         AND JSON_VALUE(accepted.payload,'$.row_hash')={record_hash('fact')})
+   OR NOT EXISTS (
+       SELECT 1 FROM OPENJSON(@prior,'$.sources') AS s
+       JOIN {records} AS capability ON capability.tenant_id=@tenant_id AND capability.epoch=@epoch
+         AND capability.record_kind='target_capability'
+         AND {equal}(JSON_QUERY(capability.payload,'$.target'),JSON_QUERY(s.value,'$.target'))=1
+       WHERE {equal}(JSON_QUERY(s.value,'$.target'),JSON_QUERY(@delivery_signal,'$.observation.execution.target'))=1
+         AND JSON_VALUE(s.value,'$.source_id')=JSON_VALUE(@delivery_signal,'$.transport.source_id')
+         AND {exact_text_equal("JSON_VALUE(s.value,'$.event_source')", "JSON_VALUE(@delivery_signal,'$.delivery.event_source')")}
+         AND JSON_VALUE(capability.payload,'$.collector_identity_id')=JSON_VALUE(@delivery_proof,'$.collector_identity_id')
+         AND JSON_VALUE(capability.payload,'$.read_status')='verified'
+         AND JSON_VALUE(capability.payload,'$.event_status')='verified'
+         AND TRY_CONVERT(datetimeoffset,JSON_VALUE(capability.payload,'$.expires_at'))>TODATETIMEOFFSET(@now,'+00:00')
+         AND EXISTS (SELECT 1 FROM OPENJSON(s.value,'$.event_types') AS e
+             WHERE {exact_text_equal('e.value', '(' + subscription_type_sql('@delivery_signal') + ')')}))
+    THROW 51072, 'Readiness requires the original current accepted transport receipt', 1;
+"""
 
 
 def connector_procedures(names: SqlNames, contracts: dict[str, RpcContract]) -> dict[str, KernelObject]:
@@ -158,8 +270,8 @@ IF COALESCE(@version,0)<>@expected_connector_revision
     THROW 51072, 'Connector revision/ownership changed or the owned connector is retired', 1;
 SELECT @desired=payload FROM {records} WHERE tenant_id=@tenant_id AND epoch=@epoch
   AND record_kind='connector_desired' AND full_key=@connector_id;
-IF @prior IS NOT NULL AND @desired IS NULL
-    THROW 51072, 'Existing connector has no protected desired-publication provenance', 1;
+IF {initial_publication_invalid_sql(names)}
+    THROW 51072, 'Initial connector publication requires a proof-free registered baseline and admitted sources', 1;
 {proposal_binding_sql(names)}
 IF EXISTS (SELECT 1 FROM OPENJSON(@desired_sources) AS s
     WHERE JSON_QUERY(s.value,'$.target') IS NULL
@@ -279,7 +391,8 @@ IF @prior IS NOT NULL AND EXISTS (
           WHERE {exact_text_equal('old_binding.[key]', 'new_binding.[key]')}
             AND {exact_text_equal('old_binding.value', 'new_binding.value')}))
     THROW 51072, 'Established physical component IDs must remain bound to the same owned nodes', 1;
-IF @prior IS NOT NULL AND TRY_CONVERT(bigint,JSON_VALUE(@prior,'$.policy_revision'))=@current_revision
+IF @prior IS NOT NULL AND @desired IS NOT NULL
+   AND TRY_CONVERT(bigint,JSON_VALUE(@prior,'$.policy_revision'))=@current_revision
    AND {exact_text_equal("JSON_VALUE(@prior,'$.name')", '@name')}
    AND {payload_hash("JSON_QUERY(@prior,'$.sources')")}={payload_hash('@sources')}
    AND {payload_hash("JSON_QUERY(@prior,'$.desired_definition')")}={payload_hash('@definition')}
@@ -333,9 +446,11 @@ BEGIN
        OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@observation,'$.delivery_verified_at'))
            <TRY_CONVERT(datetimeoffset,JSON_VALUE(@desired,'$.published_at'))
         THROW 51072, 'Readiness lacks current matched ownership/topology/identity/delivery evidence', 1;
+    {require_delivery_proof_sql(names, '@observation')}
     SET @next=JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(@next,'$.state','ready'),
         '$.identity_verified_at',JSON_VALUE(@observation,'$.identity_verified_at')),
         '$.delivery_verified_at',JSON_VALUE(@observation,'$.delivery_verified_at'));
+    SET @next=JSON_MODIFY(@next,'$.delivery_proof',JSON_QUERY(@observation,'$.delivery_proof'));
 END;
 SET @next=JSON_MODIFY(JSON_MODIFY(@next,'$.revision',@expected_connector_revision+1),
     '$.updated_at',CONVERT(nvarchar(40),@now,127)+N'Z');

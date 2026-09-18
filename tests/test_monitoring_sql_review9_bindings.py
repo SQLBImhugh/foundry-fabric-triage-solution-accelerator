@@ -23,7 +23,11 @@ from triage.monitoring.contracts import (
 from triage.monitoring.deployment_schema import RegistrationNames, kernel_abi
 from triage.monitoring.memory import InMemoryMonitoringStore, key_digest
 from triage.monitoring.schema import permission_kernel_objects, resolve_kernel_tables
-from triage.monitoring.sql_kernel_connectors import PUBLICATION_FIELDS, source_authorized_predicate
+from triage.monitoring.sql_kernel_connectors import (
+    PUBLICATION_FIELDS,
+    initial_publication_invalid_sql,
+    source_authorized_predicate,
+)
 from triage.monitoring.sql_kernel_contracts import KERNEL_VERSION
 from triage.monitoring.sql_kernel_intake import (
     connector_collection_eligible_sql,
@@ -80,6 +84,10 @@ class Review9Database(ActionAbiDatabase):
         super().__init__(h)
         self.work_fences = {}
         self.fail_connector_receipt = False
+        self.guards.create_function(
+            "JSON_EQUAL", 2,
+            lambda left, right: int(left is not None and right is not None and json.loads(left) == json.loads(right)),
+        )
 
     def handoff(self, *args, **kwargs):
         return super().handoff(*args, **kwargs)
@@ -145,8 +153,17 @@ class Review9Database(ActionAbiDatabase):
         if frontier.accepted_revision != plan.frontier_revision:
             raise RuntimeError("Accepted frontier changed (51072)")
         prior = self.model("connector", plan.connector_id, m.OwnedConnectorManifest)
+        desired_row = self.records.get(("connector_desired", plan.connector_id))
         if (prior.revision if prior else 0) != plan.expected_connector_revision:
             raise RuntimeError("Desired connector CAS changed (51072)")
+        from test_monitoring_sql_removals import _adapt
+
+        if self.guards.execute(
+            "SELECT CASE WHEN " + _adapt(self, initial_publication_invalid_sql(self.names)) + " THEN 1 ELSE 0 END",
+            {"prior": prior.model_dump_json() if prior else None,
+             "desired": desired_row.payload if desired_row else None, "plan": plan.model_dump_json()},
+        ).fetchone()[0]:
+            raise RuntimeError("Initial publication is not an admitted proof-free registered baseline (51072)")
         sources, proposals, desired_definition = plan.sources, plan.source_proposals, plan.desired_definition
         old_pending = {item.removal_id: item for item in prior.source_removals} if prior else {}
         pending = []
@@ -224,7 +241,7 @@ class Review9Database(ActionAbiDatabase):
                 "current_revision": self.control.revision, "now": self.clock().isoformat(),
             }):
                 raise RuntimeError("Desired source is not currently approved (51072)")
-        changed = prior is None or (
+        changed = prior is None or desired_row is None or (
             prior.sources != sources or prior.source_proposals != proposals or prior.desired_definition != desired_definition
             or prior.source_removals != pending
             or prior.policy_revision != self.control.revision or prior.name != plan.name
@@ -246,6 +263,7 @@ class Review9Database(ActionAbiDatabase):
                 "state": "provisioning" if changed else prior.state,
                 "identity_verified_at": None if changed else prior.identity_verified_at,
                 "delivery_verified_at": None if changed else prior.delivery_verified_at,
+                "delivery_proof": None if changed else prior.delivery_proof,
             })
         if plan.readiness_receipt_id is not None:
             if changed or prior is None or plan.readiness_receipt_id != work.reconcile_request_id:
@@ -262,10 +280,17 @@ class Review9Database(ActionAbiDatabase):
             current = m.OwnedConnectorManifest.model_validate({
                 **current.model_dump(), "state": "ready", "identity_verified_at": observation.identity_verified_at,
                 "delivery_verified_at": observation.delivery_verified_at,
+                "delivery_proof": observation.delivery_proof,
             })
         self.native_put("connector", current.connector_id, current.model_dump(mode="json"), status=current.state)
         if changed:
-            self.native_put("connector_desired", current.connector_id, {"published_at": self.clock().isoformat()})
+            self.native_put("connector_desired", current.connector_id, m.ConnectorDesiredState(
+                connector_id=current.connector_id, ownership_id=current.ownership_id,
+                publication_id=args["publication_id"], policy_revision=self.control.revision,
+                sources_hash=m._digest([value.model_dump(mode="json") for value in current.sources]),
+                definition_hash=m.connector_definition_hash(current.desired_definition),
+                published_at=self.clock(),
+            ).model_dump(mode="json"))
         reply = self.reply("controller.publish_connector", args, {
             "connector_id": current.connector_id, "connector": current.model_dump(mode="json"),
             "state": current.state, "desired_changed": changed,
@@ -311,6 +336,7 @@ class Review9Database(ActionAbiDatabase):
         effective = m.OwnedConnectorManifest.model_validate({
             **observed.model_dump(), "identity_verified_at": prior.identity_verified_at,
             "delivery_verified_at": prior.delivery_verified_at,
+            "delivery_proof": prior.delivery_proof,
             "state": "provisioning" if observed.state == "ready" and prior.state != "ready" else observed.state,
         })
         self.native_put("connector", prior.connector_id, effective.model_dump(mode="json"), status=effective.state)
@@ -331,11 +357,11 @@ class Review9Database(ActionAbiDatabase):
         return self.reply("controller.resolve_frontier", args, self._resolve_frontier_result(args))
 
 
-def setup_sql():
+def setup_sql(*, database_type=Review9Database):
     h = Harness()
     h.seed()
     h.activate()
-    db = Review9Database(h)
+    db = database_type(h)
     db.principal = "web"
     web = AzureSqlMonitoringStore(db=db, component="web")
     queued = web.request_discovery(h.version, m.ScopeSelector(tenant_id=uid(1), kind="tenant"), request_id=h.next_id())
@@ -389,7 +415,9 @@ def test_controller_connector_creation_is_planned_and_receipt_replays_before_rev
 
 
 def test_worker_ready_observation_requires_receipt_bound_controller_publication():
-    h, db, store, work, frontier = setup_sql()
+    from test_monitoring_sql_receiver_bindings import ReceiverAbiDatabase, record_delivery_evidence
+
+    h, db, store, work, frontier = setup_sql(database_type=ReceiverAbiDatabase)
     request = publication(h, work, frontier)
     created = store.publish_connector(request).connector
     store.reconcile_work(work)
@@ -418,9 +446,11 @@ def test_worker_ready_observation_requires_receipt_bound_controller_publication(
     assert bound.state == "provisioning"
     h.clock.advance(1)
     db.principal = "worker"
+    bound, proof = record_delivery_evidence(h, worker, bound, db=db)
     effective = worker.record_connector(h.version, m.OwnedConnectorManifest.model_validate({
         **bound.model_dump(), "revision": bound.revision + 1, "state": "ready",
         "identity_verified_at": h.clock(), "delivery_verified_at": h.clock(), "updated_at": h.clock(),
+        "delivery_proof": proof,
     }), expected_connector_revision=bound.revision,
         commit=connector_commit(h, worker, bound.connector_id, db=db))
     assert effective.state == "provisioning" and effective.delivery_verified_at is None
@@ -907,6 +937,8 @@ def test_memory_whole_window_rejection_preserves_the_original_page_record():
 
 
 def test_memory_worker_observation_cannot_publish_new_readiness():
+    from test_monitoring_sql_receiver_bindings import record_delivery_evidence
+
     h = Harness()
     h.seed()
     h.activate()
@@ -939,9 +971,11 @@ def test_memory_worker_observation_cannot_publish_new_readiness():
     bound = next(value for value in controller.list_connectors(m.PageQuery(**h.context())).items if value.connector_id == created.connector_id)
     assert bound.source_proposals == () and bound.sources[0].source_id == uid(901)
     h.clock.advance(1)
+    bound, proof = record_delivery_evidence(h, worker, bound)
     effective = worker.record_connector(h.version, m.OwnedConnectorManifest.model_validate({
         **bound.model_dump(), "revision": bound.revision + 1, "state": "ready",
         "identity_verified_at": h.clock(), "delivery_verified_at": h.clock(), "updated_at": h.clock(),
+        "delivery_proof": proof,
     }), expected_connector_revision=bound.revision,
         commit=connector_commit(h, worker, bound.connector_id))
     assert effective.state == "provisioning" and effective.delivery_verified_at is None

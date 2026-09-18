@@ -25,7 +25,7 @@ from triage.monitoring.contracts import (
     MonitoringConflict,
     MonitoringUnavailable,
 )
-from triage.monitoring.memory import InMemoryMonitoringStore, stable_id
+from triage.monitoring.memory import InMemoryMonitoringStore, StoredRecord, key_digest, stable_id
 from triage.monitoring.provisioning import (
     ProvisioningReview,
     plan_definition,
@@ -563,6 +563,17 @@ async def test_component_stores_execute_removal_and_retirement_through_real_stor
     else:
         await factory(seed, clock, remote).run_once()
     owned = connector(seed)
+    # This fixture starts after publication, not from dormant registration.
+    desired = m.ConnectorDesiredState(
+        connector_id=owned.connector_id, ownership_id=owned.ownership_id,
+        publication_id=str(UUID(int=84_000)), policy_revision=owned.policy_revision,
+        sources_hash=m._digest([source.model_dump(mode="json") for source in owned.sources]),
+        definition_hash=m._digest(owned.desired_definition), published_at=clock(),
+    )
+    state.records[(CONTEXT.tenant_id, CONTEXT.epoch, "connector_desired", key_digest(owned.connector_id))] = StoredRecord(
+        kind="connector_desired", key=owned.connector_id, context=CONTEXT,
+        payload=desired.model_dump_json(), version=1,
+    )
     original = owned.source_proposals[0] if logical else owned.sources[0]
     exclude(seed, target())
     web = InMemoryMonitoringStore(state=state, clock=clock, component="web")

@@ -29,6 +29,24 @@ from triage.store.incidents import InMemoryIncidentStore
 __all__ = ["factory"]
 
 
+def prior_publication(manifest, now):
+    return m.ConnectorDesiredState(
+        connector_id=manifest.connector_id, ownership_id=manifest.ownership_id,
+        publication_id=uid(90_999), policy_revision=manifest.policy_revision,
+        sources_hash=m._digest([source.model_dump(mode="json") for source in manifest.sources]),
+        definition_hash=m._digest(manifest.desired_definition), published_at=now,
+    )
+
+
+def seed_existing_publication(seed, clock):
+    # These orchestration cases start with a previously published transport,
+    # not the separate proof-free registration/first-publication lifecycle.
+    assert seed.component == "fixture"
+    manifest = connector(seed)
+    with seed._backend.transaction(write=True, operation="fixture_publication", request_id=uid(90_999)):
+        seed._put("connector_desired", manifest.connector_id, CONTEXT, prior_publication(manifest, clock()))
+
+
 async def drain_controller(runner, controller):
     results = []
     for _ in range(10):
@@ -59,6 +77,7 @@ async def test_runner_dispatch_plans_only_the_registered_transport_with_current_
     factory, tmp_path, event_capability,
 ):
     seed, state, clock, remote = setup_store(existing=())
+    seed_existing_publication(seed, clock)
     current = seed.resolve_target(target())
     seed.record_capability(
         version(seed), m.CapabilityObservation(
@@ -98,6 +117,7 @@ async def test_runner_dispatch_plans_only_the_registered_transport_with_current_
 
 async def test_runner_scope_change_worker_delete_and_controller_retirement_are_wired(factory, tmp_path):
     seed, state, clock, remote = setup_store()
+    seed_existing_publication(seed, clock)
     await factory(seed, clock, remote).run_once()
     original = connector(seed).sources[0]
     web = InMemoryMonitoringStore(state=state, clock=clock, component="web")
@@ -164,7 +184,10 @@ def test_sql_reconciliation_routes_registered_transport_to_guarded_publication()
     db.native_put(
         "connector", registered.connector_id, registered.model_dump(mode="json"), status="planned",
     )
-    db.native_put("connector_desired", registered.connector_id, {"published_at": h.clock().isoformat()})
+    db.native_put(
+        "connector_desired", registered.connector_id,
+        prior_publication(registered, h.clock()).model_dump(mode="json"),
+    )
     result = controller.reconcile_work(work)
     assert result.state == "published"
     current = next(

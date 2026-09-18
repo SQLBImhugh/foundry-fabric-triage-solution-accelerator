@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -424,7 +425,62 @@ async def test_receiver_stores_then_checkpoints_and_closes_on_stop():
     await asyncio.wait_for(task, 2)
     assert consumers[0].closed.is_set()
     assert credentials[0].closed
+    assert checkpoints.receiver_identity is None and checkpoints.receiver_identity_verified_at is None
+    assert checkpoints.receiver_publication_id is None
     assert backend.action_fences == {"existing-action-fence"}
+
+
+@pytest.mark.parametrize("change", ["policy", "definition", "publication"])
+async def test_changed_publication_reverifies_pinned_transport_before_recording_identity_time(change):
+    backend = MemoryBackend()
+    clients = []
+
+    class ChangedContextConsumer(FakeConsumer):
+        property_reads = 0
+
+        async def get_partition_properties(self, partition_id):
+            self.property_reads += 1
+            return await super().get_partition_properties(partition_id)
+
+        async def receive(self, on_event, **kwargs):
+            backend.now += timedelta(seconds=5)
+            if change == "policy":
+                backend.control = backend.control.model_copy(update={"revision": 2})
+                backend.manifest = backend.manifest.model_copy(update={"policy_revision": 2})
+            elif change == "definition":
+                definition = {**backend.manifest.desired_definition, "publication": "changed"}
+                backend.manifest = backend.manifest.model_copy(update={
+                    "desired_definition": definition, "observed_definition": definition,
+                })
+            else:
+                backend.manifest = backend.manifest.model_copy(update={"name": "Renamed connector"})
+            backend.publication = backend.publication.model_copy(update={
+                "publication_id": ITEM, "policy_revision": backend.manifest.policy_revision,
+                "published_at": backend.now,
+            })
+            await super().receive(on_event, **kwargs)
+
+    def client_factory(binding, credential, **kwargs):
+        client = ChangedContextConsumer(binding, credential, events=(FakeEvent(),), **kwargs)
+        clients.append(client)
+        return client
+
+    checkpoints = adapter(backend)
+    receiver = EventReceiver(
+        checkpoints, identity_binding(), client_factory=client_factory, credential_factory=FakeCredential,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(receiver.run(stop))
+    try:
+        await wait_until(lambda: task.done() or clients and clients[0].delivered.is_set())
+    finally:
+        stop.set()
+        await task
+    receipt, = backend.positions.values()
+    assert clients[0].property_reads == 3
+    assert receipt.transport.identity_verified_at == NOW + timedelta(seconds=5)
+    assert receipt.transport.policy_revision == backend.control.revision
+    assert checkpoints.accepted_positions == 1
 
 
 async def test_swallowed_sdk_callback_failure_stops_before_later_checkpoint(caplog):

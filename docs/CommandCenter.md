@@ -69,10 +69,18 @@ the placeholder, without selector error alerts.
 
 The broader item scan remains partial: Power BI dataset reads returned 401
 without source permissions, and request-budget/throttling gaps remain visible.
-The API's complete flag respects the latest partial generation even when no
-scopes are configured; the corresponding web/API build is deployed and its
-existing SCM restrictions were restored. No static/fake workspaces, automatic
-scope admission, remediation or extra Fabric grants were added.
+Snapshot counts remain deployment/estate-wide. **Inventory total** stays
+**Unknown** until all latest discovery generations are complete, including when
+no scopes are configured. No static/fake workspaces, automatic scope admission,
+remediation or extra Fabric grants were added.
+
+A separately bounded priority proof processed an original fresh discovery
+request on attempt 1 without manual requeue behind existing partial-inventory
+work. Its selected workspace completed ten pages with three items, including
+one unsupported Eventstream. Selector-aware preview readiness can use that
+complete workspace without declaring the estate-wide snapshot complete.
+First-scope activation remains separate acceptance work; partial-window replay
+churn is not claimed resolved.
 
 Three actual recurrences of the reused one-minute heartbeat scheduler completed
 after response-envelope validation. Portal-only missing/failed-heartbeat alerts
@@ -223,6 +231,21 @@ These choices bound inventory and polling scope. They are not wildcard
 subscriptions to every operational event in a tenant, domain or workspace.
 Native Fabric Job-event sources require their own supported, owned configuration.
 
+Preview readiness is selector-aware, unlike the estate-wide coverage snapshot.
+A complete workspace A can support a ready preview while workspace B keeps
+estate coverage Partial and **Inventory total** Unknown. Missing workspace/domain
+metadata still blocks expansion. Explicit disable/contraction operates on stored
+admissions and is not blocked merely by such an outage.
+
+The source activation contract permits an unrelated data-revision change only
+after re-evaluating the original scope inside the locked activation transaction
+and confirming identical reviewed material effects. New targets, changed
+capabilities/subscriptions, gaps or permissions, expired TTL, epoch drift or
+policy changes refuse activation. This is not a blanket stale-plan retry rule.
+The first native attempt returned a conflict and its original operation lookup
+did not establish a commit; no new native activation acceptance is claimed while
+the combined source/UI review is pending.
+
 The UI clears dependent selections and invalidates stale reads/previews.
 An existing policy can be submitted for disabling with its saved include/exclude
 rules unchanged even if workspace metadata is now unknown or missing. New
@@ -238,12 +261,15 @@ exposure before activation; this app does not add per-workspace human ACLs.
 
 ### Coverage, inventory and connector proof
 
-Coverage separates **discovered**, **access verified**, **admitted**, **current**
-and **action enabled** counts. Unsupported items are reported separately.
-An unknown denominator stays unknown; a caller-visible workspace/item listing
-does not establish complete tenant inventory. Partial enumeration preserves
-known records and reports gaps rather than treating an unreadable page as
-deletion.
+Coverage separates deployment/estate-wide **discovered**, **supported**,
+**access verified**, **admitted**, **current** and **action enabled** counts.
+Unsupported items are reported separately. The UI denominator is **Inventory
+total**, not a scope denominator: it remains **Unknown** until every latest
+discovery generation is complete. For example, a complete A with three items
+plus a partial B with five cannot make eight a known complete inventory total.
+A caller-visible listing is not complete tenant inventory. Partial enumeration
+preserves known records and reports gaps rather than treating unreadable pages
+as deletion.
 
 Admitted/current counts describe target state, not proof that every poll window
 or event delivery is current. Read their accompanying timestamps and gaps.
@@ -282,8 +308,10 @@ Read readiness in layers:
 | Current scope, review, explicit approval and reservation | Permission for one bounded action when all guards pass | Verification that the external action succeeded |
 
 The deployed collector-only heartbeat has no connector and cannot report event
-delivery. A partial latest generation remains partial with zero scopes; an
-empty target list is not evidence that the tenant is healthy.
+delivery. Any latest partial generation keeps estate completeness partial and
+**Inventory total** Unknown, including with zero scopes. A ready scoped preview
+for a complete chosen workspace does not narrow those snapshot counts or grant
+permissions. An empty target list is not evidence that the tenant is healthy.
 
 Connector records show owned source subscriptions, desired/observed topology,
 identity and delivery proof timestamps, and explicit gaps. Planned connectors
@@ -829,7 +857,11 @@ command to `heartbeat`; no second timer or mailbox path was enabled, and the
 separate silent schedule was unchanged. Three real recurrence responses were
 verified completed. The deployed missing/failed-heartbeat alerts are portal-only:
 `RunsSucceeded < 1` over 15 minutes and `RunsFailed > 0` over 5 minutes.
-No Action Group/email/webhook delivery or absence canary is claimed.
+The optional app-owned Insights log-absence rule uses a summarizing query that
+returns one zero-count row when no completed heartbeat is present; metric
+no-data is not treated as zero. Its isolated validation rule fired and resolved,
+then was disabled. The production log rule remains enabled with no actions.
+No actual controller stop or Action Group/email/webhook delivery was tested.
 
 Without the controller drain, admitted work remains queued. Without the
 collector/receiver, no fresh collection is implied by a successful heartbeat.
