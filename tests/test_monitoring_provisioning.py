@@ -865,7 +865,7 @@ def test_existing_logical_proposal_is_preserved_by_typed_withdrawal_intent():
     again = plan_definition(published, published.desired_definition, (store.resolve_target(target()),))
     assert again.source_proposals == first.source_proposals
     assert again.new_names == frozenset()
-    removal = plan_definition(published, published.desired_definition, ())
+    removal = plan_definition(published, published.desired_definition, (), removal_targets=(target(),))
     assert publication_sources(published, removal) == ()
     assert removal.source_proposals == first.source_proposals
     assert len(removal.source_removals) == 1
@@ -878,7 +878,7 @@ def test_existing_logical_proposal_is_preserved_by_typed_withdrawal_intent():
 def test_removal_plan_cannot_release_owned_component_before_receipt_bound_publication():
     store, _, _, _ = setup_store()
     prior = connector(store)
-    plan = plan_definition(prior, prior.desired_definition, ())
+    plan = plan_definition(prior, prior.desired_definition, (), removal_targets=(target(),))
     assert publication_sources(prior, plan) == prior.sources
     assert len(plan.source_removals) == 1
     assert plan.source_removals[0].source_id == prior.sources[0].source_id

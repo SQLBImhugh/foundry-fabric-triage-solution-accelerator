@@ -303,11 +303,12 @@ def test_actual_canary_contract_prepares_complete_nonsecret_physical_metadata_on
     assert all(getattr(connector, field) is None for field in (
         "identity_verified_at", "delivery_verified_at", "delivery_proof", "last_receiver_activity_at", "operation_id",
     ))
-    # Existing provisioning helpers recognize the owned nodes, but no target is
-    # admitted merely by retaining them. This proposed plan is not persisted.
+    # Missing admission is neither permission to receive nor authority to remove
+    # retained physical ownership.
     proposal = plan_definition(connector, connector.desired_definition, ())
-    assert len(proposal.source_removals) == 1
-    assert not proposal.target_by_name and not proposal.new_names
+    assert proposal.source_removals == () and not proposal.new_names
+    assert proposal.deferred_targets == tuple(source.target for source in connector.sources)
+    assert proposal.desired == connector.desired_definition
     assert plan.expires_at == NOW + timedelta(minutes=15)
 
 

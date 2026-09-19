@@ -260,6 +260,13 @@ acceptance remain open.
 
 ### Source additions and revocations
 
+Physical contraction requires affirmative current `removal_targets` from
+effective disable/exclude/deletion authority. Resolve overlapping includes and
+exclusions first; unknown domain/scope authority holds the decision. Expired
+READ capability, incomplete inventory or absence from the current eligible list
+does not authorize removing an owned source. Keep its identity and report the
+gap while ordinary intake/action/readiness fences remain in force.
+
 Controller publication first records a logical source proposal with
 `source_id=null`; no unresolved proposal may invent a physical ID. The worker
 applies only the owned definition and records the actual observation. A later
@@ -278,6 +285,62 @@ Keep `pending_removals`, `retired_sources` and `observation_receipt_id` distinct
 when interpreting a publication result. Neither a saved removal request nor
 a worker-reported `ready` state is published readiness. Key-free endpoint
 automation remains unproved; retain the manual Entra-tab bootstrap.
+
+### Held removals and receipt-bound restoration
+
+The restoration boundary is implemented and offline-tested but remains under
+review. It is not a live-restoration or resumed-receiver acceptance record.
+A source can still be physically present while its pending removal correctly
+keeps intake held; a paused/degraded worker or fresh-looking manifest does not
+make that intent safe to erase.
+
+Only controller `source_removal_supersessions` may supersede an exact pending
+physical `{removal_id, source_id}` under the current policy and work fences.
+It is not a browser override, registrar operation, SQL bootstrap recovery or
+reset command. Operators should distinguish:
+
+| Observation | Required interpretation |
+|---|---|
+| Unknown/expired capability or incomplete inventory | Hold uncertainty; do not create physical removal authority |
+| Exact original read-only presence receipt | Evidence to evaluate restoration, not permission or Ready by itself |
+| Any applicable operation ID, retained pre-POST `INTENT_GAP`, missing/ambiguous history or attempted work | Possible dispatch/effect remains unresolved; a later present-source GET cannot waive it |
+| Successful guarded supersession | New unready desired publication with preserved original audit and physical identity; fresh post-publication proof is still required |
+
+The original complete `worker.observe_connector` receipt must carry an explicit
+`ConnectorPresenceInspection`: read-only GET time, SQL-compatible definition
+hash and the complete canonical physical-GUID/`Running` map. It must follow the
+removal and be within 300 seconds. Do not substitute the latest connector
+projection, a copied receipt, heartbeat, partial topology or caller proof flag.
+
+READ must be freshly verified and the current observation admission must be
+`reviewed` or `auto_detection_only`; neither grants action permission.
+Restoration currently supports directly matched tenant/workspace/item includes,
+not domain-only admission. Matching exclusions and unresolved domain-exclusion
+authority block it. Explicit denied/blocked capability cannot be waived.
+The selected retained source's unknown event status is not an exemption for
+new sources or other failed capability checks.
+
+Quiescence is connector-specific and receipt-bound. The original GET collection
+must be completed under its exact released lease and completion receipt.
+Other active or nonterminal attempted connector work blocks restoration.
+A queued row is never-claimed only if it has zero attempts and retry attempts,
+no lease payload or physical lease row/tombstone, and no execution/action/retry/
+finalization lineage or target binding. An expired tombstone is still history; `attempts=0` alone
+is insufficient.
+
+The new immutable result retains original pending-removal objects in
+`superseded_source_removals`; old receipts/history and source IDs are not rewritten.
+Its desired publication has a new identity/time and cleared identity/delivery
+proofs. Require new post-publication read/event capability, actual collector
+identity/OID and receive/enqueue evidence before the first accepted delivery
+receipt can establish Ready. Do not require Ready or `events_enabled` for that
+first qualifying delivery, and do not bypass any other admission/provenance
+check. Unknown or unsupported conditions remain held.
+
+Never delete the intent or its history, issue operator SQL DML, re-register,
+reset, or restore an old proof merely to turn a status green. Use the current
+controller path and preserve the original evidence after uncertainty. See the
+[full source contract](TechnicalArchitecture.md#receipt-bound-source-removal-restoration).
 
 ## Coverage and recovery
 

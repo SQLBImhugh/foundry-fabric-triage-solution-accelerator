@@ -64,7 +64,7 @@ def delivery_fixture(backend):
     return h, db, worker, owned, desired
 
 
-def accept_delivery(h, worker, owned, partition_id, *, enqueued_at):
+def accept_delivery(h, worker, owned, partition_id, *, enqueued_at, source_index=0):
     partition = m.PartitionIdentity(
         **h.context(), connector_id=owned.connector_id,
         consumer_group=owned.endpoint.consumer_group, partition_id=partition_id,
@@ -77,7 +77,7 @@ def accept_delivery(h, worker, owned, partition_id, *, enqueued_at):
         partition=partition, lease=ownership.lease, first_available_sequence_number=100, observed_at=h.clock(),
     ))
     request_id = h.next_id()
-    source = owned.sources[0]
+    source = owned.sources[source_index]
     signal = m.SignalReceipt(
         delivery=m.TransportDeliveryIdentity(
             **h.context(), connector_id=owned.connector_id, event_source=source.event_source, event_id=request_id,

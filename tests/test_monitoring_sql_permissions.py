@@ -348,7 +348,7 @@ def test_new_generators_parse_on_the_declared_python_floor() -> None:
         "sql_kernel_retries.py", "sql_kernel_history.py",
         "sql_kernel_connectors.py",
         "sql_kernel_arguments.py", "sql_kernel_retention.py", "sql_kernel_sources.py", "sql_kernel_proposals.py",
-        "sql_kernel_correlation.py",
+        "sql_kernel_correlation.py", "sql_kernel_removals.py", "sql_kernel_supersessions.py",
     )
     for name in names:
         ast.parse((root / name).read_text("utf-8"), filename=name, feature_version=(3, 11))

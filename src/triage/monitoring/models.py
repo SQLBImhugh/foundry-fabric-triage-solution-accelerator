@@ -21,9 +21,11 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    SerializerFunctionWrapHandler,
     StrictBool,
     StringConstraints,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -895,6 +897,17 @@ class PendingSourceRemoval(SourceRemovalIntent):
         return SourceRemovalIntent.model_validate(self.model_dump(include=set(SourceRemovalIntent.model_fields)))
 
 
+class SourceRemovalSupersession(MonitoringModel):
+    removal_id: CanonicalId
+    source_id: OpaqueId
+
+    @model_validator(mode="after")
+    def validate_physical_selector(self) -> SourceRemovalSupersession:
+        if len(self.source_id.encode("utf-16-le")) > 512:
+            raise ValueError("Superseded physical source identity exceeds its SQL bound")
+        return self
+
+
 class ConnectorSourceRetirement(MonitoringModel):
     connector_id: CanonicalId
     ownership_id: CanonicalId
@@ -1088,6 +1101,7 @@ class ConnectorPublicationRequest(MonitoringModel):
     sources: Annotated[tuple[ConnectorSource, ...], Field(max_length=1_000)]
     source_proposals: Annotated[tuple[ConnectorSourceProposal, ...], Field(max_length=1_000)] = ()
     source_removals: Annotated[tuple[SourceRemovalIntent, ...], Field(max_length=1_000)] = ()
+    source_removal_supersessions: Annotated[tuple[SourceRemovalSupersession, ...], Field(max_length=1_000)] = ()
     desired_definition: JsonObject
     observation_receipt_id: CanonicalId | None = None
     readiness_receipt_id: CanonicalId | None = None
@@ -1106,6 +1120,19 @@ class ConnectorPublicationRequest(MonitoringModel):
             raise ValueError("Physical proposal binding and readiness are separate receipt-bound publications")
         if self.readiness_receipt_id is not None and (self.source_proposals or self.source_removals):
             raise ValueError("Readiness requires all proposals bound and removals verified")
+        supersessions = self.source_removal_supersessions
+        if supersessions and (self.observation_receipt_id is None or self.readiness_receipt_id is not None):
+            raise ValueError("Source-removal supersession requires original observation evidence, never readiness")
+        _unique(tuple(item.removal_id for item in supersessions), "Superseded removal IDs")
+        _unique(tuple(item.source_id for item in supersessions), "Superseded physical source IDs")
+        if (
+            {item.removal_id for item in supersessions} & {item.removal_id for item in self.source_removals}
+            or {item.source_id for item in supersessions} & {
+                item.source_id for item in self.source_removals if item.source_id is not None
+            }
+            or not {item.source_id for item in supersessions}.issubset({item.source_id for item in self.sources})
+        ):
+            raise ValueError("Supersession must select retained physical sources separately from pending removals")
         _unique(tuple(removal.removal_id for removal in self.source_removals), "Source removal IDs")
         _unique(tuple(
             f"source:{removal.source_id}" if removal.source_id is not None else f"proposal:{removal.proposal_id}"
@@ -1131,6 +1158,15 @@ class ConnectorPublicationRequest(MonitoringModel):
                     raise ValueError("An unresolved proposal cannot introduce a physical ID without its original observation receipt")
         return self
 
+    @model_serializer(mode="wrap")
+    def preserve_original_request_shape(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        value = handler(self)
+        # Original operation fingerprints predate this optional recovery intent.
+        # Omit only its empty default; an explicit selection must remain bound.
+        if not self.source_removal_supersessions:
+            value.pop("source_removal_supersessions", None)
+        return value
+
 
 class ConnectorPublicationPlan(MonitoringModel):
     """Immutable desired intent and its exact producer, work and observation bindings."""
@@ -1151,6 +1187,7 @@ class ConnectorPublicationPlan(MonitoringModel):
     sources: Annotated[tuple[ConnectorSource, ...], Field(max_length=1_000)]
     source_proposals: Annotated[tuple[ConnectorSourceProposal, ...], Field(max_length=1_000)] = ()
     source_removals: Annotated[tuple[SourceRemovalIntent, ...], Field(max_length=1_000)] = ()
+    source_removal_supersessions: Annotated[tuple[SourceRemovalSupersession, ...], Field(max_length=1_000)] = ()
     desired_definition: JsonObject
     observation_receipt_id: CanonicalId | None = None
     readiness_receipt_id: CanonicalId | None = None
@@ -1165,6 +1202,7 @@ class ConnectorPublicationResult(MonitoringModel):
     pending_removals: Annotated[tuple[PendingSourceRemoval, ...], Field(max_length=1_000)]
     retired_sources: Annotated[tuple[ConnectorSourceRetirement, ...], Field(max_length=1_000)]
     observation_receipt_id: CanonicalId | None
+    superseded_source_removals: Annotated[tuple[PendingSourceRemoval, ...], Field(max_length=1_000)] = ()
 
     @model_validator(mode="after")
     def validate_result(self) -> ConnectorPublicationResult:
@@ -1181,6 +1219,26 @@ class ConnectorPublicationResult(MonitoringModel):
                 or retirement.observation_receipt_id != self.observation_receipt_id
             ):
                 raise ValueError("Retirement belongs to another connector, owner or observation")
+        superseded = self.superseded_source_removals
+        _unique(tuple(removal.removal_id for removal in superseded), "Superseded removal IDs")
+        _unique(tuple(removal.source_id for removal in superseded), "Superseded physical source IDs")
+        if superseded:
+            if (
+                not self.desired_changed or self.state == "ready" or self.observation_receipt_id is None
+                or any(value is not None for value in (
+                    self.connector.identity_verified_at, self.connector.delivery_verified_at,
+                    self.connector.delivery_proof,
+                ))
+                or {removal.removal_id for removal in superseded} & {
+                    removal.removal_id for removal in (*self.pending_removals, *self.retired_sources)
+                }
+            ):
+                raise ValueError("Supersession changes desired state without readiness or retirement authority")
+            sources = {source.source_id: source for source in self.connector.sources}
+            for removal in superseded:
+                source = sources.get(removal.source_id)
+                if source is None or removal.proposal_id is not None or source.target != removal.target:
+                    raise ValueError("Supersession must retain the exact original physical source and target")
         return self
 
 
@@ -1198,6 +1256,31 @@ def connector_collection_eligible(observation: OwnedConnectorManifest) -> bool:
     )
 
 
+class ConnectorPresenceInspection(MonitoringModel):
+    """Explicit GET-only evidence for an original source-presence observation."""
+
+    read_only: Literal[True]
+    observed_at: UtcDateTime
+    definition_hash: SqlPayloadHash
+    component_states: Annotated[dict[CanonicalId, Literal["Running"]], Field(min_length=3, max_length=1_002)]
+
+    @field_validator("read_only", mode="before")
+    @classmethod
+    def validate_read_only(cls, value: object) -> object:
+        if value is not True:
+            raise ValueError("Presence inspection requires an explicit read-only boolean")
+        return value
+
+    @field_validator("component_states", mode="before")
+    @classmethod
+    def validate_component_identities(cls, value: object) -> object:
+        if not isinstance(value, dict) or any(
+            not isinstance(key, str) or canonical_id(key) != key for key in value
+        ):
+            raise ValueError("Presence inspection requires canonical physical component identities")
+        return value
+
+
 class ConnectorObservationResult(MonitoringModel):
     connector_id: CanonicalId
     connector: OwnedConnectorManifest
@@ -1212,6 +1295,7 @@ class ConnectorObservationResult(MonitoringModel):
     work_fence: PositiveRevision
     work_revision: PositiveRevision
     collection_completion_eligible: StrictBool
+    inspection: ConnectorPresenceInspection | None = None
 
     @model_validator(mode="after")
     def validate_observation(self) -> ConnectorObservationResult:
@@ -1232,6 +1316,22 @@ class ConnectorObservationResult(MonitoringModel):
             or self.observation.state == "ready" and self.observed_definition_hash is None
         ):
             raise ValueError("Collection completion requires original ready evidence or an explicit gap disposition")
+        if self.inspection is not None:
+            observed = self.observation
+            components = (observed.observed_definition or {}).get("component_ids")
+            if (
+                not self.collection_completion_eligible or observed.state != "degraded"
+                or observed.observed_definition is None or not isinstance(components, dict)
+                or self.inspection.definition_hash != self.observed_definition_hash
+                or self.inspection.definition_hash != connector_definition_hash(observed.observed_definition)
+                or set(self.inspection.component_states) != set(components.values())
+                or self.inspection.observed_at > observed.updated_at
+                or any(value is not None for value in (
+                    observed.operation_id, observed.identity_verified_at, observed.delivery_verified_at,
+                    observed.delivery_proof,
+                ))
+            ):
+                raise ValueError("Presence inspection must bind explicit complete unready observation evidence")
         return self
 
 
@@ -1309,6 +1409,7 @@ class ConnectorDesiredState(MonitoringModel):
     sources_hash: Fingerprint
     definition_hash: Fingerprint
     published_at: UtcDateTime
+    supersession_request_id: CanonicalId | None = None
 
 
 class SourceRunObservation(MonitoringModel):
@@ -2824,6 +2925,7 @@ class ConnectorPublicationContext(MonitoringModel):
     frontier: ValidationFrontier
     connector: OwnedConnectorManifest
     eligible_targets: Annotated[tuple[MonitoringTarget, ...], Field(max_length=1_000)] | None = None
+    removal_targets: Annotated[tuple[TargetIdentity, ...], Field(max_length=1_000)] = ()
 
     @model_validator(mode="after")
     def validate_publication_owner(self) -> ConnectorPublicationContext:
@@ -2834,8 +2936,13 @@ class ConnectorPublicationContext(MonitoringModel):
             or self.work.policy_revision != self.expected.revision
         ):
             raise ValueError("Connector orchestration requires its current leased reconciliation work")
-        if self.phase == "binding" and self.eligible_targets is not None:
+        if self.phase == "binding" and (self.eligible_targets is not None or self.removal_targets):
             raise ValueError("Physical binding uses original proposals, not a replacement target list")
+        _unique(tuple(target.key for target in self.removal_targets), "Affirmative removal targets")
+        for target in self.removal_targets:
+            _same_context(self.expected, target)
+            if target.workload != "fabric_pipeline":
+                raise ValueError("Connector removal authority requires pipeline target identities")
         if self.eligible_targets is not None:
             _unique(tuple(target.key for target in self.eligible_targets), "Eligible connector targets")
             for target in self.eligible_targets:

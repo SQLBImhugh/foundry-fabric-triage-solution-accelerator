@@ -36,6 +36,10 @@ from triage.monitoring.sql_kernel_contracts import (
 )
 from triage.monitoring.sql_kernel_intents import handoff_sql
 from triage.monitoring.sql_kernel_removals import source_is_pending_removal_sql
+from triage.monitoring.sql_kernel_supersessions import (
+    inspection_invalid_sql,
+    restored_intake_invalid_sql,
+)
 
 
 def _event_content_hash(expression: str) -> str:
@@ -224,6 +228,8 @@ IF EXISTS (
                       WHERE {exact_text_equal("e.value", f"({subscription_type_sql('p.payload')})")})
     )
 ) THROW 51072, 'Accepted event is outside the owned desired source; quarantine explicitly', 1;
+IF {restored_intake_invalid_sql(names)}
+    THROW 51072, 'Restored source intake needs fresh event capability and post-publication transport identity', 1;
 IF EXISTS (
     SELECT 1 FROM @positions AS p WHERE p.disposition='accepted'
       AND JSON_QUERY(p.payload,'$.transport') IS NOT NULL AND (
@@ -453,7 +459,7 @@ IF ISJSON(@observation_json)<>1 OR LEFT(LTRIM(@observation_json),1)<>N'{{'
    OR DATALENGTH(@observation_json)>1048576 OR EXISTS (
     SELECT 1 FROM OPENJSON(@observation_json) WHERE [key] NOT IN
        ('workspace_id','eventstream_id','destination_id','observed_definition','endpoint','operation_id',
-        'state','identity_verified_at','delivery_verified_at','delivery_proof','gaps'))
+        'state','identity_verified_at','delivery_verified_at','delivery_proof','gaps','inspection'))
     THROW 51073, 'Connector observation includes an unauthorized field', 1;
 DECLARE @prior nvarchar(max),@version bigint;
 SELECT @prior=payload,@version=revision FROM {records}
@@ -485,7 +491,7 @@ IF JSON_QUERY(@prior,'$.endpoint') IS NOT NULL
            <>{payload_hash("JSON_QUERY(@observation_json,'$.endpoint')")})
     THROW 51072, 'Established endpoint metadata cannot be replaced or cleared', 1;
 IF EXISTS (SELECT 1 FROM OPENJSON(@observation_json) WHERE
-    ([key] IN ('endpoint','observed_definition','delivery_proof') AND type NOT IN (0,5))
+    ([key] IN ('endpoint','observed_definition','delivery_proof','inspection') AND type NOT IN (0,5))
     OR ([key]='gaps' AND type<>4))
     THROW 51073, 'Connector observation field has the wrong JSON type', 1;
 IF JSON_QUERY(@observation_json,'$.endpoint') IS NOT NULL AND (
@@ -496,8 +502,25 @@ IF JSON_QUERY(@observation_json,'$.endpoint') IS NOT NULL AND (
     OR NULLIF(JSON_VALUE(@observation_json,'$.endpoint.consumer_group'),'') IS NULL
     OR JSON_VALUE(@observation_json,'$.endpoint.consumer_group') COLLATE Latin1_General_100_BIN2 LIKE '%[^-A-Za-z0-9$_.]%')
     THROW 51073, 'Endpoint fields must be nonsecret host/entity/group metadata, not credentials or URLs', 1;
+DECLARE @inspection nvarchar(max)=JSON_QUERY(@observation_json,'$.inspection');
+IF @inspection IS NOT NULL
+BEGIN
+    IF {inspection_invalid_sql('@inspection', '@observation_json')}
+       OR COALESCE(JSON_VALUE(@observation_json,'$.state'),'')<>'degraded'
+       OR JSON_VALUE(@prior,'$.operation_id') IS NOT NULL
+       OR JSON_VALUE(@observation_json,'$.operation_id') IS NOT NULL
+       OR EXISTS (SELECT 1 FROM OPENJSON(@prior,'$.gaps') AS pending
+           WHERE JSON_VALUE(pending.value,'$.code') IN ({literals(sorted(CONNECTOR_PENDING_GAP_CODES))}))
+       OR EXISTS (SELECT 1 FROM OPENJSON(@observation_json,'$.gaps') AS pending
+           WHERE JSON_VALUE(pending.value,'$.code') IN ({literals(sorted(CONNECTOR_PENDING_GAP_CODES))}))
+       OR EXISTS (SELECT 1 FROM OPENJSON(@observation_json)
+           WHERE [key] IN ('identity_verified_at','delivery_verified_at','delivery_proof') AND type<>0)
+       OR EXISTS (SELECT [key] COLLATE Latin1_General_100_BIN2 FROM OPENJSON(@observation_json)
+           GROUP BY [key] COLLATE Latin1_General_100_BIN2 HAVING COUNT(*)>1)
+        THROW 51073, 'Read-only inspection must preserve explicit complete running facts without readiness or operation authority', 1;
+END;
 DECLARE @next nvarchar(max)=@prior,@field nvarchar(128),@value nvarchar(max),@type int;
-DECLARE fields CURSOR LOCAL FAST_FORWARD FOR SELECT [key],value,type FROM OPENJSON(@observation_json);
+DECLARE fields CURSOR LOCAL FAST_FORWARD FOR SELECT [key],value,type FROM OPENJSON(@observation_json) WHERE [key]<>'inspection';
 OPEN fields;
 FETCH NEXT FROM fields INTO @field,@value,@type;
 WHILE @@FETCH_STATUS=0
@@ -547,7 +570,7 @@ IF @@ROWCOUNT<>1 THROW 51072, 'Connector observation lost its revision', 1;
 SET @affected=1;
 {handoff_sql(names, producer='worker', operation='worker.observe_connector', topic="N'connector'", reference='@connector_id')}
 SET @result=(SELECT @connector_id AS connector_id,JSON_QUERY(@next) AS connector,
-    JSON_QUERY(@observation) AS observation,
+    JSON_QUERY(@observation) AS observation,JSON_QUERY(@inspection) AS inspection,
     @work_id AS work_id,@owner_id AS work_owner_id,@fence AS work_fence,
     @work_revision AS work_revision,@collection_completion_eligible AS collection_completion_eligible,
     {payload_hash("JSON_QUERY(@observation_json,'$.observed_definition')")} AS observed_definition_hash,

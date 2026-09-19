@@ -340,7 +340,7 @@ def _stage(db, kernel, *, proposals=(), source_removals=None):
     params = _mutation_params(manifest, _id(41))
     params.update(prior=_json(manifest), sources=_json(manifest["sources"]),
                   proposals=_json([*manifest["source_proposals"], *proposals]),
-                  removal_intents=_json(intents))
+                  removal_intents=_json(intents), superseded_json="[]")
     body = prepare_removals_sql(kernel.names)
     for message in (
         "Desired changes must retain all owned source bindings until receipt-verified retirement",
@@ -756,7 +756,9 @@ def test_pending_removals_cannot_be_cancelled_or_reidentified_without_absence(db
     body = prepare_removals_sql(kernel.names)
     predicate = _guard(body, "Pending removal cannot be cancelled by omitting its ownership record")
     for requested in ([], [{**_intent(staged["sources"][1]), "removal_id": _id(99)}]):
-        assert _evaluate(db, kernel, predicate, {"prior": _json(staged), "removal_intents": _json(requested)})
+        assert _evaluate(db, kernel, predicate, {
+            "prior": _json(staged), "removal_intents": _json(requested), "superseded_json": "[]",
+        })
     assert "An old observation cannot authorize a new removal intent" in body
     assert "A retired removal identity cannot be reused" in body
 

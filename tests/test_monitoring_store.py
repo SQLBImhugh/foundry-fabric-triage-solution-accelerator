@@ -1740,7 +1740,7 @@ def test_receiver_heartbeat_is_health_not_delivery_verification(harness: Harness
     after = h.store.list_connectors(m.PageQuery(**h.context())).items[0]
     assert after.state == "planned"
     assert after.delivery_verified_at is None and after.identity_verified_at is None
-    assert after.last_receiver_activity_at == h.clock()
+    assert after == connector
     assert h.store.record_receiver_heartbeat(heartbeat) == recorded
     assert h.store.list_connectors(m.PageQuery(**h.context())).items[0].revision == after.revision
     h.clock.advance(1)

@@ -35,6 +35,8 @@ from triage.monitoring.models import (
     CollectionCommit,
     ConnectorDeliveryProof,
     ConnectorDesiredState,
+    ConnectorObservationResult,
+    ConnectorPresenceInspection,
     ConnectorPublicationContext,
     ConnectorPublicationRequest,
     ConnectorPublicationResult,
@@ -247,6 +249,7 @@ class MonitoringStore(Protocol):
     def record_connector(
         self, expected: RegistryVersion, manifest: OwnedConnectorManifest,
         *, expected_connector_revision: Revision, commit: CollectionCommit | None = None,
+        inspection: ConnectorPresenceInspection | None = None,
     ) -> OwnedConnectorManifest:
         """CAS restricted worker observations of an existing controller-owned topology.
 
@@ -256,10 +259,23 @@ class MonitoringStore(Protocol):
         Runtime observations require the actual connector collection work lease
         and revision. The original receipt alone establishes completion eligibility;
         it cannot publish or clear the controller frontier. Fixture setup may omit commit.
+        Optional GET-only presence inspection stays on the original receipt/handoff,
+        never on current readiness or desired state.
         """
         ...
 
     def list_connectors(self, query: PageQuery) -> RecordPage[OwnedConnectorManifest]: ...
+
+    def get_connector_observation(
+        self, context: MonitoringContext, request_id: CanonicalId,
+    ) -> ConnectorObservationResult | None:
+        """Controller preparation view of one original explicit worker observation.
+
+        Native callers read the protected handoff, not worker-private receipts.
+        Missing evidence is None; changed or ambiguous original bindings fail.
+        Only guarded publication validates the original receipt as mutation authority.
+        """
+        ...
 
     def get_connector_desired(
         self, context: MonitoringContext, connector_id: CanonicalId,
@@ -292,6 +308,16 @@ class MonitoringStore(Protocol):
         Metadata-only registration stays dormant until its first nonempty,
         admitted event-source publication. That first publication is never an
         unchanged no-op and cannot retire retained physical sources.
+        Explicit source-removal supersession keeps physical ownership and records
+        the unchanged original removal in the new publication result. It requires
+        original complete GET-only running presence and cannot establish readiness.
+        Only never-submitted removals with complete retained revision/receipt
+        history qualify; a possible write intent cannot be erased by a later GET.
+        The first recovery remains the history anchor across later publications.
+        Intake checks every original recovery audit for still-owned exact source
+        and target bindings through complete, unique connector-revision history.
+        Recovery requires a directly matched reviewed tenant/workspace/item scope;
+        unresolved domain authority and explicit event-capability denial refuse.
         """
         ...
 

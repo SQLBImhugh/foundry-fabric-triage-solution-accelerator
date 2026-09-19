@@ -109,7 +109,9 @@ IF EXISTS (SELECT JSON_VALUE(value,'$.removal_id') FROM OPENJSON(@removal_intent
     THROW 51073, 'Removal identities must be unique', 1;
 IF EXISTS (SELECT 1 FROM OPENJSON(@prior,'$.source_removals') AS old_removal
     WHERE NOT EXISTS (SELECT 1 FROM OPENJSON(@removal_intents) AS requested
-        WHERE JSON_VALUE(requested.value,'$.removal_id')=JSON_VALUE(old_removal.value,'$.removal_id')))
+        WHERE JSON_VALUE(requested.value,'$.removal_id')=JSON_VALUE(old_removal.value,'$.removal_id'))
+      AND NOT EXISTS (SELECT 1 FROM OPENJSON(@superseded_json) AS superseded
+          WHERE {names.object('json_equal')}(superseded.value,old_removal.value)=1))
     THROW 51072, 'Pending removal cannot be cancelled by omitting its ownership record', 1;
 DECLARE @removal_intent nvarchar(max),@removal_id nvarchar(36),@remove_source_id nvarchar(256),
     @remove_proposal_id nvarchar(36),@old_removal nvarchar(max),@remove_binding nvarchar(max),
@@ -143,6 +145,13 @@ BEGIN
             AND record_kind='connector_source_retirement'
             AND full_key=@connector_id+N':removal:'+@removal_id)
             THROW 51072, 'A retired removal identity cannot be reused', 1;
+        IF EXISTS (SELECT 1 FROM {names.table('monitoring_receipts')} AS original
+            CROSS APPLY OPENJSON(original.payload,'$.result.superseded_source_removals') AS superseded
+            WHERE original.tenant_id=@tenant_id AND original.epoch=@epoch
+              AND original.operation='controller.publish_connector'
+              AND JSON_VALUE(original.payload,'$.result.connector_id')=@connector_id
+              AND JSON_VALUE(superseded.value,'$.removal_id')=@removal_id)
+            THROW 51072, 'A superseded removal identity cannot be reused', 1;
         IF @remove_proposal_id IS NOT NULL SET @remove_node_name=JSON_VALUE(@remove_binding,'$.node_name');
         ELSE
         BEGIN

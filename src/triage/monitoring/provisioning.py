@@ -55,11 +55,12 @@ from triage.monitoring.inventory import (
     _retry_delay,
     validate_rest_url,
 )
-from triage.monitoring.memory import stable_id
+from triage.monitoring.memory import inventory_confirms_deletion, policy_removes_target, stable_id
 from triage.monitoring.models import (
     CapabilityObservation,
     CollectionCommit,
     ConnectorObservationResult,
+    ConnectorPresenceInspection,
     ConnectorPublicationRequest,
     ConnectorPublicationResult,
     ConnectorSource,
@@ -84,6 +85,7 @@ from triage.monitoring.models import (
     WorkDispositionRequest,
     _digest,
     connector_collection_eligible,
+    connector_definition_hash,
     validate_connector_definition,
 )
 from triage.monitoring.rate_limit import RatePolicy
@@ -101,6 +103,7 @@ PROVISIONING_POLICIES = {
     "fabric.operations": RatePolicy(120, 60),
 }
 INTENT_GAP = "definition_update_submitted_or_unknown"
+PRESENCE_GAP = "pending_source_removal_presence_observed"
 
 
 class ProvisioningReview(RuntimeError):
@@ -486,14 +489,17 @@ class DefinitionPlan:
     new_names: frozenset[str]
     source_proposals: tuple[ConnectorSourceProposal, ...] = ()
     source_removals: tuple[SourceRemovalIntent, ...] = ()
+    deferred_targets: tuple[TargetIdentity, ...] = ()
 
 
 def plan_definition(
     connector: OwnedConnectorManifest,
     baseline: dict,
     targets: tuple[MonitoringTarget, ...],
+    *,
+    removal_targets: tuple[TargetIdentity, ...] = (),
 ) -> DefinitionPlan:
-    """Only modify owned per-item sources and their default-stream references."""
+    """Missing read admission is not removal authority for an owned source."""
     baseline = _document(baseline)
     result = copy.deepcopy(baseline)
     graph = result["parts"]["eventstream.json"]
@@ -523,6 +529,13 @@ def plan_definition(
     }
     removals = [removal.intent() for removal in connector.source_removals]
     desired_targets = {target.identity.key: target.identity for target in targets}
+    authorized_removals = {target.key for target in removal_targets}
+    if authorized_removals.intersection(desired_targets):
+        raise ProvisioningReview("source_removal_conflicts_with_current_admission")
+    deferred = {
+        removal.target.key: removal.target for removal in connector.source_removals
+        if removal.target.key in desired_targets
+    }
     by_name = {}
     retained = []
     retained_proposals = list(connector.source_proposals)
@@ -555,7 +568,9 @@ def plan_definition(
             if isinstance(registered, ConnectorSourceProposal)
             else registered.source_id in pending_sources
         )
-        if removing or registered.target.key not in desired_targets:
+        if registered.target.key not in desired_targets and not removing and registered.target.key not in authorized_removals:
+            deferred[registered.target.key] = registered.target
+        if removing or registered.target.key in authorized_removals:
             if not removing:
                 selector = {
                     "source_id": None if isinstance(registered, ConnectorSourceProposal) else registered.source_id,
@@ -591,6 +606,21 @@ def plan_definition(
         or {item["name"] for item in inputs} != set(source_nodes)
     ):
         raise ProvisioningReview("stream_routing_requires_review")
+    if deferred:
+        LOG.warning(
+            "connector_topology_deferred connector_id=%s unverified_targets=%d",
+            connector.connector_id, len(deferred),
+        )
+        original_targets = {}
+        for name in source_nodes:
+            source_id = baseline["component_ids"].get(f"sources/{name}")
+            original_targets[name] = owned[source_id].target if source_id is not None else proposals[name].target
+        return DefinitionPlan(
+            copy.deepcopy(baseline), original_targets,
+            frozenset(), connector.source_proposals,
+            tuple(removal.intent() for removal in connector.source_removals),
+            tuple(deferred.values()),
+        )
     stream["inputNodes"] = [item for item in inputs if item["name"] not in removed_names]
     existing_targets = {
         source.target.key for source in (*connector.sources, *connector.source_proposals)
@@ -921,8 +951,10 @@ def prepare_connector_publication(
     *,
     request_id: str,
     max_sources: int = 100,
+    eligible_targets: tuple[MonitoringTarget, ...] | None = None,
+    removal_targets: tuple[TargetIdentity, ...] = (),
 ) -> ConnectorPublicationRequest:
-    """Controller planning from current admission, never a browser/model target list."""
+    """Retain unavailable sources; only affirmative removal evidence contracts topology."""
     if not 1 <= max_sources <= 1000:
         raise ValueError("Connector publication source bound is invalid")
     version, current_work, frontier, connector, connectors = _publication_state(
@@ -935,11 +967,13 @@ def prepare_connector_publication(
         for source in (*other.sources, *other.source_proposals)
     }
     targets = []
+    removals = {target.key: target for target in removal_targets}
+    eligible_keys = {target.key for target in eligible_targets} if eligible_targets is not None else None
     cursor = None
     seen = set()
     for _ in range(100):
         page = store.list_targets(TargetQuery(
-            **context.model_dump(), workload="fabric_pipeline", limit=100, cursor=cursor,
+            **context.model_dump(), workload="fabric_pipeline", include_inactive=True, limit=100, cursor=cursor,
         ))
         if page.version != version:
             raise MonitoringConflict("Admission changed during controller source planning")
@@ -949,6 +983,7 @@ def prepare_connector_publication(
                 current is not None and current.identity.workload == "fabric_pipeline"
                 and current.state == "current" and current.observation.enabled
                 and current.policy_revision == version.revision and current.key not in excluded
+                and (eligible_keys is None or current.key in eligible_keys)
             ):
                 targets.append(current)
         if page.next_cursor is None:
@@ -962,7 +997,11 @@ def prepare_connector_publication(
     if len(targets) > max_sources:
         raise ProvisioningReview("approved_shard_metadata_required")
     # Raw observed topology is not authority for the next desired definition.
-    plan = plan_definition(connector, connector.desired_definition, tuple(targets))
+    plan = plan_definition(
+        connector, connector.desired_definition, tuple(targets), removal_targets=tuple(removals.values()),
+    )
+    if plan.deferred_targets and connector.policy_revision != version.revision:
+        raise ProvisioningReview("source_removal_authority_unverified_for_current_policy")
     return publication_from_plan(
         version, current_work, frontier, connector, plan, request_id=request_id,
     )
@@ -987,7 +1026,11 @@ def publication_from_plan(
         sources=publication_sources(connector, plan), source_proposals=plan.source_proposals,
         source_removals=plan.source_removals,
         desired_definition=plan.desired,
-        detail="Publish sources derived from current admitted targets under the controller work fence",
+        detail=(
+            "Retain existing desired topology; unavailable source admission does not authorize removal"
+            if plan.deferred_targets else
+            "Publish sources derived from current admitted targets under the controller work fence"
+        ),
     )
 
 
@@ -1065,6 +1108,12 @@ def prepare_connector_binding(
         connector.source_proposals or connector.source_removals
     ):
         raise ProvisioningReview("physical_binding_requires_worker_changes")
+    original = store.get_connector_observation(version, current.reconcile_request_id)
+    if original is not None and original.inspection is not None:
+        return prepare_connector_supersession(
+            store, current, connector_id, request_id=request_id,
+            original_observation=original.observation,
+        )
     request = ConnectorPublicationRequest(
         request_id=request_id, expected=version, work_id=current.work_id,
         lease=current.lease, expected_work_revision=current.revision,
@@ -1078,6 +1127,144 @@ def prepare_connector_binding(
         detail="Confirm actual component bindings and remote absence from the exact owned worker observation",
     )
     return request
+
+
+def _project_source_nodes(snapshot: dict, names: set[str]) -> dict:
+    projected = copy.deepcopy(_document(snapshot))
+    graph = projected["parts"]["eventstream.json"]
+    graph["sources"] = [node for node in graph["sources"] if node["name"] in names]
+    for stream in _nodes(graph, "streams").values():
+        stream["inputNodes"] = [entry for entry in stream["inputNodes"] if entry["name"] in names]
+    projected["component_ids"] = {
+        key: value for key, value in projected["component_ids"].items()
+        if not key.startswith("sources/") or key.removeprefix("sources/") in names
+    }
+    _complete_component_map(projected)
+    return projected
+
+
+def _restored_source_definition(
+    connector: OwnedConnectorManifest, observed: dict, superseded: tuple[PendingSourceRemoval, ...],
+) -> dict:
+    """Restore only exact retained physical nodes from complete original evidence."""
+    if not superseded or connector.source_proposals:
+        raise ProvisioningReview("physical_source_supersession_required")
+    observed, desired = _document(observed), _document(connector.desired_definition)
+    _complete_component_map(observed)
+    desired_nodes = _nodes(desired["parts"]["eventstream.json"], "sources")
+    observed_nodes = _nodes(observed["parts"]["eventstream.json"], "sources")
+    owned = {source.source_id: source for source in connector.sources}
+    pending = {removal.node_name: removal for removal in connector.source_removals}
+    seen_sources = []
+    for name in observed_nodes:
+        source_id = observed["component_ids"][f"sources/{name}"]
+        source = owned.get(source_id)
+        if source is None:
+            raise ProvisioningReview("unowned_presence_source_requires_review")
+        if name not in desired_nodes:
+            removal = pending.get(name)
+            if removal is None or removal.source_id != source_id or removal.target != source.target:
+                raise ProvisioningReview("retained_presence_source_binding_mismatch")
+        seen_sources.append(source)
+    try:
+        validate_connector_definition(tuple(seen_sources), observed)
+    except ValueError:
+        raise ProvisioningReview("retained_presence_definition_unverified") from None
+    for name, node in observed_nodes.items():
+        source = owned[observed["component_ids"][f"sources/{name}"]]
+        properties = node["properties"]
+        if (
+            properties["workspaceId"] != source.target.workspace_id
+            or properties["itemId"] != source.target.item_id
+            or set(properties["includedEventTypes"]) != set(source.event_types)
+        ):
+            raise ProvisioningReview("retained_presence_source_target_mismatch")
+    projected = _project_source_nodes(observed, set(desired_nodes))
+    if not matches_update(projected, desired):
+        raise ProvisioningReview("retained_presence_changes_approved_topology")
+    restored_names = set(desired_nodes)
+    for removal in superseded:
+        if (
+            removal.source_id is None or removal not in connector.source_removals
+            or removal.node_name not in observed_nodes
+            or observed["component_ids"].get(f"sources/{removal.node_name}") != removal.source_id
+        ):
+            raise ProvisioningReview("superseded_source_presence_unverified")
+        restored_names.add(removal.node_name)
+    return _project_source_nodes(observed, restored_names)
+
+
+def prepare_connector_supersession(
+    store: MonitoringStore, work: MonitoringWork, connector_id: str, *,
+    request_id: str, original_observation: OwnedConnectorManifest | None = None,
+) -> ConnectorPublicationRequest:
+    """Propose reinstatement from original worker evidence, never current-state equality."""
+    version, current, frontier, connector, _ = _publication_state(store, work, connector_id)
+    if current.reconcile_producer != "worker" or not connector.source_removals:
+        raise ProvisioningReview("supersession_requires_original_worker_observation")
+    original = store.get_connector_observation(version, current.reconcile_request_id)
+    if original is None:
+        raise MonitoringUnavailable("Original retained-source presence observation is unavailable")
+    if original_observation is not None and original_observation != original.observation:
+        raise MonitoringUnavailable("Supersession input differs from the original observation projection")
+    original_observation = original.observation
+    inspection = original.inspection
+    if (
+        inspection is None or original.connector_id != connector_id
+        or original.reconcile_work_id != current.work_id or not original.collection_completion_eligible
+        or original.observed_definition_hash != inspection.definition_hash
+    ):
+        raise ProvisioningReview("supersession_requires_explicit_original_inspection")
+    now = store.snapshot(version).coverage.as_of
+    if not now - timedelta(seconds=300) <= inspection.observed_at <= now:
+        raise ProvisioningReview("supersession_presence_inspection_expired")
+    if (
+        original_observation.state != "degraded" or original_observation.observed_definition is None
+        or original_observation.revision != connector.revision
+        or original_observation.operation_id is not None
+        or any(getattr(original_observation, field) is not None for field in (
+            "identity_verified_at", "delivery_verified_at", "delivery_proof",
+        ))
+        or any(getattr(original_observation, field) != getattr(connector, field) for field in (
+            "tenant_id", "epoch", "connector_id", "ownership_id", "policy_revision",
+            "sources", "source_proposals", "source_removals", "desired_definition",
+            "workspace_id", "eventstream_id", "destination_id", "endpoint",
+        ))
+        or any(gap.code in {INTENT_GAP, "definition_update_outcome_unknown"} for gap in original_observation.gaps)
+    ):
+        raise ProvisioningReview("supersession_original_observation_mismatch")
+    superseded = []
+    for removal in connector.source_removals:
+        if removal.source_id is None:
+            continue
+        target = store.resolve_target(removal.target)
+        if (
+            target is not None and target.state == "current" and target.observation.enabled
+            and target.policy_revision == version.revision
+        ):
+            if inspection.observed_at <= removal.requested_at:
+                raise ProvisioningReview("supersession_observation_predates_removal")
+            superseded.append(removal)
+    restored = _restored_source_definition(connector, original_observation.observed_definition, tuple(superseded))
+    superseded_ids = {removal.removal_id for removal in superseded}
+    return ConnectorPublicationRequest.model_validate({
+        "request_id": request_id, "expected": version, "work_id": current.work_id,
+        "lease": current.lease, "expected_work_revision": current.revision,
+        "expected_frontier_revision": frontier.accepted_revision,
+        "connector_id": connector.connector_id, "ownership_id": connector.ownership_id,
+        "expected_connector_revision": connector.revision, "name": connector.name,
+        "sources": connector.sources, "source_proposals": connector.source_proposals,
+        "source_removals": tuple(
+            removal.intent() for removal in connector.source_removals if removal.removal_id not in superseded_ids
+        ),
+        "source_removal_supersessions": tuple({
+            "removal_id": removal.removal_id, "source_id": removal.source_id,
+        } for removal in superseded),
+        "desired_definition": restored,
+        "observation_receipt_id": current.reconcile_request_id,
+        "readiness_receipt_id": None,
+        "detail": "Supersede only receipt-proven retained physical sources under current read admission; readiness remains unverified",
+    })
 
 
 def publish_connector_intent(
@@ -1104,18 +1291,31 @@ def publish_connector_intent(
         return original
 
     result = original_publication()
+    prior = None
     if result is None:
         prior = next((
             value for value in _owned_connectors(store, request.expected)
             if value.connector_id == request.connector_id
         ), None)
+        supersessions = {value.removal_id: value.source_id for value in request.source_removal_supersessions}
+        if supersessions and (
+            prior is None or any(
+                not any(removal.removal_id == identifier and removal.source_id == source_id for removal in prior.source_removals)
+                for identifier, source_id in supersessions.items()
+            )
+            or request.source_proposals != prior.source_proposals
+            or {removal.removal_id: removal for removal in request.source_removals}
+            != {removal.removal_id: removal.intent() for removal in prior.source_removals if removal.removal_id not in supersessions}
+        ):
+            raise ProvisioningReview("supersession_must_select_exact_pending_physical_sources")
         if prior is not None and (
             prior.sources != request.sources
             or any(
                 proposal not in request.source_proposals for proposal in prior.source_proposals
             )
             or any(
-                removal.intent() not in request.source_removals for removal in prior.source_removals
+                removal.intent() not in request.source_removals and removal.removal_id not in supersessions
+                for removal in prior.source_removals
             )
         ):
             raise ProvisioningReview("source_ownership_must_be_retained_until_confirmation")
@@ -1138,9 +1338,41 @@ def publish_connector_intent(
         or result.connector.ownership_id != request.ownership_id
         or result.connector.revision != request.expected_connector_revision + 1
         or result.observation_receipt_id != request.observation_receipt_id
+        or not request.source_removal_supersessions and result.superseded_source_removals
     ):
         raise MonitoringUnavailable("Original connector publication returned a different intent")
-    if request.observation_receipt_id is None:
+    if request.source_removal_supersessions:
+        selected = {value.removal_id: value.source_id for value in request.source_removal_supersessions}
+        originals = {removal.removal_id: removal for removal in result.superseded_source_removals}
+        if (
+            {identifier: removal.source_id for identifier, removal in originals.items()} != selected
+            or not result.desired_changed or result.state == "ready" or result.retired_sources
+            or result.connector.sources != request.sources
+            or result.connector.source_proposals != request.source_proposals
+            or result.connector.desired_definition != request.desired_definition
+            or {removal.removal_id: removal.intent() for removal in result.pending_removals}
+            != {removal.removal_id: removal for removal in request.source_removals}
+            or any(value is not None for value in (
+                result.connector.identity_verified_at, result.connector.delivery_verified_at,
+                result.connector.delivery_proof,
+            ))
+        ):
+            raise MonitoringUnavailable("Supersession did not return exact original removals and unready retained ownership")
+        sources = {source.source_id: source for source in request.sources}
+        for removal in originals.values():
+            source = sources.get(removal.source_id)
+            if (
+                source is None or removal.target != source.target or removal.proposal_id is not None
+                or result.connector.desired_definition["component_ids"].get(f"sources/{removal.node_name}") != removal.source_id
+                or prior is not None and removal not in prior.source_removals
+            ):
+                raise MonitoringUnavailable("Supersession changed an original pending removal or its retained physical binding")
+        if prior is not None and any(
+            getattr(prior, field) != getattr(result.connector, field)
+            for field in ("workspace_id", "eventstream_id", "destination_id", "endpoint")
+        ):
+            raise MonitoringUnavailable("Supersession changed an established transport resource")
+    elif request.observation_receipt_id is None:
         if (
             result.connector.sources != request.sources
             or result.connector.source_proposals != request.source_proposals
@@ -1301,6 +1533,7 @@ class ConnectorReconciler:
         prior: OwnedConnectorManifest,
         *,
         expected_policy_revision: int | None = None,
+        inspection: ConnectorPresenceInspection | None = None,
         **changes,
     ) -> OwnedConnectorManifest:
         allowed = {
@@ -1336,6 +1569,7 @@ class ConnectorReconciler:
                 value,
                 expected_connector_revision=prior.revision,
                 commit=commit,
+                **({"inspection": inspection} if inspection is not None else {}),
             )
         except MonitoringCommitUncertain as exc:
             if exc.operation not in {"connector", "worker.observe_connector"}:
@@ -1345,12 +1579,15 @@ class ConnectorReconciler:
             )
             if receipt is None:
                 raise
-            fingerprint = _digest({
+            original_request = {
                 "expected": version.model_dump(mode="json"),
                 "manifest": value.model_dump(mode="json"),
                 "expected_connector_revision": prior.revision,
                 "commit": commit.model_dump(mode="json"),
-            })
+            }
+            if inspection is not None:
+                original_request["inspection"] = inspection.model_dump(mode="json")
+            fingerprint = _digest(original_request)
             if (
                 receipt.tenant_id != self.context.tenant_id or receipt.epoch != self.context.epoch
                 or receipt.operation != exc.operation or receipt.request_id != exc.idempotency_id
@@ -1368,6 +1605,7 @@ class ConnectorReconciler:
                         or original.collection_completion_eligible != connector_collection_eligible(value)
                         or original.observation.policy_revision != version.revision
                         or original.observation.tenant_id != version.tenant_id or original.observation.epoch != version.epoch
+                        or original.inspection != inspection
                     ):
                         raise MonitoringUnavailable("Original observation receipt belongs to another collection fence")
                     effective = original.connector
@@ -1465,6 +1703,134 @@ class ConnectorReconciler:
                     )
             result.append(current)
         return tuple(result)
+
+    async def _removal_hold(self, connector: OwnedConnectorManifest) -> str | None:
+        """Re-admission cannot cancel an immutable removal or license another POST."""
+        if not connector.source_removals:
+            return None
+        version = await self._version()
+        policies = []
+        cursor = None
+        seen = set()
+        for _ in range(10):
+            page = await asyncio.to_thread(
+                self.store.list_scopes, PageQuery(**self.context.model_dump(), limit=100, cursor=cursor),
+            )
+            if page.version != version:
+                raise MonitoringConflict("Scope changed while checking pending source removal")
+            policies.extend(page.items)
+            if page.next_cursor is None:
+                break
+            if page.next_cursor in seen:
+                raise ProvisioningReview("scope_pagination_incomplete")
+            seen.add(page.next_cursor)
+            cursor = page.next_cursor
+        else:
+            raise ProvisioningReview("scope_pagination_budget_exhausted")
+        for removal in connector.source_removals:
+            target = await asyncio.to_thread(self.store.resolve_target, removal.target)
+            if target is not None and target.state == "current" and target.observation.enabled:
+                return "pending_source_removal_readmitted_requires_supersession"
+            recorded = await asyncio.to_thread(
+                self.store.resolve_target, removal.target, include_inactive=True,
+            )
+            if policy_removes_target(removal.target, recorded, policies):
+                continue
+            if not await self._confirmed_deletion(removal.target, version):
+                return "pending_source_removal_authority_unverified"
+        return None
+
+    async def _confirmed_deletion(self, target: TargetIdentity, version: RegistryVersion) -> bool:
+        cursor = None
+        seen = set()
+        for _ in range(100):
+            page = await asyncio.to_thread(
+                self.store.list_inventory, TargetQuery(
+                    **self.context.model_dump(), workspace_id=target.workspace_id,
+                    workload=target.workload, include_inactive=True, limit=100, cursor=cursor,
+                ),
+            )
+            if page.version != version:
+                raise MonitoringConflict("Policy changed while checking source deletion evidence")
+            for item in page.items:
+                if item.target == target:
+                    generation = await asyncio.to_thread(
+                        self.store.get_inventory_generation, self.context, item.generation_id,
+                    )
+                    return inventory_confirms_deletion(target, item, generation)
+            if page.next_cursor is None:
+                return False
+            if page.next_cursor in seen:
+                raise ProvisioningReview("removal_inventory_pagination_incomplete")
+            seen.add(page.next_cursor)
+            cursor = page.next_cursor
+        raise ProvisioningReview("removal_inventory_pagination_budget_exhausted")
+
+    async def _observe_retained_presence(
+        self, work: MonitoringWork, connector: OwnedConnectorManifest, observed: dict, topology: dict,
+        *, observed_at: datetime,
+    ) -> ReconcileResult:
+        if connector.source_proposals or connector.operation_id is not None:
+            return await self._defer(work, "pending_removal_effect_state_requires_review")
+        _complete_component_map(observed)
+        source_nodes = _nodes(observed["parts"]["eventstream.json"], "sources")
+        version = await self._version()
+        verified = 0
+        for removal in connector.source_removals:
+            if removal.source_id is None:
+                continue
+            current = await asyncio.to_thread(self.store.resolve_target, removal.target)
+            if current is None or not current.observation.enabled or current.policy_revision != version.revision:
+                continue
+            node = source_nodes.get(removal.node_name)
+            owned = next((source for source in connector.sources if source.source_id == removal.source_id), None)
+            if (
+                node is None or owned is None or owned.target != removal.target
+                or observed["component_ids"].get(f"sources/{removal.node_name}") != removal.source_id
+                or node.get("type") != "FabricJobEvents"
+                or node.get("properties", {}).get("eventScope") != "Item"
+                or node["properties"].get("workspaceId") != removal.target.workspace_id
+                or node["properties"].get("itemId") != removal.target.item_id
+                or set(node["properties"].get("includedEventTypes", ())) != set(owned.event_types)
+            ):
+                raise ProvisioningReview("retained_source_presence_binding_mismatch")
+            await self._renew(work)
+            read = await self.pipeline_probe.probe(
+                current.identity, inventory_generation=current.inventory_generation, checked_at=self.clock(),
+            )
+            if read.target != current.identity or read.collector_identity_id != self.rest.collector_identity_id:
+                raise ProvisioningReview("source_probe_identity_mismatch")
+            if read.read_status != "verified":
+                return await self._defer(work, "pending_removal_source_read_unverified")
+            verified += 1
+        if not verified:
+            return await self._defer(work, "pending_removal_readmission_unverified")
+        if any(
+            node.get("status") != "Running"
+            for kind in ("sources", "streams", "destinations")
+            for node in _nodes(topology, kind).values()
+        ):
+            return await self._defer(work, "retained_source_topology_not_running")
+        saved = await self._save(
+            work, connector, expected_policy_revision=version.revision,
+            observed_definition=observed, state="degraded",
+            identity_verified_at=None, delivery_verified_at=None, delivery_proof=None,
+            gaps=(CoverageGap(
+                code=PRESENCE_GAP,
+                detail="Read-only complete owned-source presence; only the controller may supersede removal",
+            ),),
+            inspection=ConnectorPresenceInspection(
+                read_only=True, observed_at=observed_at,
+                definition_hash=connector_definition_hash(observed),
+                component_states={
+                    _identifier(node["id"]): node["status"]
+                    for kind in ("sources", "streams", "destinations")
+                    for node in _nodes(topology, kind).values()
+                },
+            ),
+        )
+        await self._finish(work, saved, PRESENCE_GAP)
+        return ReconcileResult(work.work_id, "completed", PRESENCE_GAP)
 
     async def _defer(
         self, work: MonitoringWork, code: str, retry_at: datetime | None = None
@@ -1720,6 +2086,7 @@ class ConnectorReconciler:
             if state != "Succeeded":
                 return await self._block(work, connector, "definition_operation_failed_review")
         observed, topology = await self.rest.inspect(connector, lambda: self._renew(work))
+        observed_at = self.clock()
         if submitted is not None:
             if matches_update(observed, submitted):
                 return await self._verified(
@@ -1739,6 +2106,13 @@ class ConnectorReconciler:
         planned_version = await self._version()
         if connector.policy_revision != planned_version.revision:
             return await self._defer(work, "current_controller_publication_required")
+        hold = await self._removal_hold(connector)
+        if hold is not None:
+            if hold == "pending_source_removal_readmitted_requires_supersession":
+                return await self._observe_retained_presence(
+                    work, connector, observed, topology, observed_at=observed_at,
+                )
+            return await self._defer(work, hold)
         targets = await self._targets(connector, probe=True, work=work)
         desired_count = len(_nodes(_document(connector.desired_definition)["parts"]["eventstream.json"], "sources"))
         if len(targets) != desired_count:
@@ -1774,6 +2148,13 @@ class ConnectorReconciler:
                     ),
                 )
             return await self._defer(work, "policy_changed_before_definition_update")
+        hold = await self._removal_hold(current)
+        if hold is not None:
+            await self._save(
+                work, intent, observed_definition=observed, state="degraded", operation_id=None,
+                gaps=(CoverageGap(code=hold, detail="No definition update was sent; current removal authority is unverified"),),
+            )
+            return await self._defer(work, hold)
         try:
             reply = await self.rest.update(intent, intent.desired_definition)
         except UpdateNotSent as exc:

@@ -69,8 +69,8 @@ class V2CallerStore:
     def list_targets(self, query):
         return self.controller.list_targets(query)
 
-    def resolve_target(self, identity):
-        return self.controller.resolve_target(identity)
+    def resolve_target(self, identity, *, include_inactive=False):
+        return self.controller.resolve_target(identity, include_inactive=include_inactive)
 
     def get_work(self, context, work_id):
         return self.controller.get_work(context, work_id)
@@ -93,6 +93,9 @@ class V2CallerStore:
     def get_connector_publication(self, context, request_id):
         receipt = self.receipts.get(("connector_publication", request_id))
         return m.ConnectorPublicationResult.model_validate(receipt.result) if receipt else None
+
+    def get_connector_observation(self, context, request_id):
+        return self.controller.get_connector_observation(context, request_id)
 
     def _envelope(self, operation, arguments, result):
         contract = self.kernel.rpcs[operation]
@@ -421,7 +424,7 @@ async def test_remove_retains_identity_until_exact_original_absence_then_retires
     exclude(seed, target())
     work = fresh_controller_work(seed, store, clock, str(UUID(int=81_001)))
     request = prepare_connector_publication(
-        store, work, CONNECTOR, request_id=str(UUID(int=81_002)),
+        store, work, CONNECTOR, request_id=str(UUID(int=81_002)), removal_targets=(target(),),
     )
     assert request.sources == added.sources
     assert len(request.source_removals) == 1
@@ -468,7 +471,7 @@ async def test_pending_logical_withdrawal_uses_fresh_absence_without_fabricating
     exclude(seed, target())
     removal_work = fresh_controller_work(seed, store, clock, str(UUID(int=82_003)))
     removal = prepare_connector_publication(
-        store, removal_work, CONNECTOR, request_id=str(UUID(int=82_004)),
+        store, removal_work, CONNECTOR, request_id=str(UUID(int=82_004)), removal_targets=(target(),),
     )
     pending = publish_connector_intent(store, removal)
     assert pending.pending_removals[0].source_id is None
@@ -514,7 +517,7 @@ async def test_uncertain_removal_cannot_retire_from_intent_or_repeat_post(factor
     exclude(seed, target())
     work = fresh_controller_work(seed, store, clock, str(UUID(int=83_001)))
     removal = prepare_connector_publication(
-        store, work, CONNECTOR, request_id=str(UUID(int=83_002)),
+        store, work, CONNECTOR, request_id=str(UUID(int=83_002)), removal_targets=(target(),),
     )
     publish_connector_intent(store, removal)
     remote.timeout_after_apply = True
@@ -591,7 +594,7 @@ async def test_component_stores_execute_removal_and_retirement_through_real_stor
 
     work = next(value for value in claim() if value.work_id == queued.work_id)
     request = prepare_connector_publication(
-        controller, work, CONNECTOR, request_id=str(UUID(int=84_002)),
+        controller, work, CONNECTOR, request_id=str(UUID(int=84_002)), removal_targets=(target(),),
     )
     pending = publish_connector_intent(controller, request)
     assert (*pending.connector.sources, *pending.connector.source_proposals) == (original,)
@@ -622,7 +625,7 @@ async def test_one_published_change_adds_and_removes_with_one_remote_update(fact
     exclude(seed, first)
     work = fresh_controller_work(seed, store, clock, str(UUID(int=85_001)))
     change = prepare_connector_publication(
-        store, work, CONNECTOR, request_id=str(UUID(int=85_002)),
+        store, work, CONNECTOR, request_id=str(UUID(int=85_002)), removal_targets=(first,),
     )
     assert change.sources == before.sources
     assert change.source_proposals[0].target == second

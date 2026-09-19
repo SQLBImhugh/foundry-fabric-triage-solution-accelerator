@@ -251,7 +251,10 @@ def integration_contract(tables: Mapping[str, str] | None = None) -> dict:
                 "cannot be replaced. Optional readiness_receipt_id promotes only that exact owned worker "
                 "observation after controller review; desired scope changes invalidate earlier readiness. "
                 "Typed source_removals revoke desired membership but retain physical ownership. Only "
-                "observation_receipt_id with original complete remote-absence evidence can retire it."
+                "observation_receipt_id with original complete remote-absence evidence can retire it. "
+                "The separate source_removal_supersessions path restores only never-submitted physical "
+                "removals under fresh receipt-bound running inspection, current reviewed scope/read "
+                "admission and terminal collection fencing; it never manufactures readiness."
             ),
             "worker.commit_positions.positions_json": (
                 "1-200 [{receipt_kind:identified|unidentified, receipt_key, receipt:{partition,position,status,...}}]. "
@@ -283,6 +286,15 @@ def integration_contract(tables: Mapping[str, str] | None = None) -> dict:
                 "Includes full partition, ordered receipt_keys and positions mapping (original offset/enqueued_at, "
                 "receipt kind/key, first_committed_batch_id and original payload hash). Recover the new request "
                 "from this immutable result, not journal.batch_id or caller-retained body."
+            ),
+            "worker.observe_connector.inspection": (
+                "Optional observation_json.inspection is separate read-only evidence, never a manifest "
+                "field or readiness claim. Exactly observed_at, read_only=true, definition_hash and "
+                "component_states (3-1002 canonical physical GUID keys with value Running). The "
+                "SQL NVARCHAR definition hash and complete physical ID set must match the original "
+                "explicit snapshot; full node/ID binding is checked separately. Evidence "
+                "is at most 300 seconds old. It is returned as optional result.inspection; original "
+                "receipts without it replay unchanged and cannot authorize supersession."
             ),
             "controller.reserve_action.arguments": (
                 "Full tool arguments and approval fingerprints are preserved. Closed SQL canonicalization permits "
@@ -448,7 +460,8 @@ def integration_contract(tables: Mapping[str, str] | None = None) -> dict:
             ),
             "ownership_and_desired": (
                 "Request.sources must equal all prior ownership in original order. Prior unresolved "
-                "proposals and pending removal identities cannot be omitted or changed. SQL retains original "
+                "proposals and pending removal identities cannot be omitted or changed except through the "
+                "separate proved never-submitted supersession path. SQL retains original "
                 "binding bytes/order and appends only new proposals. Effective desired sources are "
                 "(owned sources minus pending physical removals) plus (proposals minus pending withdrawals). "
                 "The reviewed desired graph is validated against this effective set, not the ownership list."
@@ -488,6 +501,11 @@ def integration_contract(tables: Mapping[str, str] | None = None) -> dict:
                 "pending_removals": "The resulting immutable pending-removal entries; equals connector.source_removals.",
                 "retired_sources": "Only the retirement tombstones committed by this operation, including logical withdrawals.",
                 "observation_receipt_id": "The original observation used for binding/retirement, or explicit null.",
+                "superseded_source_removals": (
+                    "Complete unchanged original PendingSourceRemoval objects superseded only by this "
+                    "operation. New ordinary results emit []; historical immutable receipts may omit "
+                    "the field. This is original intent history, not a retirement claim."
+                ),
             },
             "model_and_adapter_delta": (
                 "Add SourceRemovalIntent, PendingSourceRemoval and ConnectorSourceRetirement DTOs; forward "
@@ -503,9 +521,78 @@ def integration_contract(tables: Mapping[str, str] | None = None) -> dict:
                 "its four explicit collection work/fence parameters. No base-table DML, "
                 "new role or generic setter. No action, approval, budget, frontier, partition or checkpoint "
                 "mutation from retirement. Original operation replay does not re-raise removal or intake fences. "
-                "Pending removal cannot be silently cancelled; reenrolment requires a new reviewed proposal "
-                "after verified retirement. Intake may pause under the existing provisioning-state gate; "
+                "Pending removal cannot be silently cancelled. Already dispatched or uncertain removal "
+                "must reconcile through the existing remote-absence path; reenrolment after retirement "
+                "requires a new reviewed proposal. Intake may pause under the existing provisioning-state gate; "
                 "this contract does not claim continuous receiver/checkpoint liveness during reconfiguration."
+            ),
+        },
+        "connector_supersession_contract": {
+            "request": (
+                "Request/Plan.source_removal_supersessions contains at most 1000 exact "
+                "{removal_id,source_id} selectors. Both identities are unique, source_id is nonnull "
+                "and at most 512 NVARCHAR bytes. Select only existing pending physical removals; "
+                "keep all original source/proposal ownership and all nonselected removal intents. "
+                "Selectors are disjoint from source_removals. No mixed additions, bindings or retirements."
+            ),
+            "original_evidence": (
+                "The global observation_receipt_id must be this reconcile_state work's original worker "
+                "producer. SQL decodes its protected worker_reconcile_request.request_payload using "
+                "OPENJSON NVARCHAR(MAX), verifies the original receipt binding/hash, exact current "
+                "connector revision/context and explicit snapshot/inspection, and checks the original "
+                "removal publication. No inherited snapshot, caller proof flag, partial map or gap text "
+                "can substitute. Every observed physical source must match retained ownership, node "
+                "identity, target and event set; all currently desired source nodes must remain present "
+                "unchanged apart from their separately verified optional IDs. The complete observed "
+                "graph remains operator-free and routes each source exactly once through the owned "
+                "stream. Inspection must postdate removal and be at most 300 seconds old."
+            ),
+            "never_submitted": (
+                "Each connector revision since each original removal must have exactly one retained "
+                "publication/observation receipt with unchanged ownership/removal lineage. Missing or "
+                "ambiguous history blocks recovery. Any applicable original write-ahead submission "
+                "gap or operation ID, including one inherited by the removal publication, forbids "
+                "supersession even after a later clean presence observation. This path does not "
+                "adjudicate definitive-not-applied effects or pre-boundary writers."
+            ),
+            "scope_and_work": (
+                "Require current observation admission (reviewed or auto_detection_only, never pending_review), "
+                "explicit enabled tenant/workspace/item inclusion, "
+                "no matching exclusion or unresolved domain exclusion, and fresh current service "
+                "read capability. Observation admission is not action approval and this publication changes "
+                "neither target action authority nor remediation budgets. Only unknown/missing event status may be waived for selected retained "
+                "sources; explicit denial and new sources keep ordinary gates. Original collection "
+                "must be completed under its exact released owner/fence and completion receipt. "
+                "Active or nonterminal previously attempted connector work blocks supersession. "
+                "A queued candidate must have attempts=0, retry_attempt=0, no execution/action/retry/"
+                "finalization lineage, and no lease payload or physical lease row, including an expired tombstone."
+            ),
+            "atomic_publication": (
+                "Under the existing control/connector/work/frontier transaction, disposition only "
+                "never-claimed queued connector work with this publication request ID in its disposition, "
+                "publish a new desired revision/time, clear "
+                "identity/delivery proof and retain physical resources. Return all original removal "
+                "objects in the new immutable receipt without changing old receipts or labelling "
+                "present sources retired. A receipt failure rolls back the whole change."
+            ),
+            "intake_and_readiness": (
+                "Protected connector_desired.supersession_request_id retains the first recovery "
+                "receipt across later ordinary and supersession publications. Require complete unique "
+                "connector-revision receipts from that anchor and check every original supersession "
+                "audit for still-owned exact physical source/target bindings; a later recovery cannot "
+                "erase an earlier source's fence. Verified retirement of the old physical binding does "
+                "not fence a subsequently admitted different source ID. Restored targets cannot "
+                "accept new events merely because a worker later reports degraded: require current "
+                "enabled observation admission, verified read/event "
+                "capability checked after publication, and matched post-publication transport identity "
+                "and nonfuture receive/enqueue times. Do not require events_enabled, which is published "
+                "only after readiness; the first qualifying event supplies delivery proof. "
+                "Readiness still requires the separate original accepted delivery "
+                "proof. For a marked connector, readiness additionally requires the current matching "
+                "capability checked_at and the original worker.commit_positions receipt's native "
+                "recorded_at to fall between current publication and SQL now; future self-reported "
+                "event times cannot rebind an older accepted batch. Original operation replay remains "
+                "immutable. Quarantine, ordinary source intake and action budgets are unchanged."
             ),
         },
         "linked_retry_contract": {

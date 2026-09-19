@@ -194,6 +194,84 @@ immutable tombstone. Partial, inherited or uncertain observations do not prove
 absence. Mixed additions/removals preserve unrelated owners, and replay of an
 old receipt cannot replace newer state.
 
+### Affirmative removal authority
+
+Desired planning receives explicit `removal_targets` from effective current
+policy or recorded deletion authority. A disabled/excluded target can authorize
+contraction only after overlap and exclusion rules are resolved; a still-valid
+overlapping include is not a removal instruction. Unknown domain authority
+holds the decision rather than inventing permission.
+
+Expired or unknown read capability, incomplete inventory and omission from an
+eligible-target list are uncertainty, not physical removal authority. Retain
+the owned source and expose the gap while intake, action and readiness guards
+remain enforced. A source's physical presence likewise does not grant intake.
+
+### Receipt-bound source-removal restoration
+
+This is an implemented, offline-tested source contract still under review,
+not a claim that a live pending removal has been restored or a receiver resumed.
+Only the controller can submit `source_removal_supersessions` through its
+existing publication boundary. Each selector is exactly
+`{removal_id, source_id}` for a retained physical source and its original
+`pending_remote_absence` record. Selected identities are unique and disjoint
+from remaining removal requests. Preserve all unselected pending intents and
+source ownership; do not mix restoration with new additions, proposal binding
+or retirement. Unresolved logical source proposals block this narrow path.
+
+Restoration needs the **original**, complete `worker.observe_connector` receipt
+and its producer/work binding, not a current manifest or an inherited snapshot.
+The separate `ConnectorPresenceInspection` contains `read_only=true`, the actual
+GET `observed_at`, a SQL-compatible `definition_hash`, and a complete
+`component_states` map from canonical physical GUIDs to `Running`. The inspection
+must postdate the selected removal and be no more than 300 seconds old. Its
+definition hash must match the original SQL-derived observation result.
+
+The publication transaction checks all of these boundaries:
+
+| Boundary | Required evidence |
+|---|---|
+| Original ownership | Exact removal/source/node/target/transport binding and original removal publication/receipt; the full current owned graph must be accounted for |
+| Never dispatched | Complete, unique retained revision receipts from the original removal, with no applicable operation ID or write-ahead `INTENT_GAP`/unknown-write marker |
+| Inspection completion | Original read-only collection completed under its exact released owner/fence and completion receipt |
+| Other connector work | No active or unreconciled attempted work; a queued candidate has `attempts=0`, `retry_attempt=0`, no lease payload, no physical lease row or tombstone, and no target/execution/action/retry/finalization lineage |
+| Current scope/read | Current enabled observation admission, `reviewed` or `auto_detection_only`, fresh verified READ capability and an affirmative directly matched current scope; no explicit denied/blocked capability |
+
+`attempts=0` alone does not prove a queued operation was never claimed.
+The completed inspection's retained released lease is evidence for that
+inspection, not permission to ignore a lease tombstone on other queued work.
+Because `INTENT_GAP` is persisted before POST, it represents possible submission;
+even a later clean GET cannot erase that historical uncertainty. This path
+does not adjudicate already dispatched/possibly applied removals or older
+writers outside the recorded boundary.
+
+The current memory/SQL restoration checks directly match tenant, workspace or
+item includes bound to the admitted scope/rule. Domain-only admission does not
+qualify; domain exclusions are conservatively blocking in this path.
+Unknown scope/ancestry must remain held, not bypassed by widening a selector.
+Only missing/unknown event capability for the selected retained source may
+defer to fresh post-publication proof. Explicit denial, blocking or unsupported
+capability is not waived, and new additions retain their ordinary gates.
+Restoration grants no action capability or remediation budget.
+
+Acceptance writes a **new unready desired publication and timestamp** and an
+immutable receipt containing `superseded_source_removals`: the exact original
+pending-removal audit records. Original receipts/history and physical source
+identity remain unchanged; present sources are not labelled retired. Only
+proved never-claimed queued connector work may be dispositioned in the same
+transaction. Identity/delivery proofs are cleared, and receipt failure rolls
+back the whole publication.
+
+Rearming is separate. Restored sources need current admission plus new
+post-publication verified read/event capability, matching collector identity/OID,
+transport identity and valid receive/enqueue times. An actual accepted original
+stream receipt/position/hash then supports controller readiness publication.
+The first qualifying delivery must not require already-published Ready or
+`events_enabled`, because that delivery supplies the readiness proof.
+Later publication cannot discard earlier restoration audit/fences.
+Never erase a pending intent, patch SQL, re-register the connector or reset
+state to force a healthy result.
+
 ## Run sequence
 
 The typical transient Power BI path is shown below. Gated remediation,

@@ -75,10 +75,8 @@ def publish_reconciliation_connector(
 ) -> ConnectorPublicationResult | None:
     """Compose current desired intent or original-receipt binding before work completion."""
     from triage.monitoring.provisioning import (
-        plan_definition,
         prepare_connector_binding,
         prepare_connector_publication,
-        publication_from_plan,
         publish_connector_intent,
     )
 
@@ -90,18 +88,12 @@ def publish_reconciliation_connector(
             store, context.work, connector.connector_id, request_id=context.request_id,
         )
     else:
-        if context.eligible_targets is None:
-            request = prepare_connector_publication(
-                store, context.work, connector.connector_id, request_id=context.request_id,
-            )
-        else:
-            # Preserve the verified subset when read admission exists but event
-            # capability is unknown. The store still validates every proposed source.
-            plan = plan_definition(connector, connector.desired_definition, context.eligible_targets)
-            request = publication_from_plan(
-                context.expected, context.work, context.frontier, connector, plan,
-                request_id=context.request_id,
-            )
+        # Technical uncertainty holds topology; only affirmative policy evidence
+        # authorizes removal, including when publication uses a narrowed subset.
+        request = prepare_connector_publication(
+            store, context.work, connector.connector_id, request_id=context.request_id,
+            eligible_targets=context.eligible_targets, removal_targets=context.removal_targets,
+        )
         if (
             store.get_connector_desired(context.expected, connector.connector_id) is not None
             and connector.policy_revision == context.expected.revision and request.sources == connector.sources

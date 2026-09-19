@@ -709,6 +709,9 @@ ORDER BY {"intent_priority, " if priority else ""}workspace_rank,
     def put_receipt(self, receipt: StoredReceipt) -> None:
         raise MonitoringKernelUnsupported("Only a guarded transition may insert its operation receipt")
 
+    def connector_receipts(self, context, connector_id):
+        raise MonitoringKernelUnsupported("Connector receipt history is validated only inside guarded SQL publication")
+
     def get_lease(self, context: m.MonitoringContext, key: str) -> m.LeaseToken | None:
         if key.startswith("work:v1:"):
             row = self.get("work", m.canonical_id(key.rsplit(":", 1)[1]), context)
@@ -1388,19 +1391,24 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             recorded_at=receipt.recorded_at, result=result,
         )
 
-    def _sql_record_connector(self, expected, manifest, *, expected_connector_revision, commit=None):
+    def _sql_record_connector(self, expected, manifest, *, expected_connector_revision, commit=None, inspection=None):
         if commit is None:
             raise MonitoringComponentDenied("Connector observations require their actual collection work fence")
+        if inspection is not None:
+            inspection = _kernel_model(m.ConnectorPresenceInspection, inspection)
         self._sql.lock_context(expected)
         request_id = stable_id(expected, f"connector:{manifest.connector_id}:{expected_connector_revision}")
-        fingerprint = key_digest(_json({
+        original_request = {
             "expected": expected.model_dump(mode="json"), "manifest": manifest.model_dump(mode="json"),
             "expected_connector_revision": expected_connector_revision,
             "commit": commit.model_dump(mode="json"),
-        }))
+        }
+        if inspection is not None:
+            original_request["inspection"] = inspection.model_dump(mode="json")
+        fingerprint = key_digest(_json(original_request))
         replay = self._rpc_replay("worker.observe_connector", request_id, expected, fingerprint)
         if replay is not None:
-            return self._connector_collection_response(expected, manifest, commit, replay).connector
+            return self._connector_collection_response(expected, manifest, commit, replay, inspection=inspection).connector
         control = self._current(expected, intake=True)
         if _stamp(commit.lease) != _stamp(expected) or commit.lease.resource_key != m.work_key(expected, commit.work_id):
             raise MonitoringConflict("Connector collection lease belongs to another context or work")
@@ -1424,11 +1432,15 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             raise MonitoringConflict("Connector observation lost its current revision or context")
         if manifest.state == "ready":
             self._require_connector_delivery(manifest, control)
+        if inspection is not None:
+            self._validate_connector_presence_inspection(manifest, inspection)
         observed = self._persisted(manifest)
         values = observed.model_dump(mode="json", include={
             "workspace_id", "eventstream_id", "destination_id", "observed_definition", "endpoint", "operation_id",
             "state", "identity_verified_at", "delivery_verified_at", "delivery_proof", "gaps",
         })
+        if inspection is not None:
+            values["inspection"] = inspection.model_dump(mode="json")
         observation_json = _json(values)
         expected_definition_hash = self._sql.explicit_definition_hash(observation_json)
         result = self._sql.rpc("worker.observe_connector", {
@@ -1439,7 +1451,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             "expected_connector_revision": expected_connector_revision, "ownership_id": prior.ownership_id,
             "observation_json": observation_json,
         })["result"]
-        saved = self._connector_collection_response(expected, observed, commit, result)
+        saved = self._connector_collection_response(expected, observed, commit, result, inspection=inspection)
         if (
             saved.connector_id != prior.connector_id or saved.connector.revision != prior.revision + 1
             or saved.connector.identity_verified_at != prior.identity_verified_at
@@ -1452,7 +1464,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         return saved.connector
 
     @staticmethod
-    def _connector_collection_response(expected, observation, commit, result) -> m.ConnectorObservationResult:
+    def _connector_collection_response(expected, observation, commit, result, *, inspection=None) -> m.ConnectorObservationResult:
         saved = _kernel_model(m.ConnectorObservationResult, result)
         if (
             saved.work_id != commit.work_id or saved.work_owner_id != commit.lease.owner_id
@@ -1460,9 +1472,44 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             or _stamp(saved.observation) != _stamp(expected) or saved.observation.policy_revision != expected.revision
             or saved.connector_id != observation.connector_id or saved.connector.revision != observation.revision
             or saved.collection_completion_eligible != m.connector_collection_eligible(observation)
+            or saved.inspection != inspection
         ):
             raise MonitoringUnavailable("Connector observation receipt lost its exact collection work or original eligibility")
         return saved
+
+    def _connector_observation_projection(self, context, request_id):
+        document, handoff = self._native_reconciliation(context, request_id, "worker")
+        if document is None:
+            return None
+        if document["topic"] != "connector":
+            raise MonitoringConflict("The requested producer handoff is not a connector observation")
+        arguments = document["request_payload"]
+        connector = self._get("connector", document["reference_id"], context, m.OwnedConnectorManifest)
+        revision = arguments.get("expected_connector_revision")
+        if (
+            connector is None or type(revision) is not int or revision < 0
+            or connector.revision != revision + 1
+            or connector.connector_id != arguments.get("connector_id")
+            or connector.ownership_id != arguments.get("ownership_id")
+            or connector.policy_revision != document["policy_revision"]
+            or connector.policy_revision != arguments.get("expected_revision")
+        ):
+            logger.error("Original connector observation baseline changed request_hash=%s", key_digest(request_id))
+            raise MonitoringUnavailable("Original connector observation cannot be reconstructed from a changed baseline")
+        observed = self._connector_observation_from_handoff(connector, document)
+        patch = json.loads(arguments["observation_json"])
+        return _kernel_model(m.ConnectorObservationResult, {
+            "connector_id": connector.connector_id, "connector": connector,
+            "observation": observed,
+            "observed_definition_hash": self._sql.explicit_definition_hash(arguments["observation_json"]),
+            "authority": "observed_not_action_authority",
+            "reconcile_work_id": handoff.work_id, "frontier_key": handoff.frontier_key,
+            "frontier_revision": handoff.frontier_revision,
+            "work_id": arguments.get("work_id"), "work_owner_id": arguments.get("owner_id"),
+            "work_fence": arguments.get("fence"), "work_revision": arguments.get("work_revision"),
+            "collection_completion_eligible": m.connector_collection_eligible(observed),
+            "inspection": patch.get("inspection"),
+        })
 
     def _connector_publication(self, request: m.ConnectorPublicationRequest) -> m.ConnectorPublicationResult:
         self._sql.lock_context(request.expected)
@@ -1492,6 +1539,8 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         persisted = self._persisted(request)
         if persisted.sources != request.sources or persisted.source_proposals != request.source_proposals or (
             persisted.source_removals != request.source_removals
+        ) or (
+            persisted.source_removal_supersessions != request.source_removal_supersessions
         ) or (
             persisted.desired_definition != request.desired_definition
         ):
@@ -1528,6 +1577,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             frontier_revision=frontier.accepted_revision, name=persisted.name, sources=persisted.sources,
             source_proposals=persisted.source_proposals, desired_definition=persisted.desired_definition,
             source_removals=persisted.source_removals,
+            source_removal_supersessions=persisted.source_removal_supersessions,
             observation_receipt_id=request.observation_receipt_id, readiness_receipt_id=request.readiness_receipt_id,
             detail=persisted.detail,
         )
@@ -1565,8 +1615,9 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         original = self._sql.get_receipt("controller.publish_connector", request.request_id, control)
         if original is None or _kernel_model(m.ConnectorPublicationResult, self._receipt_result(original)) != result:
             raise MonitoringUnavailable("Connector publication result differs from its original committed receipt")
-        self._validate_removal_result(request, prior, result, work, publication_id, observed_definition_hash)
+        self._validate_removal_result(request, prior, result, work, publication_id, observed_definition_hash, desired)
         self._publish_connector(result.connector, control)
+        self._schedule_supersession_capabilities(request, result.superseded_source_removals, control)
         if result.desired_changed and result.state in {"planned", "provisioning"}:
             self._connector_followup(result.connector, control)
         self._sql.operation_identity("controller.publish_connector", request.request_id)
@@ -1575,13 +1626,55 @@ class AzureSqlMonitoringStore(MonitoringEngine):
     @staticmethod
     def _connector_observation_from_handoff(connector, document):
         patch = json.loads(document["request_payload"]["observation_json"])
+        # Inspection is immutable observation evidence, not current manifest state.
+        patch.pop("inspection", None)
         return _kernel_model(m.OwnedConnectorManifest, {
             **connector.model_dump(mode="json"), **patch, "updated_at": document["created_at"],
         })
 
-    def _validate_removal_result(self, request, prior, result, work, publication_id, observed_definition_hash):
+    def _validate_removal_result(self, request, prior, result, work, publication_id, observed_definition_hash, prior_desired):
         previous = {removal.removal_id: removal for removal in prior.source_removals} if prior else {}
         requested = {removal.removal_id: removal for removal in request.source_removals}
+        if request.source_removal_supersessions:
+            selected = {item.removal_id: item.source_id for item in request.source_removal_supersessions}
+            expected = {key: value for key, value in previous.items() if key in selected}
+            desired = self._get("connector_desired", request.connector_id, request.expected, m.ConnectorDesiredState)
+            expected_anchor = (
+                prior_desired.supersession_request_id
+                if prior_desired and prior_desired.supersession_request_id else request.request_id
+            )
+            if (
+                len(expected) != len(selected)
+                or {entry.removal_id: entry for entry in result.superseded_source_removals} != expected
+                or any(value.source_id != selected[key] for key, value in expected.items())
+                or {entry.removal_id: entry for entry in result.pending_removals}
+                != {key: value for key, value in previous.items() if key not in selected}
+                or result.retired_sources or not result.desired_changed or result.state != "provisioning"
+                or desired is None or desired.supersession_request_id != expected_anchor
+                or any(value is not None for value in (
+                    result.connector.identity_verified_at, result.connector.delivery_verified_at,
+                    result.connector.delivery_proof,
+                ))
+            ):
+                raise MonitoringUnavailable("Supersession result lost original removals, retained ownership or unready publication")
+            for original in expected.values():
+                receipt = self._sql.get_receipt("controller.publish_connector", original.request_id, request.expected)
+                if receipt is None:
+                    raise MonitoringUnavailable("Supersession result lost its original removal publication receipt")
+                publication = _kernel_model(m.ConnectorPublicationResult, self._receipt_result(receipt))
+                if (
+                    publication.connector_id != request.connector_id
+                    or publication.connector.ownership_id != request.ownership_id
+                    or original not in publication.pending_removals
+                    or not any(
+                        source.source_id == original.source_id and source.target == original.target
+                        for source in publication.connector.sources
+                    )
+                ):
+                    raise MonitoringUnavailable("Supersession rewrote its original removal history")
+            return
+        if result.superseded_source_removals:
+            raise MonitoringUnavailable("An ordinary publication cannot report unrequested source supersession")
         if request.observation_receipt_id is None:
             if result.retired_sources or {removal.removal_id for removal in result.pending_removals} != set(requested):
                 raise MonitoringUnavailable("Unobserved desired removal cannot retire or discard ownership")
@@ -2951,7 +3044,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             if len(rows) < limit:
                 return candidates
 
-    def _delivery_original(self, signal, control):
+    def _delivery_original(self, signal, control) -> datetime:
         transport = signal.transport
         journal = self._stream_position(signal.partition, signal.position.sequence_number)
         if journal is None or journal.batch_id != transport.request_id or journal.receipt_key != signal.delivery.key:
@@ -2980,7 +3073,8 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             )]
             if len(originals) != 1 or len(bindings) != 1:
                 raise MonitoringUnavailable("Delivery proof differs from its original protected stream evidence")
-            return
+            # The protected handoff and batch receipt share the RPC's SQL @now.
+            return _read_time(document["created_at"])
         original = self._sql.get_receipt("worker.commit_positions", transport.request_id, control)
         if original is None:
             raise MonitoringUnavailable("Delivery proof lost its original native acceptance receipt")
@@ -2997,6 +3091,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             or journal.batch_id != transport.request_id
         ):
             raise MonitoringUnavailable("Delivery proof differs from its immutable native stream acceptance")
+        return original.recorded_at
 
     def _stream_acceptance(self, context, request_id, native, *, positions=None):
         value = _kernel_model(m.StreamAcceptanceResult, native)

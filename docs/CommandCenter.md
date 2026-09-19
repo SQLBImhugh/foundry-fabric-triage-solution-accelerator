@@ -325,6 +325,37 @@ An Admin who can browse an item does not prove that the worker can read it.
 Likewise, a configured event subscription or receiver heartbeat does not prove
 an eligible failure reached durable SQL intake.
 
+### Physical removal and restoration status
+
+Expired or unknown capability, incomplete inventory and a target missing from
+an eligible list are not physical source-removal instructions. Desired planning
+needs affirmative effective-policy disable/exclude/deletion authority, with
+overlap and unknown-domain checks. The UI must keep uncertainty visible while
+intake/action/readiness fences remain enforced.
+
+A physically present source may still have a valid pending-removal fence.
+The source contract now supports controller-only receipt-bound supersession,
+not an operator/browser cancel or force-Ready control. It requires the exact
+original fresh complete GET-only worker presence inspection, original
+removal/history and current work/lease proof that the removal was neither
+dispatched nor possibly applied. Current manifest equality and `attempts=0`
+alone are not sufficient evidence.
+
+The current narrow restoration guard requires fresh verified READ and current
+reviewed or `auto_detection_only` admission under directly matched
+tenant/workspace/item includes. Domain-only admission does not qualify; domain
+exclusion/unknown authority can hold recovery. Explicit denied/blocked capability
+cannot be overridden, and no action capability is granted.
+
+A new receipt preserves the superseded pending-removal audit and physical
+identity, but publishes new unready desired state with old identity/delivery
+proofs cleared. Fresh post-publication capability, collector identity and actual
+delivery evidence must precede controller Ready. Notes, human tracking
+resolution, re-registration, manual SQL or reset cannot bypass these gates.
+This describes implemented/in-review source behavior, not a claim of current
+live restoration. See
+[held removals and restoration](OperationsGuide.md#held-removals-and-receipt-bound-restoration).
+
 ### Per-target safety review
 
 Readers can open an existing safety review from target details. Only Admin can

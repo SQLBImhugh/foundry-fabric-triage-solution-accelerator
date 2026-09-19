@@ -28,9 +28,10 @@ from triage.monitoring.memory import InMemoryMonitoringStore
 from triage.monitoring.sql_store import AzureSqlMonitoringStore
 
 
-def scoped_connector(backend, *, database_type=Review9Database):
+def scoped_connector(backend, *, database_type=Review9Database, source_count=1):
     h = Harness()
-    h.seed()
+    assert source_count in {1, 2}
+    h.seed(count=source_count)
     h.activate()
     db = database_type(h) if backend == "sql" else None
     web = AzureSqlMonitoringStore(db=db, component="web") if db else InMemoryMonitoringStore(
@@ -50,13 +51,28 @@ def scoped_connector(backend, *, database_type=Review9Database):
     work = claim_sibling(h, controller)
     producer = controller.get_reconciliation_request(h.version, work.reconcile_request_id, producer="web")
     frontier = controller.get_validation_frontier(h.version, producer.frontier_key)
-    planned = controller.publish_connector(publication(h, work, frontier)).connector
+    initial = publication(h, work, frontier)
+    if source_count == 2:
+        second = definition(h.targets[1], source_name="owned-second")
+        expanded = deepcopy(initial.desired_definition)
+        expanded["parts"]["eventstream.json"]["sources"].extend(second["parts"]["eventstream.json"]["sources"])
+        expanded["parts"]["eventstream.json"]["streams"][0]["inputNodes"].append({"name": "owned-second"})
+        initial = m.ConnectorPublicationRequest.model_validate({
+            **initial.model_dump(), "desired_definition": expanded,
+            "source_proposals": (*initial.source_proposals, initial.source_proposals[0].model_copy(update={
+                "proposal_id": uid(904), "node_name": "owned-second", "target": h.targets[1],
+            })),
+        })
+    planned = controller.publish_connector(initial).connector
     controller.reconcile_work(work)
     h.clock.advance(1)
     if db:
         db.principal = "worker"
     observed = definition(h.targets[0])
     observed["component_ids"]["sources/owned-source"] = uid(1901)
+    if source_count == 2:
+        observed["parts"] = deepcopy(initial.desired_definition["parts"])
+        observed["component_ids"]["sources/owned-second"] = uid(1902)
     worker.record_connector(h.version, m.OwnedConnectorManifest.model_validate({
         **planned.model_dump(), "revision": planned.revision + 1,
         "workspace_id": uid(970), "eventstream_id": uid(971), "destination_id": uid(903),
@@ -124,7 +140,7 @@ def test_materialized_result_must_match_original_worker_observation_even_if_publ
         scoped_connector("sql", database_type=ChangedBindingResultDatabase)
 
 
-def removal_request(h, web, controller, owned, db):
+def removal_request(h, web, controller, owned, db, *, source_index=0):
     if db:
         db.principal = "web"
     web.request_discovery(h.version, m.ScopeSelector(tenant_id=uid(1), kind="tenant"), request_id=h.next_id())
@@ -134,9 +150,19 @@ def removal_request(h, web, controller, owned, db):
     producer = controller.get_reconciliation_request(h.version, work.reconcile_request_id, producer="web")
     frontier = controller.get_validation_frontier(h.version, producer.frontier_key)
     desired = deepcopy(owned.desired_definition)
-    desired["parts"]["eventstream.json"]["sources"] = []
-    desired["parts"]["eventstream.json"]["streams"][0]["inputNodes"] = []
-    desired["component_ids"].pop("sources/owned-source")
+    selected = owned.sources[source_index]
+    component_key, = [
+        key for key, value in desired["component_ids"].items()
+        if key.startswith("sources/") and value == selected.source_id
+    ]
+    node_name = component_key.split("/", 1)[1]
+    desired["parts"]["eventstream.json"]["sources"] = [
+        node for node in desired["parts"]["eventstream.json"]["sources"] if node["name"] != node_name
+    ]
+    desired["parts"]["eventstream.json"]["streams"][0]["inputNodes"] = [
+        node for node in desired["parts"]["eventstream.json"]["streams"][0]["inputNodes"] if node["name"] != node_name
+    ]
+    desired["component_ids"].pop(component_key)
     request = m.ConnectorPublicationRequest(
         request_id=h.next_id(), expected=h.version, work_id=work.work_id, lease=work.lease,
         expected_work_revision=work.revision, expected_frontier_revision=frontier.accepted_revision,
@@ -144,7 +170,7 @@ def removal_request(h, web, controller, owned, db):
         expected_connector_revision=owned.revision, name=owned.name,
         sources=owned.sources, source_proposals=owned.source_proposals,
         source_removals=(m.SourceRemovalIntent(
-            removal_id=h.next_id(), source_id=owned.sources[0].source_id, proposal_id=None,
+            removal_id=h.next_id(), source_id=selected.source_id, proposal_id=None,
             detail="Remove this owned source after its exact remote absence is verified.",
         ),), desired_definition=desired, detail="Publish a removal intent without releasing physical ownership.",
     )

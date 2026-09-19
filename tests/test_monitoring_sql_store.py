@@ -1237,7 +1237,7 @@ def test_sql_stream_boundary_and_heartbeat_do_not_manufacture_delivery_proof(sql
     current = next(item for item in other.list_connectors(m.PageQuery(**h.context())).items if item.connector_id == h.connector_id)
     assert current.delivery_verified_at == connector.delivery_verified_at
     assert current.identity_verified_at == connector.identity_verified_at
-    assert current.last_receiver_activity_at == h.clock()
+    assert current == connector
     assert other.get_stream_checkpoint(h.partition) is None
     assert other.list_receiver_heartbeats(m.MonitoringContext(**h.context()), connector_id=h.connector_id) == (heartbeat,)
 

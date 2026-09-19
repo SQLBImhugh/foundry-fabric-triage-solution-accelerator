@@ -290,6 +290,9 @@ class Review9Database(ActionAbiDatabase):
                 sources_hash=m._digest([value.model_dump(mode="json") for value in current.sources]),
                 definition_hash=m.connector_definition_hash(current.desired_definition),
                 published_at=self.clock(),
+                supersession_request_id=(
+                    json.loads(desired_row.payload).get("supersession_request_id") if desired_row else None
+                ),
             ).model_dump(mode="json"))
         reply = self.reply("controller.publish_connector", args, {
             "connector_id": current.connector_id, "connector": current.model_dump(mode="json"),
@@ -325,6 +328,9 @@ class Review9Database(ActionAbiDatabase):
         ):
             raise RuntimeError("Connector observation CAS changed (51072)")
         patch = json.loads(args["observation_json"])
+        inspection = patch.pop("inspection", None)
+        if inspection is not None:
+            inspection = m.ConnectorPresenceInspection.model_validate(inspection).model_dump(mode="json")
         for field in ("workspace_id", "eventstream_id", "destination_id", "endpoint"):
             value = prior.model_dump(mode="json")[field]
             if value is not None and patch[field] != value:
@@ -350,6 +356,7 @@ class Review9Database(ActionAbiDatabase):
             "collection_completion_eligible": bool(self.native_rows(
                 f"SELECT CASE WHEN {connector_collection_eligible_sql()} THEN 1 ELSE 0 END", args,
             )[0][0]),
+            "inspection": inspection,
             **self.handoff("worker.observe_connector", args, topic="connector", reference=prior.connector_id),
         })
 

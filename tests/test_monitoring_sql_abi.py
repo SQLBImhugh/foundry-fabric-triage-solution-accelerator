@@ -523,7 +523,9 @@ class AbiDatabase(KernelProtocolDatabase):
             work = m.MonitoringWork.model_validate_json(self.records[("work", args["work_id"])].payload)
             if work.lease is None or work.lease.fence != args["fence"] or work.revision != args["work_revision"]:
                 raise RuntimeError("Work transition lost ownership (51074)")
-            assert args["transition"] in {"complete", "retry"}
+            assert args["transition"] in {"complete", "retry", "disposition"}
+            if args["transition"] == "disposition":
+                assert operation == "worker.transition_work" and args["detail"]
             if operation == "worker.transition_work" and args["transition"] == "complete" and not any(
                 name == "worker.accept_facts" and entry["payload"]["result"]["work_id"] == work.work_id
                 and entry["payload"]["result"]["work_fence"] == work.lease.fence
@@ -539,9 +541,10 @@ class AbiDatabase(KernelProtocolDatabase):
                 raise RuntimeError("Reconciliation has no terminal guarded result (51072)")
             work = m.MonitoringWork.model_validate({
                 **work.model_dump(), "revision": work.revision + 1,
-                "state": "completed" if args["transition"] == "complete" else "waiting",
-                "lease": None, "completed_at": self.clock() if args["transition"] == "complete" else None,
+                "state": {"complete": "completed", "retry": "waiting", "disposition": "dispositioned"}[args["transition"]],
+                "lease": None, "completed_at": self.clock() if args["transition"] != "retry" else None,
                 "due_at": args["retry_at"].replace(tzinfo=UTC) if args["retry_at"] else work.due_at,
+                "disposition": args["detail"] if args["transition"] == "disposition" else work.disposition,
             })
             self.save_work(work)
             result = {"work_id": work.work_id, "work": work.model_dump(mode="json")}

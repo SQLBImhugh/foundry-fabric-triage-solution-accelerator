@@ -238,7 +238,9 @@ async def test_direct_initial_removal_cannot_bypass_dormant_orchestration(backen
     frontier = controller.get_validation_frontier(CONTEXT, producer.frontier_key)
     request = publication_from_plan(
         fixture.version("controller"), work, frontier, registered,
-        plan_definition(registered, registered.desired_definition, ()), request_id=fixture.h.next_id(),
+        plan_definition(
+            registered, registered.desired_definition, (), removal_targets=(fixture.identity,),
+        ), request_id=fixture.h.next_id(),
     )
     with pytest.raises(MonitoringConflict, match="Initial connector publication"):
         controller.publish_connector(request)

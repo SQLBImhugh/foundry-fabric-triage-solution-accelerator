@@ -549,6 +549,17 @@ An initially dormant source is not removed just because it has no admitted
 target; later revocation after publication still fences intake and retains
 ownership until exact complete absence is proved.
 
+Unknown or expired read capability and partial inventory do not authorize
+physical removal. If a removal intent already exists, seeing the source present
+does not cancel it. The implemented, in-review controller restoration path needs
+an original fresh GET-only presence receipt, never-dispatched history, current
+read/scope authority and connector-specific work fences. It preserves the old
+audit and publishes new unready state; post-publication capability and actual
+delivery proof still precede Ready. Domain-only admission is not supported by
+this narrow restoration guard. Do not erase intent, re-register, reset or patch
+SQL to force success. See
+[receipt-bound restoration](OperationsGuide.md#held-removals-and-receipt-bound-restoration).
+
 The existing one-minute command schedule was changed to `heartbeat`, not
 duplicated. Three real recurrences were decoded as completed. The controller
 has an 840-second monotonic admission window, including lock wait, with two

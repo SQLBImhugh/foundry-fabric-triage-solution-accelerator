@@ -364,6 +364,51 @@ receipt/checkpoint coupling. A shared `work:` key prefix or generic privileged
 JSON setter cannot provide those guarantees. Prove negative role cases with
 actual deployed identities, not only a translated SQL test backend.
 
+### Affirmative removal and guarded source restoration
+
+The implemented restoration source contract is offline-tested and under review;
+it is not full native, live-restored or receiver-resumption acceptance.
+Desired planning requires affirmative effective-policy `removal_targets` for
+disable/exclusion or recorded deletion authority. Resolve overlapping scopes;
+unknown domain authority, expired read capability, incomplete inventory and
+omission from current admission are not permission to delete physical sources.
+Intake, actions and readiness still fail closed while that uncertainty is held.
+
+An existing pending removal can be superseded only by the controller's
+`source_removal_supersessions` for exact retained physical removal/source
+selectors. Keep all other pending intents and ownership unchanged; do not mix
+new additions, bindings or retirement into this path. Require the original
+fresh complete `worker.observe_connector` receipt with its separate
+`ConnectorPresenceInspection`, explicit GET-only flag/time, SQL definition hash
+and complete physical-GUID/`Running` map. A current manifest is not that proof.
+
+The original removal publication and every intervening revision receipt must
+prove no dispatch/possible effect. Retained pre-POST submission markers or
+operation IDs, missing history, active work and nonterminal attempted work
+block restoration even if the source is later seen present.
+Inspection collection must have its exact terminal owner/fence/completion proof.
+Other queued work is never-claimed only with zero attempts/retry attempts, no
+lease payload or physical lease row/tombstone and no effect/retry/finalization
+lineage; zero attempts alone is not sufficient.
+
+Current enabled READ admission may be reviewed or automatic detection-only,
+with fresh verified read capability and no explicit denied/blocked status.
+Current memory/SQL checks require direct tenant/workspace/item inclusion;
+domain-only admission is not supported, and domain exclusions remain
+conservatively blocking. Unknown event capability can defer only for selected
+retained sources, not new additions. This grants no action authority.
+
+One transaction publishes a new unready desired identity/time, clears old
+identity/delivery proofs and records the exact superseded pending-removal audit
+in a new receipt without changing original history/source identity.
+Only proved never-claimed queued connector work is dispositioned.
+New post-publication read/event capability and matching collector identity/OID,
+receive/enqueue and accepted original delivery-receipt evidence are required.
+The first qualifying event must not depend on Ready/`events_enabled`, which
+can be published only after its delivery proof. Never use intent erasure,
+operator SQL DML, re-registration or reset as a substitute.
+See [the detailed restoration boundary](TechnicalArchitecture.md#receipt-bound-source-removal-restoration).
+
 Azure SQL supports `CREATE USER ... WITHOUT LOGIN` and `EXECUTE AS USER` for
 database-scoped tests. Those tests cannot prove deployed-MI sign-in,
 network/firewall admission or reconnect/recovery. Verify service-principal/UAMI SQL SIDs from
@@ -724,6 +769,8 @@ procedures against owned canary resources.
 | Controller | Stale scope after approval, denied approval, revoked deferred retry, shared target ownership, newer/active runs, unknown activity effects, uncertain POST and exact completion. |
 | Power BI actions | Crash after accepted refresh POST, missing correlation, concurrent external refresh, deferred retry racing an operator command and no first-unseen-refresh success fallback. |
 | Finalization | Incident/processed write failure, recovery before work completion, process exit, ambiguous terminal commit and no in-memory success or repeated effect. |
+| Physical source removal | Expired read capability, partial inventory and omitted admission retain sources; only affirmative effective disable/exclude/deletion authority contracts topology. Overlapping includes and unknown domain authority do not create removal permission. |
+| Removal restoration | Exact original fresh GET-only presence receipt, complete Running map and history; reject stale/current-manifest proof, possible POST markers, ambiguous revisions, attempted work and queued lease tombstones. Direct-scope limits, denied capability, unchanged audit/identity, atomic unready publication and post-publication first-delivery rearming remain enforced. |
 | Clean reset | Empty new state, wrong-target or misbound-writer refusal, omitted registered target/writer blocking, in-flight effect blocking, old approval/message/event replay, ambiguous reset acknowledgement and no old-schema/config fallback. |
 | Coverage | Retention exhausted, quiet but disconnected source, stale worker, paused capacity, backlog, throttling and a busy workspace that cannot starve another. |
 | UI | Admin-only changes, Reader coverage, stale-response cancellation, revision conflicts, token-refresh lock, empty/incomplete states and current styling. |

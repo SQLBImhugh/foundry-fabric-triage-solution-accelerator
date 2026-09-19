@@ -9,6 +9,10 @@ from triage.monitoring.sql_kernel_removals import (
     desired_source_projection_sql,
     prepare_removals_sql,
 )
+from triage.monitoring.sql_kernel_supersessions import (
+    prepare_supersession_selection_sql,
+    validate_supersession_sql,
+)
 
 
 def binding_receipt_sql(names: SqlNames) -> str:
@@ -90,6 +94,8 @@ IF EXISTS (SELECT JSON_VALUE(value,'$.proposal_id') FROM OPENJSON(@proposals)
    OR EXISTS (SELECT JSON_VALUE(value,'$.node_name') COLLATE Latin1_General_100_BIN2 FROM OPENJSON(@proposals)
     GROUP BY JSON_VALUE(value,'$.node_name') COLLATE Latin1_General_100_BIN2 HAVING COUNT(*)>1)
     THROW 51073, 'Logical proposal identities and node names must be unique', 1;
+{prepare_supersession_selection_sql(names)}
+{validate_supersession_sql(names, complete_component_map_sql())}
 {prepare_removals_sql(names)}
 IF @binding_receipt_id IS NULL AND EXISTS (
     SELECT 1 FROM OPENJSON(@proposals) AS p
@@ -103,7 +109,7 @@ IF @binding_receipt_id IS NULL AND EXISTS (
           AND EXISTS (SELECT 1 FROM OPENJSON(@prior,'$.observed_definition.component_ids') AS observed_id
               WHERE {exact_text_equal('observed_id.[key]', "N'sources/'+JSON_VALUE(p.value,'$.node_name')")})))
     THROW 51072, 'An unresolved proposal cannot acquire a supplied ID or adopt an already observed unowned node without its original receipt', 1;
-IF @binding_receipt_id IS NOT NULL
+IF @binding_receipt_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM @supersessions)
 BEGIN
     IF @prior IS NULL OR @readiness_id IS NOT NULL
        OR @binding_receipt_id<>JSON_VALUE(@stored_work,'$.reconcile_request_id')

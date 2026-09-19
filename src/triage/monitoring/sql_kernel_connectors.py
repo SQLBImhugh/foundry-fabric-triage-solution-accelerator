@@ -25,12 +25,16 @@ from triage.monitoring.sql_kernel_removals import (
     retirement_records_sql,
     source_is_pending_removal_sql,
 )
+from triage.monitoring.sql_kernel_supersessions import (
+    supersession_current_scope_sql,
+    supersession_disposition_work_sql,
+)
 
 PUBLICATION_FIELDS = (
     "connector_id", "ownership_id", "work_id", "lease_owner_id", "lease_fence",
     "expected_work_revision", "expected_connector_revision", "policy_revision",
     "producer_request_id", "producer_fingerprint", "frontier_key", "frontier_revision",
-    "name", "sources", "source_proposals", "source_removals", "desired_definition",
+    "name", "sources", "source_proposals", "source_removals", "source_removal_supersessions", "desired_definition",
     "observation_receipt_id", "readiness_receipt_id", "detail",
 )
 SUBSCRIPTION_TYPES = tuple(
@@ -53,16 +57,30 @@ def subscription_type_sql(receipt: str) -> str:
     return f"CASE {clauses} ELSE NULL END"
 
 
-def source_authorized_predicate() -> str:
-    return """COALESCE(JSON_VALUE(@approved_target,'$.state'),'')='current'
+def source_authorized_predicate(*, require_events: bool = True) -> str:
+    event = "AND COALESCE(JSON_VALUE(@source_capability,'$.event_status'),'')='verified'" if require_events else ""
+    return f"""COALESCE(JSON_VALUE(@approved_target,'$.state'),'')='current'
 AND COALESCE(JSON_VALUE(@approved_target,'$.observation.enabled'),'')='true'
 AND COALESCE(TRY_CONVERT(bigint,JSON_VALUE(@approved_target,'$.policy_revision')),-1)=@current_revision
 AND COALESCE(JSON_VALUE(@source_capability,'$.read_status'),'')='verified'
-AND COALESCE(JSON_VALUE(@source_capability,'$.event_status'),'')='verified'
+{event}
 AND TRY_CONVERT(datetimeoffset,JSON_VALUE(@source_capability,'$.expires_at')) IS NOT NULL
 AND TRY_CONVERT(datetimeoffset,JSON_VALUE(@source_capability,'$.expires_at'))>TODATETIMEOFFSET(@now,'+00:00')
 AND COALESCE(JSON_QUERY(@source_capability,'$.target'),'') COLLATE Latin1_General_100_BIN2
     =COALESCE(@source_target,'missing') COLLATE Latin1_General_100_BIN2"""
+
+
+def restored_source_authorized_predicate(names: SqlNames) -> str:
+    equal = names.object("json_equal")
+    return f"""({source_authorized_predicate(require_events=False)})
+AND COALESCE(JSON_VALUE(@source_capability,'$.event_status'),'unknown') IN ('verified','unknown')
+AND {equal}(JSON_QUERY(@approved_target,'$.identity'),@source_target)=1
+AND {exact_text_equal("JSON_VALUE(@source_capability,'$.capability_id')", "JSON_VALUE(@approved_target,'$.capability_id')")}
+AND {exact_text_equal("JSON_VALUE(@source_capability,'$.inventory_generation')", "JSON_VALUE(@approved_target,'$.inventory_generation')")}
+AND {canonical_guid("JSON_VALUE(@source_capability,'$.collector_identity_id')")}
+AND TRY_CONVERT(datetimeoffset,JSON_VALUE(@source_capability,'$.checked_at')) IS NOT NULL
+AND TRY_CONVERT(datetimeoffset,JSON_VALUE(@source_capability,'$.checked_at'))<=TODATETIMEOFFSET(@now,'+00:00')
+AND ({supersession_current_scope_sql(names)})"""
 
 
 def publish_update_sql(names: SqlNames) -> str:
@@ -77,6 +95,11 @@ def desired_update_expression() -> str:
     return """JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(@prior,'$.name',@name),
     '$.sources',JSON_QUERY(@sources)),'$.desired_definition',JSON_QUERY(@definition)),
     '$.policy_revision',@current_revision)"""
+
+
+def desired_supersession_request_expression() -> str:
+    return """COALESCE(JSON_VALUE(@desired,'$.supersession_request_id'),
+    CASE WHEN EXISTS (SELECT 1 FROM @supersessions) THEN @request_id ELSE NULL END)"""
 
 
 def invalidate_readiness_expression() -> str:
@@ -115,18 +138,26 @@ def initial_publication_invalid_sql(names: SqlNames) -> str:
        +(SELECT COUNT(*) FROM OPENJSON(@plan,'$.source_proposals'))=0)"""
 
 
+def recovered_readiness_time_current_sql(timestamp: str) -> str:
+    return f"""(JSON_VALUE(@delivery_desired,'$.supersession_request_id') IS NULL OR (
+    {timestamp} IS NOT NULL
+    AND {timestamp}>=TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_desired,'$.published_at'))
+    AND {timestamp}<=TODATETIMEOFFSET(@now,'+00:00')))"""
+
+
 def require_delivery_proof_sql(names: SqlNames, observation: str) -> str:
     """Bind readiness to the original RPC receipt, accepted signal and broker journal."""
     records, receipts = names.table("monitoring_records"), names.table("monitoring_receipts")
     equal = names.object("json_equal")
     return f"""
 DECLARE @delivery_proof nvarchar(max)=JSON_QUERY({observation},'$.delivery_proof'),
-    @delivery_signal nvarchar(max),@delivery_batch nvarchar(max),@delivery_desired nvarchar(max);
+    @delivery_signal nvarchar(max),@delivery_batch nvarchar(max),@delivery_desired nvarchar(max),
+    @delivery_batch_recorded_at datetime2(6);
 SELECT @delivery_signal=payload FROM {records}
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='signal' AND status='accepted'
   AND full_key=JSON_VALUE(@delivery_proof,'$.receipt_key')
   AND key_hash={key_hash("JSON_VALUE(@delivery_proof,'$.receipt_key')")};
-SELECT @delivery_batch=payload FROM {receipts}
+SELECT @delivery_batch=payload,@delivery_batch_recorded_at=recorded_at FROM {receipts}
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND operation='worker.commit_positions'
   AND request_id=JSON_VALUE(@delivery_proof,'$.request_id');
 SELECT @delivery_desired=payload FROM {records}
@@ -155,6 +186,7 @@ IF @delivery_proof IS NULL OR @delivery_signal IS NULL OR @delivery_batch IS NUL
    OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.transport.identity_verified_at')) IS NULL
    OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.position.enqueued_at')) IS NULL
    OR TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_desired,'$.published_at')) IS NULL
+   OR NOT {recovered_readiness_time_current_sql("TODATETIMEOFFSET(@delivery_batch_recorded_at,'+00:00')")}
    OR NOT {exact_text_equal("JSON_VALUE(@delivery_proof,'$.received_at')", "JSON_VALUE(@delivery_signal,'$.received_at')")}
    OR NOT {exact_text_equal("JSON_VALUE(@delivery_proof,'$.identity_verified_at')", "JSON_VALUE(@delivery_signal,'$.transport.identity_verified_at')")}
    OR TRY_CONVERT(datetimeoffset,JSON_VALUE({observation},'$.delivery_verified_at'))<>TRY_CONVERT(datetimeoffset,JSON_VALUE(@delivery_signal,'$.received_at'))
@@ -201,6 +233,7 @@ IF @delivery_proof IS NULL OR @delivery_signal IS NULL OR @delivery_batch IS NUL
          AND JSON_VALUE(capability.payload,'$.read_status')='verified'
          AND JSON_VALUE(capability.payload,'$.event_status')='verified'
          AND TRY_CONVERT(datetimeoffset,JSON_VALUE(capability.payload,'$.expires_at'))>TODATETIMEOFFSET(@now,'+00:00')
+         AND {recovered_readiness_time_current_sql("TRY_CONVERT(datetimeoffset,JSON_VALUE(capability.payload,'$.checked_at'))")}
          AND EXISTS (SELECT 1 FROM OPENJSON(s.value,'$.event_types') AS e
              WHERE {exact_text_equal('e.value', '(' + subscription_type_sql('@delivery_signal') + ')')}))
     THROW 51072, 'Readiness requires the original current accepted transport receipt', 1;
@@ -309,7 +342,13 @@ BEGIN
     WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='target' AND full_key=@source_key;
     SELECT @source_capability=payload FROM {records} WITH (UPDLOCK,HOLDLOCK)
     WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='target_capability' AND full_key=@source_key;
-    IF NOT ({source_authorized_predicate()})
+    IF EXISTS (SELECT 1 FROM @supersessions AS restored
+        WHERE {names.object('json_equal')}(JSON_QUERY(restored.binding_json,'$.target'),@source_target)=1)
+    BEGIN
+        IF CASE WHEN {restored_source_authorized_predicate(names)} THEN 1 ELSE 0 END<>1
+            THROW 51072, 'Restored source lacks current reviewed scope and fresh service read admission', 1;
+    END
+    ELSE IF NOT ({source_authorized_predicate()})
         THROW 51072, 'Desired source is outside current approved observation/event capability', 1;
     FETCH NEXT FROM approved_sources INTO @source_target;
 END;
@@ -455,6 +494,7 @@ END;
 SET @next=JSON_MODIFY(JSON_MODIFY(@next,'$.revision',@expected_connector_revision+1),
     '$.updated_at',CONVERT(nvarchar(40),@now,127)+N'Z');
 {retirement_records_sql(names)}
+{supersession_disposition_work_sql(names)}
 IF @prior IS NULL
 BEGIN
     {record_insert(names, 'connector', '@connector_id', '@next', status="N'planned'")}
@@ -469,6 +509,7 @@ BEGIN
     DECLARE @desired_payload nvarchar(max)=(SELECT @connector_id AS connector_id,@ownership_id AS ownership_id,
         @publication_id AS publication_id,@current_revision AS policy_revision,
         {payload_hash('@sources')} AS sources_hash,{payload_hash('@definition')} AS definition_hash,
+        {desired_supersession_request_expression()} AS supersession_request_id,
         CONVERT(nvarchar(40),@now,127)+N'Z' AS published_at FOR JSON PATH,WITHOUT_ARRAY_WRAPPER);
     IF @desired IS NULL
     BEGIN
@@ -481,7 +522,7 @@ SET @affected=1;
 SET @result=(SELECT @connector_id AS connector_id,JSON_QUERY(@next) AS connector,
     JSON_VALUE(@next,'$.state') AS state,@desired_changed AS desired_changed
     ,JSON_QUERY(@removals) AS pending_removals,JSON_QUERY(@retired_json) AS retired_sources,
-    @binding_receipt_id AS observation_receipt_id
+    @binding_receipt_id AS observation_receipt_id,JSON_QUERY(@superseded_json) AS superseded_source_removals
     FOR JSON PATH,INCLUDE_NULL_VALUES,WITHOUT_ARRAY_WRAPPER);
 {save_receipt(names, contract.operation)}"""
     return {contract.operation: procedure(names, contract, body, replay=True)}
