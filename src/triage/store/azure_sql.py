@@ -376,6 +376,37 @@ class AzureSqlDatabase:
             self._close_cursor(cur)
 
     def query(self, sql: str, *params: Any) -> list[tuple]:
+        """Run a read and return its rows, retrying once on a dead connection.
+
+        A pooled connection that has idled past the server's timeout does not
+        report itself as closed: it fails the *next* statement with
+        ``Communication link failure``. The deployed command center sat idle for
+        two days, and every first request afterwards -- each code path holding
+        its own connection -- answered 503 before the retry-on-next-use recovered
+        it. An operator opening the UI saw empty lists and no reason, which is
+        indistinguishable from a healthy empty tenant.
+
+        Retrying is safe here and only here. A read has no external effect, so
+        replaying it cannot duplicate one. ``execute`` deliberately does not
+        retry: an autocommit statement may have committed before the link
+        dropped, and that uncertainty needs receipt reconciliation, not a replay.
+        A transaction never retries either, for the reason ``_ensure`` gives.
+        """
+        try:
+            return self._query_once(sql, *params)
+        except BaseException as exc:
+            if (
+                not _is_connection_error(exc)
+                or getattr(self._local, "transaction_active", False)
+                or getattr(self._local, "transaction_failed", False)
+            ):
+                raise
+            logger.info(
+                "Discarded a dead Azure SQL connection (%s) and retrying one read", self.target,
+            )
+        return self._query_once(sql, *params)
+
+    def _query_once(self, sql: str, *params: Any) -> list[tuple]:
         conn = self._ensure()
         if conn is None:
             raise SqlUnavailable(f"Azure SQL unavailable ({self.target})")
