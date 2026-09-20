@@ -235,7 +235,18 @@ class SqlBackend:
         except (MonitoringStoreError, ValidationError, ValueError):
             raise
         except Exception as exc:
-            logger.error("Monitoring SQL operation failed operation=%s error_type=%s", operation, type(exc).__name__)
+            # The class alone is not actionable. A guarded refusal carries a
+            # 5107x code and is decoded below, but everything else -- a
+            # ProgrammingError from a renamed column, a DataError from an
+            # oversized value -- looks identical in a log that prints only the
+            # type, and an operator has nothing to act on. The message is
+            # redacted and truncated for the same reason every other store
+            # boundary redacts: a SQL error can quote the row that failed.
+            detail = redact_text(str(exc))[:400]
+            logger.error(
+                "Monitoring SQL operation failed operation=%s error_type=%s detail=%s",
+                operation, type(exc).__name__, detail,
+            )
             code = re.search(r"\b(5107[0-7])\b", str(exc))
             if code is not None:
                 error = {
