@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from typing import Annotated, Literal, TypeVar
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
@@ -91,6 +92,41 @@ FILTER_COLUMNS = {
 
 def _digest(value: str | None) -> bytes | None:
     return bytes.fromhex(key_digest(value)) if value is not None else None
+
+
+@lru_cache(maxsize=1)
+def _guard_messages() -> tuple[tuple[str, str], ...]:
+    """Every kernel guard message paired with the code its THROW raises.
+
+    The driver does not carry a THROW's error number to the client. Against a
+    live Azure SQL server ``mssql-python`` raises ProgrammingError whose entire
+    text is "Driver Error: Syntax error or access violation; DDBC Error:
+    [Microsoft][SQL Server]<message>", with no number in the message, ``args``
+    or any attribute. So matching on the number alone -- which is all the
+    offline fakes ever produced -- classified every deterministic guard refusal
+    as MonitoringUnavailable, "shared state was not replaced". A worker then
+    retries a policy refusal forever as though the database were down, which is
+    exactly what a live connector reconciliation did every three minutes.
+
+    The messages are literals in the same generated SQL that is deployed, so
+    deriving the map from that generator cannot drift from the database. A
+    message used by two different codes is dropped rather than guessed.
+    """
+    seen: dict[str, set[str]] = {}
+    for statement in build_permission_kernel().statements:
+        for code, message in re.findall(r"THROW\s+(5107[0-7])\s*,\s*'((?:[^']|'')*)'", statement):
+            seen.setdefault(message.replace("''", "'"), set()).add(code)
+    unique = {message: next(iter(codes)) for message, codes in seen.items() if len(codes) == 1}
+    # Longest first so a short message cannot shadow a longer one containing it.
+    return tuple(sorted(unique.items(), key=lambda item: -len(item[0])))
+
+
+def _guard_code(text: str) -> str | None:
+    """The kernel guard code this driver error represents, if it is one."""
+    numbered = re.search(r"\b(5107[0-7])\b", text)
+    if numbered is not None:
+        return numbered[1]
+    return next((code for message, code in _guard_messages() if message and message in text), None)
 
 
 def _db_time(value: datetime) -> datetime:
@@ -247,15 +283,15 @@ class SqlBackend:
                 "Monitoring SQL operation failed operation=%s error_type=%s detail=%s",
                 operation, type(exc).__name__, detail,
             )
-            code = re.search(r"\b(5107[0-7])\b", str(exc))
-            if code is not None:
+            number = _guard_code(str(exc))
+            if number is not None:
                 error = {
                     "51070": MonitoringComponentDenied, "51072": MonitoringConflict,
                     "51073": MonitoringConflict, "51074": MonitoringLeaseLost,
                     "51076": MonitoringNotBootstrapped, "51077": MonitoringKernelUnsupported,
                     "51071": MonitoringConflict,
-                }.get(code[1], MonitoringUnavailable)
-                raise error(f"Guarded SQL operation {operation} was refused ({code[1]})") from exc
+                }.get(number, MonitoringUnavailable)
+                raise error(f"Guarded SQL operation {operation} was refused ({number})") from exc
             raise MonitoringUnavailable(f"Monitoring SQL operation {operation} failed; shared state was not replaced") from exc
         finally:
             self._local.active = False
