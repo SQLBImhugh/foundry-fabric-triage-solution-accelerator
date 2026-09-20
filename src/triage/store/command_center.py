@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, m
 
 from triage.models import TriageResult
 from triage.redaction import redact_text
+from triage.store.atomic import replace_atomically
 from triage.store.azure_sql import SqlUnavailable, quote_identifier
 
 RunState = Literal["running", "completed", "failed"]
@@ -683,7 +684,7 @@ class JsonFileCommandCenterStore(InMemoryCommandCenterStore):
                 json.dump(snapshot.model_dump(mode="json"), output, ensure_ascii=True)
                 output.flush()
                 os.fsync(output.fileno())
-            temp_path.replace(self.path)
+            replace_atomically(temp_path, self.path)
         finally:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)

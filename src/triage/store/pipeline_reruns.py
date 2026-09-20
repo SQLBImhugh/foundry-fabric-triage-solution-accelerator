@@ -17,6 +17,7 @@ from typing import Any, Protocol
 
 from triage.pipeline_models import PipelineRerunRecord, RerunState
 from triage.redaction import redact_text
+from triage.store.atomic import replace_atomically
 from triage.store.azure_sql import quote_identifier
 
 logger = logging.getLogger("triage.store.pipeline_reruns")
@@ -115,7 +116,7 @@ class JsonFilePipelineRerunStore(InMemoryPipelineRerunStore):
             json.dumps({key: value.model_dump(mode="json") for key, value in self._items.items()}),
             encoding="utf-8",
         )
-        temp.replace(self.path)
+        replace_atomically(temp, self.path)
 
 
 class AzureSqlPipelineRerunStore:

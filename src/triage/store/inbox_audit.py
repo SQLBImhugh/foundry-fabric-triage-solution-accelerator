@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from triage.redaction import redact
+from triage.store.atomic import replace_atomically
 from triage.store.azure_sql import SqlUnavailable, quote_identifier
 
 logger = logging.getLogger("triage.store.inbox_audit")
@@ -171,7 +172,7 @@ class JsonFileInboxAudit(InMemoryInboxAudit):
         payload = {"ignored": list(self._items.values()), "updated_at": _utcnow()}
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        replace_atomically(tmp, self.path)
 
     def _persist(self, row: dict[str, Any]) -> None:
         self._write()

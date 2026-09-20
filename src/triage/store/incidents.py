@@ -27,6 +27,7 @@ from triage.models import Incident, TriageResult
 from triage.pipeline_models import PipelineFailure, PipelineRun
 from triage.redaction import redact
 from triage.signature import incident_id
+from triage.store.atomic import replace_atomically
 
 logger = logging.getLogger("triage.store")
 
@@ -374,7 +375,7 @@ class JsonFileIncidentStore(InMemoryIncidentStore):
         }
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        replace_atomically(tmp, self.path)
 
     def _on_reset(self) -> None:
         if self.path.exists():
