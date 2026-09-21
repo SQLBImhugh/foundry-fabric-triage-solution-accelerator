@@ -3382,41 +3382,35 @@ class MonitoringEngine:
         return None
 
     def _stale_presence_evidence(self, producer, connector, control):
-        """Resolve connector evidence that can never be accepted, once.
+        """Refuse expired presence evidence once instead of retrying it forever.
 
-        Two conditions are permanent, not transient. A presence inspection is
-        only valid for ``SUPERSESSION_EVIDENCE_TTL_SECONDS``, and a handoff
-        whose observation is no longer the connector's current revision has
-        been overtaken by a later observation. Neither can improve by waiting.
+        A source-removal supersession is authorized by a presence inspection
+        valid only for ``SUPERSESSION_EVIDENCE_TTL_SECONDS``. The preparation
+        path raises ``supersession_presence_inspection_expired`` when it is
+        older, and that exception crosses the SQL store boundary, where the
+        catch-all turns it into ``MonitoringUnavailable`` -- "shared state was
+        not replaced". That reads as a transient outage, so the work is
+        retried rather than resolved.
 
-        Both surfaced as retries. The expired case raised
-        ``supersession_presence_inspection_expired``, which crosses the SQL
-        store boundary where the catch-all turns it into
-        ``MonitoringUnavailable`` -- "shared state was not replaced". The
-        overtaken case raises the same class directly from the observation
-        projection, which refuses to reconstruct a changed baseline. Both read
-        as a transient outage, so the work was retried rather than resolved: a
-        deployed controller repeated the identical refusal 48 times across 23
-        hours while the worker's collection work sat ``completed``, so no
-        fresher evidence was ever produced and event intake stayed fenced.
+        Nothing can make the evidence younger. A deployed controller retried
+        the identical refusal 48 times across 23 hours while the worker's
+        collection work sat ``completed``, so no fresh observation was ever
+        produced and event intake stayed fenced behind evidence that could
+        never be accepted.
 
-        Reject the handoff, which is the outcome the reconciliation model
-        already defines for superseded evidence, and queue one bounded
-        re-observation. The removal fence is untouched and no supersession is
-        authorized here.
+        Expiry is an ordinary outcome, not a fault: reject the handoff, which
+        is the outcome the reconciliation model already defines for superseded
+        evidence, and queue one bounded re-observation. The removal fence is
+        untouched and no supersession is authorized here.
         """
         if not connector.source_removals:
             return None
-        observed = self._get("connector_observation", producer.request_id, control, m.OwnedConnectorManifest)
-        overtaken = observed is not None and observed.revision != connector.revision
-        if not overtaken:
-            inspection = self._presence_inspection(producer, control)
-            if inspection is None:
-                return None
-            now = self._now()
-            if now - timedelta(seconds=m.SUPERSESSION_EVIDENCE_TTL_SECONDS) <= inspection.observed_at <= now:
-                return None
+        inspection = self._presence_inspection(producer, control)
+        if inspection is None:
+            return None
         now = self._now()
+        if now - timedelta(seconds=m.SUPERSESSION_EVIDENCE_TTL_SECONDS) <= inspection.observed_at <= now:
+            return None
         # Keyed on the rejected handoff, never the connector revision: the
         # revision has not changed, so a revision-keyed draft would resolve to
         # the existing completed work and silently enqueue nothing.
@@ -3428,10 +3422,10 @@ class MonitoringEngine:
             reason="Expired source-presence evidence requires a fresh bounded observation.",
         ))
         logger.info(
-            "connector_evidence_unusable connector_id=%s reason=%s",
-            connector.connector_id, "overtaken" if overtaken else "inspection_expired",
+            "connector_presence_evidence_expired connector_id=%s observed_at=%s",
+            connector.connector_id, inspection.observed_at.isoformat(),
         )
-        return "rejected", "Connector evidence can no longer be accepted; a fresh observation was queued."
+        return "rejected", "Source-presence evidence expired before publication; a fresh observation was queued."
 
     def _presence_inspection(self, producer, control):
         """The presence inspection carried by a worker connector handoff.

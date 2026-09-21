@@ -77,6 +77,16 @@ from triage.redaction import redact_text
 from triage.store.azure_sql import AzureSqlDatabase, SqlCommitUncertain
 
 logger = logging.getLogger("triage.monitoring.sql")
+#: Metadata-only failures on the exported telemetry family.
+#:
+#: Only the ``triage.telemetry`` family reaches Azure Monitor, deliberately, so
+#: that ordinary logs carrying incident text are never exported. That left
+#: guarded SQL failures invisible: a live controller reported
+#: ``error_cause=ProgrammingError`` with no way to see which statement or guard
+#: produced it, and diagnosing it meant guessing. The operation name, exception
+#: class and the already-redacted, truncated detail are metadata by the same
+#: standard as the rest of this family.
+telemetry_logger = logging.getLogger("triage.telemetry.sql")
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 RECORD_COLUMNS = (
@@ -281,6 +291,10 @@ class SqlBackend:
             detail = redact_text(str(exc))[:400]
             logger.error(
                 "Monitoring SQL operation failed operation=%s error_type=%s detail=%s",
+                operation, type(exc).__name__, detail,
+            )
+            telemetry_logger.error(
+                "monitoring_sql_failed operation=%s error_type=%s detail=%s",
                 operation, type(exc).__name__, detail,
             )
             number = _guard_code(str(exc))

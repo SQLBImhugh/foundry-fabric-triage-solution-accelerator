@@ -191,34 +191,6 @@ def test_expired_presence_evidence_is_rejected_once_and_requeues_a_fresh_observa
     assert refreshed[0].work_id != collection.work_id
 
 
-def test_an_overtaken_connector_handoff_is_rejected_rather_than_reconstructed():
-    """A handoff the connector has moved past can never be reconstructed.
-
-    The observation projection refuses a changed baseline by raising
-    MonitoringUnavailable directly, with no cause, so it reads as a store
-    outage and is retried. Two such handoffs sat leased for 23 hours in
-    production behind exactly this.
-
-    The guard lives on the shared engine and the SQL store inherits it; this
-    exercises it directly, which the SQL protocol double cannot do outside a
-    transaction. End-to-end SQL behaviour is covered by the expired-evidence
-    test above.
-    """
-    existing = scoped_connector("memory", database_type=SupersessionProtocolDatabase)
-    h, _, _, controller, _, owned = existing
-    _, controller, _, owned, _, _, _, request = recovery_case("memory", existing=existing)
-    producer = controller._get(
-        "worker_reconcile_request", request.observation_receipt_id, h.version, m.ReconciliationRequest,
-    )
-    control = controller._control(h.version)
-    connector = controller._get("connector", owned.connector_id, h.version, m.OwnedConnectorManifest)
-    overtaken = connector.model_copy(update={"revision": connector.revision + 1})
-
-    outcome = controller._stale_presence_evidence(producer, overtaken, control)
-
-    assert outcome is not None and outcome[0] == "rejected"
-
-
 def test_memory_supersession_preserves_original_removal_and_physical_identity():
     h, controller, _, owned, pending, _, _, request = recovery_case()
     before_receipts = deepcopy(h.state.receipts)
