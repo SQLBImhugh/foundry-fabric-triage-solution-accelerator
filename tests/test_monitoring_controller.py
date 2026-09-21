@@ -17,6 +17,7 @@ from triage.monitoring.controller import (
     controller_heartbeat,
 )
 from triage.monitoring.models import (
+    SUPERSESSION_EVIDENCE_TTL_SECONDS,
     IncidentIdentity,
     MonitoringWorkDraft,
     RegistryVersion,
@@ -35,7 +36,7 @@ from triage.monitoring.runtime import (
     target_signature,
 )
 from triage.policy import REMEDIATION_ACTIONS, PolicyLedger, TriagePolicy
-from triage.runner import TriageRunner
+from triage.runner import RECONCILE_LEASE_SECONDS, TriageRunner
 from triage.settings import Settings
 from triage.store.incidents import InMemoryIncidentStore
 from triage.tools.flags import DataQualityFlagTable
@@ -536,3 +537,81 @@ async def test_monitoring_drain_leaves_later_work_queued_after_elapsed_budget(ru
         limit=10, budget=HeartbeatBudget(840, 690, lambda: elapsed[0]),
     ) == ["completed"]
     assert len(claims) == 1
+
+
+async def test_reconciliation_claims_its_own_pool_ahead_of_actions_with_a_short_lease(runner, monkeypatch):
+    """Deterministic publication must not queue behind a triage awaiting approval.
+
+    Reconciliation used to share one claim with the action kinds and inherit
+    their lease, which is sized for a model call plus an approval wait. It is a
+    single SQL transaction, and the connector evidence it publishes expires
+    after SUPERSESSION_EVIDENCE_TTL_SECONDS, so that lease outlived the
+    evidence and the retry could never succeed.
+    """
+    claims = []
+
+    def claim(request):
+        claims.append(request)
+        if request.kinds == ("reconcile_state",):
+            return (SimpleNamespace(work_id="reconciliation"),)
+        pytest.fail("Actions must not be claimed while reconciliation is available")
+
+    async def execute(work):
+        return f"- {work.work_id}: done"
+
+    monkeypatch.setattr(runner.monitoring, "claim_work", claim)
+    monkeypatch.setattr(runner, "execute_monitoring_work", execute)
+
+    assert await runner.drain_monitoring_work(limit=1) == ["- reconciliation: done"]
+
+    assert [request.kinds for request in claims] == [("reconcile_state",)]
+    assert claims[0].lease_seconds == RECONCILE_LEASE_SECONDS
+    assert claims[0].lease_seconds < SUPERSESSION_EVIDENCE_TTL_SECONDS
+
+
+async def test_actions_are_claimed_when_no_reconciliation_is_due(runner, monkeypatch):
+    claims = []
+
+    def claim(request):
+        claims.append(request)
+        if request.kinds == ("reconcile_state",):
+            return ()
+        return (SimpleNamespace(work_id="triage-item"),)
+
+    async def execute(work):
+        return f"- {work.work_id}: done"
+
+    monkeypatch.setattr(runner.monitoring, "claim_work", claim)
+    monkeypatch.setattr(runner, "execute_monitoring_work", execute)
+
+    assert await runner.drain_monitoring_work(limit=1) == ["- triage-item: done"]
+
+    assert [request.kinds for request in claims] == [
+        ("reconcile_state",),
+        ("triage", "deferred_retry", "verify_action", "finalize"),
+    ]
+    # Actions keep the long lease: they wait on a model call and an approval.
+    assert claims[1].lease_seconds > RECONCILE_LEASE_SECONDS
+
+
+async def test_an_empty_queue_stops_draining_without_claiming_forever(runner, monkeypatch):
+    claims = []
+
+    def claim(request):
+        claims.append(request)
+        return ()
+
+    monkeypatch.setattr(runner.monitoring, "claim_work", claim)
+
+    assert await runner.drain_monitoring_work(limit=10) == []
+
+    # One probe of each pool, then stop; not ten rounds of both.
+    assert [request.kinds for request in claims] == [
+        ("reconcile_state",),
+        ("triage", "deferred_retry", "verify_action", "finalize"),
+    ]
+
+
+def test_a_reconciliation_lease_cannot_outlive_the_evidence_it_publishes():
+    assert RECONCILE_LEASE_SECONDS < SUPERSESSION_EVIDENCE_TTL_SECONDS
+

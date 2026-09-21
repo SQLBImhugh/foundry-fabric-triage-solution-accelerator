@@ -41,6 +41,7 @@ from triage.monitoring.controller import (
     reconcile_monitoring_work,
 )
 from triage.monitoring.models import (
+    SUPERSESSION_EVIDENCE_TTL_SECONDS,
     IncidentIdentity,
     LeaseRenewal,
     MonitoringContext,
@@ -113,6 +114,19 @@ from triage.tools.teams import (
 )
 
 logger = logging.getLogger("triage.runner")
+
+#: Lease for one deterministic reconciliation claim.
+#:
+#: Reconciliation is a single synchronous SQL transaction, so this only has to
+#: cover that transaction, not a model call or an approval wait. It must stay
+#: comfortably below SUPERSESSION_EVIDENCE_TTL_SECONDS: a failed attempt has to
+#: become claimable again while the evidence that authorizes it is still valid,
+#: or the retry is guaranteed to fail. Sharing the action lease broke exactly
+#: that, and the work was then retried for 23 hours against evidence that had
+#: expired eleven minutes into the first attempt.
+RECONCILE_LEASE_SECONDS = 120
+if RECONCILE_LEASE_SECONDS >= SUPERSESSION_EVIDENCE_TTL_SECONDS:  # pragma: no cover - contradiction guard
+    raise AssertionError("A reconciliation lease must expire before the evidence it publishes")
 
 
 def _pipeline_signature(failure: PipelineFailure, identity: TargetIdentity) -> str:
@@ -2024,17 +2038,42 @@ class TriageRunner:
         context = self.monitoring_context
         owner = str(uuid4())
         lines: list[str] = []
+        action_lease = min(
+            900,
+            max(15, self.settings.triage_timeout_seconds + self.settings.approval_timeout_seconds + 90),
+        )
         for _ in range(max(1, min(limit, 100))):
             if budget is not None and not budget.can_claim():
                 break
-            # Claim only what can start now. Leasing a whole batch before slow
-            # model/approval calls would let later leases expire in our hands.
+            # Deterministic reconciliation claims separately, and first.
+            #
+            # It used to share one claim with the action kinds and inherit
+            # their lease, which is sized for a model call plus an approval
+            # wait -- about 690s in this deployment. Reconciliation is a single
+            # synchronous SQL transaction that takes milliseconds, so that
+            # lease was three orders of magnitude too long, and a failed
+            # attempt made the work unclaimable for eleven minutes.
+            #
+            # Connector supersession is authorized by evidence that expires
+            # after SUPERSESSION_EVIDENCE_TTL_SECONDS. With the action lease,
+            # a single missed attempt outlived the evidence, so the retry could
+            # never succeed and fresh evidence was produced only to expire in
+            # the queue behind a triage item awaiting approval. Publication is
+            # also what clears the fences that gate the rest of the queue, so
+            # it goes first; it drains quickly enough not to displace actions.
             work = self.monitoring.claim_work(WorkClaimRequest(
-                **context.model_dump(), owner_id=owner,
-                kinds=("reconcile_state", "triage", "deferred_retry", "verify_action", "finalize"),
-                limit=1, per_workspace_limit=1,
-                lease_seconds=min(900, max(15, self.settings.triage_timeout_seconds + self.settings.approval_timeout_seconds + 90)),
+                **context.model_dump(), owner_id=owner, kinds=("reconcile_state",),
+                limit=1, per_workspace_limit=1, lease_seconds=RECONCILE_LEASE_SECONDS,
             ))
+            if not work:
+                # Claim only what can start now. Leasing a whole batch before
+                # slow model/approval calls would let later leases expire in
+                # our hands.
+                work = self.monitoring.claim_work(WorkClaimRequest(
+                    **context.model_dump(), owner_id=owner,
+                    kinds=("triage", "deferred_retry", "verify_action", "finalize"),
+                    limit=1, per_workspace_limit=1, lease_seconds=action_lease,
+                ))
             if not work:
                 break
             lines.append(await self.execute_monitoring_work(work[0]))
