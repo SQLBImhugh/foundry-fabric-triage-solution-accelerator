@@ -191,6 +191,49 @@ def test_expired_presence_evidence_is_rejected_once_and_requeues_a_fresh_observa
     assert refreshed[0].work_id != collection.work_id
 
 
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+def test_an_overtaken_handoff_is_rejected_and_requeued_on_both_backends(backend):
+    """A connector revision never goes backwards, so an overtaken handoff is finished.
+
+    The offline store keeps the observation record, so stale evidence stayed
+    readable and would be published as current. The SQL store instead refuses
+    to reconstruct a changed baseline, which reads as an outage and was retried
+    forever. Live, that left the connector frontier at accepted=8/validated=0
+    with no committed prefix, because handoff revision 1 never resolved, and
+    every later acknowledgement then failed guard 51072 for lacking it.
+    """
+    existing = scoped_connector(backend, database_type=SupersessionProtocolDatabase)
+    h, db, _, controller, worker, owned = existing
+    _, controller, worker, owned, pending, collection, _, request = recovery_case(
+        backend, existing=existing,
+    )
+    if db:
+        db.principal = "controller"
+
+    def inspect():
+        producer = controller._get(
+            "worker_reconcile_request", request.observation_receipt_id, h.version, m.ReconciliationRequest,
+        )
+        connector = controller._get("connector", owned.connector_id, h.version, m.OwnedConnectorManifest)
+        overtaken = connector.model_copy(update={"revision": connector.revision + 3})
+        return (
+            controller._connector_observation_overtaken(producer, overtaken, h.version),
+            controller._connector_observation_overtaken(producer, connector, h.version),
+        )
+
+    if db is None:
+        moved, unchanged = inspect()
+    else:
+        # The SQL adapter reads through restricted views, which refuse any
+        # statement outside an owned transaction.
+        with controller._sql.transaction(write=False, operation="inspect", request_id=h.next_id()):
+            moved, unchanged = inspect()
+
+    assert moved is True
+    # The unchanged connector is not overtaken, so a healthy handoff still publishes.
+    assert unchanged is False
+
+
 def test_memory_supersession_preserves_original_removal_and_physical_identity():
     h, controller, _, owned, pending, _, _, request = recovery_case()
     before_receipts = deepcopy(h.state.receipts)

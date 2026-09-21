@@ -1805,6 +1805,18 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         self._publish_connector(connector, control)
         return None
 
+    def _connector_observation_overtaken(self, producer, connector, control) -> bool:
+        # The restricted controller view does not expose connector_observation
+        # records, so the base comparison cannot work here and would silently
+        # answer False. The raw handoff arguments carry the revision this
+        # observation was taken against, and an observation always advances the
+        # connector by exactly one.
+        document, _ = self._native_reconciliation(control, producer.request_id, "worker")
+        if document is None or document.get("topic") != "connector":
+            return False
+        revision = document["request_payload"].get("expected_connector_revision")
+        return type(revision) is int and connector.revision != revision + 1
+
     def _action_work(self, context, work_id, lease, *, revision=None):
         work = self._get("work", m.canonical_id(work_id), context, m.MonitoringWork)
         if (

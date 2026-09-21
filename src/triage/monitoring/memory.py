@@ -3405,12 +3405,21 @@ class MonitoringEngine:
         """
         if not connector.source_removals:
             return None
-        inspection = self._presence_inspection(producer, control)
-        if inspection is None:
-            return None
+        if self._connector_observation_overtaken(producer, connector, control):
+            # A later observation already advanced the connector, so this
+            # handoff's baseline can never be reconstructed. On the SQL store
+            # the projection refuses outright; on the offline store the stale
+            # observation is still readable and would otherwise be published.
+            overtaken = True
+        else:
+            overtaken = False
+            inspection = self._presence_inspection(producer, control)
+            if inspection is None:
+                return None
+            now = self._now()
+            if now - timedelta(seconds=m.SUPERSESSION_EVIDENCE_TTL_SECONDS) <= inspection.observed_at <= now:
+                return None
         now = self._now()
-        if now - timedelta(seconds=m.SUPERSESSION_EVIDENCE_TTL_SECONDS) <= inspection.observed_at <= now:
-            return None
         # Keyed on the rejected handoff, never the connector revision: the
         # revision has not changed, so a revision-keyed draft would resolve to
         # the existing completed work and silently enqueue nothing.
@@ -3422,10 +3431,27 @@ class MonitoringEngine:
             reason="Expired source-presence evidence requires a fresh bounded observation.",
         ))
         logger.info(
-            "connector_presence_evidence_expired connector_id=%s observed_at=%s",
-            connector.connector_id, inspection.observed_at.isoformat(),
+            "connector_evidence_unusable connector_id=%s reason=%s",
+            connector.connector_id, "overtaken" if overtaken else "inspection_expired",
         )
-        return "rejected", "Source-presence evidence expired before publication; a fresh observation was queued."
+        return "rejected", "Connector evidence can no longer be accepted; a fresh observation was queued."
+
+    def _connector_observation_overtaken(self, producer, connector, control) -> bool:
+        """Has a later observation already advanced this connector?
+
+        The offline store keeps the observation record, so the stale evidence
+        stays readable and would be published as if current. The SQL store
+        instead refuses to reconstruct a changed baseline, which reads as an
+        outage and is retried forever. Either way the handoff is finished: a
+        connector revision never goes backwards.
+
+        This is not cosmetic. The live connector frontier reached
+        accepted=8/validated=0 with no committed prefix at all, because handoff
+        revision 1 stayed pending_validation from the start, and every later
+        acknowledgement then failed guard 51072 for lacking that prefix.
+        """
+        observed = self._get("connector_observation", producer.request_id, control, m.OwnedConnectorManifest)
+        return observed is not None and observed.revision != connector.revision
 
     def _presence_inspection(self, producer, control):
         """The presence inspection carried by a worker connector handoff.
