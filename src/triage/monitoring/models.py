@@ -1246,6 +1246,17 @@ CONNECTOR_PENDING_GAP_CODES = frozenset({
     "definition_update_submitted_or_unknown", "definition_update_outcome_unknown", "definition_update_pending",
 })
 
+#: How long a source-presence inspection may authorize a removal supersession.
+#:
+#: Stale presence evidence must never authorize supersession, so the window is
+#: deliberately short. It was written as a bare ``300`` in both the Python
+#: preparation path and the generated SQL guard, which is two places to change
+#: and no way to notice when only one of them moves.
+#:
+#: Consuming it has to be faster than this: a controller that claims the work
+#: after the window can never succeed, however often it retries.
+SUPERSESSION_EVIDENCE_TTL_SECONDS = 300
+
 
 def connector_collection_eligible(observation: OwnedConnectorManifest) -> bool:
     """Only original ready evidence or an explicit gap disposition finishes collection."""

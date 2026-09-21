@@ -1759,6 +1759,9 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             and producer.request_payload.get("definition_observed")
             and connector.state in {"provisioning", "ready", "degraded"}
         ):
+            stale = self._stale_presence_evidence(producer, connector, control)
+            if stale is not None:
+                return stale
             work = self._get("work", producer.work_id, control, m.MonitoringWork)
             frontier = self._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
             result = self._publish_connector_context(m.ConnectorPublicationContext(
@@ -1770,7 +1773,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             if result is None:
                 raise MonitoringUnavailable("Connector binding did not return its original publication result")
             self._publish_connector(result.connector, control)
-            return
+            return None
         if producer.request_payload.get("readiness_requested"):
             work = self._get("work", producer.work_id, control, m.MonitoringWork)
             frontier = self._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
@@ -1786,6 +1789,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             ))
             connector = result.connector
         self._publish_connector(connector, control)
+        return None
 
     def _action_work(self, context, work_id, lease, *, revision=None):
         work = self._get("work", m.canonical_id(work_id), context, m.MonitoringWork)

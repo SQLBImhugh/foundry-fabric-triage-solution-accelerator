@@ -57,6 +57,7 @@ from triage.monitoring.inventory import (
 )
 from triage.monitoring.memory import inventory_confirms_deletion, policy_removes_target, stable_id
 from triage.monitoring.models import (
+    SUPERSESSION_EVIDENCE_TTL_SECONDS,
     CapabilityObservation,
     CollectionCommit,
     ConnectorObservationResult,
@@ -1216,7 +1217,7 @@ def prepare_connector_supersession(
     ):
         raise ProvisioningReview("supersession_requires_explicit_original_inspection")
     now = store.snapshot(version).coverage.as_of
-    if not now - timedelta(seconds=300) <= inspection.observed_at <= now:
+    if not now - timedelta(seconds=SUPERSESSION_EVIDENCE_TTL_SECONDS) <= inspection.observed_at <= now:
         raise ProvisioningReview("supersession_presence_inspection_expired")
     if (
         original_observation.state != "degraded" or original_observation.observed_definition is None

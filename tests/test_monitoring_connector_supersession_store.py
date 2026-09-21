@@ -141,6 +141,56 @@ def recovery_case(backend="memory", *, possible_write=False, finish_inspection=T
     return h, controller, worker, owned, pending, collection, observation, request
 
 
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+def test_expired_presence_evidence_is_rejected_once_and_requeues_a_fresh_observation(backend):
+    """Evidence that can never become younger must not be retried forever.
+
+    A deployed controller retried the identical refusal 48 times across 23
+    hours: the presence inspection had aged past its TTL, the preparation path
+    raised, the SQL boundary reported it as MonitoringUnavailable -- a
+    transient outage -- and the worker's collection work was already
+    ``completed``, so nothing ever produced fresher evidence.
+    """
+    existing = scoped_connector(backend, database_type=SupersessionProtocolDatabase)
+    h, db, _, controller, worker, owned = existing
+    _, controller, worker, owned, pending, collection, _, request = recovery_case(backend, existing=existing)
+
+    # The 120s lease expires inside the 300s evidence window, which is the
+    # production shape: the controller re-claims work whose evidence has
+    # already aged out.
+    h.clock.advance(m.SUPERSESSION_EVIDENCE_TTL_SECONDS + 1)
+    if db:
+        db.principal = "controller"
+    claimed = controller.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(931), kinds=("reconcile_state",), limit=200, per_workspace_limit=200,
+    ))
+    work = next(item for item in claimed if item.work_id == request.work_id)
+
+    outcome = reconcile_monitoring_work(controller, work)
+
+    assert outcome.state == "rejected"
+    # The detail is the kernel's own wording on the SQL backend, so the
+    # backend-independent guarantee is the queued re-observation below.
+    # Resolved, not left leased for another doomed attempt.
+    assert controller.get_work(h.version, work.work_id).state == "completed"
+    # The removal fence is untouched; nothing was superseded on stale evidence.
+    current = next(item for item in controller.list_connectors(m.PageQuery(**h.context())).items
+                   if item.connector_id == owned.connector_id)
+    assert len(current.source_removals) == len(pending.pending_removals)
+    assert current.sources == owned.sources
+    # A fresh observation is queued, keyed so it cannot collide with the
+    # completed collection work.
+    if db:
+        db.principal = "worker"
+    refreshed = [
+        item for item in _collection_work_rows(h, db)
+        if item.connector_id == owned.connector_id and item.state == "queued"
+        and "fresh bounded observation" in item.reason
+    ]
+    assert len(refreshed) == 1
+    assert refreshed[0].work_id != collection.work_id
+
+
 def test_memory_supersession_preserves_original_removal_and_physical_identity():
     h, controller, _, owned, pending, _, _, request = recovery_case()
     before_receipts = deepcopy(h.state.receipts)

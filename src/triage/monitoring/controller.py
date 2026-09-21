@@ -172,7 +172,7 @@ async def controller_heartbeat(
         HEARTBEAT_BUDGET_SECONDS, remaining["human"], work_seconds,
     )
     with heartbeat_span() as span:
-        status, error_type = "completed", ""
+        status, error_type, error_cause = "completed", "", ""
         workers = [
             asyncio.create_task(worker("automatic")),
             asyncio.create_task(worker("human")),
@@ -187,6 +187,7 @@ async def controller_heartbeat(
         except BaseException as exc:
             status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
             error_type = type(exc).__name__
+            error_cause = _root_cause(exc)
             raise
         finally:
             for task in workers:
@@ -200,21 +201,47 @@ async def controller_heartbeat(
                 "heartbeat.automatic_calls": started["automatic"], "heartbeat.human_calls": started["human"],
                 "heartbeat.automatic_results": completed["automatic"], "heartbeat.human_results": completed["human"],
                 "heartbeat.budget_exhausted": exhausted, "error.type": error_type,
+                "error.cause": error_cause,
             }.items():
                 span.set(key, value)
             health = telemetry_status()
             heartbeat_logger.log(
                 logging.INFO if status == "completed" else logging.WARNING,
                 "heartbeat_finished status=%s elapsed_ms=%d automatic_calls=%d human_calls=%d "
-                "automatic_results=%d human_results=%d budget_exhausted=%s error_type=%s "
+                "automatic_results=%d human_results=%d budget_exhausted=%s error_type=%s error_cause=%s "
                 "telemetry_configuration=%s export_failures=%d export_warnings=%d ingestion=unverified",
                 status, elapsed_ms, started["automatic"], started["human"],
-                completed["automatic"], completed["human"], exhausted, error_type,
+                completed["automatic"], completed["human"], exhausted, error_type, error_cause,
                 health["configuration"], health["export_failures"], health["export_warnings"],
             )
     if not lines and not budget.can_claim():
         return ["Heartbeat admission budget exhausted; no new work was claimed. Any queued work remains pending."]
     return lines
+
+
+def _root_cause(exc: BaseException) -> str:
+    """Name the originating failure behind a wrapped store error.
+
+    The SQL store boundary reports anything it did not expect as
+    MonitoringUnavailable, "shared state was not replaced". A deterministic
+    policy refusal wrapped that way is indistinguishable in telemetry from a
+    database outage: a deployed controller repeated one identical refusal for
+    23 hours while the heartbeat reported only ``error_type=MonitoringUnavailable``,
+    and nothing in App Insights could tell an operator that retrying was futile.
+
+    Only the class name and a fixed diagnostic ``code`` are copied out.
+    ProvisioningReview codes are fixed strings by construction; exception
+    messages are never emitted here, because they can quote remote content.
+    """
+    cause, depth = exc.__cause__, 0
+    while cause is not None and depth < 5:
+        code = getattr(cause, "code", None)
+        if isinstance(code, str) and code:
+            return f"{type(cause).__name__}:{code}"
+        if cause.__cause__ is None:
+            return type(cause).__name__
+        cause, depth = cause.__cause__, depth + 1
+    return ""
 
 
 def current_execution() -> MonitoringExecution | None:

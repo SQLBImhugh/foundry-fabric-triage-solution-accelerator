@@ -1210,7 +1210,9 @@ class MonitoringEngine:
             connector = self._get("connector", payload["connector_id"], control, m.OwnedConnectorManifest)
             if connector is None:
                 raise MonitoringUnavailable("Accepted connector observation is absent")
-            self._reconcile_connector_observation(request, connector, control)
+            stale = self._reconcile_connector_observation(request, connector, control)
+            if stale is not None:
+                return stale
         elif request.topic == "rest_page":
             return self._publish_rest_window(request, control)
         elif request.topic == "stream_intake":
@@ -3347,6 +3349,9 @@ class MonitoringEngine:
             and observed.state in {"provisioning", "ready", "degraded"}
             and (connector.source_proposals or connector.source_removals) and self.component != "fixture"
         ):
+            stale = self._stale_presence_evidence(producer, connector, control)
+            if stale is not None:
+                return stale
             work = self._get("work", producer.work_id, control, m.MonitoringWork)
             frontier = self._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
             result = self._publish_connector_context(m.ConnectorPublicationContext(
@@ -3358,7 +3363,7 @@ class MonitoringEngine:
             if result is None:
                 raise MonitoringUnavailable("Connector binding did not return its original publication result")
             self._publish_connector(result.connector, control)
-            return
+            return None
         if observed is not None and observed.state == "ready" and self.component != "fixture":
             work = self._get("work", producer.work_id, control, m.MonitoringWork)
             frontier = self._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
@@ -3374,6 +3379,66 @@ class MonitoringEngine:
             ))
             connector = result.connector
         self._publish_connector(connector, control)
+        return None
+
+    def _stale_presence_evidence(self, producer, connector, control):
+        """Refuse expired presence evidence once instead of retrying it forever.
+
+        A source-removal supersession is authorized by a presence inspection
+        that is only valid for ``SUPERSESSION_EVIDENCE_TTL_SECONDS``. The
+        preparation path raises ``supersession_presence_inspection_expired``
+        when it is older, and that exception crosses the SQL store boundary,
+        where the catch-all turns it into ``MonitoringUnavailable`` -- "shared
+        state was not replaced". That reads as a transient outage, so the work
+        is retried rather than resolved.
+
+        Nothing can make the evidence younger. A deployed controller therefore
+        retried the identical refusal 48 times over 23 hours while the worker's
+        collection work sat ``completed``, so no fresh observation was ever
+        produced and event intake stayed fenced behind evidence that could
+        never be accepted.
+
+        Expiry is an ordinary outcome, not a fault: reject this handoff as
+        stale, which is the outcome the reconciliation model already defines
+        for superseded evidence, and queue one bounded re-observation so the
+        worker produces evidence the controller can still use. The removal
+        fence is untouched, and no supersession is authorized here.
+        """
+        if not connector.source_removals:
+            return None
+        inspection = self._presence_inspection(producer, control)
+        if inspection is None:
+            return None
+        observed_at = inspection.observed_at
+        now = self._now()
+        if now - timedelta(seconds=m.SUPERSESSION_EVIDENCE_TTL_SECONDS) <= observed_at <= now:
+            return None
+        # Keyed on the rejected handoff, never the connector revision: the
+        # revision has not changed, so a revision-keyed draft would resolve to
+        # the existing completed work and silently enqueue nothing.
+        self._enqueue(m.MonitoringWorkDraft(
+            **_stamp(control),
+            work_id=stable_id(control, f"connector-reobserve:{producer.request_id}"),
+            kind="connector_reconcile", connector_id=connector.connector_id,
+            policy_revision=control.revision, created_at=now, due_at=now,
+            reason="Expired source-presence evidence requires a fresh bounded observation.",
+        ))
+        logger.info(
+            "connector_presence_evidence_expired connector_id=%s observed_at=%s",
+            connector.connector_id, observed_at.isoformat(),
+        )
+        return "rejected", "Source-presence evidence expired before publication; a fresh observation was queued."
+
+    def _presence_inspection(self, producer, control):
+        """The presence inspection carried by a worker connector handoff.
+
+        Read through the same observation projection the preparation path uses.
+        The offline handoff promotes the inspection to its own key while the
+        kernel keeps it inside the observation argument, and this guard must
+        not depend on which of those shapes it is looking at.
+        """
+        observation = self._connector_observation_projection(control, producer.request_id)
+        return None if observation is None else observation.inspection
 
     def _publish_connector(self, manifest: m.OwnedConnectorManifest, control: m.DeploymentControl) -> None:
         connectors = self._all("connector", control, m.OwnedConnectorManifest)

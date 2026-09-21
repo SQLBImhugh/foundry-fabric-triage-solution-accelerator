@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from triage.monitoring.models import CONNECTOR_PENDING_GAP_CODES
+from triage.monitoring.models import CONNECTOR_PENDING_GAP_CODES, SUPERSESSION_EVIDENCE_TTL_SECONDS
 from triage.monitoring.sql_kernel_common import (
     canonical_guid,
     exact_text_equal,
@@ -145,7 +145,7 @@ def supersession_observation_matches_sql(names: SqlNames) -> str:
     return f"""@binding_receipt_payload IS NOT NULL AND @binding_observation IS NOT NULL
 AND @supersession_request IS NOT NULL AND @supersession_request_binding IS NOT NULL AND @supersession_patch IS NOT NULL
 AND @supersession_observed_at IS NOT NULL
-AND @supersession_observed_at BETWEEN DATEADD(second,-300,@now) AND @now
+AND @supersession_observed_at BETWEEN DATEADD(second,-{SUPERSESSION_EVIDENCE_TTL_SECONDS},@now) AND @now
 AND {exact_text_equal("JSON_VALUE(@binding_receipt_payload,'$.binding_hash')",
                       "CONVERT(nvarchar(64)," + payload_hash('@supersession_request_binding') + ")")}
 AND {exact_text_equal("JSON_VALUE(@supersession_request,'$.fingerprint')", 'CONVERT(nvarchar(64),@binding_receipt_fingerprint)')}
