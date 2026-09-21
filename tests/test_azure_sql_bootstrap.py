@@ -211,6 +211,9 @@ class Cursor:
     def execute(self, sql, *params):
         engine = self.connection.engine
         state = self.connection.data()
+        if sql == "SELECT 1":
+            self.rows = [(1,)]
+            return
         engine.commands.append((sql, params, self.connection.autocommit))
         if sql == bootstrap.TARGET_SQL:
             self.rows = engine.target_rows

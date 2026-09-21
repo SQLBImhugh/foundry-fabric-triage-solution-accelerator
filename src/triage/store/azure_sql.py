@@ -287,6 +287,7 @@ class AzureSqlDatabase:
         if getattr(self._local, "transaction_active", False):
             self._local.transaction_failed = True
             raise SqlTransactionAborted("Nested SQL transactions are not supported")
+        self._validate_before_transaction()
         conn = self._ensure()
         if conn is None:
             raise SqlUnavailable(f"Azure SQL unavailable ({self.target})")
@@ -350,6 +351,20 @@ class AzureSqlDatabase:
                     self._drop()
                     if not isinstance(exc, Exception):
                         raise
+
+    def _validate_before_transaction(self) -> None:
+        """Replace a dead pooled connection before BEGIN makes retry unsafe."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        if not conn.autocommit:
+            self._drop()
+            raise SqlTransactionAborted("The SQL connection has an unowned transaction")
+        # Azure SQL can leave an idled pooled connection looking open until the
+        # next statement fails. Probe while autocommit is still on, so the
+        # existing one-shot read retry can replace it before BEGIN. Once the
+        # transaction starts, reconnecting would replay an uncertain unit.
+        self.query("SELECT 1")
 
     def execute(self, sql: str, *params: Any) -> int:
         """Run a statement and return the number of rows it affected.

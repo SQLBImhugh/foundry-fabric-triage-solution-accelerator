@@ -57,7 +57,8 @@ class FakeCursor:
         if sql == "fail":
             raise ValueError("Statement rejected")
         self.connection.statements.append((sql, params, self.connection.autocommit))
-        self.connection.pending.append((sql, params))
+        if not self.connection.autocommit:
+            self.connection.pending.append((sql, params))
 
     def fetchall(self):
         return [("value",)]

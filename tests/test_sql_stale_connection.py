@@ -126,6 +126,22 @@ def test_writes_are_never_replayed_after_a_lost_link(monkeypatch):
     assert fresh.statements == []
 
 
+def test_transaction_refreshes_dead_pooled_connection_before_begin(monkeypatch):
+    stale = StaleConnection(stale=False)
+    fresh = StaleConnection(stale=False)
+    db = _database(monkeypatch, [stale, fresh])
+    assert db.query("SELECT warmup") == [("value",)]
+    stale.stale = True
+
+    with db.transaction():
+        assert db.query("SELECT inside") == [("value",)]
+
+    assert stale.attempts == ["SELECT warmup", "SELECT 1"]
+    assert stale.closed is True
+    assert fresh.attempts == ["SELECT 1", "SELECT inside"]
+    assert fresh.statements == ["SELECT 1", "SELECT inside"]
+
+
 def test_a_read_inside_a_transaction_does_not_reconnect(monkeypatch):
     stale = StaleConnection(stale=False)
     fresh = StaleConnection(stale=False)
