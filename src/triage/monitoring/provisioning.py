@@ -28,7 +28,7 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import NamedTuple, Protocol
 from uuid import UUID, uuid5
 
 import httpx
@@ -902,14 +902,27 @@ class OwnedEventCapabilityProbe:
             })
 
 
+class PublicationState(NamedTuple):
+    """One resolution of everything a connector publication is authorized against.
+
+    Resolving this twice, and then taking a third snapshot only to read a clock,
+    is what let presence evidence expire between the check that admitted a
+    handoff and the check that authorized it. Each resolution computes
+    estate-wide coverage.
+    """
+
+    version: RegistryVersion
+    work: MonitoringWork
+    frontier: ValidationFrontier
+    connector: OwnedConnectorManifest
+    connectors: tuple[OwnedConnectorManifest, ...]
+
+
 def _publication_state(
     store: MonitoringStore,
     work: MonitoringWork,
     connector_id: str,
-) -> tuple[
-    RegistryVersion, MonitoringWork, ValidationFrontier,
-    OwnedConnectorManifest, tuple[OwnedConnectorManifest, ...],
-]:
+) -> PublicationState:
     if store.component != "controller":
         raise MonitoringComponentDenied("Only the controller may plan desired connector publication")
     context = MonitoringContext(tenant_id=work.tenant_id, epoch=work.epoch)
@@ -923,7 +936,8 @@ def _publication_state(
         or current_work.reconcile_request_id is None or current_work.reconcile_producer is None
     ):
         raise MonitoringLeaseLost("Controller publication requires the current reconciliation lease")
-    control = store.snapshot(context).control
+    snapshot = store.snapshot(context)
+    control = snapshot.control
     if control.maintenance:
         raise MonitoringConflict("Maintenance stops connector publication")
     version = RegistryVersion(**context.model_dump(), revision=control.revision)
@@ -939,7 +953,7 @@ def _publication_state(
     matches = [value for value in connectors if value.connector_id == canonical_id(connector_id)]
     if len(matches) != 1:
         raise ProvisioningReview("owned_connector_not_unique")
-    return version, current_work, frontier, matches[0], connectors
+    return PublicationState(version, current_work, frontier, matches[0], connectors)
 
 
 def prepare_connector_publication(
@@ -1101,16 +1115,20 @@ def prepare_connector_binding(
     store: MonitoringStore, work: MonitoringWork, connector_id: str, *, request_id: str,
 ) -> ConnectorPublicationRequest:
     """Confirm additions/removals through the original observation, not readiness."""
-    version, current, frontier, connector, _ = _publication_state(store, work, connector_id)
+    state = _publication_state(store, work, connector_id)
+    version, current, frontier, connector = state.version, state.work, state.frontier, state.connector
     if current.reconcile_producer != "worker" or not (
         connector.source_proposals or connector.source_removals
     ):
         raise ProvisioningReview("physical_binding_requires_worker_changes")
     original = store.get_connector_observation(version, current.reconcile_request_id)
     if original is not None and original.inspection is not None:
+        # Hand the resolved state down rather than letting supersession resolve
+        # it again. Each resolution is an estate-wide snapshot, and the presence
+        # inspection it is checked against is only valid for 300 seconds.
         return prepare_connector_supersession(
             store, current, connector_id, request_id=request_id,
-            original_observation=original.observation,
+            original_observation=original.observation, state=state,
         )
     request = ConnectorPublicationRequest(
         request_id=request_id, expected=version, work_id=current.work_id,
@@ -1195,9 +1213,12 @@ def _restored_source_definition(
 def prepare_connector_supersession(
     store: MonitoringStore, work: MonitoringWork, connector_id: str, *,
     request_id: str, original_observation: OwnedConnectorManifest | None = None,
+    state: PublicationState | None = None,
 ) -> ConnectorPublicationRequest:
     """Propose reinstatement from original worker evidence, never current-state equality."""
-    version, current, frontier, connector, _ = _publication_state(store, work, connector_id)
+    if state is None:
+        state = _publication_state(store, work, connector_id)
+    version, current, frontier, connector = state.version, state.work, state.frontier, state.connector
     if current.reconcile_producer != "worker" or not connector.source_removals:
         raise ProvisioningReview("supersession_requires_original_worker_observation")
     original = store.get_connector_observation(version, current.reconcile_request_id)
@@ -1213,7 +1234,13 @@ def prepare_connector_supersession(
         or original.observed_definition_hash != inspection.definition_hash
     ):
         raise ProvisioningReview("supersession_requires_explicit_original_inspection")
-    now = store.snapshot(version).coverage.as_of
+    # Read the clock here, not from the snapshot above. The kernel re-checks the
+    # same 300-second window against its own SYSUTCDATETIME immediately after
+    # this, and a kernel refusal aborts the transaction, so it cannot be turned
+    # into a durable rejection. Checking against an older coverage timestamp
+    # made this pre-check the weaker of the two and let expiry surface there
+    # instead, where the only outcome is a rollback and a retry.
+    now = store.now()
     if not now - timedelta(seconds=SUPERSESSION_EVIDENCE_TTL_SECONDS) <= inspection.observed_at <= now:
         raise ProvisioningReview("supersession_presence_inspection_expired")
     if (

@@ -1821,12 +1821,16 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 return stale
             work = self._get("work", producer.work_id, control, m.MonitoringWork)
             frontier = self._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
-            result = self._publish_connector_context(m.ConnectorPublicationContext(
-                phase="binding",
-                request_id=stable_id(control, f"connector-bind:{producer.request_id}:{work.lease.fence}"),
-                expected=m.RegistryVersion(**_stamp(control), revision=control.revision),
-                work=work, frontier=frontier, connector=connector,
-            ))
+            rejected, result = self._bind_connector_evidence(
+                producer, connector, control, m.ConnectorPublicationContext(
+                    phase="binding",
+                    request_id=stable_id(control, f"connector-bind:{producer.request_id}:{work.lease.fence}"),
+                    expected=m.RegistryVersion(**_stamp(control), revision=control.revision),
+                    work=work, frontier=frontier, connector=connector,
+                ),
+            )
+            if rejected is not None:
+                return rejected
             if result is None:
                 raise MonitoringUnavailable("Connector binding did not return its original publication result")
             self._publish_connector(result.connector, control)

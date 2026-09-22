@@ -15,6 +15,7 @@ executor: the existing controller remains the only workload-action component.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from triage.models import Incident
@@ -186,6 +187,15 @@ class MonitoringStore(Protocol):
 
     def snapshot(self, context: MonitoringContext) -> MonitoringSnapshot:
         """Read control and coverage at one consistent registry revision."""
+        ...
+
+    def now(self) -> datetime:
+        """The authoritative clock, for windows shorter than a snapshot takes.
+
+        A snapshot's coverage timestamp is the moment that snapshot began, so
+        using it to check a 300-second evidence window makes the check weaker
+        than the kernel guard it is meant to pre-empt.
+        """
         ...
 
     def list_scopes(self, query: PageQuery) -> RecordPage[ScopePolicy]: ...

@@ -78,7 +78,10 @@ CONTROLLER_OPERATIONS = frozenset({
 })
 SHARED_WORK_OPERATIONS = frozenset({"claim_work", "renew_lease", "disposition_work"})
 CONNECTOR_PUBLICATION_OPERATIONS = frozenset({
-    "snapshot", "get_work", "get_reconciliation_request", "get_validation_frontier",
+    # "now" is the authoritative clock. Composition needs it because the
+    # presence-evidence window is 300 seconds and a snapshot's coverage
+    # timestamp is already older than the kernel guard's own clock read.
+    "snapshot", "now", "get_work", "get_reconciliation_request", "get_validation_frontier",
     "list_connectors", "get_connector_desired", "list_targets", "resolve_target", "get_connector_publication",
     "get_operation_receipt", "get_connector_observation", "publish_connector", "enqueue_work",
 })
@@ -3354,12 +3357,16 @@ class MonitoringEngine:
                 return stale
             work = self._get("work", producer.work_id, control, m.MonitoringWork)
             frontier = self._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
-            result = self._publish_connector_context(m.ConnectorPublicationContext(
-                phase="binding",
-                request_id=stable_id(control, f"connector-bind:{producer.request_id}:{work.lease.fence}"),
-                expected=m.RegistryVersion(**_stamp(control), revision=control.revision),
-                work=work, frontier=frontier, connector=connector,
-            ))
+            rejected, result = self._bind_connector_evidence(
+                producer, connector, control, m.ConnectorPublicationContext(
+                    phase="binding",
+                    request_id=stable_id(control, f"connector-bind:{producer.request_id}:{work.lease.fence}"),
+                    expected=m.RegistryVersion(**_stamp(control), revision=control.revision),
+                    work=work, frontier=frontier, connector=connector,
+                ),
+            )
+            if rejected is not None:
+                return rejected
             if result is None:
                 raise MonitoringUnavailable("Connector binding did not return its original publication result")
             self._publish_connector(result.connector, control)
@@ -3420,9 +3427,22 @@ class MonitoringEngine:
             if now - timedelta(seconds=m.SUPERSESSION_EVIDENCE_TTL_SECONDS) <= inspection.observed_at <= now:
                 return None
         now = self._now()
-        # Keyed on the rejected handoff, never the connector revision: the
-        # revision has not changed, so a revision-keyed draft would resolve to
-        # the existing completed work and silently enqueue nothing.
+        return self._reject_connector_evidence(
+            producer, connector, control, "overtaken" if overtaken else "inspection_expired",
+        )
+
+    def _reject_connector_evidence(self, producer, connector, control, reason: str):
+        """Resolve a handoff whose evidence can never be accepted, exactly once.
+
+        Keyed on the rejected handoff, never the connector revision: the
+        revision has not changed, so a revision-keyed draft would resolve to
+        the existing completed work and silently enqueue nothing. Keying it on
+        the producer request also makes a repeat attempt idempotent -- one
+        outstanding re-observation per rejected handoff, not one per attempt.
+        Unbounded competing observations advance the baseline and overtake
+        candidates that are still fresh.
+        """
+        now = self._now()
         self._enqueue(m.MonitoringWorkDraft(
             **_stamp(control),
             work_id=stable_id(control, f"connector-reobserve:{producer.request_id}"),
@@ -3431,10 +3451,42 @@ class MonitoringEngine:
             reason="Expired source-presence evidence requires a fresh bounded observation.",
         ))
         logger.info(
-            "connector_evidence_unusable connector_id=%s reason=%s",
-            connector.connector_id, "overtaken" if overtaken else "inspection_expired",
+            "connector_evidence_unusable connector_id=%s reason=%s", connector.connector_id, reason,
         )
         return "rejected", "Connector evidence can no longer be accepted; a fresh observation was queued."
+
+    def _bind_connector_evidence(self, producer, connector, control, context):
+        """Publish the binding, or resolve evidence that aged out during preparation.
+
+        The early check above proves the inspection was inside its window when
+        this handoff was selected. Preparation then re-reads publication state
+        and re-checks the same inspection, so evidence with little margin left
+        can expire in flight and raise ``supersession_presence_inspection_expired``.
+
+        That refusal used to escape. On the SQL store the transaction catch-all
+        reported it as ``MonitoringUnavailable`` -- shared state could not be
+        reached -- so the work was retried rather than resolved, and since
+        nothing can make evidence younger every retry produced the identical
+        refusal. A deployed controller repeated one of these 48 times across 23
+        hours with event intake fenced behind it.
+
+        Catching here is safe because a ``ProvisioningReview`` is a Python
+        decision taken after reads, never the consequence of a failed SQL
+        statement, so the surrounding transaction is still valid and the
+        follow-up write below is allowed. Only this one code is caught: every
+        other review code means something genuinely needs review, and turning
+        those into a silent rejection would hide them.
+        """
+        from triage.monitoring.provisioning import ProvisioningReview
+
+        try:
+            return None, self._publish_connector_context(context)
+        except ProvisioningReview as exc:
+            if exc.code != "supersession_presence_inspection_expired":
+                raise
+            return self._reject_connector_evidence(
+                producer, connector, control, "inspection_expired_during_preparation",
+            ), None
 
     def _connector_observation_overtaken(self, producer, connector, control) -> bool:
         """Has a later observation already advanced this connector?
@@ -3730,6 +3782,11 @@ class MonitoringEngine:
     @atomic()
     def snapshot(self, context: m.MonitoringContext) -> m.MonitoringSnapshot:
         return m.MonitoringSnapshot(control=self._control(context), coverage=self._coverage(context))
+
+    @atomic()
+    def now(self) -> datetime:
+        """The authoritative clock, read now rather than when a snapshot began."""
+        return self._now()
 
     def _save_work(self, work: m.MonitoringWork) -> m.MonitoringWork:
         return self._put(
