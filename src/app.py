@@ -234,9 +234,13 @@ class TriageControllerAgent(BaseAgent):
                     raise RuntimeError(report.summary())
                 return AgentResponse(messages=[Message("assistant", [report.summary()])])
 
-        # One triage at a time. Two concurrent runs would race on the incident
-        # store and could remediate the same failure twice -- the exact
-        # duplicate-action problem the dedup logic exists to prevent.
+        # Order work inside this invocation. That is all this does: a hosted
+        # agent is constructed fresh per request -- eight hours of telemetry
+        # recorded 67 distinct role instances for 64 heartbeats -- so this lock
+        # spans nothing beyond the call it is taken in. Duplicate remediation is
+        # prevented by the durable per-alert claim taken in _drain_mailbox, on
+        # the shared database, or not at all. Do not read this line as the
+        # protection; tests/test_claims.py proves where the protection lives.
         async with self._lock:
             if is_silent:
                 summary = await self._silent_sweep()

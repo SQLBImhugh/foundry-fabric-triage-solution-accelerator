@@ -15,7 +15,13 @@ from __future__ import annotations
 
 import time
 
-from triage.store.claims import DEFAULT_LEASE_SECONDS, InMemoryClaimStore, build_claim_store
+from triage.store.claims import (
+    DEFAULT_LEASE_SECONDS,
+    AzureSqlClaimStore,
+    InMemoryClaimStore,
+    _row_key,
+    build_claim_store,
+)
 
 
 def test_only_the_first_caller_gets_the_claim() -> None:
@@ -199,3 +205,111 @@ def test_the_retry_claim_is_held_until_the_row_is_finished(tmp_path, test_settin
     asyncio.run(drain(fake, claims=claims))
 
     assert held == [True], "the claim was released before the row was completed"
+
+
+# --- two hosted instances, no shared lock ------------------------------------
+
+
+class _KeyedSql:
+    """A SQL double that enforces the primary key, because that is the arbiter.
+
+    The existing doubles set ``raise_duplicate`` by hand, which proves the
+    branch but not the invariant. Here the second INSERT of a live key fails
+    because the key is already present, and the conditional steal matches no
+    row because the lease has not expired -- the same two steps the server
+    performs.
+    """
+
+    is_available = True
+
+    def integrity_error(self):
+        """The driver's duplicate-key class, as the store asks for it.
+
+        Defined as a method, not an attribute: ``_is_duplicate_key`` calls
+        ``db.integrity_error()`` and swallows any failure, so an attribute here
+        would make every INSERT look like an unclassified error and the tests
+        below would pass without the duplicate-key branch ever running.
+        """
+        return KeyError
+
+    def __init__(self) -> None:
+        self.rows: dict[str, tuple[str, float]] = {}
+        self.clock = 1000.0
+
+    def execute(self, sql: str, *params):
+        statement = sql.strip().split()[0].upper()
+        if statement == "INSERT":
+            row, owner, lease, _text = params
+            # A primary key rejects the row whether or not the lease expired.
+            # Expiry is settled by the conditional steal, on the server.
+            if row in self.rows:
+                raise KeyError("Violation of PRIMARY KEY constraint")
+            self.rows[row] = (owner, self.clock + float(lease))
+            return 1
+        if statement == "UPDATE":
+            owner, lease, row = params
+            held = self.rows.get(row)
+            if held is None or held[1] > self.clock:
+                return 0
+            self.rows[row] = (owner, self.clock + float(lease))
+            return 1
+        if statement == "DELETE":
+            row, owner = params[0], params[1]
+            if self.rows.get(row, (None, 0))[0] == owner:
+                del self.rows[row]
+                return 1
+            return 0
+        raise AssertionError(f"unexpected statement {statement}")
+
+
+def test_two_independent_instances_cannot_both_claim_one_alert() -> None:
+    """The production shape: separate processes, separate locks, one database.
+
+    A hosted agent is rebuilt per request -- eight hours of telemetry recorded
+    67 distinct role instances for 64 heartbeats -- so the ``asyncio.Lock`` in
+    ``app.py`` orders work inside one invocation and spans nothing beyond it.
+    Duplicate remediation is prevented by this claim, on the shared database,
+    or not at all.
+    """
+    db = _KeyedSql()
+    first, second = AzureSqlClaimStore(db=db), AzureSqlClaimStore(db=db)
+    key = "message:tenant:epoch:alert-1"
+
+    assert first.claim(key) is True
+    assert second.claim(key) is False, "two hosted instances both took one alert"
+
+
+def test_the_loser_takes_over_only_after_the_lease_expires() -> None:
+    """A crashed instance must not hold an alert for ever."""
+    db = _KeyedSql()
+    first, second = AzureSqlClaimStore(db=db), AzureSqlClaimStore(db=db)
+    key = "message:tenant:epoch:alert-1"
+    assert first.claim(key, lease_seconds=60) is True
+
+    db.clock += 61
+
+    assert second.claim(key) is True
+
+
+def test_a_released_alert_is_immediately_available_to_the_other_instance() -> None:
+    db = _KeyedSql()
+    first, second = AzureSqlClaimStore(db=db), AzureSqlClaimStore(db=db)
+    key = "message:tenant:epoch:alert-1"
+    assert first.claim(key) is True
+    first.release(key)
+
+    assert second.claim(key) is True
+
+
+def test_one_instance_cannot_release_the_claim_another_now_holds() -> None:
+    """Ownership is proved on delete, so a slow loser cannot open the door."""
+    db = _KeyedSql()
+    first, second = AzureSqlClaimStore(db=db), AzureSqlClaimStore(db=db)
+    key = "message:tenant:epoch:alert-1"
+    assert first.claim(key, lease_seconds=60) is True
+    db.clock += 61
+    assert second.claim(key) is True
+
+    first.release(key)
+
+    assert db.rows[_row_key(key)][0] == second._held[_row_key(key)]

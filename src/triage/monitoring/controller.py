@@ -60,9 +60,54 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("triage.monitoring.controller")
 heartbeat_logger = logging.getLogger("triage.telemetry.heartbeat")
-# The scheduled invocation has a 900-second HTTP limit. Leave time to return
-# and persist completion; reaching this deadline never cancels a claimed effect.
+# The controller's own admission deadline, in seconds.
+#
+# This is not the host's HTTP limit. An earlier comment here claimed "the
+# scheduled invocation has a 900-second HTTP limit" and sized the budget at
+# 840 on that basis. Measured against the deployed caller it was false: the
+# bi-triage-command-sweep Logic App configures timeout PT15M on its agent call,
+# but Logic Apps Consumption enforces a 120-second ceiling on a synchronous
+# outbound request, and its Invoke_the_agent action failed three times with
+# code=BadRequest at exactly 120 seconds while every successful run finished
+# within 115.
+#
+# So the controller reasoned with a deadline seven times longer than it had:
+# it admitted work it could never report and was cut off mid-flight, and since
+# coroutine cancellation does not stop a running asyncio.to_thread body, the
+# SQL work carried on with nobody left to observe it.
+#
+# Override it with HEARTBEAT_BUDGET_SECONDS when the caller's real deadline
+# differs. A deadline the runtime cannot verify is a guess, so this one is
+# stated, and heartbeat_budget_seconds refuses a value that cannot accommodate
+# one unit of work. Reaching it never cancels a claimed effect; the lease does
+# that.
 HEARTBEAT_BUDGET_SECONDS = 840
+
+
+def heartbeat_work_seconds(settings: Any) -> int:
+    """The execution allowance one admitted unit may need."""
+    # Existing per-command execution bound plus its lease/finalization allowance.
+    return settings.triage_timeout_seconds + settings.approval_timeout_seconds + 90
+
+
+def heartbeat_budget_seconds(settings: Any) -> int:
+    """The configured admission deadline, checked against the work it must hold.
+
+    A deadline shorter than one work allowance makes ``can_claim()`` false on
+    its first check, so every heartbeat returns having done nothing, for ever,
+    with no error anywhere. That silent starvation is worse than a refusal.
+    """
+    budget = int(getattr(settings, "heartbeat_budget_seconds", HEARTBEAT_BUDGET_SECONDS))
+    if budget <= 0:
+        raise ValueError("The heartbeat admission deadline must be positive")
+    work_seconds = heartbeat_work_seconds(settings)
+    if work_seconds <= 0:
+        raise ValueError("Heartbeat work requires a positive execution budget")
+    if budget < work_seconds:
+        raise ValueError(
+            f"A heartbeat deadline of {budget}s cannot admit {work_seconds}s of work"
+        )
+    return budget
 _CURRENT: ContextVar[MonitoringExecution | None] = ContextVar("monitoring_execution", default=None)
 ACTION_KINDS: dict[str, ActionKind] = {
     "refresh_powerbi_dataset": "powerbi_refresh",
@@ -137,11 +182,9 @@ async def controller_heartbeat(
         command_drain = drain_commands
     clock = clock or time.monotonic
     began = clock() if started_at is None else started_at
-    # Existing per-command execution bound plus its lease/finalization allowance.
-    work_seconds = runner.settings.triage_timeout_seconds + runner.settings.approval_timeout_seconds + 90
-    if work_seconds <= 0:
-        raise ValueError("Heartbeat work requires a positive execution budget")
-    budget = HeartbeatBudget(began + HEARTBEAT_BUDGET_SECONDS, work_seconds, clock)
+    work_seconds = heartbeat_work_seconds(runner.settings)
+    budget_seconds = heartbeat_budget_seconds(runner.settings)
+    budget = HeartbeatBudget(began + budget_seconds, work_seconds, clock)
     lines: list[str] = []
     remaining = {"automatic": max(1, min(rounds, 100)), "human": max(1, min(rounds, 100))}
     started = {"automatic": 0, "human": 0}
@@ -172,7 +215,7 @@ async def controller_heartbeat(
 
     heartbeat_logger.info(
         "heartbeat_started budget_seconds=%d per_queue_limit=%d work_budget_seconds=%s",
-        HEARTBEAT_BUDGET_SECONDS, remaining["human"], work_seconds,
+        budget_seconds, remaining["human"], work_seconds,
     )
     with heartbeat_span() as span:
         status, error_type, error_cause = "completed", "", ""

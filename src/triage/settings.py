@@ -198,6 +198,11 @@ class Settings(BaseSettings):
     triage_max_tokens: int = 80_000
     triage_timeout_seconds: int = 300
 
+    # The controller's admission deadline. Not the host's HTTP limit: see
+    # triage.monitoring.controller.HEARTBEAT_BUDGET_SECONDS for the measured
+    # caller behaviour that made the previous assumption false.
+    heartbeat_budget_seconds: int = 840
+
     app_version: str = "0.1.0"
 
 
