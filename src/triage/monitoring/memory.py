@@ -58,6 +58,13 @@ from triage.redaction import redact_text
 from triage.store.retries import MAX_ATTEMPTS, backoff_seconds
 
 logger = logging.getLogger("triage.monitoring.memory")
+#: Exported to Azure Monitor. Only fixed identifiers are written to it.
+telemetry_logger = logging.getLogger("triage.telemetry.monitoring")
+#: The closed set of reasons a connector handoff's evidence is refused. Fixed
+#: literals, so they are safe to export; an unknown value is a bug, not a label.
+EVIDENCE_REJECTION_REASONS = frozenset({
+    "overtaken", "inspection_expired", "inspection_expired_during_preparation",
+})
 SCAN_BUDGET = 5_000
 PLAN_TTL_SECONDS = 900
 SOURCE_FRESHNESS_SECONDS = 300
@@ -3451,6 +3458,16 @@ class MonitoringEngine:
             reason="Expired source-presence evidence requires a fresh bounded observation.",
         ))
         logger.info(
+            "connector_evidence_unusable connector_id=%s reason=%s", connector.connector_id, reason,
+        )
+        # Also exported. The local line above is not: only the triage.telemetry
+        # family reaches Azure Monitor, so without this an operator watching a
+        # fenced connector cannot tell a resolved rejection from the outage the
+        # same condition used to be reported as. Both fields are fixed -- a
+        # canonical GUID and a literal from EVIDENCE_REJECTION_REASONS.
+        if reason not in EVIDENCE_REJECTION_REASONS:
+            raise MonitoringUnavailable("Connector evidence rejection reported an unknown reason")
+        telemetry_logger.info(
             "connector_evidence_unusable connector_id=%s reason=%s", connector.connector_id, reason,
         )
         return "rejected", "Connector evidence can no longer be accepted; a fresh observation was queued."

@@ -21,9 +21,11 @@ import pytest
 
 from triage.monitoring.contracts import FixedDiagnosticError, MonitoringUnavailable
 from triage.monitoring.controller import _root_cause
+from triage.monitoring.memory import EVIDENCE_REJECTION_REASONS, telemetry_logger
 from triage.monitoring.sql_store import _exported_failure_fields
 
 CANARY = "synthetic-row-canary-value"
+CONNECTOR_ID = "250d1cca-de6a-550d-a7c2-aa625f40c86e"
 
 
 class DriverLikeError(Exception):
@@ -136,3 +138,42 @@ def test_nothing_in_the_exported_family_emits_row_content(
         )
 
     assert CANARY not in caplog.text
+
+
+# --- connector evidence rejection ------------------------------------------
+
+
+def test_connector_evidence_rejection_is_exported_with_fixed_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The fix for a fenced connector has to be visible, or it cannot be trusted.
+
+    This decision used to be reported as MonitoringUnavailable. Without an
+    exported line an operator cannot tell a resolved rejection from the outage
+    it used to look like, because triage.monitoring.memory is not exported.
+    """
+    with caplog.at_level(logging.INFO, logger="triage.telemetry.monitoring"):
+        telemetry_logger.info(
+            "connector_evidence_unusable connector_id=%s reason=%s",
+            CONNECTOR_ID, "inspection_expired_during_preparation",
+        )
+
+    assert "connector_id=" + CONNECTOR_ID in caplog.text
+    assert "reason=inspection_expired_during_preparation" in caplog.text
+    assert len(caplog.records) == 1
+
+
+def test_every_rejection_reason_is_a_fixed_literal() -> None:
+    """Only values from the closed set may be exported."""
+    assert EVIDENCE_REJECTION_REASONS == {
+        "overtaken", "inspection_expired", "inspection_expired_during_preparation",
+    }
+    assert all(
+        reason.replace("_", "").isalnum() and reason.islower() and len(reason) <= 64
+        for reason in EVIDENCE_REJECTION_REASONS
+    )
+
+
+def test_the_exported_family_covers_the_monitoring_logger() -> None:
+    """configure_azure_monitor exports the triage.telemetry family by prefix."""
+    assert telemetry_logger.name.startswith("triage.telemetry.")
