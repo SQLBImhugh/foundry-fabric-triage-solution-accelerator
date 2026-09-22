@@ -35,6 +35,7 @@ import httpx
 from pydantic import TypeAdapter, ValidationError
 
 from triage.monitoring.contracts import (
+    FixedDiagnosticError,
     MonitoringCommitUncertain,
     MonitoringComponentDenied,
     MonitoringConflict,
@@ -107,12 +108,8 @@ INTENT_GAP = "definition_update_submitted_or_unknown"
 PRESENCE_GAP = "pending_source_removal_presence_observed"
 
 
-class ProvisioningReview(RuntimeError):
+class ProvisioningReview(FixedDiagnosticError):
     """A fixed diagnostic code, never raw remote definition or HTTP content."""
-
-    def __init__(self, code: str) -> None:
-        self.code = code
-        super().__init__(code)
 
 
 class UpdateNotSent(RestReadError):

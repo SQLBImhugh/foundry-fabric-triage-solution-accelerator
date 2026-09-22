@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from triage.approvals import ApprovalDecision, ApprovalRequest
 from triage.monitoring.contracts import (
+    FixedDiagnosticError,
     MonitoringComponentDenied,
     MonitoringConflict,
     MonitoringLeaseLost,
@@ -219,6 +221,13 @@ async def controller_heartbeat(
     return lines
 
 
+#: Longest cause identifier this boundary will export, matching the SQL store's
+#: own field bound.
+MAX_EXPORTED_CAUSE = 128
+#: A fixed diagnostic code is a lower-case identifier chosen in this repository.
+_FIXED_CODE = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
+
+
 def _root_cause(exc: BaseException) -> str:
     """Name the originating failure behind a wrapped store error.
 
@@ -229,17 +238,20 @@ def _root_cause(exc: BaseException) -> str:
     23 hours while the heartbeat reported only ``error_type=MonitoringUnavailable``,
     and nothing in App Insights could tell an operator that retrying was futile.
 
-    Only the class name and a fixed diagnostic ``code`` are copied out.
-    ProvisioningReview codes are fixed strings by construction; exception
-    messages are never emitted here, because they can quote remote content.
+    Only the class name, and a code from an exception type that declares its
+    code to be a fixed identifier, are copied out. Reading ``code`` from any
+    class was not safe: a driver exception can carry whatever the server put in
+    that attribute, and an independent review captured an 833-character value
+    quoting a synthetic row. The pattern check is a second bound, not the
+    primary one -- the type is what establishes provenance.
     """
     cause, depth = exc.__cause__, 0
     while cause is not None and depth < 5:
-        code = getattr(cause, "code", None)
-        if isinstance(code, str) and code:
-            return f"{type(cause).__name__}:{code}"
+        code = getattr(cause, "code", None) if isinstance(cause, FixedDiagnosticError) else None
+        if isinstance(code, str) and _FIXED_CODE.match(code):
+            return f"{type(cause).__name__}:{code}"[:MAX_EXPORTED_CAUSE]
         if cause.__cause__ is None:
-            return type(cause).__name__
+            return type(cause).__name__[:MAX_EXPORTED_CAUSE]
         cause, depth = cause.__cause__, depth + 1
     return ""
 

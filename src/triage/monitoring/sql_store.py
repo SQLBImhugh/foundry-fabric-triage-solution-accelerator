@@ -139,6 +139,44 @@ def _guard_code(text: str) -> str | None:
     return next((code for message, code in _guard_messages() if message and message in text), None)
 
 
+#: Longest identifier this boundary will export. Long enough for our own
+#: operation and guard names, short enough that a quoted row cannot ride along.
+MAX_EXPORTED_FIELD = 128
+
+
+def _exported_token(value: str) -> str:
+    """One whitespace-free, bounded token safe to place in an exported field.
+
+    Separators are stripped rather than escaped: the exported line is parsed by
+    splitting on spaces, so a value containing one would silently invent fields.
+    """
+    token = "".join(character for character in value if not character.isspace())
+    return token[:MAX_EXPORTED_FIELD] if token else "none"
+
+
+def _exported_failure_fields(operation: str, exc: BaseException) -> dict[str, str]:
+    """Fixed identifiers describing a failed SQL operation, and nothing else.
+
+    Only the ``triage.telemetry`` family reaches Azure Monitor, so whatever this
+    returns leaves the tenant. Redaction removes credential shapes, not customer
+    data: a conversion or truncation error quotes the row that failed, and an
+    independent review captured a synthetic row value surviving redaction into
+    the exported message. Truncating that message does not make it metadata.
+
+    So the message is not exported at all. What an operator actually needs is
+    which operation failed, which exception class the driver raised, and -- when
+    it is one of ours -- the guard code that says the refusal was deterministic.
+    Each of those is a fixed literal from this repository or a class name. The
+    full redacted detail still goes to the local ``triage.monitoring.sql``
+    logger, which is deliberately not exported.
+    """
+    return {
+        "operation": _exported_token(operation),
+        "error_type": _exported_token(type(exc).__name__),
+        "guard_code": _exported_token(_guard_code(str(exc)) or ""),
+    }
+
+
 def _db_time(value: datetime) -> datetime:
     return value.astimezone(UTC).replace(tzinfo=None)
 
@@ -293,9 +331,14 @@ class SqlBackend:
                 "Monitoring SQL operation failed operation=%s error_type=%s detail=%s",
                 operation, type(exc).__name__, detail,
             )
+            # Exported: fixed identifiers only. The redacted detail above stays
+            # on the local logger, which Azure Monitor never receives.
             telemetry_logger.error(
-                "monitoring_sql_failed operation=%s error_type=%s detail=%s",
-                operation, type(exc).__name__, detail,
+                "monitoring_sql_failed %s",
+                " ".join(
+                    f"{key}={value}"
+                    for key, value in _exported_failure_fields(operation, exc).items()
+                ),
             )
             number = _guard_code(str(exc))
             if number is not None:

@@ -101,6 +101,24 @@ class MonitoringStoreError(RuntimeError):
     """A visible monitoring persistence failure, never a successful empty result."""
 
 
+class FixedDiagnosticError(RuntimeError):
+    """An error whose ``code`` is a fixed identifier chosen in this repository.
+
+    Telemetry may name this code because it is a literal in our own source, not
+    a value derived from a row, a remote definition or an HTTP body. Nothing
+    else is safe to export: a driver exception can expose a ``code`` attribute
+    holding whatever the server put in it, and an independent review captured
+    an 833-character value quoting a synthetic row.
+
+    Subclass this rather than adding another name to an allowlist, so the
+    telemetry boundary can decide by type instead of by spelling.
+    """
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
 class MonitoringUnavailable(MonitoringStoreError):
     """Shared state could not be reached; intake, ownership and actions fail closed."""
 
