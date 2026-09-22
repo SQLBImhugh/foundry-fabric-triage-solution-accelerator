@@ -148,16 +148,17 @@ async def controller_heartbeat(
     completed = {"automatic": 0, "human": 0}
     failed = False
 
-    async def worker(queue: str) -> None:
+    async def worker(queue: str, prefer: str = "reconcile_state") -> None:
         nonlocal failed
         try:
             while remaining[queue] and not failed and budget.can_claim():
                 # Both automatic workers share one quota. The drain rechecks
-                # the deadline immediately before its durable claim.
+                # the deadline immediately before each durable claim.
                 remaining[queue] -= 1
                 started[queue] += 1
                 result = (
-                    await runner.drain_monitoring_work(limit=1, budget=budget) if queue == "automatic"
+                    await runner.drain_monitoring_work(limit=1, budget=budget, prefer=prefer)
+                    if queue == "automatic"
                     else await command_drain(runner, limit=1, budget=budget)
                 )
                 completed[queue] += len(result)
@@ -176,9 +177,12 @@ async def controller_heartbeat(
     with heartbeat_span() as span:
         status, error_type, error_cause = "completed", "", ""
         workers = [
-            asyncio.create_task(worker("automatic")),
+            # One automatic worker leads each pool. They share the automatic
+            # quota and borrow when their own pool is empty, so neither pool
+            # can be starved by a continuous backlog in the other.
+            asyncio.create_task(worker("automatic", prefer="reconcile_state")),
             asyncio.create_task(worker("human")),
-            asyncio.create_task(worker("automatic")),
+            asyncio.create_task(worker("automatic", prefer="action")),
         ]
         try:
             # A sibling's SQL failure stops new claims, not an in-flight action.

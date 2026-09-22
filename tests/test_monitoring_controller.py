@@ -348,7 +348,7 @@ async def test_heartbeat_interleaves_bounded_automatic_and_human_work(test_setti
     class Runner:
         settings = test_settings
 
-        async def drain_monitoring_work(self, *, limit, budget):
+        async def drain_monitoring_work(self, *, limit, budget, prefer="reconcile_state"):
             assert budget.can_claim()
             calls.append(("automatic", limit))
             return ["automatic result"] if len(calls) <= 2 else []
@@ -369,7 +369,7 @@ async def test_heartbeat_does_not_turn_sql_outage_into_an_empty_success(test_set
     class Runner:
         settings = test_settings
 
-        async def drain_monitoring_work(self, *, limit, budget):
+        async def drain_monitoring_work(self, *, limit, budget, prefer="reconcile_state"):
             raise MonitoringUnavailable("Synthetic SQL outage")
 
     async def human(_runner, *, limit, budget):
@@ -386,7 +386,7 @@ async def test_heartbeat_stops_before_second_long_human_command(test_settings, c
     class Runner:
         settings = test_settings
 
-        async def drain_monitoring_work(self, *, limit, budget):
+        async def drain_monitoring_work(self, *, limit, budget, prefer="reconcile_state"):
             calls.append(("automatic", budget.deadline))
             return []
 
@@ -423,7 +423,7 @@ async def test_heartbeat_shared_quotas_still_bound_fast_work(test_settings):
     class Runner:
         settings = test_settings
 
-        async def drain_monitoring_work(self, *, limit, budget):
+        async def drain_monitoring_work(self, *, limit, budget, prefer="reconcile_state"):
             calls["automatic"] += 1
             await asyncio.sleep(0)
             return ["automatic"]
@@ -445,7 +445,7 @@ async def test_heartbeat_waits_for_claimed_sibling_after_failure_without_cancell
     class Runner:
         settings = test_settings
 
-        async def drain_monitoring_work(self, *, limit, budget):
+        async def drain_monitoring_work(self, *, limit, budget, prefer="reconcile_state"):
             nonlocal automatic_calls
             automatic_calls += 1
             if automatic_calls == 1:
@@ -480,7 +480,7 @@ async def test_elapsed_heartbeat_deadline_does_not_cancel_or_repeat_claimed_work
     class Runner:
         settings = test_settings
 
-        async def drain_monitoring_work(self, *, limit, budget):
+        async def drain_monitoring_work(self, *, limit, budget, prefer="reconcile_state"):
             return []
 
     async def human(_runner, *, limit, budget):

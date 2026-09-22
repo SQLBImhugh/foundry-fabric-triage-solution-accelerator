@@ -369,7 +369,7 @@ async def test_heartbeat_deadline_leaves_second_long_command_queued(runner, comm
     elapsed, executed = [0.0], []
     monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=lambda: elapsed[0]))
 
-    async def automatic(*, limit, budget):
+    async def automatic(*, limit, budget, prefer="reconcile_state"):
         return []
 
     async def execute(request):

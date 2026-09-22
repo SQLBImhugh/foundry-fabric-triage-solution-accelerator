@@ -382,7 +382,7 @@ async def test_approval_wait_does_not_block_other_bounded_heartbeat_slots(test_s
     class Runner:
         settings = test_settings
 
-        async def drain_monitoring_work(self, *, limit, budget):
+        async def drain_monitoring_work(self, *, limit, budget, prefer="reconcile_state"):
             assert limit == 1
             assert budget.can_claim()
             return await drain("automatic")

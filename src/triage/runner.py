@@ -128,6 +128,18 @@ RECONCILE_LEASE_SECONDS = 120
 if RECONCILE_LEASE_SECONDS >= SUPERSESSION_EVIDENCE_TTL_SECONDS:  # pragma: no cover - contradiction guard
     raise AssertionError("A reconciliation lease must expire before the evidence it publishes")
 
+#: The two automatic work pools the controller drains.
+#:
+#: They are claimed separately because they need different leases, and served
+#: by separate heartbeat workers because they need independent progress.
+#: Reconciliation publishes the evidence that clears fences for everything
+#: else; actions include verifying and finalizing effects that have already
+#: been submitted to a service, which cannot be left indefinitely unconfirmed.
+MONITORING_POOLS: dict[str, tuple[str, ...]] = {
+    "reconcile_state": ("reconcile_state",),
+    "action": ("triage", "deferred_retry", "verify_action", "finalize"),
+}
+
 
 def _pipeline_signature(failure: PipelineFailure, identity: TargetIdentity) -> str:
     return target_signature(
@@ -2032,51 +2044,56 @@ class TriageRunner:
             reason="An operator or mail reference requires exact REST verification before reasoning or action.",
         ))
 
-    async def drain_monitoring_work(self, *, limit: int = 20, budget: HeartbeatBudget | None = None) -> list[str]:
+    async def drain_monitoring_work(
+        self, *, limit: int = 20, budget: HeartbeatBudget | None = None,
+        prefer: str = "reconcile_state",
+    ) -> list[str]:
         if budget is not None and not budget.can_claim():
             return []
         context = self.monitoring_context
         owner = str(uuid4())
         lines: list[str] = []
-        action_lease = min(
-            900,
-            max(15, self.settings.triage_timeout_seconds + self.settings.approval_timeout_seconds + 90),
-        )
+        leases = {
+            "reconcile_state": RECONCILE_LEASE_SECONDS,
+            # Sized for a model call plus an approval wait.
+            "action": min(
+                900,
+                max(15, self.settings.triage_timeout_seconds + self.settings.approval_timeout_seconds + 90),
+            ),
+        }
+        # Each caller prefers one pool and borrows the other only when its own
+        # is empty. Strict global priority was not enough: with reconciliation
+        # continuously eligible it claimed every automatic turn, so verifying
+        # and finalizing already-submitted effects never ran. The heartbeat
+        # gives each pool its own worker, so preference here decides who leads,
+        # not who is served.
+        order = ("reconcile_state", "action")
+        if prefer not in leases:
+            raise ValueError(f"Unknown monitoring work pool {prefer!r}")
+        if prefer == "action":
+            order = ("action", "reconcile_state")
         for _ in range(max(1, min(limit, 100))):
-            if budget is not None and not budget.can_claim():
-                break
-            # Deterministic reconciliation claims separately, and first.
-            #
-            # It used to share one claim with the action kinds and inherit
-            # their lease, which is sized for a model call plus an approval
-            # wait -- about 690s in this deployment. Reconciliation is a single
-            # synchronous SQL transaction that takes milliseconds, so that
-            # lease was three orders of magnitude too long, and a failed
-            # attempt made the work unclaimable for eleven minutes.
-            #
-            # Connector supersession is authorized by evidence that expires
-            # after SUPERSESSION_EVIDENCE_TTL_SECONDS. With the action lease,
-            # a single missed attempt outlived the evidence, so the retry could
-            # never succeed and fresh evidence was produced only to expire in
-            # the queue behind a triage item awaiting approval. Publication is
-            # also what clears the fences that gate the rest of the queue, so
-            # it goes first; it drains quickly enough not to displace actions.
-            work = self.monitoring.claim_work(WorkClaimRequest(
-                **context.model_dump(), owner_id=owner, kinds=("reconcile_state",),
-                limit=1, per_workspace_limit=1, lease_seconds=RECONCILE_LEASE_SECONDS,
-            ))
-            if not work:
+            work = None
+            for pool in order:
+                # Every distinct claim is its own admission decision. Checking
+                # once per round was not enough: a slow empty lookup in the
+                # first pool could cross the cutoff, and the second pool still
+                # leased work outside the window it was admitted under.
+                if budget is not None and not budget.can_claim():
+                    return lines
                 # Claim only what can start now. Leasing a whole batch before
                 # slow model/approval calls would let later leases expire in
                 # our hands.
-                work = self.monitoring.claim_work(WorkClaimRequest(
-                    **context.model_dump(), owner_id=owner,
-                    kinds=("triage", "deferred_retry", "verify_action", "finalize"),
-                    limit=1, per_workspace_limit=1, lease_seconds=action_lease,
+                claimed = self.monitoring.claim_work(WorkClaimRequest(
+                    **context.model_dump(), owner_id=owner, kinds=MONITORING_POOLS[pool],
+                    limit=1, per_workspace_limit=1, lease_seconds=leases[pool],
                 ))
-            if not work:
+                if claimed:
+                    work = claimed[0]
+                    break
+            if work is None:
                 break
-            lines.append(await self.execute_monitoring_work(work[0]))
+            lines.append(await self.execute_monitoring_work(work))
         return lines
 
     async def execute_monitoring_work(
