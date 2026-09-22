@@ -29,6 +29,7 @@ from triage.monitoring.controller import (
     HeartbeatBudget,
     controller_heartbeat,
     heartbeat_budget_seconds,
+    heartbeat_response_seconds,
 )
 from triage.settings import Settings
 
@@ -103,3 +104,70 @@ def test_admission_closes_before_the_deadline_by_a_full_work_allowance() -> None
     budget = HeartbeatBudget(deadline=1200.0, work_seconds=690.0, clock=lambda: 509.0)
     assert budget.can_claim()
     assert not HeartbeatBudget(deadline=1200.0, work_seconds=690.0, clock=lambda: 511.0).can_claim()
+
+
+# --- returning before the caller gives up ------------------------------------
+
+
+async def test_the_heartbeat_stops_starting_work_before_the_response_deadline() -> None:
+    """Return a partial report rather than being killed holding a full one.
+
+    Cancelled heartbeats recorded automatic_calls=3 and 4: the loop kept
+    starting units past the caller's ceiling. Stopping before it converts a
+    cancellation into an ordinary partial result, and the units already
+    admitted keep their leases either way.
+    """
+    elapsed = [0.0]
+    calls = []
+
+    class Runner:
+        settings = _settings(heartbeat_response_seconds=100)
+
+        async def drain_monitoring_work(self, *, limit, budget, prefer="reconcile_state"):
+            calls.append(elapsed[0])
+            elapsed[0] += 40
+            return [f"- unit at {int(calls[-1])}s"]
+
+    async def human(_runner, *, limit, budget):
+        return []
+
+    lines = await controller_heartbeat(
+        Runner(), command_drain=human, started_at=0.0, clock=lambda: elapsed[0],
+    )
+
+    assert calls and max(calls) < 100, f"work started after the deadline: {calls}"
+    assert lines, "a bounded heartbeat still reports what it did"
+
+
+async def test_an_unbounded_response_deadline_keeps_draining() -> None:
+    """Zero means no response bound, for a caller that genuinely waits."""
+    elapsed = [0.0]
+    calls = []
+
+    class Runner:
+        settings = _settings(heartbeat_response_seconds=0)
+
+        async def drain_monitoring_work(self, *, limit, budget, prefer="reconcile_state"):
+            calls.append(elapsed[0])
+            elapsed[0] += 40
+            return ["- unit"]
+
+    async def human(_runner, *, limit, budget):
+        return []
+
+    await controller_heartbeat(
+        Runner(), command_drain=human, started_at=0.0, clock=lambda: elapsed[0],
+    )
+
+    assert max(calls) >= 100, "an unbounded heartbeat stopped early"
+
+
+def test_a_response_deadline_above_the_admission_budget_is_refused() -> None:
+    """Promising a longer response than the admission window is incoherent."""
+    with pytest.raises(ValueError, match="response"):
+        heartbeat_response_seconds(_settings(heartbeat_response_seconds=900))
+
+
+def test_a_negative_response_deadline_is_refused() -> None:
+    with pytest.raises(ValueError, match="response"):
+        heartbeat_response_seconds(_settings(heartbeat_response_seconds=-1))

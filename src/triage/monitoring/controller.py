@@ -108,6 +108,32 @@ def heartbeat_budget_seconds(settings: Any) -> int:
             f"A heartbeat deadline of {budget}s cannot admit {work_seconds}s of work"
         )
     return budget
+
+
+#: Stop starting new units this many seconds before the caller gives up.
+#: Zero disables the bound, for a caller that genuinely waits.
+HEARTBEAT_RESPONSE_SECONDS = 100
+
+
+def heartbeat_response_seconds(settings: Any) -> int:
+    """How long the heartbeat may take before it must report what it has.
+
+    Separate from the admission deadline, which asks whether a unit can finish.
+    This asks whether the caller is still listening. The shipped caller is a
+    Logic App, and Logic Apps Consumption aborts a synchronous outbound request
+    at 120 seconds whatever its configured timeout says, so a heartbeat that
+    keeps starting units past that point is killed holding its report. Returning
+    a partial result costs nothing: every admitted unit is protected by its
+    lease, and the next invocation continues from the queue.
+    """
+    response = int(getattr(settings, "heartbeat_response_seconds", HEARTBEAT_RESPONSE_SECONDS))
+    if response < 0:
+        raise ValueError("The heartbeat response deadline cannot be negative")
+    if response > heartbeat_budget_seconds(settings):
+        raise ValueError(
+            "The heartbeat response deadline cannot outlast its admission deadline"
+        )
+    return response
 _CURRENT: ContextVar[MonitoringExecution | None] = ContextVar("monitoring_execution", default=None)
 ACTION_KINDS: dict[str, ActionKind] = {
     "refresh_powerbi_dataset": "powerbi_refresh",
@@ -184,7 +210,11 @@ async def controller_heartbeat(
     began = clock() if started_at is None else started_at
     work_seconds = heartbeat_work_seconds(runner.settings)
     budget_seconds = heartbeat_budget_seconds(runner.settings)
+    response_seconds = heartbeat_response_seconds(runner.settings)
     budget = HeartbeatBudget(began + budget_seconds, work_seconds, clock)
+
+    def still_listening() -> bool:
+        return not response_seconds or clock() - began < response_seconds
     lines: list[str] = []
     remaining = {"automatic": max(1, min(rounds, 100)), "human": max(1, min(rounds, 100))}
     started = {"automatic": 0, "human": 0}
@@ -194,7 +224,7 @@ async def controller_heartbeat(
     async def worker(queue: str, prefer: str = "reconcile_state") -> None:
         nonlocal failed
         try:
-            while remaining[queue] and not failed and budget.can_claim():
+            while remaining[queue] and not failed and budget.can_claim() and still_listening():
                 # Both automatic workers share one quota. The drain rechecks
                 # the deadline immediately before each durable claim.
                 remaining[queue] -= 1

@@ -202,6 +202,9 @@ class Settings(BaseSettings):
     # triage.monitoring.controller.HEARTBEAT_BUDGET_SECONDS for the measured
     # caller behaviour that made the previous assumption false.
     heartbeat_budget_seconds: int = 840
+    # Stop starting new heartbeat units at this point and report what was done,
+    # rather than being cut off holding the report. 0 disables the bound.
+    heartbeat_response_seconds: int = 100
 
     app_version: str = "0.1.0"
 
