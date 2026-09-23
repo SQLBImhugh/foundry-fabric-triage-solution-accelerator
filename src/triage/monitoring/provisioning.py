@@ -65,6 +65,7 @@ from triage.monitoring.models import (
     CollectionCommit,
     ConnectorObservationResult,
     ConnectorPresenceInspection,
+    ConnectorPublicationContext,
     ConnectorPublicationRequest,
     ConnectorPublicationResult,
     ConnectorSource,
@@ -905,7 +906,7 @@ class OwnedEventCapabilityProbe:
             })
 
 
-class PublicationState(NamedTuple):
+class _PublicationState(NamedTuple):
     """One resolution of everything a connector publication is authorized against.
 
     Resolving this twice, and then taking a third snapshot only to read a clock,
@@ -925,7 +926,7 @@ def _publication_state(
     store: ControllerMonitoringStore,
     work: MonitoringWork,
     connector_id: str,
-) -> PublicationState:
+) -> _PublicationState:
     if store.component != "controller":
         raise MonitoringComponentDenied("Only the controller may plan desired connector publication")
     context = MonitoringContext(tenant_id=work.tenant_id, epoch=work.epoch)
@@ -956,7 +957,40 @@ def _publication_state(
     matches = [value for value in connectors if value.connector_id == canonical_id(connector_id)]
     if len(matches) != 1:
         raise ProvisioningReview("owned_connector_not_unique")
-    return PublicationState(version, current_work, frontier, matches[0], connectors)
+    return _PublicationState(version, current_work, frontier, matches[0], connectors)
+
+
+def prepare_connector_reconciliation(
+    store: ControllerMonitoringStore, context: ConnectorPublicationContext,
+) -> ConnectorPublicationRequest | None:
+    """Own phase selection and original evidence within one preparation operation."""
+    state = _publication_state(store, context.work, context.connector.connector_id)
+    if (
+        state.version != context.expected
+        or state.work.revision != context.work.revision
+        or state.frontier.accepted_revision != context.frontier.accepted_revision
+        or state.connector.revision != context.connector.revision
+    ):
+        raise MonitoringConflict("Connector preparation context changed")
+    if context.phase == "binding":
+        return _prepare_connector_binding(store, state, request_id=context.request_id)
+    # Technical uncertainty holds topology; only affirmative policy evidence
+    # authorizes removal, including when publication uses a narrowed subset.
+    request = _prepare_connector_publication(
+        store, state, request_id=context.request_id,
+        eligible_targets=context.eligible_targets, removal_targets=context.removal_targets,
+    )
+    connector = state.connector
+    if (
+        store.get_connector_desired(state.version, connector.connector_id) is not None
+        and connector.policy_revision == state.version.revision
+        and request.sources == connector.sources
+        and request.source_proposals == connector.source_proposals
+        and request.source_removals == tuple(removal.intent() for removal in connector.source_removals)
+        and request.desired_definition == connector.desired_definition
+    ):
+        return None
+    return request
 
 
 def prepare_connector_publication(
@@ -972,9 +1006,21 @@ def prepare_connector_publication(
     """Retain unavailable sources; only affirmative removal evidence contracts topology."""
     if not 1 <= max_sources <= 1000:
         raise ValueError("Connector publication source bound is invalid")
-    version, current_work, frontier, connector, connectors = _publication_state(
+    state = _publication_state(
         store, work, connector_id,
     )
+    return _prepare_connector_publication(
+        store, state, request_id=request_id, max_sources=max_sources,
+        eligible_targets=eligible_targets, removal_targets=removal_targets,
+    )
+
+
+def _prepare_connector_publication(
+    store: ControllerMonitoringStore, state: _PublicationState, *, request_id: str,
+    max_sources: int = 100, eligible_targets: tuple[MonitoringTarget, ...] | None = None,
+    removal_targets: tuple[TargetIdentity, ...] = (),
+) -> ConnectorPublicationRequest:
+    version, current_work, frontier, connector, connectors = state
     context = MonitoringContext(tenant_id=version.tenant_id, epoch=version.epoch)
     excluded = {
         source.target.key for other in connectors
@@ -1119,6 +1165,12 @@ def prepare_connector_binding(
 ) -> ConnectorPublicationRequest:
     """Confirm additions/removals through the original observation, not readiness."""
     state = _publication_state(store, work, connector_id)
+    return _prepare_connector_binding(store, state, request_id=request_id)
+
+
+def _prepare_connector_binding(
+    store: ControllerMonitoringStore, state: _PublicationState, *, request_id: str,
+) -> ConnectorPublicationRequest:
     version, current, frontier, connector = state.version, state.work, state.frontier, state.connector
     if current.reconcile_producer != "worker" or not (
         connector.source_proposals or connector.source_removals
@@ -1126,12 +1178,8 @@ def prepare_connector_binding(
         raise ProvisioningReview("physical_binding_requires_worker_changes")
     original = store.get_connector_observation(version, current.reconcile_request_id)
     if original is not None and original.inspection is not None:
-        # Hand the resolved state down rather than letting supersession resolve
-        # it again. Each resolution is an estate-wide snapshot, and the presence
-        # inspection it is checked against is only valid for 300 seconds.
-        return prepare_connector_supersession(
-            store, current, connector_id, request_id=request_id,
-            original_observation=original.observation, state=state,
+        return _prepare_connector_supersession(
+            store, state, original, request_id=request_id,
         )
     request = ConnectorPublicationRequest(
         request_id=request_id, expected=version, work_id=current.work_id,
@@ -1216,12 +1264,10 @@ def _restored_source_definition(
 def prepare_connector_supersession(
     store: ControllerMonitoringStore, work: MonitoringWork, connector_id: str, *,
     request_id: str, original_observation: OwnedConnectorManifest | None = None,
-    state: PublicationState | None = None,
 ) -> ConnectorPublicationRequest:
     """Propose reinstatement from original worker evidence, never current-state equality."""
-    if state is None:
-        state = _publication_state(store, work, connector_id)
-    version, current, frontier, connector = state.version, state.work, state.frontier, state.connector
+    state = _publication_state(store, work, connector_id)
+    version, current, connector = state.version, state.work, state.connector
     if current.reconcile_producer != "worker" or not connector.source_removals:
         raise ProvisioningReview("supersession_requires_original_worker_observation")
     original = store.get_connector_observation(version, current.reconcile_request_id)
@@ -1229,23 +1275,33 @@ def prepare_connector_supersession(
         raise MonitoringUnavailable("Original retained-source presence observation is unavailable")
     if original_observation is not None and original_observation != original.observation:
         raise MonitoringUnavailable("Supersession input differs from the original observation projection")
+    return _prepare_connector_supersession(store, state, original, request_id=request_id)
+
+
+def _require_fresh_presence(
+    store: MonitoringReader, inspection: ConnectorPresenceInspection,
+) -> None:
+    now = store.now()
+    if not now - timedelta(seconds=SUPERSESSION_EVIDENCE_TTL_SECONDS) <= inspection.observed_at <= now:
+        raise ProvisioningReview("supersession_presence_inspection_expired")
+
+
+def _prepare_connector_supersession(
+    store: ControllerMonitoringStore, state: _PublicationState,
+    original: ConnectorObservationResult, *, request_id: str,
+) -> ConnectorPublicationRequest:
+    version, current, frontier, connector = state.version, state.work, state.frontier, state.connector
+    if current.reconcile_producer != "worker" or not connector.source_removals:
+        raise ProvisioningReview("supersession_requires_original_worker_observation")
     original_observation = original.observation
     inspection = original.inspection
     if (
-        inspection is None or original.connector_id != connector_id
+        inspection is None or original.connector_id != connector.connector_id
         or original.reconcile_work_id != current.work_id or not original.collection_completion_eligible
         or original.observed_definition_hash != inspection.definition_hash
     ):
         raise ProvisioningReview("supersession_requires_explicit_original_inspection")
-    # Read the clock here, not from the snapshot above. The kernel re-checks the
-    # same 300-second window against its own SYSUTCDATETIME immediately after
-    # this, and a kernel refusal aborts the transaction, so it cannot be turned
-    # into a durable rejection. Checking against an older coverage timestamp
-    # made this pre-check the weaker of the two and let expiry surface there
-    # instead, where the only outcome is a rollback and a retry.
-    now = store.now()
-    if not now - timedelta(seconds=SUPERSESSION_EVIDENCE_TTL_SECONDS) <= inspection.observed_at <= now:
-        raise ProvisioningReview("supersession_presence_inspection_expired")
+    _require_fresh_presence(store, inspection)
     if (
         original_observation.state != "degraded" or original_observation.observed_definition is None
         or original_observation.revision != connector.revision
@@ -1275,6 +1331,12 @@ def prepare_connector_supersession(
             superseded.append(removal)
     restored = _restored_source_definition(connector, original_observation.observed_definition, tuple(superseded))
     superseded_ids = {removal.removal_id for removal in superseded}
+    # Target reads can outlive evidence that was fresh on entry. Recheck the
+    # authoritative clock after those reads, never a cached snapshot timestamp.
+    # A Python expiry decision can be durably rejected in this transaction; a
+    # failed native guard aborts it and must never be followed by more writes.
+    # The kernel keeps its own final freshness check at publication.
+    _require_fresh_presence(store, inspection)
     return ConnectorPublicationRequest.model_validate({
         "request_id": request_id, "expected": version, "work_id": current.work_id,
         "lease": current.lease, "expected_work_revision": current.revision,

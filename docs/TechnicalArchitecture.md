@@ -190,6 +190,18 @@ those timestamps.
 
 ### Eventstream source publication
 
+The controller calls `prepare_connector_reconciliation` with its current
+reconciliation context. This preparation module owns desired-versus-binding
+selection, unchanged-intent detection, one publication-state read and the
+original observation lookup. Resolved preparation state stays private; callers
+do not pass cached state between preparation functions.
+
+Source-removal supersession checks the authoritative clock before and after
+target reads. Evidence that expires during those reads takes the existing
+durable rejection path without attempting publication. The native publication
+guard still checks freshness in its own transaction; no Python handler writes
+after a failed native guard, and the 300-second evidence lifetime is unchanged.
+
 Already-created app-owned transport uses the
 [operator metadata registrar](DeploymentGuide.md#register-existing-app-owned-connector-metadata).
 Its reviewed original create and fresh complete item/definition/topology capture

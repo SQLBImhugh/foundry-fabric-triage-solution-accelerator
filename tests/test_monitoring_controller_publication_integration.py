@@ -50,16 +50,18 @@ from triage.store.incidents import InMemoryIncidentStore
 @pytest.fixture
 def publication_calls(monkeypatch):
     calls = []
-    for name in ("prepare_connector_publication", "prepare_connector_binding", "publish_connector_intent"):
+    for name in ("prepare_connector_reconciliation", "publish_connector_intent"):
         original = getattr(provisioning, name)
 
         def invoke(store, value, *args, operation=name, implementation=original, **kwargs):
-            work_id = value.work_id
+            work = value.work if isinstance(value, m.ConnectorPublicationContext) else value
+            work_id = work.work_id
             current = store.get_work(CONTEXT, work_id)
             assert store.component == "controller" and store._backend.transaction_active
             assert current.kind == "reconcile_state" and current.state == "leased" and current.lease is not None
-            assert current.lease == value.lease
-            calls.append((operation, work_id, current.lease.fence))
+            assert current.lease == work.lease
+            phase = f"{operation}:{value.phase}" if isinstance(value, m.ConnectorPublicationContext) else operation
+            calls.append((phase, work_id, current.lease.fence))
             return implementation(store, value, *args, **kwargs)
 
         monkeypatch.setattr(provisioning, name, invoke)
@@ -296,7 +298,7 @@ async def test_empty_registry_runs_real_controller_store_and_worker_to_receipt_b
     proposal = planned.source_proposals[0]
     assert proposal.source_id is None and proposal.target == fixture.identity
     assert fixture.remote.update_bodies == []
-    assert ("prepare_connector_publication", scope_work.work_id, scope_work.lease.fence) in publication_calls
+    assert ("prepare_connector_reconciliation:desired", scope_work.work_id, scope_work.lease.fence) in publication_calls
     assert ("publish_connector_intent", scope_work.work_id, scope_work.lease.fence) in publication_calls
     before_worker = tuple(publication_calls)
     run = await fixture.apply_worker()
@@ -324,7 +326,7 @@ async def test_empty_registry_runs_real_controller_store_and_worker_to_receipt_b
     assert bound.sources[0].source_id == fixture.remote.graph["sources"][0]["id"]
     assert bound.sources[0].source_id not in {proposal.proposal_id, proposal.node_name}
     assert bound.state != "ready" and bound.identity_verified_at is None and bound.delivery_verified_at is None
-    assert any(operation == "prepare_connector_binding" for operation, _, _ in publication_calls)
+    assert any(operation == "prepare_connector_reconciliation:binding" for operation, _, _ in publication_calls)
     assert not any(row.kind in {"action", "action_owner", "incident_state"} for row in fixture.rows())
     assert fixture.use("controller").get_work(CONTEXT, scope_work.work_id).state == "completed"
     fixture.h.clock.advance(1)
@@ -376,7 +378,7 @@ async def test_real_add_then_remove_retains_ownership_until_original_remote_abse
     selector = removal.intent().model_dump(mode="json")
     assert set(selector) == {"removal_id", "source_id", "proposal_id", "detail"}
     assert selector["source_id"] == original_source.source_id and selector["proposal_id"] is None
-    assert ("prepare_connector_publication", removal_work.work_id, removal_work.lease.fence) in publication_calls
+    assert ("prepare_connector_reconciliation:desired", removal_work.work_id, removal_work.lease.fence) in publication_calls
     assert not any(row.kind == "connector_source_retirement" for row in fixture.rows())
     in_flight = []
 
@@ -429,7 +431,7 @@ async def test_real_add_then_remove_retains_ownership_until_original_remote_abse
     assert tombstone.original_binding == original_source
     assert tombstone.original_removal == removal
     assert tombstone.policy_revision == fixture.version("controller").revision
-    assert ("prepare_connector_binding", tombstone.work_id, tombstone.work_fence) in publication_calls
+    assert ("prepare_connector_reconciliation:binding", tombstone.work_id, tombstone.work_fence) in publication_calls
     controller = fixture.use("controller")
     confirmation = controller.get_connector_publication(CONTEXT, tombstone.confirmation_request_id)
     assert confirmation.retired_sources == (tombstone,)

@@ -2,7 +2,7 @@
 
 A source-removal supersession is authorized by a presence inspection valid for
 SUPERSESSION_EVIDENCE_TTL_SECONDS. The reconciliation path checks that once, up
-front, and then prepares the publication -- which performs three estate-wide
+front, and then prepares the publication -- which previously performed three estate-wide
 monitoring snapshots before it re-checks the same inspection
 (``provisioning.py`` ``_publication_state`` twice, then the TTL read). Evidence
 that was fresh at the first check can be expired by the last one.
@@ -17,7 +17,9 @@ identical refusal. A deployed controller repeated one of these 48 times across
 Expiry between the two checks is an ordinary outcome with a defined resolution:
 reject the handoff and queue exactly one bounded re-observation, which is what
 the early check already does. These tests drive the real controller path with a
-virtual clock, and cover the baseline and freshness matrix the review required.
+virtual clock. They cover the unchanged-baseline, expiry and replay cases;
+test_connector_preparation also exercises target-read expiry through the
+restricted SQL adapter.
 """
 
 from __future__ import annotations
@@ -37,8 +39,8 @@ from triage.monitoring.memory import MonitoringEngine, stable_id
 __all__ = ["factory"]
 
 #: Seconds of virtual time each estate-wide snapshot is made to consume. Three
-#: snapshots run between the early freshness check and the TTL re-check, so any
-#: value above a third of the remaining margin expires the evidence in flight.
+#: snapshots formerly ran between the early freshness check and the TTL re-check.
+#: The remaining snapshot must not supply a cached timestamp for that check.
 SNAPSHOT_SECONDS = 3
 
 

@@ -148,34 +148,14 @@ def publish_reconciliation_connector(
 ) -> ConnectorPublicationResult | None:
     """Compose current desired intent or original-receipt binding before work completion."""
     from triage.monitoring.provisioning import (
-        prepare_connector_binding,
-        prepare_connector_publication,
+        prepare_connector_reconciliation,
         publish_connector_intent,
     )
 
     if store.component != "controller":
         raise MonitoringComponentDenied("Only the controller composes connector publication")
-    connector = context.connector
-    if context.phase == "binding":
-        request = prepare_connector_binding(
-            store, context.work, connector.connector_id, request_id=context.request_id,
-        )
-    else:
-        # Technical uncertainty holds topology; only affirmative policy evidence
-        # authorizes removal, including when publication uses a narrowed subset.
-        request = prepare_connector_publication(
-            store, context.work, connector.connector_id, request_id=context.request_id,
-            eligible_targets=context.eligible_targets, removal_targets=context.removal_targets,
-        )
-        if (
-            store.get_connector_desired(context.expected, connector.connector_id) is not None
-            and connector.policy_revision == context.expected.revision and request.sources == connector.sources
-            and request.source_proposals == connector.source_proposals
-            and request.source_removals == tuple(removal.intent() for removal in connector.source_removals)
-            and request.desired_definition == connector.desired_definition
-        ):
-            return None
-    return publish_connector_intent(store, request)
+    request = prepare_connector_reconciliation(store, context)
+    return publish_connector_intent(store, request) if request is not None else None
 
 
 def reconcile_monitoring_work(store: ControllerMonitoringStore, work: MonitoringWork) -> ReconciliationResult:
