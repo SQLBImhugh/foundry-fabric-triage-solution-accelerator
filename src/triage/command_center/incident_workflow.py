@@ -36,6 +36,7 @@ from triage.command_center.incident_models import (
 from triage.command_center.models import Actor, ApiFailure, AskInput
 from triage.models import Incident
 from triage.store.azure_sql import SqlUnavailable
+from triage.store.durability import persistence_confirmed
 from triage.store.incident_workflow import (
     DEFAULT_ACTIVITY_TABLE,
     AzureSqlIncidentWorkflowStore,
@@ -96,7 +97,7 @@ class IncidentWorkflowService:
                 if runtime.incidents is None:
                     raise ValueError("Offline incident collaboration requires an incident store")
                 store = InMemoryIncidentWorkflowStore(runtime.incidents)
-        if runtime.web.mode == "live" and not store.is_durable:
+        if runtime.web.mode == "live" and not persistence_confirmed(store):
             raise ValueError("Live incident collaboration cannot use an in-memory store")
         self.store = store
         self._ask = ask or runtime.ask

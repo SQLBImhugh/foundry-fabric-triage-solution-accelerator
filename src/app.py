@@ -44,6 +44,7 @@ from triage.observability import configure_telemetry, telemetry_status
 from triage.runner import TriageRunner
 from triage.settings import settings
 from triage.store.claims import build_claim_store
+from triage.store.durability import persistence_confirmed
 from triage.tools.inbox import BIRequest, mailbox_scope_refusal, parse_hints
 
 logging.basicConfig(
@@ -142,7 +143,7 @@ class TriageControllerAgent(BaseAgent):
             db=self._runner.sql,
             table=settings.claim_table_name,
         )
-        if not getattr(self._claims, "is_durable", False):
+        if not persistence_confirmed(self._claims):
             logger.warning(
                 "Claim store is not durable: set AZURE_SQL_SERVER and "
                 "AZURE_SQL_DATABASE. Two concurrent invocations could triage "

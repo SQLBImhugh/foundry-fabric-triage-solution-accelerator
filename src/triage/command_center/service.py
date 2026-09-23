@@ -43,7 +43,8 @@ from triage.prompts import load_prompt
 from triage.providers import get_provider
 from triage.redaction import redact_text
 from triage.store.approvals import AzureSqlApprovalChannel
-from triage.store.azure_sql import AzureSqlDatabase, quote_identifier
+from triage.store.azure_sql import quote_identifier
+from triage.store.durability import select_state_database
 
 logger = logging.getLogger("triage.command_center.service")
 _LIMIT = 200
@@ -178,9 +179,7 @@ class CommandCenterService:
         if web.mode == "live":
             if not settings.azure_sql_server or not settings.azure_sql_database:
                 raise ValueError("Live command center requires Azure SQL server and database settings")
-            self.db = db or AzureSqlDatabase(
-                server=settings.azure_sql_server, database=settings.azure_sql_database,
-            )
+            self.db = select_state_database(settings, fixture=False, db=db)
             self.history = history or AzureSqlCommandCenterStore(
                 self.db, run_table=settings.agent_run_table_name,
                 event_table=settings.agent_event_table_name, command_table=settings.agent_command_table_name,

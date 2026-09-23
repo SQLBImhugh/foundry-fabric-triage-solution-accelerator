@@ -818,6 +818,21 @@ followed by `InterfaceError` on every subsequent use.
 
 ### Fail-closed durability and transaction ownership
 
+`store/durability.py` concentrates database selection and persistence-health
+interpretation for the runner, monitoring runtime and Command Center. Explicit
+fixture selection constructs no SQL handle; live selection requires a shared
+handle or complete connection settings. It never tests connectivity to choose
+between SQL and a local adapter.
+
+Selection and confirmation are different facts. The legacy `is_durable`
+property can become false after a read or write fails. Callers therefore use
+`persistence_confirmed` or `require_shared_persistence` at the point where they
+need shared state, not only at startup. A malformed health value is an error,
+not truthy success. These checks do not prove a particular write committed:
+affected-row checks, original receipts and authoritative recovery remain in
+the adapters. Live runner construction also rejects an injected local incident
+store before it can authorize work.
+
 All affected live record and coordination stores fail closed. An unreachable
 database cannot be replaced by process-local incidents, approvals, processed
 messages, retries, baselines, claims or command-center state. Recovery retries

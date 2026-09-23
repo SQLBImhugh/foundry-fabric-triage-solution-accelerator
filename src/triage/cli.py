@@ -41,6 +41,7 @@ from triage.runner import (
     discover_scenarios,
 )
 from triage.settings import settings
+from triage.store.durability import persistence_confirmed
 from triage.tools.dataset import render_rows, render_table
 
 console = Console()
@@ -386,7 +387,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     #
     # A scenario cannot target shared state, even without clearing it. Shared
     # resets belong to the deployment maintenance and action-reconciliation gate.
-    if getattr(runner.store, "is_durable", False):
+    if persistence_confirmed(runner.store):
         console.print(
             "[red]Refusing to run:[/red] this scenario clears the incident "
             "store, and the store is durable (Azure SQL), not a local file. "

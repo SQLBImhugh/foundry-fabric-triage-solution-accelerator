@@ -58,6 +58,11 @@ from triage.policy import TriagePolicy
 from triage.signature import compute_signature
 from triage.store.approvals import InMemoryApprovalChannel
 from triage.store.azure_sql import AzureSqlDatabase
+from triage.store.durability import (
+    StateConfigurationError,
+    persistence_confirmed,
+    select_state_database,
+)
 from triage.store.processed import ProcessedMessageLog
 
 logger = logging.getLogger("triage.monitoring.runtime")
@@ -122,7 +127,7 @@ class ScopedProcessedLog:
 
     @property
     def is_durable(self) -> bool:
-        return bool(getattr(self._inner, "is_durable", False))
+        return persistence_confirmed(self._inner)
 
 
 class FixtureApprovalChannel(InMemoryApprovalChannel):
@@ -344,10 +349,10 @@ def build_monitoring_store(
     if component not in {"worker", "web", "controller"}:
         raise ValueError("Live monitoring requires an explicit worker, web or controller component.")
     tenant_id = canonical_id(settings.monitoring_tenant_id)
-    if db is None:
-        if not settings.azure_sql_server or not settings.azure_sql_database:
-            raise MonitoringNotBootstrapped("Live monitoring requires both Azure SQL connection settings.")
-        db = AzureSqlDatabase(server=settings.azure_sql_server, database=settings.azure_sql_database)
+    try:
+        db = select_state_database(settings, fixture=False, db=db)
+    except StateConfigurationError as exc:
+        raise MonitoringNotBootstrapped("Live monitoring requires both Azure SQL connection settings.") from exc
     try:
         from triage.monitoring.sql_store import AzureSqlMonitoringStore
     except ModuleNotFoundError as exc:

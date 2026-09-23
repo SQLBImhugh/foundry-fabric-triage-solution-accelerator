@@ -88,6 +88,11 @@ from triage.policy import TriagePolicy
 from triage.providers import get_provider
 from triage.signature import SIGNATURE_VERSION, compute_signature
 from triage.store.claims import ClaimStore, build_claim_store
+from triage.store.durability import (
+    persistence_confirmed,
+    require_shared_persistence,
+    select_state_database,
+)
 from triage.store.incidents import IncidentStore, InMemoryIncidentStore, JsonFileIncidentStore
 from triage.store.pipeline_reruns import (
     AzureSqlPipelineRerunStore,
@@ -332,6 +337,8 @@ class TriageRunner:
         # constructed fresh for each request, so six separate connections would
         # mean six Entra logins per alert rather than one.
         self._sql = self._build_sql()
+        if not self.fixture and store is not None:
+            require_shared_persistence(store, operation="Live incident store selection")
         if not self.fixture:
             inspect_context(self.monitoring, self.settings.monitoring_tenant_id)
         if self.fixture and store is not None:
@@ -428,19 +435,11 @@ class TriageRunner:
 
     def _build_sql(self):
         """Select explicit fixture state or a DML-only, credential-injected SQL handle."""
-        if self.fixture:
-            return None
-        canonical_id(self.settings.monitoring_tenant_id)
-        server = self.settings.azure_sql_server
-        database = self.settings.azure_sql_database
-        if not server or not database:
-            raise ValueError("MONITORING_MODE=live requires AZURE_SQL_SERVER and AZURE_SQL_DATABASE.")
-
-        from triage.store.azure_sql import AzureSqlDatabase
-
-        return AzureSqlDatabase(
-            server=server, database=database, tables=self._sql_tables(),
-            credential=self._credential,
+        if not self.fixture:
+            canonical_id(self.settings.monitoring_tenant_id)
+        return select_state_database(
+            self.settings, fixture=self.fixture, credential=self._credential,
+            tables=None if self.fixture else self._sql_tables(),
         )
 
     def _sql_tables(self) -> dict[str, str]:
@@ -465,8 +464,8 @@ class TriageRunner:
     def _build_store(self) -> IncidentStore:
         """Choose where incidents live.
 
-        Falls back to the JSON file when no database is configured, so the
-        offline rehearsal path is unchanged and needs no SQL driver.
+        Explicit fixture selection uses JSON without a SQL driver. Live
+        selection already required a shared database; errors never select JSON.
         """
         if self._sql is None:
             return JsonFileIncidentStore(self.base_dir / "runs" / "incidents.json")
@@ -480,8 +479,8 @@ class TriageRunner:
     def build_processed_log(self):
         """Where the record of already-triaged mail lives.
 
-        Mirrors ``_build_store``: the database when one is configured, a JSON
-        file otherwise. This has to outlive the process -- a hosted agent is
+        Mirrors ``_build_store``: the selected shared database or explicit
+        fixture file. This has to outlive the process -- a hosted agent is
         rebuilt for every invocation, so anything held in memory here is always
         empty on arrival.
         """
@@ -1106,7 +1105,7 @@ class TriageRunner:
             artifacts = await self._triage_pipeline(
                 failure, client=client, reruns=reruns, scenario=scenario,
             )
-            if self._sql is None or getattr(self.store, "is_durable", False):
+            if self._sql is None or persistence_confirmed(self.store):
                 processed.mark(event_key, received_at=artifacts.request.received_at)
             else:
                 logger.error("Pipeline outcome is not durable; leaving the source run unprocessed")
@@ -1146,8 +1145,8 @@ class TriageRunner:
                         known.id, "resolved" if outcome.succeeded else "investigating",
                         f"Correlated pipeline rerun {run.id} verified {outcome.status}. {outcome.detail}",
                     )
-                    if self._sql is not None and not getattr(self.store, "is_durable", False):
-                        raise RuntimeError("Could not persist the verified pipeline rerun outcome")
+                    if self._sql is not None:
+                        require_shared_persistence(self.store, operation="Verified pipeline rerun outcome")
                 finished = record.model_copy(update={
                     "state": "completed" if outcome.succeeded else "failed",
                     "detail": outcome.detail,
