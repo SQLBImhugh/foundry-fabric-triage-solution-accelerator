@@ -15,17 +15,21 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, overload
 from uuid import NAMESPACE_URL, uuid5
 from weakref import WeakKeyDictionary
 
 from triage.monitoring.contracts import (
+    ControllerMonitoringStore,
     MonitoringConflict,
     MonitoringKernelUnsupported,
     MonitoringNotBootstrapped,
+    MonitoringReader,
     MonitoringSchemaMismatch,
     MonitoringStore,
     MonitoringUnavailable,
+    WebMonitoringStore,
+    WorkerMonitoringStore,
 )
 from triage.monitoring.models import (
     ActionKind,
@@ -161,7 +165,7 @@ def _fixture_view(
     return store
 
 
-def _fixture_binding(store: MonitoringStore) -> FixtureBinding:
+def _fixture_binding(store: MonitoringReader) -> FixtureBinding:
     try:
         binding = _FIXTURES.get(store)
     except TypeError as exc:
@@ -171,18 +175,38 @@ def _fixture_binding(store: MonitoringStore) -> FixtureBinding:
     return binding
 
 
+@overload
+def fixture_component(store: MonitoringReader, component: Literal["worker"]) -> WorkerMonitoringStore: ...
+
+
+@overload
+def fixture_component(store: MonitoringReader, component: Literal["web"]) -> WebMonitoringStore: ...
+
+
+@overload
+def fixture_component(store: MonitoringReader, component: Literal["controller"]) -> ControllerMonitoringStore: ...
+
+
+@overload
 def fixture_component(
-    store: MonitoringStore, component: Literal["worker", "web", "controller"],
+    store: MonitoringReader, component: Literal["worker", "web", "controller"],
+) -> MonitoringStore: ...
+
+
+def fixture_component(
+    store: MonitoringReader, component: Literal["worker", "web", "controller"],
 ) -> MonitoringStore:
     """Construct an explicit restricted view over the same offline fixture state."""
     if component not in {"worker", "web", "controller"}:
         raise ValueError("A fixture component view must select worker, web or controller.")
     binding = _fixture_binding(store)
-    return store if store.component == component else _fixture_view(binding, component)
+    if store.component == component and isinstance(store, MonitoringStore):
+        return store
+    return _fixture_view(binding, component)
 
 
 @contextmanager
-def fixture_setup(store: MonitoringStore) -> Iterator[MonitoringStore]:
+def fixture_setup(store: MonitoringReader) -> Iterator[MonitoringStore]:
     """Grant an explicit test/demo setup context, never authority to the runtime view."""
     binding = _fixture_binding(store)
     setup = _fixture_view(binding, "fixture")
@@ -192,14 +216,14 @@ def fixture_setup(store: MonitoringStore) -> Iterator[MonitoringStore]:
         _FIXTURES.pop(setup, None)
 
 
-def fixture_approvals(store: MonitoringStore) -> FixtureApprovalChannel:
+def fixture_approvals(store: MonitoringReader) -> FixtureApprovalChannel:
     binding = _FIXTURES.get(store)
     if binding is None:
         raise ValueError("This store was not constructed as an explicit runtime fixture.")
     return binding.approvals
 
 
-def fixture_clock(store: MonitoringStore) -> FixtureClock:
+def fixture_clock(store: MonitoringReader) -> FixtureClock:
     binding = _FIXTURES.get(store)
     if binding is None:
         raise ValueError("The registry has no runtime fixture clock.")
@@ -232,7 +256,7 @@ def fixture_target(workload: Workload, workspace_id: str, item_id: str) -> Targe
     )
 
 
-def inspect_context(store: MonitoringStore, tenant_id: str) -> MonitoringContext:
+def inspect_context(store: MonitoringReader, tenant_id: str) -> MonitoringContext:
     tenant_id = canonical_id(tenant_id)
     inspection = store.inspect_bootstrap(expected_tenant_id=tenant_id)
     if inspection.status == "missing":
@@ -246,6 +270,35 @@ def inspect_context(store: MonitoringStore, tenant_id: str) -> MonitoringContext
     if inspection.control is None:
         raise MonitoringUnavailable("Bootstrap inspection returned no deployment control.")
     return MonitoringContext(tenant_id=tenant_id, epoch=inspection.control.epoch)
+
+
+@overload
+def build_monitoring_store(
+    settings: Any, *, db: AzureSqlDatabase | None = None, fixture: bool = False,
+    component: Literal["worker"], policy: TriagePolicy | None = None,
+) -> WorkerMonitoringStore: ...
+
+
+@overload
+def build_monitoring_store(
+    settings: Any, *, db: AzureSqlDatabase | None = None, fixture: bool = False,
+    component: Literal["web"], policy: TriagePolicy | None = None,
+) -> WebMonitoringStore: ...
+
+
+@overload
+def build_monitoring_store(
+    settings: Any, *, db: AzureSqlDatabase | None = None, fixture: bool = False,
+    component: Literal["controller"], policy: TriagePolicy | None = None,
+) -> ControllerMonitoringStore: ...
+
+
+@overload
+def build_monitoring_store(
+    settings: Any, *, db: AzureSqlDatabase | None = None, fixture: bool = False,
+    component: Literal["worker", "web", "controller"] | None = None,
+    policy: TriagePolicy | None = None,
+) -> MonitoringStore: ...
 
 
 def build_monitoring_store(
@@ -310,7 +363,7 @@ def build_monitoring_store(
 
 
 def registered_targets(
-    store: MonitoringStore, context: MonitoringContext, *, workload: Workload | None = None,
+    store: MonitoringReader, context: MonitoringContext, *, workload: Workload | None = None,
     include_inactive: bool = False,
 ) -> list[MonitoringTarget]:
     """Read all pages at one registry revision; never return a truncated estate."""

@@ -34,7 +34,11 @@ from triage.detectors.silent_failures import (
     load_probes,
 )
 from triage.models import BIRequest, Incident, TriageResult
-from triage.monitoring.contracts import MonitoringConflict, MonitoringStore, MonitoringStoreError
+from triage.monitoring.contracts import (
+    ControllerMonitoringStore,
+    MonitoringConflict,
+    MonitoringStoreError,
+)
 from triage.monitoring.controller import (
     HeartbeatBudget,
     MonitoringExecution,
@@ -311,7 +315,7 @@ class TriageRunner:
         retry_store_path: Path | None = None,
         semantic_health_path: Path | None = None,
         command_center_store: Any = None,
-        monitoring_store: MonitoringStore | None = None,
+        monitoring_store: ControllerMonitoringStore | None = None,
         credential: Any = None,
         fixture: bool | None = None,
     ):
@@ -354,7 +358,7 @@ class TriageRunner:
     # --- inbox -------------------------------------------------------------
 
     @property
-    def monitoring(self) -> MonitoringStore:
+    def monitoring(self) -> ControllerMonitoringStore:
         if self._monitoring_store is None:
             self._monitoring_store = build_monitoring_store(
                 self.settings, db=self._sql, fixture=self.fixture, component="controller",

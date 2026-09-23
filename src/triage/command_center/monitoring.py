@@ -26,10 +26,11 @@ from triage.monitoring.contracts import (
     MonitoringKernelUnsupported,
     MonitoringLeaseLost,
     MonitoringNotBootstrapped,
+    MonitoringReader,
     MonitoringSchemaMismatch,
-    MonitoringStore,
     MonitoringStoreError,
     MonitoringUnavailable,
+    WebMonitoringStore,
 )
 from triage.monitoring.models import (
     ActivateScopeRequest,
@@ -175,30 +176,34 @@ def _store_errors() -> Iterator[None]:
         raise ApiFailure(422, "invalid_request", _INVALID_REQUEST) from exc
 
 
+def _inspect_monitoring(store: MonitoringReader, tenant_id: str) -> BootstrapInspection:
+    inspection = store.inspect_bootstrap(expected_tenant_id=tenant_id)
+    if inspection.expected_tenant_id != tenant_id or inspection.status == "wrong_tenant":
+        raise ApiFailure(
+            503, "monitoring_bootstrap_mismatch",
+            "Monitoring bootstrap does not belong to the server's deployment tenant.",
+        )
+    if inspection.status == "missing":
+        raise MonitoringNotBootstrapped()
+    if inspection.status == "incompatible":
+        raise MonitoringSchemaMismatch()
+    if inspection.status == "kernel_incomplete":
+        raise MonitoringKernelUnsupported(inspection.detail)
+    if inspection.control is None or inspection.control.tenant_id != tenant_id:
+        raise ApiFailure(
+            503, "monitoring_bootstrap_mismatch",
+            "Monitoring bootstrap has no valid deployment control.",
+        )
+    return inspection
+
+
 class MonitoringService:
-    def __init__(self, store: MonitoringStore, *, tenant_id: str) -> None:
+    def __init__(self, store: WebMonitoringStore, *, tenant_id: str) -> None:
         self.store = store
         self.tenant_id = _IDENTIFIER.validate_python(tenant_id)
 
     def _inspection(self) -> BootstrapInspection:
-        inspection = self.store.inspect_bootstrap(expected_tenant_id=self.tenant_id)
-        if inspection.expected_tenant_id != self.tenant_id or inspection.status == "wrong_tenant":
-            raise ApiFailure(
-                503, "monitoring_bootstrap_mismatch",
-                "Monitoring bootstrap does not belong to the server's deployment tenant.",
-            )
-        if inspection.status == "missing":
-            raise MonitoringNotBootstrapped()
-        if inspection.status == "incompatible":
-            raise MonitoringSchemaMismatch()
-        if inspection.status == "kernel_incomplete":
-            raise MonitoringKernelUnsupported(inspection.detail)
-        if inspection.control is None or inspection.control.tenant_id != self.tenant_id:
-            raise ApiFailure(
-                503, "monitoring_bootstrap_mismatch",
-                "Monitoring bootstrap has no valid deployment control.",
-            )
-        return inspection
+        return _inspect_monitoring(self.store, self.tenant_id)
 
     def _control(self, expected: RegistryVersion | None = None) -> DeploymentControl:
         inspection = self._inspection()
@@ -475,7 +480,7 @@ class MonitoringService:
 
 
 def resolve_command_target(
-    store: MonitoringStore, *, tenant_id: str, target_id: str, kind: str,
+    store: MonitoringReader, *, tenant_id: str, target_id: str, kind: str,
 ) -> MonitoringTarget:
     """Resolve a human selection again at enqueue and after durable command ownership.
 
@@ -492,8 +497,9 @@ def resolve_command_target(
         )
         if identity.key != target_id:
             raise ApiFailure(422, "invalid_target", "Use the target's canonical registry identity.")
-        monitoring = MonitoringService(store, tenant_id=tenant_id)
-        control = monitoring._control()
+        control = _inspect_monitoring(store, _IDENTIFIER.validate_python(tenant_id)).control
+        if control is None:
+            raise MonitoringNotBootstrapped()
         if identity.tenant_id != control.tenant_id:
             raise ApiFailure(422, "invalid_target", "The target is outside the deployment tenant.")
         if identity.epoch != control.epoch:

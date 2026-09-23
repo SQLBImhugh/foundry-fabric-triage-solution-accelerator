@@ -31,7 +31,7 @@ from triage.models import Incident, TriageResult
 from triage.monitoring.contracts import (
     MonitoringComponentDenied,
     MonitoringConflict,
-    MonitoringStore,
+    WebMonitoringStore,
 )
 from triage.monitoring.runtime import (
     FIXTURE_TENANT_ID,
@@ -150,7 +150,7 @@ class CommandCenterService:
         self, settings, web: WebSettings, *, history=None, incidents=None, approvals=None,
         db=None,
         incident_workflow: IncidentWorkflowService | None = None,
-        monitoring_store: MonitoringStore | None = None,
+        monitoring_store: WebMonitoringStore | None = None,
     ):
         from triage.store.command_center import (
             AzureSqlCommandCenterStore,

@@ -1206,7 +1206,7 @@ def test_store_contract_is_runtime_checkable_with_explicit_atomic_boundaries() -
         "record_safety_review", "reserve_action", "get_action_by_request",
         "record_action_submission", "record_action_outcome", "finalize_work", "get_finalization",
     }
-    assert required.issubset(vars(MonitoringStore))
+    assert required.issubset(dir(MonitoringStore))
     assert not {"bootstrap", "migrate", "reset", "grant_role"}.intersection(vars(MonitoringStore))
     assert all(inspect.signature(getattr(MonitoringStore, method)).return_annotation is not inspect.Signature.empty for method in required)
 

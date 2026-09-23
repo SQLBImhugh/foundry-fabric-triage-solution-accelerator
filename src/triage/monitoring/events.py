@@ -35,8 +35,9 @@ from triage.monitoring.contracts import (
     MonitoringCommitUncertain,
     MonitoringConflict,
     MonitoringLeaseLost,
-    MonitoringStore,
+    MonitoringReader,
     MonitoringStoreError,
+    WorkerMonitoringStore,
 )
 from triage.monitoring.models import (
     MAX_JSON_BYTES,
@@ -656,7 +657,7 @@ def _request_id(partition: PartitionIdentity, position: StreamPosition, digest: 
 
 
 async def current_connector(
-    store: MonitoringStore,
+    store: MonitoringReader,
     binding: ConnectorBinding,
     context: MonitoringContext,
 ) -> tuple[DeploymentControl, OwnedConnectorManifest]:
@@ -713,7 +714,7 @@ class SqlCheckpointStore:
 
     def __init__(
         self,
-        store: MonitoringStore,
+        store: WorkerMonitoringStore,
         *,
         persistence: EventPersistence,
         binding: ConnectorBinding,

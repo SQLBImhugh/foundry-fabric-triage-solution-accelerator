@@ -40,8 +40,8 @@ from triage.monitoring.contracts import (
     MonitoringCommitUncertain,
     MonitoringConflict,
     MonitoringLeaseLost,
-    MonitoringStore,
     MonitoringStoreError,
+    WorkerMonitoringStore,
 )
 from triage.monitoring.inventory import (
     FabricInventoryClient,
@@ -72,7 +72,6 @@ from triage.monitoring.models import (
     MonitoringModel,
     MonitoringTarget,
     MonitoringWork,
-    MonitoringWorkDraft,
     ObservationWindow,
     PageQuery,
     PowerBIWindowRow,
@@ -724,7 +723,7 @@ class MonitoringCollector:
     """
 
     def __init__(
-        self, store: MonitoringStore, context: MonitoringContext,
+        self, store: WorkerMonitoringStore, context: MonitoringContext,
         inventory_client: FabricInventoryClient,
         pipeline_client: FabricPipelinePollingClient,
         powerbi_client: PowerBIPollingClient,
@@ -804,16 +803,6 @@ class MonitoringCollector:
             lease=current.lease, disposition="retry" if retry_at is not None else "superseded",
             detail=detail, retry_at=retry_at,
         ))
-
-    async def _enqueue(self, draft: MonitoringWorkDraft) -> None:
-        existing = await asyncio.to_thread(self.store.get_work, self.context, draft.work_id)
-        if existing is not None:
-            if (existing.kind, existing.target, existing.scope_id, existing.discovery_selector) != (
-                draft.kind, draft.target, draft.scope_id, draft.discovery_selector,
-            ):
-                raise MonitoringConflict("Collector work identity was reused for different work")
-            return
-        await asyncio.to_thread(self.store.enqueue_work, draft)
 
     async def _records(
         self, reader: Callable[[QueryT], RecordPage[RecordT]], query: QueryT,

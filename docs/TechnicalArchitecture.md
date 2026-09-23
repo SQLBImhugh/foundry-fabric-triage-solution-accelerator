@@ -132,6 +132,19 @@ Tests across both adapters remain necessary: they exercise shared safety
 invariants while preserving legitimate differences in original-receipt and
 pending-frontier handling.
 
+Callers receive a role-specific interface. `MonitoringReader` carries shared
+queries; `WebMonitoringStore` adds configuration intents, `WorkerMonitoringStore`
+adds collection and intake, and `ControllerMonitoringStore` adds publication and
+guarded actions. Worker and controller interfaces share work ownership operations.
+Receiver ownership/health uses the existing `EventPersistence` interface.
+The store factory advertises the selected role in its return type, and web tests
+use a web-only fake rather than a fake with controller methods.
+
+The aggregate `MonitoringStore` contract remains for explicit fixture setup and
+compatibility. These interfaces improve caller locality; they grant no authority.
+Runtime operation checks and native SQL permissions remain mandatory, including
+when Python code bypasses an interface through dynamic attribute access.
+
 ### SQL writer boundary
 
 Runtime monitoring stores require an explicit component. Database permissions

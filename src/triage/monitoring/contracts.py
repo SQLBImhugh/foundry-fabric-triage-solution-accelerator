@@ -161,25 +161,19 @@ class ConnectorPublisher(Protocol):
     """Trusted synchronous controller composition, never a model-supplied callback."""
 
     def __call__(
-        self, store: MonitoringStore, context: ConnectorPublicationContext,
+        self, store: ControllerMonitoringStore, context: ConnectorPublicationContext,
     ) -> ConnectorPublicationResult | None: ...
 
 
 @runtime_checkable
-class MonitoringStore(Protocol):
-    """The SQL and explicit offline-fixture implementations share these semantics.
+class MonitoringReader(Protocol):
+    """Shared registry queries, without configuration, collection or action writes.
 
-    Every runtime operation checks bootstrap, pinned tenant and epoch. Reads used
-    for admission are current shared-state reads, never process caches. Revision
-    conflicts, missing bootstrap and unavailable SQL raise the typed errors above.
-    Same idempotency ID and same validated content return the original receipt;
-    different content under that ID raises MonitoringConflict.
+    Reads use current shared state. A narrow Python interface is not a grant:
+    runtime role checks, SQL permissions, tenant and epoch validation still apply."""
 
-    Only deployment tooling owns DDL, reset and initial control creation. There
-    is deliberately no bootstrap, migration, credential or human-ACL method.
-    """
-
-    component: RuntimeComponent
+    @property
+    def component(self) -> RuntimeComponent: ...
 
     def inspect_bootstrap(self, *, expected_tenant_id: CanonicalId) -> BootstrapInspection:
         """Inspect without DDL; an unreachable database raises MonitoringUnavailable."""
@@ -199,6 +193,96 @@ class MonitoringStore(Protocol):
         ...
 
     def list_scopes(self, query: PageQuery) -> RecordPage[ScopePolicy]: ...
+
+    def list_inventory(
+        self, query: TargetQuery, *, generation_id: CanonicalId | None = None,
+    ) -> RecordPage[InventoryItem]:
+        """Read the latest UI projection or one retained generation, never filter latest into a snapshot."""
+        ...
+
+    def list_workspaces(
+        self, query: PageQuery, *, generation_id: CanonicalId | None = None,
+    ) -> RecordPage[InventoryWorkspace]:
+        """Read named containers, optionally from a retained generation, outside workload counts."""
+        ...
+
+    def list_domains(
+        self, query: PageQuery, *, generation_id: CanonicalId | None = None,
+    ) -> RecordPage[InventoryDomain]:
+        """Read latest named domains or exactly the requested retained generation."""
+        ...
+
+    def get_inventory_generation(
+        self, context: MonitoringContext, generation_id: CanonicalId,
+    ) -> InventoryGeneration | None: ...
+
+    def list_connectors(self, query: PageQuery) -> RecordPage[OwnedConnectorManifest]: ...
+
+    def get_connector_desired(
+        self, context: MonitoringContext, connector_id: CanonicalId,
+    ) -> ConnectorDesiredState | None:
+        """Read protected controller publication, distinct from registered metadata."""
+        ...
+
+    def resolve_target(
+        self, identity: TargetIdentity, *, include_inactive: bool = False,
+    ) -> MonitoringTarget | None:
+        """Return current admission by default; inactive records allow read-only follow-up."""
+        ...
+
+    def list_targets(self, query: TargetQuery) -> RecordPage[MonitoringTarget]: ...
+
+    def coverage(self, context: MonitoringContext) -> CoverageView: ...
+
+    def get_work(self, context: MonitoringContext, work_id: CanonicalId) -> MonitoringWork | None: ...
+
+    def get_safety_review(
+        self, context: MonitoringContext, review_id: CanonicalId,
+    ) -> SafetyReview | None: ...
+
+    def get_operation_receipt(
+        self, context: MonitoringContext, operation: str, request_id: str,
+    ) -> OperationReceipt | None:
+        """Reconcile the exact operation/id reported by MonitoringCommitUncertain."""
+        ...
+
+
+@runtime_checkable
+class MonitoringWorkStore(MonitoringReader, Protocol):
+    """Worker/controller ownership operations; not a web capability."""
+
+    def claim_work(self, request: WorkClaimRequest) -> tuple[MonitoringWork, ...]:
+        """Claim bounded, due work fairly across workspaces and command/intake classes.
+
+        Use database time, conditional ownership and increasing fencing tokens;
+        respect shared per-workspace shares across replicas. Recheck current
+        admission at dequeue. Expired effectful work resumes verification or
+        finalization, never another POST.
+        """
+        ...
+
+    def renew_lease(self, request: LeaseRenewal) -> LeaseToken:
+        """Renew only the current owner/fence, using database time."""
+        ...
+
+    def disposition_work(self, request: WorkDispositionRequest) -> MonitoringWork:
+        """Atomically defer or disposition non-executing work and its source receipt.
+
+        Preserve action fences. A controller terminal result, crash or refusal
+        that needs an Incident must use finalize_work instead. Historical evidence
+        counts an occurrence without overwriting newer evidence or reopening a
+        verified resolution. Rejection consumes no approval or remediation budget.
+        Before any reservation, deterministic historical/out-of-scope/unsupported/
+        cancelled/superseded evidence may atomically disposition source work and
+        its processed marker without inventing an Incident. It cannot dispose a
+        submitted action execution or replace verification/finalization.
+        """
+        ...
+
+
+@runtime_checkable
+class WebMonitoringStore(MonitoringReader, Protocol):
+    """Human configuration intents and their original receipts, never action authority."""
 
     def preview_scope(self, request: ScopePreviewRequest) -> ActivationPlan:
         """Persist an expiring dry run without Fabric writes, grants or workload actions.
@@ -226,6 +310,49 @@ class MonitoringStore(Protocol):
         self, context: MonitoringContext, idempotency_id: CanonicalId,
     ) -> ActivationReceipt | None: ...
 
+    def record_safety_review(self, request: SafetyReviewRequest) -> SafetyReview:
+        """        Accept requested safety intent, immediately fence new actions and enqueue
+        immutable controller reconciliation. Return pending_validation with the
+        original requested_state; only the controller publishes technical proof.
+
+        Preserve reviewed parameters until persistence redaction; bind verification
+        to definition/parameter fingerprints and revision. Never copy attestation
+        onto automatically discovered items. This is not a human-permission grant.
+        Revocation is deny-only and remains valid after the old expiry. Retain
+        original reviewed_at and expires_at; the operation receipt's recorded_at
+        is the separate SQL acceptance time. Never backdate review time or extend
+        expiry to make revocation fit a validity window.
+        If redaction removes replay values, retain the original parameter_hash,
+        set parameters=None/parameters_redacted=True and mark the review unverifiable;
+        redaction placeholders must never become executable replay parameters.
+        """
+        ...
+
+    def get_safety_review_operation(
+        self, context: MonitoringContext, request_id: CanonicalId,
+    ) -> SafetyReviewOperationReceipt | None:
+        """Read the original committed operation, never reconstruct it from the latest review.
+
+        Return the immutable redacted result and its request/revision binding.
+        Absence means not observed, not proof that an uncertain transaction rolled back.
+        """
+        ...
+
+    def request_discovery(
+        self, expected: RegistryVersion, selector: ScopeSelector, *, request_id: CanonicalId,
+    ) -> MonitoringWork:
+        """Accept explicit discovery intent and return its initial reconcile_state work.
+
+        Controller publication queues selector-bound inventory work. No active
+        scope is required, and producer replay cannot mutate existing controller work.
+        """
+        ...
+
+
+@runtime_checkable
+class WorkerMonitoringStore(MonitoringWorkStore, Protocol):
+    """Fenced collection and intake; no controller publication or remediation."""
+
     def record_inventory(self, batch: InventoryBatch) -> InventoryGeneration:
         """Commit this page/generation with retained known inventory and explicit gaps.
 
@@ -239,28 +366,6 @@ class MonitoringStore(Protocol):
         describe the committed snapshot.
         """
         ...
-
-    def list_inventory(
-        self, query: TargetQuery, *, generation_id: CanonicalId | None = None,
-    ) -> RecordPage[InventoryItem]:
-        """Read the latest UI projection or one retained generation, never filter latest into a snapshot."""
-        ...
-
-    def list_workspaces(
-        self, query: PageQuery, *, generation_id: CanonicalId | None = None,
-    ) -> RecordPage[InventoryWorkspace]:
-        """Read named containers, optionally from a retained generation, outside workload counts."""
-        ...
-
-    def list_domains(
-        self, query: PageQuery, *, generation_id: CanonicalId | None = None,
-    ) -> RecordPage[InventoryDomain]:
-        """Read latest named domains or exactly the requested retained generation."""
-        ...
-
-    def get_inventory_generation(
-        self, context: MonitoringContext, generation_id: CanonicalId,
-    ) -> InventoryGeneration | None: ...
 
     def record_capability(
         self, expected: RegistryVersion, observation: CapabilityObservation,
@@ -292,25 +397,6 @@ class MonitoringStore(Protocol):
         """
         ...
 
-    def list_connectors(self, query: PageQuery) -> RecordPage[OwnedConnectorManifest]: ...
-
-    def get_connector_observation(
-        self, context: MonitoringContext, request_id: CanonicalId,
-    ) -> ConnectorObservationResult | None:
-        """Controller preparation view of one original explicit worker observation.
-
-        Native callers read the protected handoff, not worker-private receipts.
-        Missing evidence is None; changed or ambiguous original bindings fail.
-        Only guarded publication validates the original receipt as mutation authority.
-        """
-        ...
-
-    def get_connector_desired(
-        self, context: MonitoringContext, connector_id: CanonicalId,
-    ) -> ConnectorDesiredState | None:
-        """Read protected controller publication, distinct from registered metadata."""
-        ...
-
     def get_connector_delivery(
         self, context: MonitoringContext, connector_id: CanonicalId, collector_identity_id: CanonicalId,
     ) -> ConnectorDeliveryProof | None:
@@ -319,90 +405,6 @@ class MonitoringStore(Protocol):
         Revalidate the immutable intake, broker position, source, endpoint, pinned
         identity and current desired-publication boundary. Quarantine, old policy,
         cache counters and receiver heartbeats never establish delivery.
-        """
-        ...
-
-    def publish_connector(self, request: ConnectorPublicationRequest) -> ConnectorPublicationResult:
-        """Controller-only desired-manifest CAS under the reconciliation work lease.
-
-        Derive producer/frontier provenance from protected state, not caller claims.
-        Connector resource bindings remain unchanged. Retain source ownership in
-        sources/source_proposals; source_removals excludes desired membership
-        immediately without releasing those IDs. Only an original complete
-        observation receipt can bind proposals or retire exactly absent sources.
-        Its result can therefore differ from the requested source collections.
-        Readiness is a separate original-receipt publication against the current
-        desired definition; worker observations alone never create new readiness.
-        Metadata-only registration stays dormant until its first nonempty,
-        admitted event-source publication. That first publication is never an
-        unchanged no-op and cannot retire retained physical sources.
-        Explicit source-removal supersession keeps physical ownership and records
-        the unchanged original removal in the new publication result. It requires
-        original complete GET-only running presence and cannot establish readiness.
-        Only never-submitted removals with complete retained revision/receipt
-        history qualify; a possible write intent cannot be erased by a later GET.
-        The first recovery remains the history anchor across later publications.
-        Intake checks every original recovery audit for still-owned exact source
-        and target bindings through complete, unique connector-revision history.
-        Recovery requires a directly matched reviewed tenant/workspace/item scope;
-        unresolved domain authority and explicit event-capability denial refuse.
-        """
-        ...
-
-    def get_connector_publication(
-        self, context: MonitoringContext, request_id: CanonicalId,
-    ) -> ConnectorPublicationResult | None:
-        """Read the immutable original publication, never the latest connector."""
-        ...
-
-    def resolve_target(
-        self, identity: TargetIdentity, *, include_inactive: bool = False,
-    ) -> MonitoringTarget | None:
-        """Return current admission by default; inactive records allow read-only follow-up."""
-        ...
-
-    def list_targets(self, query: TargetQuery) -> RecordPage[MonitoringTarget]: ...
-
-    def coverage(self, context: MonitoringContext) -> CoverageView: ...
-
-    def enqueue_work(self, work: MonitoringWorkDraft) -> MonitoringWork:
-        """Idempotently enqueue under current admission, epoch and activation cutoff.
-
-        Deduplicate exact source execution across poll/event/mail/operator/retry.
-        Separate executions still share the canonical incident budget. Already
-        submitted actions may enqueue read-only verification after scope disable.
-        Inventory work uses the typed discovery_selector or an existing scope_id;
-        an absent selector never expands to an unconstrained scan.
-        """
-        ...
-
-    def get_work(self, context: MonitoringContext, work_id: CanonicalId) -> MonitoringWork | None: ...
-
-    def claim_work(self, request: WorkClaimRequest) -> tuple[MonitoringWork, ...]:
-        """Claim bounded, due work fairly across workspaces and command/intake classes.
-
-        Use database time, conditional ownership and increasing fencing tokens;
-        respect shared per-workspace shares across replicas. Recheck current
-        admission at dequeue. Expired effectful work resumes verification or
-        finalization, never another POST.
-        """
-        ...
-
-    def renew_lease(self, request: LeaseRenewal) -> LeaseToken:
-        """Renew only the current owner/fence, using database time."""
-        ...
-
-    def disposition_work(self, request: WorkDispositionRequest) -> MonitoringWork:
-        """Atomically defer or disposition non-executing work and its source receipt.
-
-        Preserve action fences. A controller terminal result, crash or refusal
-        that needs an Incident must use finalize_work instead. Historical evidence
-        counts an occurrence without overwriting newer evidence or reopening a
-        verified resolution. Rejection consumes no approval or remediation budget.
-        Before any reservation, deterministic historical/out-of-scope/unsupported/
-        cancelled/superseded evidence may atomically disposition source work and
-        its processed marker without inventing an Incident. It cannot dispose a
-        submitted action execution or replace verification/finalization.
         """
         ...
 
@@ -483,35 +485,74 @@ class MonitoringStore(Protocol):
 
     def get_stream_checkpoint(self, partition: PartitionIdentity) -> StreamCheckpoint | None: ...
 
-    def record_safety_review(self, request: SafetyReviewRequest) -> SafetyReview:
-        """        Accept requested safety intent, immediately fence new actions and enqueue
-        immutable controller reconciliation. Return pending_validation with the
-        original requested_state; only the controller publishes technical proof.
+    def complete_collection_work(
+        self, context: MonitoringContext, *, work_id: CanonicalId, lease: LeaseToken,
+        expected_work_revision: Revision,
+    ) -> MonitoringWork:
+        """Complete accepted collection under the same producer work fence.
 
-        Preserve reviewed parameters until persistence redaction; bind verification
-        to definition/parameter fingerprints and revision. Never copy attestation
-        onto automatically discovered items. This is not a human-permission grant.
-        Revocation is deny-only and remains valid after the old expiry. Retain
-        original reviewed_at and expires_at; the operation receipt's recorded_at
-        is the separate SQL acceptance time. Never backdate review time or extend
-        expiry to make revocation fit a validity window.
-        If redaction removes replay values, retain the original parameter_hash,
-        set parameters=None/parameters_redacted=True and mark the review unverifiable;
-        redaction placeholders must never become executable replay parameters.
+        Completion neither publishes authority nor clears a validation frontier.
+        It is never an alternative to incident persistence for effectful work.
         """
         ...
 
-    def get_safety_review(
-        self, context: MonitoringContext, review_id: CanonicalId,
-    ) -> SafetyReview | None: ...
 
-    def get_safety_review_operation(
+@runtime_checkable
+class ControllerMonitoringStore(MonitoringWorkStore, Protocol):
+    """Deterministic publication and guarded actions under current work ownership."""
+
+    def get_connector_observation(
         self, context: MonitoringContext, request_id: CanonicalId,
-    ) -> SafetyReviewOperationReceipt | None:
-        """Read the original committed operation, never reconstruct it from the latest review.
+    ) -> ConnectorObservationResult | None:
+        """Controller preparation view of one original explicit worker observation.
 
-        Return the immutable redacted result and its request/revision binding.
-        Absence means not observed, not proof that an uncertain transaction rolled back.
+        Native callers read the protected handoff, not worker-private receipts.
+        Missing evidence is None; changed or ambiguous original bindings fail.
+        Only guarded publication validates the original receipt as mutation authority.
+        """
+        ...
+
+    def publish_connector(self, request: ConnectorPublicationRequest) -> ConnectorPublicationResult:
+        """Controller-only desired-manifest CAS under the reconciliation work lease.
+
+        Derive producer/frontier provenance from protected state, not caller claims.
+        Connector resource bindings remain unchanged. Retain source ownership in
+        sources/source_proposals; source_removals excludes desired membership
+        immediately without releasing those IDs. Only an original complete
+        observation receipt can bind proposals or retire exactly absent sources.
+        Its result can therefore differ from the requested source collections.
+        Readiness is a separate original-receipt publication against the current
+        desired definition; worker observations alone never create new readiness.
+        Metadata-only registration stays dormant until its first nonempty,
+        admitted event-source publication. That first publication is never an
+        unchanged no-op and cannot retire retained physical sources.
+        Explicit source-removal supersession keeps physical ownership and records
+        the unchanged original removal in the new publication result. It requires
+        original complete GET-only running presence and cannot establish readiness.
+        Only never-submitted removals with complete retained revision/receipt
+        history qualify; a possible write intent cannot be erased by a later GET.
+        The first recovery remains the history anchor across later publications.
+        Intake checks every original recovery audit for still-owned exact source
+        and target bindings through complete, unique connector-revision history.
+        Recovery requires a directly matched reviewed tenant/workspace/item scope;
+        unresolved domain authority and explicit event-capability denial refuse.
+        """
+        ...
+
+    def get_connector_publication(
+        self, context: MonitoringContext, request_id: CanonicalId,
+    ) -> ConnectorPublicationResult | None:
+        """Read the immutable original publication, never the latest connector."""
+        ...
+
+    def enqueue_work(self, work: MonitoringWorkDraft) -> MonitoringWork:
+        """Idempotently enqueue under current admission, epoch and activation cutoff.
+
+        Deduplicate exact source execution across poll/event/mail/operator/retry.
+        Separate executions still share the canonical incident budget. Already
+        submitted actions may enqueue read-only verification after scope disable.
+        Inventory work uses the typed discovery_selector or an existing scope_id;
+        an absent selector never expands to an unconstrained scan.
         """
         ...
 
@@ -638,27 +679,6 @@ class MonitoringStore(Protocol):
         self, context: MonitoringContext, finalization_id: CanonicalId,
     ) -> FinalizationReceipt | None: ...
 
-    def request_discovery(
-        self, expected: RegistryVersion, selector: ScopeSelector, *, request_id: CanonicalId,
-    ) -> MonitoringWork:
-        """Accept explicit discovery intent and return its initial reconcile_state work.
-
-        Controller publication queues selector-bound inventory work. No active
-        scope is required, and producer replay cannot mutate existing controller work.
-        """
-        ...
-
-    def complete_collection_work(
-        self, context: MonitoringContext, *, work_id: CanonicalId, lease: LeaseToken,
-        expected_work_revision: Revision,
-    ) -> MonitoringWork:
-        """Complete accepted collection under the same producer work fence.
-
-        Completion neither publishes authority nor clears a validation frontier.
-        It is never an alternative to incident persistence for effectful work.
-        """
-        ...
-
     def observe_source(
         self, observation: SourceRunObservation, *, work_id: CanonicalId, lease: LeaseToken,
     ) -> SourceRunObservation:
@@ -672,12 +692,6 @@ class MonitoringStore(Protocol):
     def get_incident_state(self, identity: IncidentIdentity) -> IncidentState | None: ...
 
     def get_incident(self, identity: IncidentIdentity) -> Incident | None: ...
-
-    def get_operation_receipt(
-        self, context: MonitoringContext, operation: str, request_id: str,
-    ) -> OperationReceipt | None:
-        """Reconcile the exact operation/id reported by MonitoringCommitUncertain."""
-        ...
 
     def get_reconciliation_request(
         self, context: MonitoringContext, request_id: CanonicalId, *, producer: ProducerComponent,
@@ -721,3 +735,20 @@ class MonitoringStore(Protocol):
         None selects the same standard controller publisher used by the runner.
         """
         ...
+
+
+@runtime_checkable
+class MonitoringStore(WorkerMonitoringStore, WebMonitoringStore, ControllerMonitoringStore, Protocol):
+    """Aggregate compatibility contract for explicit fixture setup.
+
+    Runtime callers use the role-specific interfaces above. Every adapter still
+    enforces its selected role and the original operation, receipt and transaction
+    semantics. This aggregate grants no additional authority.
+
+    Every operation checks bootstrap, pinned tenant and epoch. Admission reads
+    are authoritative, never cached. Same idempotency ID and validated content
+    return the original receipt; changed content under that ID is a conflict.
+    Missing bootstrap, revision conflicts and unavailable SQL raise typed errors.
+    Schema installation, reset and initial control creation belong to deployment
+    tooling, not any runtime interface.
+    """

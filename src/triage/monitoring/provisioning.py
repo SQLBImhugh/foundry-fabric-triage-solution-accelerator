@@ -35,14 +35,16 @@ import httpx
 from pydantic import TypeAdapter, ValidationError
 
 from triage.monitoring.contracts import (
+    ControllerMonitoringStore,
     FixedDiagnosticError,
     MonitoringCommitUncertain,
     MonitoringComponentDenied,
     MonitoringConflict,
     MonitoringLeaseLost,
-    MonitoringStore,
+    MonitoringReader,
     MonitoringStoreError,
     MonitoringUnavailable,
+    WorkerMonitoringStore,
 )
 from triage.monitoring.engine import inventory_confirms_deletion, policy_removes_target
 from triage.monitoring.events import (
@@ -774,7 +776,7 @@ def publication_sources(
 
 
 def _owned_connectors(
-    store: MonitoringStore, context: MonitoringContext,
+    store: MonitoringReader, context: MonitoringContext,
 ) -> tuple[OwnedConnectorManifest, ...]:
     result = []
     cursor = None
@@ -801,7 +803,7 @@ class OwnedEventCapabilityProbe:
     """Read the registered source through the collector identity, without receiving."""
 
     def __init__(
-        self, store: MonitoringStore, context: MonitoringContext,
+        self, store: WorkerMonitoringStore, context: MonitoringContext,
         rest: ProvisioningRestClient, binding: ConnectorBinding, *,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -920,7 +922,7 @@ class PublicationState(NamedTuple):
 
 
 def _publication_state(
-    store: MonitoringStore,
+    store: ControllerMonitoringStore,
     work: MonitoringWork,
     connector_id: str,
 ) -> PublicationState:
@@ -958,7 +960,7 @@ def _publication_state(
 
 
 def prepare_connector_publication(
-    store: MonitoringStore,
+    store: ControllerMonitoringStore,
     work: MonitoringWork,
     connector_id: str,
     *,
@@ -1113,7 +1115,7 @@ def _materialized_sources(
 
 
 def prepare_connector_binding(
-    store: MonitoringStore, work: MonitoringWork, connector_id: str, *, request_id: str,
+    store: ControllerMonitoringStore, work: MonitoringWork, connector_id: str, *, request_id: str,
 ) -> ConnectorPublicationRequest:
     """Confirm additions/removals through the original observation, not readiness."""
     state = _publication_state(store, work, connector_id)
@@ -1212,7 +1214,7 @@ def _restored_source_definition(
 
 
 def prepare_connector_supersession(
-    store: MonitoringStore, work: MonitoringWork, connector_id: str, *,
+    store: ControllerMonitoringStore, work: MonitoringWork, connector_id: str, *,
     request_id: str, original_observation: OwnedConnectorManifest | None = None,
     state: PublicationState | None = None,
 ) -> ConnectorPublicationRequest:
@@ -1294,7 +1296,7 @@ def prepare_connector_supersession(
 
 
 def publish_connector_intent(
-    store: MonitoringStore, request: ConnectorPublicationRequest,
+    store: ControllerMonitoringStore, request: ConnectorPublicationRequest,
 ) -> ConnectorPublicationResult:
     """Synchronous controller adapter; never installed in the worker maintenance loop."""
     if store.component != "controller":
@@ -1481,7 +1483,7 @@ class ConnectorReconciler:
 
     def __init__(
         self,
-        store: MonitoringStore,
+        store: WorkerMonitoringStore,
         context: MonitoringContext,
         rest: ProvisioningRestClient,
         pipeline_probe: SourceProbe,

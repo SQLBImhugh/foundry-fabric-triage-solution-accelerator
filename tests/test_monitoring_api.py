@@ -37,9 +37,9 @@ from triage.monitoring.contracts import (
     MonitoringLeaseLost,
     MonitoringNotBootstrapped,
     MonitoringSchemaMismatch,
-    MonitoringStore,
     MonitoringStoreError,
     MonitoringUnavailable,
+    WebMonitoringStore,
 )
 from triage.monitoring.models import (
     ActivateScopeRequest,
@@ -108,12 +108,12 @@ MUTATION_METHODS = {
 }
 
 
-class WebStoreSpec(MonitoringStore):
+class WebStoreSpec(WebMonitoringStore):
     component = "web"
 
 
 class RecordingStore:
-    """Typed HTTP-facing fake methods behind an autospecced MonitoringStore.
+    """Typed HTTP-facing fake methods behind the web-only monitoring interface.
 
     All other protocol calls fail. The fake records admission and committed
     mutations separately so a refused request cannot be mistaken for a write.
@@ -123,8 +123,8 @@ class RecordingStore:
     def __init__(self) -> None:
         self.port = create_autospec(WebStoreSpec, instance=True, spec_set=True)
         self.port.component = "web"
-        for name in dir(MonitoringStore):
-            if not name.startswith("_"):
+        for name in dir(WebMonitoringStore):
+            if not name.startswith("_") and callable(getattr(WebMonitoringStore, name)):
                 getattr(self.port, name).side_effect = self.unexpected
         for name in STORE_METHODS:
             getattr(self.port, name).side_effect = getattr(self, name)
@@ -1147,7 +1147,8 @@ def test_uncertain_mutations_preserve_receipt_id_without_reporting_success_or_re
     assert set(response.json()) == {"code", "message"}
     assert getattr(store.port, method).call_count == 1
     if operation == "refresh":
-        assert store.port.get_work.call_count == store.port.enqueue_work.call_count == 0
+        assert store.port.get_work.call_count == 0
+        assert not hasattr(store.port, "enqueue_work")
 
 
 def test_uncertain_activation_can_be_reconciled_by_its_original_receipt(client, store, signing):
@@ -1193,7 +1194,8 @@ def test_inventory_refresh_queues_one_typed_intent_without_scanning_fabric(clien
         RegistryVersion.model_validate(body["expected"]),
         ScopeSelector.model_validate(body["selector"]), request_id=OPERATION,
     )
-    assert store.port.enqueue_work.call_count == store.port.get_work.call_count == 0
+    assert store.port.get_work.call_count == 0
+    assert not hasattr(store.port, "enqueue_work")
     assert len(store.works) == len(store.mutations) == 1
     assert set(method for method, _ in store.calls) == {
         "inspect_bootstrap", "request_discovery",
@@ -1213,7 +1215,8 @@ def test_inventory_idempotency_checks_selector_and_original_revision(client, sto
     assert send(client, store, signing, "refresh", roles=("admin",), body=new_revision).status_code == 409
     assert len(store.works) == len(store.mutations) == 1
     assert store.port.request_discovery.call_count == 4
-    assert store.port.enqueue_work.call_count == store.port.get_work.call_count == 0
+    assert store.port.get_work.call_count == 0
+    assert not hasattr(store.port, "enqueue_work")
 
 
 @pytest.mark.parametrize("same_intent", [True, False])
@@ -1228,7 +1231,8 @@ def test_discovery_replay_is_decided_by_the_store_without_api_work_lookups(
     response = send(client, store, signing, "refresh", roles=("admin",))
     assert response.status_code == (200 if same_intent else 409)
     assert store.port.request_discovery.call_count == 1
-    assert store.port.get_work.call_count == store.port.enqueue_work.call_count == 0
+    assert store.port.get_work.call_count == 0
+    assert not hasattr(store.port, "enqueue_work")
     assert len(store.works) == len(store.mutations) == 1
     assert store.works[OPERATION] == original
 
@@ -1244,7 +1248,8 @@ def test_inventory_queue_commit_uncertainty_is_not_hidden_by_a_followup_read(cli
     response = send(client, store, signing, "refresh", roles=("admin",))
     assert response.status_code == 503 and OPERATION in response.json()["message"]
     assert store.port.request_discovery.call_count == 1
-    assert store.port.get_work.call_count == store.port.enqueue_work.call_count == 0
+    assert store.port.get_work.call_count == 0
+    assert not hasattr(store.port, "enqueue_work")
     assert OPERATION in store.works
 
 
@@ -1264,7 +1269,8 @@ def test_discovery_conflict_is_not_reconciled_into_success(client, store, signin
     assert response.status_code == 409
     assert response.json()["code"] == code
     assert store.port.request_discovery.call_count == 1
-    assert store.port.get_work.call_count == store.port.enqueue_work.call_count == 0
+    assert store.port.get_work.call_count == 0
+    assert not hasattr(store.port, "enqueue_work")
 
 
 @pytest.mark.parametrize("field,value", [

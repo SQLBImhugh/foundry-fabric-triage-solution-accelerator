@@ -23,11 +23,11 @@ from typing import TYPE_CHECKING, Any
 
 from triage.approvals import ApprovalDecision, ApprovalRequest
 from triage.monitoring.contracts import (
+    ControllerMonitoringStore,
     FixedDiagnosticError,
     MonitoringComponentDenied,
     MonitoringConflict,
     MonitoringLeaseLost,
-    MonitoringStore,
 )
 from triage.monitoring.models import (
     ActionKind,
@@ -144,7 +144,7 @@ ACTION_KINDS: dict[str, ActionKind] = {
 
 
 def publish_reconciliation_connector(
-    store: MonitoringStore, context: ConnectorPublicationContext,
+    store: ControllerMonitoringStore, context: ConnectorPublicationContext,
 ) -> ConnectorPublicationResult | None:
     """Compose current desired intent or original-receipt binding before work completion."""
     from triage.monitoring.provisioning import (
@@ -178,7 +178,7 @@ def publish_reconciliation_connector(
     return publish_connector_intent(store, request)
 
 
-def reconcile_monitoring_work(store: MonitoringStore, work: MonitoringWork) -> ReconciliationResult:
+def reconcile_monitoring_work(store: ControllerMonitoringStore, work: MonitoringWork) -> ReconciliationResult:
     """Keep deterministic connector composition inside the store's one transaction."""
     if store.component != "controller":
         raise MonitoringComponentDenied("Deterministic runtime publication requires the controller component")
@@ -366,7 +366,7 @@ class MonitoringApprovalRequest(ApprovalRequest):
 
 @dataclass
 class MonitoringExecution:
-    store: MonitoringStore
+    store: ControllerMonitoringStore
     work: MonitoringWork
     incident: IncidentIdentity
     observation: SourceRunObservation | None = None

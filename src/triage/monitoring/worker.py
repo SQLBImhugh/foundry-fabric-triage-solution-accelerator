@@ -40,9 +40,9 @@ from triage.monitoring.contracts import (
     MonitoringCommitUncertain,
     MonitoringConflict,
     MonitoringLeaseLost,
-    MonitoringStore,
     MonitoringStoreError,
     MonitoringUnavailable,
+    WorkerMonitoringStore,
 )
 from triage.monitoring.events import (
     AsyncCredential,
@@ -539,7 +539,7 @@ class MonitoringWorker:
 
     def __init__(
         self,
-        store: MonitoringStore,
+        store: WorkerMonitoringStore,
         persistence: EventPersistence,
         collector: Collector,
         config: WorkerConfig,
@@ -764,7 +764,7 @@ class MonitoringWorker:
 
 @dataclass(frozen=True)
 class MaintenanceServices:
-    store: MonitoringStore
+    store: WorkerMonitoringStore
     context: MonitoringContext
     collector: Collector
     provisioner: ConnectorMaintenance | None
