@@ -48,6 +48,7 @@ from triage.monitoring.events import (
 from triage.monitoring.memory import (
     InMemoryMonitoringState,
     MemoryBackend,
+    MemoryMonitoringAdapter,
     MonitoringEngine,
     StoredReceipt,
     StoredRecord,
@@ -449,7 +450,10 @@ class SqlProtocolFixtureBackend(MemoryBackend):
 class SqlProtocolFixtureStore(MonitoringEngine):
     def __init__(self, *, db, tables=None, policy=None, redactor=None):
         options = {"redactor": redactor} if redactor else {}
-        super().__init__(SqlProtocolFixtureBackend(db, tables), component="fixture", policy=policy, **options)
+        super().__init__(
+            SqlProtocolFixtureBackend(db, tables), component="fixture",
+            adapter_factory=MemoryMonitoringAdapter, policy=policy, **options,
+        )
 
     def record_inventory(self, batch):
         if batch.commit is None:

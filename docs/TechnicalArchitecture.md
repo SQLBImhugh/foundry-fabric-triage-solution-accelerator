@@ -110,6 +110,28 @@ The hybrid implementation and its live acceptance are tracked in
 [HybridMonitoringPlan.md](HybridMonitoringPlan.md). Successful infrastructure
 provisioning does not establish event delivery or durable end-to-end operation.
 
+### Monitoring engine and persistence adapters
+
+`monitoring/engine.py` owns the shared monitoring rules and the synchronous
+operation transaction. `monitoring/records.py` defines the record interface.
+`monitoring/adapters.py` defines the required semantic operations: native receipt
+reads, evidence projections, guarded mutations and reconciliation. The explicit
+offline adapter is in `monitoring/memory.py`; the Azure SQL adapter is in
+`monitoring/sql_store.py`.
+
+The public store constructors select an adapter and retain the existing caller
+interface. They do not override shared rules. Every semantic operation is
+abstract until that adapter implements it, so adding an operation without its
+SQL implementation fails construction rather than inheriting an offline default.
+This addresses the earlier overtaken-observation check that read an
+offline-only record family and silently found nothing in a restricted SQL view.
+
+SQL retains its native procedures, checked views, receipt formats and transaction
+rules. The offline adapter does not stand in for native SQL permission acceptance.
+Tests across both adapters remain necessary: they exercise shared safety
+invariants while preserving legitimate differences in original-receipt and
+pending-frontier handling.
+
 ### SQL writer boundary
 
 Runtime monitoring stores require an explicit component. Database permissions

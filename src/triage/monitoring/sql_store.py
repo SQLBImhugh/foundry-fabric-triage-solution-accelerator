@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_valid
 
 from triage.models import Incident
 from triage.monitoring import models as m
+from triage.monitoring.adapters import MonitoringAdapter, Rejection
 from triage.monitoring.contracts import (
     ConnectorPublisher,
     MonitoringCommitUncertain,
@@ -36,6 +37,7 @@ from triage.monitoring.contracts import (
     MonitoringStoreError,
     MonitoringUnavailable,
 )
+from triage.monitoring.engine import SCAN_BUDGET, MonitoringEngine
 from triage.monitoring.events import (
     ConnectorScope,
     OwnershipChange,
@@ -46,10 +48,9 @@ from triage.monitoring.events import (
     UnidentifiedReceiptBatch,
     UnidentifiedSignal,
 )
-from triage.monitoring.memory import (
-    SCAN_BUDGET,
+from triage.monitoring.rate_limit import RateDecision, RatePolicy, _delay, _ordered_policies
+from triage.monitoring.records import (
     ActionOwner,
-    MonitoringEngine,
     StoredReceipt,
     StoredRecord,
     _json,
@@ -61,7 +62,6 @@ from triage.monitoring.memory import (
     key_digest,
     stable_id,
 )
-from triage.monitoring.rate_limit import RateDecision, RatePolicy, _delay, _ordered_policies
 from triage.monitoring.schema import resolve_kernel_tables
 from triage.monitoring.sql_kernel_contracts import (
     CATALOGUE_KINDS,
@@ -88,6 +88,7 @@ logger = logging.getLogger("triage.monitoring.sql")
 #: standard as the rest of this family.
 telemetry_logger = logging.getLogger("triage.telemetry.sql")
 ModelT = TypeVar("ModelT", bound=BaseModel)
+ResultT = TypeVar("ResultT")
 
 RECORD_COLUMNS = (
     "record_kind, full_key, revision, status, workload, workspace_id, item_id, "
@@ -903,22 +904,33 @@ ORDER BY {"intent_priority, " if priority else ""}workspace_rank,
 
 
 class AzureSqlMonitoringStore(MonitoringEngine):
-    """Explicit SQL component, checked views and static RPCs; no permissive default."""
+    """Public store selecting checked SQL semantics and transaction ownership."""
 
     def __init__(
         self, *, db: AzureSqlDatabase, component: Component, tables: Mapping[str, str] | None = None,
         policy: TriagePolicy | None = None, redactor: Callable[[str], str] = redact_text,
     ) -> None:
         self._sql = SqlBackend(db, tables, component=component)
-        super().__init__(self._sql, component=component, policy=policy, redactor=redactor)
+        super().__init__(
+            self._sql, component=component, policy=policy, redactor=redactor,
+            adapter_factory=lambda engine: SqlMonitoringAdapter(engine, self._sql),
+        )
 
-    def _run_operation(self, method, write: bool, args: tuple, kwargs: dict):
+
+class SqlMonitoringAdapter(MonitoringAdapter):
+    """Native semantic transitions; no inherited offline implementation."""
+
+    def __init__(self, engine: MonitoringEngine, backend: SqlBackend) -> None:
+        super().__init__(engine)
+        self._sql = backend
+
+    def run_operation(self, method: Callable[..., ResultT], write: bool, args: tuple[object, ...], kwargs: dict[str, object]) -> ResultT:
         if method.__name__ in {
             "list_partition_ownership", "change_partition_ownership", "claim_partition",
             "ensure_stream_start", "get_stream_start", "record_stream_receipts",
             "record_unidentified_receipts", "get_stream_acceptance",
             "advance_stream_checkpoint", "get_stream_checkpoint", "record_receiver_heartbeat",
-        } and self.component != "worker":
+        } and self.engine.component != "worker":
             raise MonitoringComponentDenied("Receiver persistence requires the worker SQL component")
         if method.__name__ in {
             "record_inventory", "record_capability", "record_rest_page", "preview_scope",
@@ -929,7 +941,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 else args[0].target if method.__name__ == "record_rest_page" else args[0]
             )
             self._sql.lock_context(context)
-            return method(self, *args, **kwargs)
+            return method(self.engine, *args, **kwargs)
         handlers = {
             "enqueue_work": self._sql_enqueue_work,
             "claim_work": self._sql_claim_work,
@@ -960,7 +972,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             "get_source_disposition": self._sql_source_disposition,
             "observe_source": self._sql_observe_source,
             "bind_approval": self._sql_bind_approval,
-            "publish_connector": self._connector_publication,
+            "publish_connector": self.engine._connector_publication,
             "record_connector": self._sql_record_connector,
         }
         handler = handlers.get(method.__name__)
@@ -973,11 +985,11 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 f"{method.__name__} requires a complete guarded semantic kernel binding; "
                 "no raw-table or synchronous producer-publication fallback was attempted",
             )
-        result = method(self, *args, **kwargs)
+        result = method(self.engine, *args, **kwargs)
         if method.__name__ == "inspect_bootstrap" and result.status in {"ready", "maintenance"}:
             operations = {
                 name: rpc for name, rpc in self._sql.contracts.items()
-                if self.component in rpc.components
+                if self.engine.component in rpc.components
             }
             rows = self._sql.db.query(
                 "SELECT " + ", ".join("OBJECT_ID(?, 'P')" for _ in operations),
@@ -1004,8 +1016,8 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 raise MonitoringUnavailable("The deployed v2 kernel inspection disagrees with current control")
         return result
 
-    def _pending_validation(self, identity):
-        for frontier in self._all("validation_frontier", identity, m.ValidationFrontier):
+    def pending_validation(self, identity: m.TargetIdentity) -> bool:
+        for frontier in self.engine._all("validation_frontier", identity, m.ValidationFrontier):
             if frontier.target is not None and frontier.target != identity:
                 continue
             row = self._sql.get("validation_frontier", frontier.frontier_key, identity)
@@ -1017,10 +1029,10 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                     return True
         return False
 
-    def _pending_frontier_count(self, context):
+    def pending_frontier_count(self, context: m.MonitoringContext) -> int:
         return self._sql.count("validation_frontier", context, filters={"status": "pending_validation"})
 
-    def _save_work(self, work):
+    def save_work(self, work: m.MonitoringWork) -> m.MonitoringWork:
         if work.state == "queued" and work.revision == 1 and work.lease is None:
             draft = m.MonitoringWorkDraft.model_validate(
                 work.model_dump(include=set(m.MonitoringWorkDraft.model_fields)),
@@ -1028,14 +1040,14 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             return self._sql_enqueue_work(draft)
         raise MonitoringKernelUnsupported("Existing work changes require their exact guarded transition")
 
-    def _schedule_connector(self, target, control):
-        if len(self._registered_connectors(control)) == 1:
+    def schedule_connector(self, target: m.MonitoringTarget, control: m.DeploymentControl) -> m.MonitoringWork | None:
+        if len(self.engine._registered_connectors(control)) == 1:
             return None
-        capability = self._get("target_capability", target.key, control, m.CapabilityObservation)
+        capability = self.engine._get("target_capability", target.key, control, m.CapabilityObservation)
         if capability is None or capability.event_status != "verified":
             return None
         existing = [
-            connector for connector in self._all("connector", control, m.OwnedConnectorManifest)
+            connector for connector in self.engine._all("connector", control, m.OwnedConnectorManifest)
             if connector.state != "deleted" and any(
                 source.target == target.identity for source in (*connector.sources, *connector.source_proposals)
             )
@@ -1044,7 +1056,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             frame = self._sql.source_frame
             if frame is None or frame.producer is None:
                 raise MonitoringConflict("Initial desired source needs its current controller reconciliation context")
-            frontier = self._get("validation_frontier", frame.producer.frontier_key, control, m.ValidationFrontier)
+            frontier = self.engine._get("validation_frontier", frame.producer.frontier_key, control, m.ValidationFrontier)
             proposal_id = stable_id(control, f"connector-source-proposal:{target.key}")
             node_name = f"source_{proposal_id.replace('-', '')}"
             events = ("Microsoft.Fabric.JobEvents.ItemJobCreated", "Microsoft.Fabric.JobEvents.ItemJobFailed")
@@ -1064,7 +1076,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                     "name": "monitoring_endpoint", "type": "CustomEndpoint", "inputNodes": [{"name": "monitoring_stream"}],
                 }],
             }}, "component_ids": {}}
-            result = self._connector_publication(m.ConnectorPublicationRequest(
+            result = self.engine._connector_publication(m.ConnectorPublicationRequest(
                 request_id=stable_id(control, f"connector-proposal:{frame.work.work_id}:{target.key}"),
                 expected=m.RegistryVersion(**_stamp(control), revision=control.revision),
                 work_id=frame.work.work_id, lease=frame.work.lease, expected_work_revision=frame.work.revision,
@@ -1075,12 +1087,12 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 sources=(), source_proposals=(proposal,), desired_definition=definition,
                 detail="Publish an explicit logical per-item source proposal without any physical component identity.",
             ))
-            return self._connector_followup(result.connector, control)
+            return self.engine._connector_followup(result.connector, control)
         if len(existing) != 1:
             raise MonitoringConflict("A target has more than one owned desired event subscription")
-        return None if existing[0].state == "ready" else self._connector_followup(existing[0], control)
+        return None if existing[0].state == "ready" else self.engine._connector_followup(existing[0], control)
 
-    def _idempotent(self, operation, request_id, context, request, model, apply):
+    def idempotent(self, operation: str, request_id: str, context: m.MonitoringContext, request: BaseModel | dict[str, object], model: type[ModelT], apply: Callable[[], ModelT]) -> ModelT:
         web = operation in {"preview", "activation", "safety_review", "discovery"}
         if operation not in {"inventory", "capability", "rest_page", "preview", "activation", "safety_review", "discovery"}:
             raise MonitoringKernelUnsupported(f"{operation} has no guarded operation-receipt adapter")
@@ -1088,7 +1100,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         fingerprint = key_digest(_json(raw))
         native = "web.commit_intent" if web else "worker.accept_facts"
         native_id = self._native_request_id(context, operation, request_id)
-        self._control(context)
+        self.engine._control(context)
         replay = self._rpc_replay(native, native_id, context, fingerprint)
         if replay is not None:
             if web:
@@ -1116,10 +1128,10 @@ class AzureSqlMonitoringStore(MonitoringEngine):
     def _native_request_id(context, operation, request_id):
         return stable_id(context, f"preview:{request_id}") if operation == "preview" else request_id
 
-    def _put(self, kind, key, context, value, **indices):
+    def put(self, kind: str, key: str, context: m.MonitoringContext, value: ModelT, **indices: object) -> ModelT:
         frame = self._sql.collection
         if kind == "plan" and frame is not None and frame.operation == "preview":
-            saved = self._persisted(value)
+            saved = self.engine._persisted(value)
             reply = self._sql.rpc("web.commit_intent", {
                 **_stamp(context), "request_id": self._native_request_id(context, "preview", frame.request_id),
                 "fingerprint": frame.fingerprint,
@@ -1128,9 +1140,9 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 "intent_json": _json(saved.model_dump(mode="json")),
             })
             return _kernel_model(m.ActivationPlan, reply["result"]["original_intent"])
-        return super()._put(kind, key, context, value, **indices)
+        return self.engine._put_record(kind, key, context, value, **indices)
 
-    def _commit_scope_intent(self, control, definition):
+    def commit_scope_intent(self, control: m.DeploymentControl, definition: m.ScopeDefinition) -> tuple[m.DeploymentControl, m.ScopePolicy]:
         frame = self._sql.collection
         if frame is None or frame.operation != "activation":
             raise MonitoringKernelUnsupported("A scope edit requires its original typed activation operation")
@@ -1139,20 +1151,20 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             **_stamp(control), "request_id": frame.request_id, "fingerprint": frame.fingerprint,
             "expected_revision": control.revision, "intent_kind": "scope", "intent_id": definition.scope_id,
             "expected_intent_revision": prior.version if prior else 0,
-            "intent_json": _json(self._persisted(definition).model_dump(mode="json")),
+            "intent_json": _json(self.engine._persisted(definition).model_dump(mode="json")),
         })["result"]
         receipt = self._sql.get_receipt("web.commit_intent", frame.request_id, control)
-        updated = self._control(control)
+        updated = self.engine._control(control)
         scope = m.ScopePolicy(
             **result["original_intent"], revision=result["policy_revision"], updated_at=receipt.recorded_at,
         )
         return updated, scope
 
-    def _commit_review_intent(self, control, pending, expected_review_revision):
+    def commit_review_intent(self, control: m.DeploymentControl, pending: m.SafetyReview, expected_review_revision: int) -> tuple[m.DeploymentControl, m.SafetyReview]:
         frame = self._sql.collection
         if frame is None or frame.operation != "safety_review":
             raise MonitoringKernelUnsupported("A review edit requires its original typed intent operation")
-        saved = self._persisted(pending)
+        saved = self.engine._persisted(pending)
         intent = saved.model_dump(mode="json", include={
             "review_id", "target", "action", "requested_state", "reviewer_id", "reviewed_at", "expires_at",
             "parameters", "parameter_hash", "definition_hash", "configuration_hash", "replay_safe", "detail",
@@ -1163,12 +1175,12 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             "expected_intent_revision": expected_review_revision, "intent_json": _json(intent),
         })["result"]
         receipt = self._sql.get_receipt("web.commit_intent", frame.request_id, control)
-        return self._control(control), self._review_from_intent(
+        return self.engine._control(control), self._review_from_intent(
             result["original_intent"], revision=result["new_intent_revision"],
             expected_policy=control.revision, accepted_at=receipt.recorded_at,
         )
 
-    def _decode(self, record, model):
+    def decode(self, record: StoredRecord, model: type[ModelT]) -> ModelT:
         if record.kind == "stream_start" and model is StreamStart:
             value = _kernel_model(m.StreamStartRecord, json.loads(record.payload))
             if value.partition_key != record.key or value.first_sequence_number != record.sequence_number:
@@ -1190,7 +1202,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 raise MonitoringUnavailable("A recorded source disposition disappeared during its read")
             return result
         if record.kind not in {"scope", "plan", "review_request"}:
-            return super()._decode(record, model)
+            return self.engine._decode_record(record, model)
         try:
             document = json.loads(record.payload)
             request_id = m.canonical_id(document.pop("request_id"))
@@ -1233,10 +1245,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             replay_safe=intent.get("replay_safe", False), exact_correlation_verified=False, detail=intent["detail"],
         ))
 
-    def _request_reconciliation(
-        self, control, *, request_id, topic, reference_id, fingerprint, payload,
-        target=None, window=None, evidence=(), producer_commit=None,
-    ):
+    def request_reconciliation(self, control: m.DeploymentControl, *, request_id: str, topic: str, reference_id: str, fingerprint: str, payload: dict[str, object], target: m.TargetIdentity | None=None, window: m.ObservationWindow | None=None, evidence: tuple[m.EvidenceBinding, ...]=(), producer_commit: m.CollectionCommit | None=None) -> m.MonitoringWork:
         frame = self._sql.collection
         if frame is not None and frame.operation in {"activation", "safety_review", "discovery"}:
             if frame.operation == "discovery":
@@ -1259,18 +1268,18 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         if frame.request_id != request_id:
             raise MonitoringConflict("Native intake cannot change the original API request identity")
         if frame.operation == "inventory":
-            result = self._get("generation", reference_id, control, m.InventoryGeneration)
+            result = self.engine._get("generation", reference_id, control, m.InventoryGeneration)
         elif frame.operation == "capability":
-            result = self._get("capability", request_id, control, m.CapabilityObservation)
+            result = self.engine._get("capability", request_id, control, m.CapabilityObservation)
         else:
-            progress = self._get("poll_progress", target.key, control, m.PollProgress)
+            progress = self.engine._get("poll_progress", target.key, control, m.PollProgress)
             receipt_keys = []
             for kind, key in frame.records:
                 if kind in {"rest_observation", "rest_powerbi_row", "quarantine"}:
                     receipt_keys.append(key)
             result = m.RestPageReceipt(
                 intake=m.IntakeReceipt(
-                    **_stamp(control), request_id=request_id, recorded_at=self._now(),
+                    **_stamp(control), request_id=request_id, recorded_at=self.engine._now(),
                     receipt_keys=tuple(receipt_keys), work_ids=(), publication_status="pending_validation",
                 ),
                 checkpoint=progress.checkpoint,
@@ -1291,7 +1300,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         core_key = f"intake:{frame.operation}:{request_id}"
         if self._sql.get("intake_disposition", core_key, control) is not None:
             raise MonitoringConflict("Unaccepted intake result material already exists; no orphan adoption was attempted")
-        self._put(
+        self.engine._put(
             "intake_disposition", core_key, control, core, target_key=target.key if target else None,
             parent_key=producer_commit.work_id, generation_id=producer_commit.work_id if topic == "inventory" else None,
         )
@@ -1369,7 +1378,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             core.result.intake, work_ids=tuple(work_ids), recorded_at=recorded_at,
         ))
 
-    def _finish_poll_work(self, work):
+    def finish_poll_work(self, work: m.MonitoringWork) -> m.MonitoringWork:
         frame = self._sql.collection
         if frame is None or not frame.part_ids:
             raise MonitoringUnavailable("A poll cannot finish before its guarded intake receipts")
@@ -1403,7 +1412,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 expected_policy=native_result["policy_revision"] - 1, accepted_at=receipt.recorded_at,
             )
         plan_id = stable_id(context, f"plan:{request_id}")
-        plan = self._get("plan", plan_id, context, m.ActivationPlan)
+        plan = self.engine._get("plan", plan_id, context, m.ActivationPlan)
         if plan is None:
             raise MonitoringUnavailable("The accepted activation lost its original dry-run plan")
         scope = m.ScopePolicy(
@@ -1417,8 +1426,8 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             queued_work_ids=(native_result["reconcile_work_id"],),
         )
 
-    def _receipt(self, operation, request_id, context, model):
-        self._control(context)
+    def receipt(self, operation: str, request_id: str, context: m.MonitoringContext, model: type[ModelT]) -> ModelT | None:
+        self.engine._control(context)
         if operation in {"activation", "safety_review", "discovery", "preview"}:
             receipt = self._sql.get_receipt(
                 "web.commit_intent", self._native_request_id(context, operation, request_id), context,
@@ -1453,10 +1462,10 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         if operation == "connector":
             receipt = self._sql.get_receipt("worker.observe_connector", request_id, context)
             return _kernel_model(m.ConnectorObservationResult, self._receipt_result(receipt)).connector if receipt else None
-        return super()._receipt(operation, request_id, context, model)
+        return self.engine._read_receipt(operation, request_id, context, model)
 
     def _sql_operation_receipt(self, context, operation, request_id):
-        self._control(context)
+        self.engine._control(context)
         if operation == "approval_binding":
             binding, receipt = self._approval_binding_receipt(context, request_id)
             if binding is None:
@@ -1480,7 +1489,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 return None
             result = self._receipt_result(receipt)
         else:
-            result_model = self._receipt(operation, request_id, context, models[operation])
+            result_model = self.engine._receipt(operation, request_id, context, models[operation])
             if result_model is None:
                 return None
             native = {
@@ -1513,10 +1522,10 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         replay = self._rpc_replay("worker.observe_connector", request_id, expected, fingerprint)
         if replay is not None:
             return self._connector_collection_response(expected, manifest, commit, replay, inspection=inspection).connector
-        control = self._current(expected, intake=True)
+        control = self.engine._current(expected, intake=True)
         if _stamp(commit.lease) != _stamp(expected) or commit.lease.resource_key != m.work_key(expected, commit.work_id):
             raise MonitoringConflict("Connector collection lease belongs to another context or work")
-        work = self._owned_work(expected, commit.work_id, commit.lease, commit.expected_work_revision)
+        work = self.engine._owned_work(expected, commit.work_id, commit.lease, commit.expected_work_revision)
         if (
             work.kind != "connector_reconcile" or work.connector_id != manifest.connector_id
             or work.target is not None or work.execution is not None
@@ -1524,7 +1533,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             or work.finalization_id is not None or work.retry_attempt != 0
         ):
             raise MonitoringConflict("Connector observation belongs to another collection work identity")
-        prior = self._get("connector", manifest.connector_id, control, m.OwnedConnectorManifest)
+        prior = self.engine._get("connector", manifest.connector_id, control, m.OwnedConnectorManifest)
         if prior is None or any(getattr(prior, key) != getattr(manifest, key) for key in (
             "ownership_id", "name", "sources", "source_proposals", "source_removals", "desired_definition",
         )):
@@ -1535,10 +1544,10 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         ):
             raise MonitoringConflict("Connector observation lost its current revision or context")
         if manifest.state == "ready":
-            self._require_connector_delivery(manifest, control)
+            self.engine._require_connector_delivery(manifest, control)
         if inspection is not None:
-            self._validate_connector_presence_inspection(manifest, inspection)
-        observed = self._persisted(manifest)
+            self.engine._validate_connector_presence_inspection(manifest, inspection)
+        observed = self.engine._persisted(manifest)
         values = observed.model_dump(mode="json", include={
             "workspace_id", "eventstream_id", "destination_id", "observed_definition", "endpoint", "operation_id",
             "state", "identity_verified_at", "delivery_verified_at", "delivery_proof", "gaps",
@@ -1581,14 +1590,14 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             raise MonitoringUnavailable("Connector observation receipt lost its exact collection work or original eligibility")
         return saved
 
-    def _connector_observation_projection(self, context, request_id):
+    def connector_observation_projection(self, context: m.MonitoringContext, request_id: str) -> m.ConnectorObservationResult | None:
         document, handoff = self._native_reconciliation(context, request_id, "worker")
         if document is None:
             return None
         if document["topic"] != "connector":
             raise MonitoringConflict("The requested producer handoff is not a connector observation")
         arguments = document["request_payload"]
-        connector = self._get("connector", document["reference_id"], context, m.OwnedConnectorManifest)
+        connector = self.engine._get("connector", document["reference_id"], context, m.OwnedConnectorManifest)
         revision = arguments.get("expected_connector_revision")
         if (
             connector is None or type(revision) is not int or revision < 0
@@ -1615,7 +1624,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             "inspection": patch.get("inspection"),
         })
 
-    def _connector_publication(self, request: m.ConnectorPublicationRequest) -> m.ConnectorPublicationResult:
+    def connector_publication(self, request: m.ConnectorPublicationRequest) -> m.ConnectorPublicationResult:
         self._sql.lock_context(request.expected)
         fingerprint = key_digest(_json(request.model_dump(mode="json")))
         replay = self._rpc_replay("controller.publish_connector", request.request_id, request.expected, fingerprint)
@@ -1624,23 +1633,23 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             if result.connector_id != request.connector_id or result.connector.ownership_id != request.ownership_id:
                 raise MonitoringUnavailable("Original connector publication identifies another owner or connector")
             return result
-        control = self._current(request.expected, intake=True)
-        work = self._owned_work(control, request.work_id, request.lease, request.expected_work_revision)
+        control = self.engine._current(request.expected, intake=True)
+        work = self.engine._owned_work(control, request.work_id, request.lease, request.expected_work_revision)
         if work.kind != "reconcile_state":
             raise MonitoringConflict("Desired connector publication requires reconciliation work, not an action lease")
         document, handoff = self._native_reconciliation(control, work.reconcile_request_id, work.reconcile_producer)
-        frontier = self._get("validation_frontier", handoff.frontier_key, control, m.ValidationFrontier) if handoff else None
+        frontier = self.engine._get("validation_frontier", handoff.frontier_key, control, m.ValidationFrontier) if handoff else None
         if (
             document is None or handoff.work_id != work.work_id or handoff.policy_revision != control.revision
             or frontier is None or frontier.accepted_revision != request.expected_frontier_revision
         ):
             raise MonitoringConflict("Desired connector publication lost its current producer/frontier binding")
-        prior = self._get("connector", request.connector_id, control, m.OwnedConnectorManifest)
-        desired = self._get("connector_desired", request.connector_id, control, m.ConnectorDesiredState)
+        prior = self.engine._get("connector", request.connector_id, control, m.OwnedConnectorManifest)
+        desired = self.engine._get("connector_desired", request.connector_id, control, m.ConnectorDesiredState)
         if (prior.revision if prior else 0) != request.expected_connector_revision:
             raise MonitoringConflict("Desired connector revision changed")
-        self._validate_initial_connector_publication(prior, desired, request)
-        persisted = self._persisted(request)
+        self.engine._validate_initial_connector_publication(prior, desired, request)
+        persisted = self.engine._persisted(request)
         if persisted.sources != request.sources or persisted.source_proposals != request.source_proposals or (
             persisted.source_removals != request.source_removals
         ) or (
@@ -1659,7 +1668,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             ):
                 raise MonitoringConflict("Readiness requires the exact original owned worker observation")
             readiness = self._connector_observation_from_handoff(prior, document)
-            self._require_connector_delivery(readiness, control)
+            self.engine._require_connector_delivery(readiness, control)
         if request.observation_receipt_id is not None:
             if (
                 prior is None or work.reconcile_producer != "worker" or document["topic"] != "connector"
@@ -1671,7 +1680,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             observed_definition_hash = self._sql.explicit_definition_hash(document["request_payload"]["observation_json"])
             if observed_definition_hash is None:
                 raise MonitoringConflict("Physical reconciliation requires an explicit original definition observation")
-        expected_sources, expected_proposals, expected_definition = self._connector_desired_values(request, prior, observed)
+        expected_sources, expected_proposals, expected_definition = self.engine._connector_desired_values(request, prior, observed)
         plan = m.ConnectorPublicationPlan(
             connector_id=request.connector_id, ownership_id=request.ownership_id, work_id=work.work_id,
             lease_owner_id=work.lease.owner_id, lease_fence=work.lease.fence,
@@ -1720,10 +1729,10 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         if original is None or _kernel_model(m.ConnectorPublicationResult, self._receipt_result(original)) != result:
             raise MonitoringUnavailable("Connector publication result differs from its original committed receipt")
         self._validate_removal_result(request, prior, result, work, publication_id, observed_definition_hash, desired)
-        self._publish_connector(result.connector, control)
-        self._schedule_supersession_capabilities(request, result.superseded_source_removals, control)
+        self.engine._publish_connector(result.connector, control)
+        self.engine._schedule_supersession_capabilities(request, result.superseded_source_removals, control)
         if result.desired_changed and result.state in {"planned", "provisioning"}:
-            self._connector_followup(result.connector, control)
+            self.engine._connector_followup(result.connector, control)
         self._sql.operation_identity("controller.publish_connector", request.request_id)
         return result
 
@@ -1742,7 +1751,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         if request.source_removal_supersessions:
             selected = {item.removal_id: item.source_id for item in request.source_removal_supersessions}
             expected = {key: value for key, value in previous.items() if key in selected}
-            desired = self._get("connector_desired", request.connector_id, request.expected, m.ConnectorDesiredState)
+            desired = self.engine._get("connector_desired", request.connector_id, request.expected, m.ConnectorDesiredState)
             expected_anchor = (
                 prior_desired.supersession_request_id
                 if prior_desired and prior_desired.supersession_request_id else request.request_id
@@ -1789,7 +1798,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                     if removal != previous[removal.removal_id]:
                         raise MonitoringUnavailable("An existing pending removal was rewritten")
                     continue
-                binding, node = self._removal_binding(prior, requested[removal.removal_id])
+                binding, node = self.engine._removal_binding(prior, requested[removal.removal_id])
                 if (
                     removal.node_name != node or removal.target != binding.target
                     or removal.request_id != request.request_id or removal.publication_id != publication_id
@@ -1800,7 +1809,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             if result.pending_removals or {entry.removal_id for entry in result.retired_sources} != set(previous):
                 raise MonitoringUnavailable("Physical absence confirmation must explain every retirement atomically")
             for entry in result.retired_sources:
-                binding, node = self._removal_binding(prior, requested[entry.removal_id])
+                binding, node = self.engine._removal_binding(prior, requested[entry.removal_id])
                 if (
                     entry.original_removal != previous[entry.removal_id] or entry.original_binding != binding
                     or entry.node_name != node or entry.confirmation_request_id != request.request_id
@@ -1810,18 +1819,18 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 ):
                     raise MonitoringUnavailable("Retirement does not match its original binding, observation and current work")
 
-    def _reconcile_connector_observation(self, producer, connector, control):
+    def reconcile_connector_observation(self, producer: m.ReconciliationRequest, connector: m.OwnedConnectorManifest, control: m.DeploymentControl) -> Rejection | None:
         if (
             (connector.source_proposals or connector.source_removals)
             and producer.request_payload.get("definition_observed")
             and connector.state in {"provisioning", "ready", "degraded"}
         ):
-            stale = self._stale_presence_evidence(producer, connector, control)
+            stale = self.engine._stale_presence_evidence(producer, connector, control)
             if stale is not None:
                 return stale
-            work = self._get("work", producer.work_id, control, m.MonitoringWork)
-            frontier = self._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
-            rejected, result = self._bind_connector_evidence(
+            work = self.engine._get("work", producer.work_id, control, m.MonitoringWork)
+            frontier = self.engine._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
+            rejected, result = self.engine._bind_connector_evidence(
                 producer, connector, control, m.ConnectorPublicationContext(
                     phase="binding",
                     request_id=stable_id(control, f"connector-bind:{producer.request_id}:{work.lease.fence}"),
@@ -1833,12 +1842,12 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 return rejected
             if result is None:
                 raise MonitoringUnavailable("Connector binding did not return its original publication result")
-            self._publish_connector(result.connector, control)
+            self.engine._publish_connector(result.connector, control)
             return None
         if producer.request_payload.get("readiness_requested"):
-            work = self._get("work", producer.work_id, control, m.MonitoringWork)
-            frontier = self._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
-            result = self._connector_publication(m.ConnectorPublicationRequest(
+            work = self.engine._get("work", producer.work_id, control, m.MonitoringWork)
+            frontier = self.engine._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
+            result = self.engine._connector_publication(m.ConnectorPublicationRequest(
                 request_id=stable_id(control, f"connector-ready:{producer.request_id}:{work.lease.fence}"),
                 expected=m.RegistryVersion(**_stamp(control), revision=control.revision),
                 work_id=work.work_id, lease=work.lease, expected_work_revision=work.revision,
@@ -1849,15 +1858,10 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 detail="Publish the original receipt-bound readiness observation without changing desired scope.",
             ))
             connector = result.connector
-        self._publish_connector(connector, control)
+        self.engine._publish_connector(connector, control)
         return None
 
-    def _connector_observation_overtaken(self, producer, connector, control) -> bool:
-        # The restricted controller view does not expose connector_observation
-        # records, so the base comparison cannot work here and would silently
-        # answer False. The raw handoff arguments carry the revision this
-        # observation was taken against, and an observation always advances the
-        # connector by exactly one.
+    def connector_observation_overtaken(self, producer: m.ReconciliationRequest, connector: m.OwnedConnectorManifest, control: m.DeploymentControl) -> bool:
         document, _ = self._native_reconciliation(control, producer.request_id, "worker")
         if document is None or document.get("topic") != "connector":
             return False
@@ -1865,20 +1869,20 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         return type(revision) is int and connector.revision != revision + 1
 
     def _action_work(self, context, work_id, lease, *, revision=None):
-        work = self._get("work", m.canonical_id(work_id), context, m.MonitoringWork)
+        work = self.engine._get("work", m.canonical_id(work_id), context, m.MonitoringWork)
         if (
             work is None or work.kind not in {"triage", "deferred_retry", "verify_action", "finalize"}
             or work.state not in {"leased", "finalizing"} or work.lease is None
             or _stamp(work) != _stamp(context) or work.key != lease.resource_key
             or (work.lease.owner_id, work.lease.fence) != (lease.owner_id, lease.fence)
-            or work.lease.expires_at <= self._now()
+            or work.lease.expires_at <= self.engine._now()
         ):
             raise MonitoringLeaseLost("The exact action work lease is absent, superseded or expired")
         if revision is not None and work.revision != revision:
             raise MonitoringConflict("The action work revision changed")
         return work
 
-    def _action_commit_work(self, context, commit):
+    def action_commit_work(self, context: m.MonitoringContext, commit: m.CollectionCommit) -> m.MonitoringWork:
         return self._action_work(context, commit.work_id, commit.lease, revision=commit.expected_work_revision)
 
     @contextmanager
@@ -1888,7 +1892,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         alias_window_id = None
         if producer is not None and producer.topic == "rest_page":
             by_key = {}
-            for handoff in self._all(
+            for handoff in self.engine._all(
                 "validation_handoff", work, m.ValidationHandoff,
                 filters={"parent_key": producer.frontier_key}, budget=m.MAX_RECONCILIATION_BINDINGS,
             ):
@@ -1905,7 +1909,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             evidence = tuple(by_key[key] for key in sorted(by_key))
             page = m.RestPageRequest.model_validate(producer.request_payload)
             if page.target.workload == "powerbi":
-                alias_window_id = self._powerbi_window_id(page)
+                alias_window_id = self.engine._powerbi_window_id(page)
         self._sql._local.source_frame = SourceFrame(work, producer, evidence, alias_window_id)
         try:
             yield
@@ -1930,14 +1934,14 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 continue
             alias = None
             if binding.kind == "rest_observation":
-                candidate = self._decode(row, m.SourceRunObservation)
+                candidate = self.engine._decode(row, m.SourceRunObservation)
             elif binding.kind == "signal":
-                signal = self._decode(row, m.SignalReceipt)
+                signal = self.engine._decode(row, m.SignalReceipt)
                 candidate = signal.observation if signal.status == "accepted" else None
             else:
-                raw = self._decode(row, m.PowerBIWindowRow)
+                raw = self.engine._decode(row, m.PowerBIWindowRow)
                 alias = frame.alias_window_id
-                candidate = self._resolve_powerbi_row(frame.work, alias, raw) if alias is not None else raw.observation
+                candidate = self.engine._resolve_powerbi_row(frame.work, alias, raw) if alias is not None else raw.observation
             if candidate == observation:
                 return binding.kind, binding.key, alias
         raise MonitoringConflict("Source observation has no exact accepted evidence in this owned reconciliation window")
@@ -1946,9 +1950,9 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         frame = self._sql.source_frame
         if frame is None or frame.work.lease is None:
             raise MonitoringConflict("Source operation requires its original work lease")
-        persisted = self._persisted(observation)
+        persisted = self.engine._persisted(observation)
         kind, key, alias = self._source_evidence(persisted, disposing=disposing)
-        control = self._control(frame.work)
+        control = self.engine._control(frame.work)
         arguments = {
             **_stamp(frame.work),
             "expected_revision": control.revision if disposing or frame.work.kind == "reconcile_state" else frame.work.policy_revision,
@@ -1963,7 +1967,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             **arguments, "request_id": stable_id(frame.work, f"{operation}:{fingerprint}"), "fingerprint": fingerprint,
         }
 
-    def _save_source(self, observation):
+    def save_source(self, observation: m.SourceRunObservation) -> m.SourceRunObservation:
         arguments = self._source_arguments(observation, "controller.publish_source")
         native = self._sql.rpc("controller.publish_source", arguments)["result"]
         result = _kernel_model(m.SourcePublicationResult, native)
@@ -1977,29 +1981,26 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         if work.target != observation.execution.target or observation.authority != "rest":
             raise MonitoringConflict("Fresh source evidence requires the exact owned target and REST authority")
         with self._source_scope(work):
-            return self._save_source(observation)
+            return self.engine._save_source(observation)
 
-    def _source_disposition(
-        self, execution, disposition, detail, *, work_id=None, finalization_id=None,
-        incident_identity=None, observation=None,
-    ):
+    def source_disposition(self, execution: m.SourceExecutionIdentity, disposition: str, detail: str, *, work_id: str | None=None, finalization_id: str | None=None, incident_identity: m.IncidentIdentity | None=None, observation: m.SourceRunObservation | None=None) -> m.ProcessedSourceRecord:
         if finalization_id is not None or incident_identity is not None:
             raise MonitoringConflict("Incident-backed source disposition belongs to the atomic finalization RPC")
         frame = self._sql.source_frame
         if frame is None:
             raise MonitoringConflict("Non-effect source disposition requires its explicit current work context")
-        source = observation or self._get("source", execution.key, execution.target, m.SourceRunObservation)
+        source = observation or self.engine._get("source", execution.key, execution.target, m.SourceRunObservation)
         if source is None or source.execution != execution:
             raise MonitoringConflict("Source disposition requires exact recorded or accepted source evidence")
-        if self._submitted_action_owner(execution) is not None:
+        if self.engine._submitted_action_owner(execution) is not None:
             raise MonitoringConflict("A submitted action execution retains action verification and finalization")
         subject = None
         if work_id is not None and work_id != frame.work.work_id:
-            subject = self._get("work", work_id, frame.work, m.MonitoringWork)
+            subject = self.engine._get("work", work_id, frame.work, m.MonitoringWork)
             if subject is None or subject.execution != execution:
                 raise MonitoringConflict("Source cleanup subject has another execution")
         arguments = self._source_arguments(source, "controller.disposition_source", disposing=True, extra={
-            "disposition": disposition, "detail": self._redactor(detail)[:2000],
+            "disposition": disposition, "detail": self.engine._redactor(detail)[:2000],
             "subject_work_id": subject.work_id if subject else None,
             "expected_subject_revision": subject.revision if subject else None,
         })
@@ -2011,7 +2012,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         return result.disposition
 
     def _approval_binding_receipt(self, context, approval_id):
-        binding = self._get("approval_binding", approval_id, context, m.ApprovalBinding)
+        binding = self.engine._get("approval_binding", approval_id, context, m.ApprovalBinding)
         if binding is None:
             return None, None
         request_id = stable_id(context, f"approval-binding:{approval_id}")
@@ -2026,15 +2027,15 @@ class AzureSqlMonitoringStore(MonitoringEngine):
 
     def _sql_bind_approval(self, request):
         self._sql.lock_context(request.expected)
-        origin = self._approval_origin(request)
+        origin = self.engine._approval_origin(request)
         original, _ = self._approval_binding_receipt(request.expected, request.approval.approval_id)
         if original is not None:
             if original.model_dump(mode="json", exclude={"created_at", "expires_at"}) != origin:
                 raise MonitoringConflict("Approval identity was already bound to different scope/source/review intent")
             return original
         work = self._action_work(request.expected, request.work_id, request.lease)
-        binding = self._approval_binding_record(request, work)
-        source = self._get("source", request.source_execution.key, request.expected, m.SourceRunObservation)
+        binding = self.engine._approval_binding_record(request, work)
+        source = self.engine._get("source", request.source_execution.key, request.expected, m.SourceRunObservation)
         if source is None or source.authority != "rest":
             raise MonitoringConflict("Approval binding requires the recorded exact REST source")
         request_id = stable_id(request.expected, f"approval-binding:{request.approval.approval_id}")
@@ -2048,26 +2049,26 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             result = _kernel_model(m.SourcePublicationResult, self._sql.rpc("controller.publish_source", arguments)["result"])
         if result.source_key != request.source_execution.key:
             raise MonitoringUnavailable("Approval source validation returned another execution")
-        saved = self._put(
+        saved = self.engine._put(
             "approval_binding", request.approval.approval_id, request.expected, binding,
             target_key=request.source_execution.target.key,
         )
         self._sql.operation_identity("approval_binding", request.approval.approval_id)
         return saved
 
-    def _schedule_verification(self, action):
-        control = self._control(action.request.expected)
+    def schedule_verification(self, action: m.ActionReservation) -> m.MonitoringWork:
+        control = self.engine._control(action.request.expected)
         # The action's durable deadline gates due claims. Reuse queued work
         # without borrowing its lease to rewrite its older due_at or lineage.
-        return self._enqueue(m.MonitoringWorkDraft(
+        return self.engine._enqueue(m.MonitoringWorkDraft(
             **_stamp(control), work_id=stable_id(control, f"verify:{action.reservation_id}:{action.revision}"),
-            kind="verify_action", policy_revision=control.revision, created_at=self._now(),
-            due_at=action.next_verification_at or self._now(), target=action.request.source_execution.target,
+            kind="verify_action", policy_revision=control.revision, created_at=self.engine._now(),
+            due_at=action.next_verification_at or self.engine._now(), target=action.request.source_execution.target,
             execution=action.request.source_execution, action_reservation_id=action.reservation_id,
             reason="Reconcile the existing external effect; never submit another POST.",
         ))
 
-    def _submitted_action_owner(self, execution):
+    def submitted_action_owner(self, execution: m.SourceExecutionIdentity) -> ActionOwner | None:
         rows = self._sql.db.query(
             f"SELECT TOP (2) {RECORD_COLUMNS} FROM {self._sql.tables['monitoring_records']} "
             "WHERE tenant_id = ? AND epoch = ? AND record_kind = 'action' AND target_hash = ? "
@@ -2081,7 +2082,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         if len(rows) != 1:
             raise MonitoringUnavailable("Submitted execution correlates to more than one native reservation")
         row = self._sql._record(rows[0], execution.target)
-        action = self._decode(row, m.ActionReservation)
+        action = self.engine._decode(row, m.ActionReservation)
         if action.submitted_execution != execution:
             raise MonitoringUnavailable("Native submission lookup returned another exact execution")
         return ActionOwner(
@@ -2098,19 +2099,19 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             if action.request != request:
                 raise MonitoringUnavailable("Original reservation receipt differs from the requested source/intent")
             return m.ActionReservationDecision(status="reserved", reservation=action, detail=action.detail)
-        control = self._current(request.expected, intake=True)
-        if self._policy.max_write_actions < 1 or m.ACTION_TO_TOOL[request.action] not in self._policy.allowed_actions:
+        control = self.engine._current(request.expected, intake=True)
+        if self.engine._policy.max_write_actions < 1 or m.ACTION_TO_TOOL[request.action] not in self.engine._policy.allowed_actions:
             raise MonitoringConflict("The controller policy does not permit this new action")
         work = self._action_work(request.expected, request.work_id, request.lease)
         if work.kind not in {"triage", "deferred_retry"} or work.execution != request.source_execution:
             raise MonitoringConflict("A reservation requires the exact current source work")
-        target = self._target(request.source_execution.target)
-        review = self._get("review", request.review_id, control, m.SafetyReview)
-        capability = self._get("target_capability", request.source_execution.target.key, control, m.CapabilityObservation)
-        source = self._get("source", request.source_execution.key, control, m.SourceRunObservation)
+        target = self.engine._target(request.source_execution.target)
+        review = self.engine._get("review", request.review_id, control, m.SafetyReview)
+        capability = self.engine._get("target_capability", request.source_execution.target.key, control, m.CapabilityObservation)
+        source = self.engine._get("source", request.source_execution.key, control, m.SourceRunObservation)
         if (
             target is None or not target.action.enabled or target.action.action != request.action
-            or review is None or not self._review_current(review, capability, control)
+            or review is None or not self.engine._review_current(review, capability, control)
             or target.action.review_id != request.review_id or review.revision != request.expected_review_revision
             or review.parameter_hash != request.parameter_hash or review.definition_hash != request.definition_hash
             or review.configuration_hash != request.configuration_hash
@@ -2124,7 +2125,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             raise MonitoringConflict("Accepted intake still fences this target's new action")
         expiry = min(review.expires_at, capability.expires_at, work.lease.expires_at,
                      source.observed_at + timedelta(seconds=300))
-        if expiry <= self._now():
+        if expiry <= self.engine._now():
             raise MonitoringConflict("Source, ownership or review validation expired")
         validation = m.ReservationValidation(
             policy_revision=control.revision, work_fence=work.lease.fence, source_key=source.key,
@@ -2140,10 +2141,10 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             kind="controller_validation", key=work.work_id, context=m.MonitoringContext(**_stamp(control)),
             version=prior.version + 1 if prior else 1, payload=_json(proof), target_key=target.key,
         ))
-        persisted = self._persisted(request)
+        persisted = self.engine._persisted(request)
         if persisted != request:
             raise MonitoringConflict("Redacted action arguments cannot authorize the requested external effect")
-        state = self._incident_state(request.incident)
+        state = self.engine._incident_state(request.incident)
         reservation_id = stable_id(control, f"action:{request.idempotency_id}")
         result = self._sql.rpc("controller.reserve_action", {
             **_stamp(control), "request_id": request.idempotency_id, "fingerprint": fingerprint,
@@ -2180,15 +2181,15 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             if result.reservation_id != request.reservation_id or result.retry_work is not None:
                 raise MonitoringUnavailable("Original action-transition receipt has different lineage")
             return result.reservation
-        control = self._control(request)
-        action = self._fenced_action(
+        control = self.engine._control(request)
+        action = self.engine._fenced_action(
             request, request.reservation_id, request.expected_reservation_revision, request.action_fence,
         )
-        work = self._action_transition_commit(request, action, commit)
-        saved = self._persisted(request)
+        work = self.engine._action_transition_commit(request, action, commit)
+        saved = self.engine._persisted(request)
         changes: dict[str, object]
         if isinstance(saved, m.ActionSubmissionRequest):
-            submitted = self._validate_action_submission(action, saved)
+            submitted = self.engine._validate_action_submission(action, saved)
             changes = {
                 "submitted_at": saved.submitted_at.isoformat(),
                 "next_verification_at": saved.next_verification_at.isoformat(), "detail": saved.detail,
@@ -2197,26 +2198,26 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 changes["submitted_execution"] = submitted.model_dump(mode="json")
             transition = saved.state
         else:
-            self._validate_action_outcome(action, saved)
+            self.engine._validate_action_outcome(action, saved)
             submitted = action.submitted_execution
             transition = saved.disposition
             changes = {
                 "detail": saved.detail,
-                "next_verification_at": (self._now() + timedelta(seconds=120)).isoformat()
+                "next_verification_at": (self.engine._now() + timedelta(seconds=120)).isoformat()
                 if transition == "uncertain" else None,
             }
             if saved.configuration is not None:
                 changes["configuration"] = saved.configuration.model_dump(mode="json")
             if transition != "uncertain":
                 expires_at = min(work.lease.expires_at, saved.observed_at + timedelta(seconds=300))
-                if expires_at <= self._now():
+                if expires_at <= self.engine._now():
                     raise MonitoringConflict("Current work or exact action verification has expired")
                 validation = m.ActionOutcomeValidation(
                     reservation_id=action.reservation_id, outcome=transition, work_fence=work.lease.fence,
                     expires_at=expires_at, submitted_execution=saved.submitted_execution,
                     configuration=saved.configuration, request=saved, commit=commit,
                 )
-                self._put(
+                self.engine._put(
                     "controller_validation", action.reservation_id, request, validation,
                     target_key=action.request.source_execution.target.key,
                 )
@@ -2244,10 +2245,10 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         ):
             raise MonitoringUnavailable("Guarded action transition changed original request, execution or fence")
         if isinstance(saved, m.ActionSubmissionRequest) or transition == "uncertain":
-            self._schedule_verification(updated)
+            self.engine._schedule_verification(updated)
         if isinstance(saved, m.ActionOutcomeRequest) and saved.observation is not None:
             with self._source_scope(work):
-                self._save_source(saved.observation)
+                self.engine._save_source(saved.observation)
         self._sql.operation_identity("controller.transition_action", request.request_id)
         return updated
 
@@ -2257,11 +2258,11 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         replay = self._rpc_replay("controller.transition_action", request.request_id, request, fingerprint)
         if replay is not None:
             result = _kernel_model(m.ActionTransitionResult, replay)
-            if result.reservation_id != request.reservation_id or result.reservation.rejection != self._persisted(request.evidence):
+            if result.reservation_id != request.reservation_id or result.reservation.rejection != self.engine._persisted(request.evidence):
                 raise MonitoringUnavailable("Original rejection receipt disagrees with its request")
             return result.reservation
-        control = self._control(request)
-        action = self._fenced_action(
+        control = self.engine._control(request)
+        action = self.engine._fenced_action(
             request, request.reservation_id, request.expected_reservation_revision, request.action_fence,
         )
         work = self._action_work(request, request.work_id, request.lease)
@@ -2273,7 +2274,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             or (action.request.lease.owner_id, action.request.lease.fence) != (request.lease.owner_id, request.lease.fence)
         ):
             raise MonitoringConflict("Only the original unsubmitted action owner can record definitive rejection")
-        saved = self._persisted(request)
+        saved = self.engine._persisted(request)
         native = self._sql.rpc("controller.transition_action", {
             **_stamp(request), "request_id": request.request_id, "fingerprint": fingerprint,
             "expected_revision": control.revision, "work_id": work.work_id, "owner_id": work.lease.owner_id,
@@ -2298,23 +2299,23 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         if replay is not None:
             receipt = self._sql.get_receipt("controller.finalize", request.finalization_id, request)
             return self._finalization_response(request, request.finalization_id, receipt)
-        control = self._control(request)
+        control = self.engine._control(request)
         work = self._action_work(request, request.work_id, request.lease, revision=request.expected_work_revision)
         if work.execution != request.source_execution:
             raise MonitoringConflict("Finalization must retain the exact owned source execution")
         if request.action_reservation_id is not None and request.action_reservation_id != work.action_reservation_id:
             raise MonitoringConflict("Finalization cannot change the work's existing action lineage")
-        source = self._get("source", request.source_execution.key, request, m.SourceRunObservation)
+        source = self.engine._get("source", request.source_execution.key, request, m.SourceRunObservation)
         if source is None or source.started_at is None:
             raise MonitoringConflict("Finalization requires exact durable source chronology")
-        state = self._incident_state(request.incident_identity)
+        state = self.engine._incident_state(request.incident_identity)
         incident_id = state.incident_id if state else canonical_incident_id(request.incident_identity)
         prior = self._sql.incident(incident_id)
         if prior is not None and Incident.model_validate_json(prior).signature != request.incident_identity.signature:
             raise MonitoringConflict("The existing incident belongs to another canonical signature")
         candidate = request.incident.model_copy(deep=True)
         candidate.id = incident_id
-        candidate = self._persisted(candidate)
+        candidate = self.engine._persisted(candidate)
         plan = m.FinalizationPlan(
             work_id=work.work_id, expected_work_revision=work.revision,
             lease_owner_id=work.lease.owner_id, lease_fence=work.lease.fence,
@@ -2358,7 +2359,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         if receipt is None:
             raise MonitoringUnavailable("The original finalization receipt is absent")
         result = _kernel_model(m.FinalizationResult, self._receipt_result(receipt))
-        plan = self._get("finalization_plan", finalization_id, context, m.FinalizationPlan)
+        plan = self.engine._get("finalization_plan", finalization_id, context, m.FinalizationPlan)
         if (
             plan is None or result.finalization_id != finalization_id or result.work_id != plan.work_id
             or result.incident_id != plan.incident_id or result.incident.signature != plan.signature
@@ -2377,7 +2378,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         )
 
     def _sql_source_disposition(self, execution):
-        self._control(execution.target)
+        self.engine._control(execution.target)
         row = self._sql.get("source_disposition", execution.key, execution.target)
         if row is None:
             return None
@@ -2394,7 +2395,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             if result.disposition != record or result.source_key != execution.key:
                 raise MonitoringUnavailable("Source disposition differs from its original non-effect receipt")
             return record
-        receipt = self._receipt("finalization", m.canonical_id(finalization_id), execution.target, m.FinalizationReceipt)
+        receipt = self.engine._receipt("finalization", m.canonical_id(finalization_id), execution.target, m.FinalizationReceipt)
         if (
             receipt is None or receipt.state != "completed" or receipt.source_execution != execution
             or value.get("work_id") != receipt.work_id or value.get("disposition") != receipt.source_disposition
@@ -2421,7 +2422,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         binding = self._sql.get("validation_handoff", key, context)
         if binding is None:
             raise MonitoringUnavailable("Native producer request has no protected validation handoff")
-        handoff = self._decode(binding, m.ValidationHandoff)
+        handoff = self.engine._decode(binding, m.ValidationHandoff)
         if (
             handoff.work_id != document["work_id"] or handoff.producer_request_id != request_id
             or handoff.producer_fingerprint != document["fingerprint"]
@@ -2484,7 +2485,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             row = self._sql.get("intake_disposition", cores[0]["key"], context)
             if row is None:
                 raise MonitoringUnavailable("Accepted collection result material is unavailable")
-            core = self._decode(row, m.CollectionAcceptance)
+            core = self.engine._decode(row, m.CollectionAcceptance)
             if document["request_id"] not in core.part_ids or core.fingerprint != document["fingerprint"]:
                 raise MonitoringUnavailable("Collection result material is not bound to this native part")
             canonical.update(
@@ -2497,7 +2498,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         return _kernel_model(m.ReconciliationRequest, canonical), core
 
     def _sql_reconciliation_request(self, context, request_id, *, producer):
-        self._control(context)
+        self.engine._control(context)
         document, _ = self._native_reconciliation(context, m.canonical_id(request_id), producer)
         return self._canonical_reconciliation(context, document)[0] if document is not None else None
 
@@ -2513,7 +2514,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             raise MonitoringUnavailable("The original resolution proof is unreadable") from exc
 
     def _sql_reconcile_work(self, work, *, connector_publisher: ConnectorPublisher | None = None):
-        with self._using_connector_publisher(connector_publisher):
+        with self.engine._using_connector_publisher(connector_publisher):
             return self._sql_reconcile_claimed_work(work)
 
     def _sql_reconcile_claimed_work(self, work):
@@ -2537,8 +2538,8 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         document, handoff = self._native_reconciliation(work, work.reconcile_request_id, work.reconcile_producer)
         if document is None or handoff.work_id != work.work_id:
             raise MonitoringUnavailable("Reconciliation has no exact immutable producer handoff")
-        control = self._control(work)
-        frontier = self._get("validation_frontier", handoff.frontier_key, work, m.ValidationFrontier)
+        control = self.engine._control(work)
+        frontier = self.engine._get("validation_frontier", handoff.frontier_key, work, m.ValidationFrontier)
         if frontier is None:
             raise MonitoringUnavailable("Accepted intake has no protected frontier")
         request = m.ReconcileStateRequest(
@@ -2554,8 +2555,8 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         replay = self._rpc_replay("controller.resolve_frontier", request.request_id, request, fingerprint)
         if replay is not None:
             return self._reconciliation_response(request, replay)
-        control = self._current(m.RegistryVersion(**_stamp(request), revision=request.expected_policy_revision))
-        work = self._owned_work(request, request.work_id, request.lease, request.expected_work_revision)
+        control = self.engine._current(m.RegistryVersion(**_stamp(request), revision=request.expected_policy_revision))
+        work = self.engine._owned_work(request, request.work_id, request.lease, request.expected_work_revision)
         if work.kind != "reconcile_state":
             raise MonitoringConflict("Publication cannot promote ordinary work into reconciliation")
         document, handoff = self._native_reconciliation(request, work.reconcile_request_id, work.reconcile_producer)
@@ -2603,7 +2604,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 decision, detail = "published", "Accepted bounded intake part was validated; publication remains fenced."
             else:
                 with self._source_scope(work, canonical):
-                    state, detail = self._publish_reconciliation(canonical, control)
+                    state, detail = self.engine._publish_reconciliation(canonical, control)
                 decision = "rejected" if state == "rejected" else "published"
                 complete = bool(window is not None and window.get("collection_complete"))
                 if core is not None and core.operation == "inventory" and core.result.completeness != "complete":
@@ -2620,7 +2621,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             acknowledge_handoff=acknowledge_handoff,
             closing_request_id=window.get("closing_request_id") if window and complete and not reject_window else None,
         )
-        proof = self._persisted(validation).model_dump(mode="json", exclude={"validation_id"})
+        proof = self.engine._persisted(validation).model_dump(mode="json", exclude={"validation_id"})
         proof["evidence_digest"] = validation.evidence_digest.upper()
         key = validation.validation_id
         if self._sql.get("frontier_validation", key, request) is not None:
@@ -2642,7 +2643,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         self._sql_transition(
             request, work_id=work.work_id, lease=work.lease, expected_work_revision=work.revision,
             request_id=stable_id(request, f"publication-work:{request.request_id}"), fingerprint=fingerprint,
-            transition=transition, retry_at=self._now() + timedelta(seconds=15) if transition == "retry" else None,
+            transition=transition, retry_at=self.engine._now() + timedelta(seconds=15) if transition == "retry" else None,
             detail=detail[:2000], reconciliation=True,
         )
         self._sql.operation_identity("controller.resolve_frontier", request.request_id)
@@ -2750,12 +2751,12 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             return _kernel_model(m.MonitoringWork, replay["work"])
         self._sql.lock_context(work)
         result = None
-        for index, draft in enumerate(self._inventory_drafts(work)):
+        for index, draft in enumerate(self.engine._inventory_drafts(work)):
             reply = self._sql.rpc("controller.enqueue_work", {
                 **_stamp(work), "request_id": draft.work_id,
                 "fingerprint": fingerprint if index == 0 else key_digest(_json(draft.model_dump(mode="json"))),
                 "expected_revision": work.policy_revision, "work_id": draft.work_id,
-                "draft_json": _json(self._persisted(draft).model_dump(mode="json", exclude_none=True)),
+                "draft_json": _json(self.engine._persisted(draft).model_dump(mode="json", exclude_none=True)),
             })["result"]
             if index == 0:
                 result = reply
@@ -2767,19 +2768,19 @@ class AzureSqlMonitoringStore(MonitoringEngine):
 
     def _sql_claim_work(self, request: m.WorkClaimRequest) -> tuple[m.MonitoringWork, ...]:
         for kind in request.kinds:
-            self._authorize_work(kind)
+            self.engine._authorize_work(kind)
         self._sql.lock_context(request)
-        after_workspace = self._sql._fair_workspace(request) if self.component == "controller" else ""
+        after_workspace = self._sql._fair_workspace(request) if self.engine.component == "controller" else ""
         claimed = []
         for record in self._sql.due(request, after_workspace=after_workspace):
-            candidate = self._decode(record, m.MonitoringWork)
+            candidate = self.engine._decode(record, m.MonitoringWork)
             if candidate.action_reservation_id is not None:
-                action = self._get("action", candidate.action_reservation_id, request, m.ActionReservation)
+                action = self.engine._get("action", candidate.action_reservation_id, request, m.ActionReservation)
                 if action is None or action.request.source_execution != candidate.execution or (
                     action.state in {"submitted", "uncertain"} and action.next_verification_at is None
                 ):
                     raise MonitoringUnavailable("Queued action work lost its exact action lineage or verification deadline")
-            reply = self._sql.rpc(f"{self.component}.claim_work", {
+            reply = self._sql.rpc(f"{self.engine.component}.claim_work", {
                 **_stamp(request), "work_id": record.key, "owner_id": request.owner_id,
                 "lease_seconds": request.lease_seconds,
             })
@@ -2787,7 +2788,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                 continue
             saved = _kernel_model(m.MonitoringWork, reply["result"]["work"])
             lease = _kernel_model(m.LeaseToken, reply["result"]["lease"])
-            self._authorize_work(saved.kind)
+            self.engine._authorize_work(saved.kind)
             if (
                 saved.work_id != record.key or saved.lease != lease or saved.state != "leased"
                 or lease.owner_id != request.owner_id
@@ -2803,18 +2804,18 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         transition: str, lease_seconds: int | None = None, retry_at: datetime | None = None,
         detail: str | None = None, reconciliation: bool = False,
     ) -> m.MonitoringWork:
-        operation = f"{self.component}.transition_work"
-        control = self._control(context)
+        operation = f"{self.engine.component}.transition_work"
+        control = self.engine._control(context)
         replay = self._rpc_replay(operation, request_id, context, fingerprint)
         if replay is not None:
             saved = _kernel_model(m.MonitoringWork, replay["work"])
             if saved.work_id != work_id or _stamp(saved) != _stamp(context):
                 raise MonitoringUnavailable("Original work-transition receipt identifies another work/context")
             return saved
-        work = self._get("work", m.canonical_id(work_id), context, m.MonitoringWork)
+        work = self.engine._get("work", m.canonical_id(work_id), context, m.MonitoringWork)
         if work is None:
             raise MonitoringLeaseLost("Guarded transition requires its existing work")
-        self._authorize_work(work.kind)
+        self.engine._authorize_work(work.kind)
         if work.kind == "reconcile_state" and transition in {"complete", "disposition"} and not reconciliation:
             raise MonitoringKernelUnsupported("Reconciliation completion must atomically publish or reject its protected frontier")
         result = self._sql.rpc(operation, {
@@ -2822,7 +2823,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             # A fresh observation can finish an older collection work item;
             # its original receipt, not the work's creation policy, is the proof.
             "expected_revision": (
-                control.revision if self.component == "worker" and work.kind == "connector_reconcile"
+                control.revision if self.engine.component == "worker" and work.kind == "connector_reconcile"
                 and transition == "complete" else work.policy_revision
             ),
             "work_id": work_id,
@@ -2830,7 +2831,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             "work_revision": work.revision if expected_work_revision is None else expected_work_revision,
             "transition": transition, "lease_seconds": lease_seconds,
             "retry_at": retry_at,
-            "detail": self._redactor(detail) if detail else None, "finalization_id": None,
+            "detail": self.engine._redactor(detail) if detail else None, "finalization_id": None,
         })["result"]
         saved = _kernel_model(m.MonitoringWork, result["work"])
         if saved.work_id != work_id:
@@ -2867,7 +2868,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         return saved.lease
 
     def _sql_disposition_work(self, request: m.WorkDispositionRequest) -> m.MonitoringWork:
-        if self.component == "controller" and request.disposition != "retry":
+        if self.engine.component == "controller" and request.disposition != "retry":
             self._sql.lock_context(request)
             fingerprint = key_digest(_json(request.model_dump(mode="json")))
             replay = self._rpc_replay("controller.disposition_source", request.request_id, request, fingerprint)
@@ -2877,12 +2878,12 @@ class AzureSqlMonitoringStore(MonitoringEngine):
                     raise MonitoringUnavailable("Original disposition receipt belongs to another work")
                 return result.work
             work = self._action_work(request, request.work_id, request.lease, revision=request.expected_work_revision)
-            if work.action_reservation_id is not None or self._work_reservation(work) is not None:
+            if work.action_reservation_id is not None or self.engine._work_reservation(work) is not None:
                 raise MonitoringConflict("Existing effects require incident verification/finalization")
-            source = self._noneffect_source(work, request.disposition)
+            source = self.engine._noneffect_source(work, request.disposition)
             with self._source_scope(work):
                 arguments = self._source_arguments(source, "controller.disposition_source", disposing=True, extra={
-                    "disposition": request.disposition, "detail": self._redactor(request.detail)[:2000],
+                    "disposition": request.disposition, "detail": self.engine._redactor(request.detail)[:2000],
                     "subject_work_id": None, "expected_subject_revision": None,
                 })
             arguments.update(request_id=request.request_id, fingerprint=fingerprint)
@@ -2944,8 +2945,8 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         )
 
     def _sql_list_partition_ownership(self, scope: ConnectorScope) -> tuple[PartitionOwnership, ...]:
-        self._partition_connector(scope, receiving=False)
-        rows = self._all(
+        self.engine._partition_connector(scope, receiving=False)
+        rows = self.engine._all(
             "partition_ownership", scope, m.PartitionOwnershipResult, filters={"parent_key": scope.connector_id},
         )
         result = []
@@ -2966,25 +2967,25 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         replay = self._rpc_replay("worker.partition", request_id, partition, fingerprint)
         if replay is not None:
             return self._ownership_result(partition, replay)
-        control = self._control(partition)
+        control = self.engine._control(partition)
         prior = self._partition_journal(partition)
         prior_etag = prior.etag if prior else None
         if request.expected_etag != prior_etag:
             return None
         lease = prior.lease if prior else None
         if request.release is not None:
-            self._partition_connector(partition, receiving=False)
+            self.engine._partition_connector(partition, receiving=False)
             if lease is None or (
                 lease.owner_id, lease.fence,
             ) != (request.release.owner_id, request.release.fence):
                 return None
             transition, new_owner, seconds = "release", None, None
         else:
-            self._partition_connector(partition, receiving=True)
+            self.engine._partition_connector(partition, receiving=True)
             claim = request.claim
-            if lease is not None and lease.expires_at > self._now() and lease.owner_id != claim.owner_id:
+            if lease is not None and lease.expires_at > self.engine._now() and lease.owner_id != claim.owner_id:
                 return None
-            transition = "renew" if lease and lease.owner_id == claim.owner_id and lease.expires_at > self._now() else "claim"
+            transition = "renew" if lease and lease.owner_id == claim.owner_id and lease.expires_at > self.engine._now() else "claim"
             new_owner, seconds = claim.owner_id, claim.lease_seconds
         native = self._sql.rpc("worker.partition", {
             **self._partition_arguments(partition), "request_id": request_id, "fingerprint": fingerprint,
@@ -3016,9 +3017,9 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         return result.lease if result else None
 
     def _owned_native_partition(self, partition, lease):
-        self._partition_connector(partition, receiving=True)
+        self.engine._partition_connector(partition, receiving=True)
         prior = self._partition_journal(partition)
-        if prior is None or prior.lease is None or prior.lease.expires_at <= self._now() or (
+        if prior is None or prior.lease is None or prior.lease.expires_at <= self.engine._now() or (
             prior.lease.owner_id, prior.lease.fence,
         ) != (lease.owner_id, lease.fence):
             raise MonitoringLeaseLost("Partition ownership is absent, expired or superseded")
@@ -3032,7 +3033,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         )
 
     def _sql_get_stream_start(self, partition: m.PartitionIdentity) -> StreamStart | None:
-        self._control(partition)
+        self.engine._control(partition)
         row = self._sql.get("stream_start", partition.key, partition)
         if row is None:
             return None
@@ -3058,9 +3059,9 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             if result.partition != partition:
                 raise MonitoringUnavailable("Original retention receipt belongs to another partition")
             return self._stream_start_result(result.start)
-        control = self._control(partition)
+        control = self.engine._control(partition)
         owner = self._owned_native_partition(partition, request.lease)
-        if request.observed_at > self._now():
+        if request.observed_at > self.engine._now():
             raise MonitoringConflict("Broker boundary observation time is in the database clock's future")
         current = self._sql_get_stream_start(partition)
         checkpoint = self._sql_get_stream_checkpoint(partition)
@@ -3124,8 +3125,8 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             raise MonitoringUnavailable("Native position lost its exact durable receipt payload")
         return value
 
-    def _delivery_candidates(self, context, connector, collector_identity_id):
-        desired = self._get("connector_desired", connector.connector_id, context, m.ConnectorDesiredState)
+    def delivery_candidates(self, context: m.MonitoringContext, connector: m.OwnedConnectorManifest, collector_identity_id: str) -> list[m.SignalReceipt]:
+        desired = self.engine._get("connector_desired", connector.connector_id, context, m.ConnectorDesiredState)
         if desired is None:
             return []
         parameters = (
@@ -3168,12 +3169,12 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             if len(rows) < limit:
                 return candidates
 
-    def _delivery_original(self, signal, control) -> datetime:
+    def delivery_original(self, signal: m.SignalReceipt, control: m.DeploymentControl) -> datetime:
         transport = signal.transport
         journal = self._stream_position(signal.partition, signal.position.sequence_number)
         if journal is None or journal.batch_id != transport.request_id or journal.receipt_key != signal.delivery.key:
             raise MonitoringUnavailable("Delivery proof lost its original native acceptance or broker position")
-        if self.component == "controller":
+        if self.engine.component == "controller":
             # The checked fact view requires an immutable accepted receipt.
             # Planning uses its original protected handoff; the publication RPC
             # rechecks the exact private receipt without granting cross-role reads.
@@ -3247,11 +3248,11 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         replay = self._rpc_replay("worker.commit_positions", request.request_id, partition, fingerprint)
         if replay is not None:
             return self._stream_acceptance(partition, request.request_id, replay, positions=positions)
-        control = self._control(partition)
+        control = self.engine._control(partition)
         self._owned_native_partition(partition, request.lease)
-        connector = self._partition_connector(partition, receiving=True)
+        connector = self.engine._partition_connector(partition, receiving=True)
         positions = tuple(
-            _update(entry, receipt=self._quarantine_pending_removal(entry.receipt, connector))
+            _update(entry, receipt=self.engine._quarantine_pending_removal(entry.receipt, connector))
             if isinstance(entry.receipt, m.SignalReceipt) else entry
             for entry in positions
         )
@@ -3267,12 +3268,12 @@ class AzureSqlMonitoringStore(MonitoringEngine):
 
     def _sql_record_stream_receipts(self, request: m.StreamReceiptBatch) -> m.IntakeReceipt:
         positions = tuple(_StreamPositionEnvelope(
-            receipt_kind="identified", receipt_key=receipt.delivery.key, receipt=self._persisted(receipt),
+            receipt_kind="identified", receipt_key=receipt.delivery.key, receipt=self.engine._persisted(receipt),
         ) for receipt in request.receipts)
         return self._commit_stream_positions(request, request.partition, positions)
 
     def _sql_record_unidentified_receipts(self, request: UnidentifiedReceiptBatch) -> m.IntakeReceipt:
-        saved = _UnidentifiedReceipt.model_validate(self._persisted(request.receipt).model_dump())
+        saved = _UnidentifiedReceipt.model_validate(self.engine._persisted(request.receipt).model_dump())
         position = _StreamPositionEnvelope(
             receipt_kind="unidentified",
             receipt_key=f"{saved.partition.key}:unidentified:{saved.position.sequence_number}", receipt=saved,
@@ -3280,7 +3281,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         return self._commit_stream_positions(request, saved.partition, (position,))
 
     def _sql_get_stream_acceptance(self, context, request_id):
-        self._control(context)
+        self.engine._control(context)
         request_id = m.canonical_id(request_id)
         receipt = self._sql.get_receipt("worker.commit_positions", request_id, context)
         if receipt is None:
@@ -3297,7 +3298,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         )
 
     def _sql_get_stream_checkpoint(self, partition: m.PartitionIdentity) -> m.StreamCheckpoint | None:
-        self._control(partition)
+        self.engine._control(partition)
         row = self._sql.get("stream_checkpoint", partition.key, partition)
         if row is None:
             return None
@@ -3313,7 +3314,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         replay = self._rpc_replay("worker.advance_checkpoint", request.request_id, partition, fingerprint)
         if replay is not None:
             return self._checkpoint_result(partition, replay)
-        control = self._control(partition)
+        control = self.engine._control(partition)
         self._owned_native_partition(partition, request.lease)
         position = self._stream_position(partition, request.through.sequence_number)
         if position is None or (
@@ -3332,18 +3333,18 @@ class AzureSqlMonitoringStore(MonitoringEngine):
         return result
 
     def _sql_record_receiver_heartbeat(self, heartbeat: ReceiverHeartbeat) -> ReceiverHeartbeat:
-        control = self._control(heartbeat)
+        control = self.engine._control(heartbeat)
         request_id = stable_id(heartbeat, f"heartbeat:{key_digest(heartbeat.model_dump_json())}")
         fingerprint = key_digest(_json(heartbeat.model_dump(mode="json")))
         replay = self._rpc_replay("worker.record_heartbeat", request_id, heartbeat, fingerprint)
         if replay is not None:
             return _kernel_model(ReceiverHeartbeat, replay)
-        if heartbeat.observed_at > self._now() or any(
+        if heartbeat.observed_at > self.engine._now() or any(
             value is not None and value > heartbeat.observed_at
             for value in (heartbeat.last_delivery_at, heartbeat.last_maintenance_at)
         ):
             raise MonitoringConflict("Receiver heartbeat timestamps are inconsistent with its observation")
-        saved = self._persisted(heartbeat)
+        saved = self.engine._persisted(heartbeat)
         result = self._sql.rpc("worker.record_heartbeat", {
             **_stamp(heartbeat), "request_id": request_id, "fingerprint": fingerprint,
             "expected_revision": control.revision, "worker_id": saved.worker_id,
@@ -3369,9 +3370,9 @@ class AzureSqlMonitoringStore(MonitoringEngine):
     def _sql_safety_review_operation(
         self, context: m.MonitoringContext, request_id: str,
     ) -> m.SafetyReviewOperationReceipt | None:
-        if self.component != "web":
+        if self.engine.component != "web":
             raise MonitoringComponentDenied("Original human-intent receipts are read through the web component SQL route")
-        self._control(context)
+        self.engine._control(context)
         request_id = m.canonical_id(request_id)
         receipt = self._sql.get_receipt("web.commit_intent", request_id, context)
         if receipt is None:
@@ -3395,6 +3396,7 @@ class AzureSqlMonitoringStore(MonitoringEngine):
             fingerprint=receipt.fingerprint, recorded_at=receipt.recorded_at, review=review,
             requested_state=review.requested_state, publication_status=review.publication_status,
         ))
+
 
 
 class _KernelBudgetDenied(MonitoringConflict):

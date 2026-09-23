@@ -44,6 +44,7 @@ from triage.monitoring.contracts import (
     MonitoringStoreError,
     MonitoringUnavailable,
 )
+from triage.monitoring.engine import inventory_confirms_deletion, policy_removes_target
 from triage.monitoring.events import (
     WIRE_TO_SUBSCRIPTION_TYPE,
     ConnectorBinding,
@@ -56,7 +57,6 @@ from triage.monitoring.inventory import (
     _retry_delay,
     validate_rest_url,
 )
-from triage.monitoring.memory import inventory_confirms_deletion, policy_removes_target, stable_id
 from triage.monitoring.models import (
     SUPERSESSION_EVIDENCE_TTL_SECONDS,
     CapabilityObservation,
@@ -91,6 +91,7 @@ from triage.monitoring.models import (
     validate_connector_definition,
 )
 from triage.monitoring.rate_limit import RatePolicy
+from triage.monitoring.records import stable_id
 from triage.pipeline_models import canonical_id
 
 LOG = logging.getLogger("triage.monitoring.provisioning")

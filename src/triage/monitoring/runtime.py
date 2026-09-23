@@ -211,7 +211,7 @@ def stable_id(value: str) -> str:
 
 
 def source_work_id(execution: SourceExecutionIdentity, kind: str = "triage") -> str:
-    from triage.monitoring.memory import stable_id as registry_id
+    from triage.monitoring.records import stable_id as registry_id
 
     return registry_id(execution.target, f"{kind}:{execution.key}")
 

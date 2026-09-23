@@ -93,6 +93,9 @@ azd ai agent monitor bi-triage-controller
   action reservations and receipts. Live configuration comes from Azure SQL,
   not an environment target list. `MONITORING_MODE=fixture` is an explicit
   offline mode, never a fallback for unavailable live state.
+  Its shared engine composes a required `MonitoringAdapter`; SQL and offline
+  semantic operations are explicit implementations, not private-method
+  overrides. New semantic operations require both adapters and contract tests.
 - The monitoring worker discovers supported targets, polls service history,
   reconciles app-owned Eventstream sources and receives events with a pinned
   managed identity. An event is a source reference, not proof of a failed or
