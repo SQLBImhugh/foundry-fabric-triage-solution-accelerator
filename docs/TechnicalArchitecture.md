@@ -159,6 +159,15 @@ selections retain the existing workspace rotation, quotas and native claim.
 Install the new view and read grant before deploying a caller that requires it;
 a missing projection fails bootstrap rather than selecting the expensive route.
 
+Heartbeat context lookup, queue claims and synchronous reconciliation run off
+the event loop. The human-command drain uses the same cancellation-settlement
+helper for its SQL reads and writes. Cancelling the awaiting coroutine stops new
+work but does not cancel or replay a submitted synchronous operation: the helper
+observes its original executor future before propagating cancellation. A failure
+that arrives during settlement remains visible as metadata; transaction and
+receipt recovery still belong to the store. Process termination is distinct
+from cooperative cancellation and still requires durable recovery.
+
 ### SQL writer boundary
 
 Runtime monitoring stores require an explicit component. Database permissions

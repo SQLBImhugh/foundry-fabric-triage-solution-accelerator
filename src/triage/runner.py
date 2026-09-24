@@ -43,6 +43,7 @@ from triage.monitoring.controller import (
     HeartbeatBudget,
     MonitoringExecution,
     reconcile_monitoring_work,
+    settled_thread,
 )
 from triage.monitoring.models import (
     SUPERSESSION_EVIDENCE_TTL_SECONDS,
@@ -2053,7 +2054,7 @@ class TriageRunner:
     ) -> list[str]:
         if budget is not None and not budget.can_claim():
             return []
-        context = self.monitoring_context
+        context = await settled_thread(lambda: self.monitoring_context)
         owner = str(uuid4())
         lines: list[str] = []
         leases = {
@@ -2087,10 +2088,17 @@ class TriageRunner:
                 # Claim only what can start now. Leasing a whole batch before
                 # slow model/approval calls would let later leases expire in
                 # our hands.
-                claimed = self.monitoring.claim_work(WorkClaimRequest(
+                request = WorkClaimRequest(
                     **context.model_dump(), owner_id=owner, kinds=MONITORING_POOLS[pool],
                     limit=1, per_workspace_limit=1, lease_seconds=leases[pool],
-                ))
+                )
+
+                def claim(request: WorkClaimRequest):
+                    if budget is not None and not budget.can_claim():
+                        return ()
+                    return self.monitoring.claim_work(request)
+
+                claimed = await settled_thread(claim, request)
                 if claimed:
                     work = claimed[0]
                     break
@@ -2109,7 +2117,7 @@ class TriageRunner:
         if policy.component != "controller":
             raise MonitoringConflict("Collection work cannot be dispatched as a controller action.")
         if policy.dispatch_route == "reconcile_state":
-            result = await asyncio.to_thread(reconcile_monitoring_work, self.monitoring, work)
+            result = await settled_thread(reconcile_monitoring_work, self.monitoring, work)
             return f"- {work.work_id}: deterministic reconciliation {result.state}."
         if work.execution is None or work.target is None or work.lease is None:
             raise MonitoringConflict("Controller dispatch requires exact leased source work.")

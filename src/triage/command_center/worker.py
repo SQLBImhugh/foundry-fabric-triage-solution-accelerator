@@ -13,6 +13,7 @@ from uuid import uuid4
 from triage.command_center.models import ApiFailure
 from triage.command_center.monitoring import resolve_command_target
 from triage.models import BIRequest
+from triage.monitoring.controller import settled_thread
 from triage.monitoring.models import MonitoringTarget
 
 logger = logging.getLogger("triage.command_center.worker")
@@ -73,12 +74,12 @@ async def _execute(runner, command, target: MonitoringTarget) -> tuple[str, str]
 async def drain_commands(runner, *, limit: int = 1, budget: HeartbeatBudget | None = None) -> list[str]:
     if budget is not None and not budget.can_claim():
         return []
-    history = await asyncio.to_thread(runner.build_command_center_store)
-    await asyncio.to_thread(history.expire_commands)
-    claims = await asyncio.to_thread(runner._pipeline_claim_store)
+    history = await settled_thread(runner.build_command_center_store)
+    await settled_thread(history.expire_commands)
+    claims = await settled_thread(runner._pipeline_claim_store)
     worker_id = f"{socket.gethostname()}:{uuid4().hex[:12]}"
     lines: list[str] = []
-    for candidate in await asyncio.to_thread(history.eligible_commands, limit=100):
+    for candidate in await settled_thread(history.eligible_commands, limit=100):
         if len(lines) >= max(1, min(limit, 10)) or budget is not None and not budget.can_claim():
             break
         if candidate.state != "queued":
@@ -86,10 +87,10 @@ async def drain_commands(runner, *, limit: int = 1, budget: HeartbeatBudget | No
         target_key = f"command-target:{candidate.target_id.casefold()}"
         execution_budget = runner.settings.triage_timeout_seconds + runner.settings.approval_timeout_seconds + 30
         began = time.monotonic()
-        if not await asyncio.to_thread(claims.claim, target_key, lease_seconds=execution_budget + 60):
+        if not await settled_thread(claims.claim, target_key, lease_seconds=execution_budget + 60):
             continue
         try:
-            if await asyncio.to_thread(history.target_blocked, candidate.target_id):
+            if await settled_thread(history.target_blocked, candidate.target_id):
                 logger.warning("Command target requires reconciliation: %s", candidate.target_id)
                 continue
             if budget is not None and not budget.can_claim():
@@ -97,7 +98,7 @@ async def drain_commands(runner, *, limit: int = 1, budget: HeartbeatBudget | No
             remaining = execution_budget - (time.monotonic() - began)
             if remaining <= 0:
                 continue
-            command = await asyncio.to_thread(
+            command = await settled_thread(
                 history.claim_command,
                 candidate.id, worker_id, lease_seconds=execution_budget + 60,
             )
@@ -106,7 +107,7 @@ async def drain_commands(runner, *, limit: int = 1, budget: HeartbeatBudget | No
             run_id = ""
             entered_execution = False
             try:
-                target = await asyncio.to_thread(_target, runner, command)
+                target = await settled_thread(_target, runner, command)
                 if command.kind == "pipeline_sweep":
                     _require_pipeline_selection(runner)
                 remaining = execution_budget - (time.monotonic() - began)
@@ -124,11 +125,11 @@ async def drain_commands(runner, *, limit: int = 1, budget: HeartbeatBudget | No
                 )
                 try:
                     if entered_execution:
-                        await asyncio.to_thread(
+                        await settled_thread(
                             history.interrupt_command, command.id, worker_id, summary, run_id=run_id,
                         )
                     else:
-                        await asyncio.to_thread(
+                        await settled_thread(
                             history.finish_command, command.id, worker_id, state="failed", summary=summary,
                         )
                 except Exception:
@@ -138,7 +139,7 @@ async def drain_commands(runner, *, limit: int = 1, budget: HeartbeatBudget | No
                 logger.error("Operator command %s: %s", command.id, summary)
             else:
                 try:
-                    await asyncio.to_thread(
+                    await settled_thread(
                         history.finish_command,
                         command.id, worker_id, state="completed", summary=summary, run_id=run_id,
                     )
@@ -149,5 +150,5 @@ async def drain_commands(runner, *, limit: int = 1, budget: HeartbeatBudget | No
                     summary = f"Execution finished; finalization is unconfirmed. Review command {command.id} and run {run_id}."
             lines.append(f"- {command.id}: {summary}")
         finally:
-            await asyncio.to_thread(claims.release, target_key)
+            await settled_thread(claims.release, target_key)
     return lines

@@ -15,11 +15,12 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from functools import partial
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from triage.approvals import ApprovalDecision, ApprovalRequest
 from triage.monitoring.contracts import (
@@ -60,6 +61,44 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("triage.monitoring.controller")
 heartbeat_logger = logging.getLogger("triage.telemetry.heartbeat")
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+async def settled_thread(
+    function: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs,
+) -> _T:
+    """Keep a synchronous operation owned until it settles, even after cancellation.
+
+    Cancelling a coroutine cannot stop its SQL thread. Keep the executor future
+    shielded and observe its outcome before propagating cancellation; otherwise
+    a caller can release coordination while the original transaction still runs.
+    The operation itself retains its native transaction and no-replay rules.
+    """
+    future = asyncio.get_running_loop().run_in_executor(
+        None, copy_context().run, partial(function, *args, **kwargs),
+    )
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError as cancelled:
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        error = None if future.cancelled() else future.exception()
+        heartbeat_logger.warning(
+            "heartbeat_sync_settled status=%s error_type=%s",
+            "uncertain" if future.cancelled() else "failed" if error is not None else "completed",
+            type(error).__name__ if error is not None else "",
+        )
+        if error is not None:
+            raise cancelled from error
+        raise
+
+
 # The controller's own admission deadline, in seconds.
 #
 # This is not the host's HTTP limit. An earlier comment here claimed "the
