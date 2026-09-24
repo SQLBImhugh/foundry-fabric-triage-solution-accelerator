@@ -1346,7 +1346,14 @@ may fail with 403. The project-scoped grant permits that project's agent
 endpoints, not just the named controller; use a narrower supported scope when
 required. A workflow definition or successful deployment is not invocation proof.
 
-The caller timeout is `PT15M`. The controller uses an 840-second monotonic
+The workflow requests `background=true`, `store=true`, `stream=false`, retains
+the returned response ID, and polls only that ID. Its `PT15M` polling budget is
+not an HTTP timeout override: Consumption HTTP requests still have a 120-second
+limit. Scheduler runs are serialized, POST retries remain disabled, and only GET
+status reads may retry. Install a hosting version that supports stored background
+Responses and verify submit/disconnect/poll behavior before enabling the timer.
+
+The controller uses an 840-second monotonic
 admission window starting before lock acquisition, with two automatic and one
 human-command concurrent slots. Slots refill within bounded queue quotas only
 when the remaining window covers the execution allowance. Exhausted lock-wait
@@ -1363,8 +1370,12 @@ making it a prerequisite for the web deployment. Review both schedule history
 and durable triage outcomes: a transport-completed response is not necessarily
 a healthy business result.
 
-The scheduler validates controller response status/error and decodes supported
-base64 `$content` envelopes; HTTP 200 or CLI exit zero is not sufficient.
+The scheduler validates response identity on every poll, then requires completed
+status without an error. Queued/in-progress/failed/cancelled/incomplete responses
+cannot pass that final check, and reaching the polling limit fails the run.
+Supported base64 `$content` envelopes are decoded; HTTP 200 or CLI exit zero is
+not sufficient. Stored background submission is not automatic process-loss replay
+of the custom controller; durable application recovery remains in Azure SQL.
 [controller-health-alerts.bicep](../infra/controller-health-alerts.bicep) targets
 the existing heartbeat workflow, not a second schedule:
 

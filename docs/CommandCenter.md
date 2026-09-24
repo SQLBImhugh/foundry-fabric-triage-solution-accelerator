@@ -870,7 +870,12 @@ collects inventory, REST history and events; the web process does not do those
 scans or execute production investigations. `command sweep` remains available
 when only human-command draining is wanted.
 
-The scheduler template has a 15-minute timeout. Heartbeat admission has an
+The scheduler template submits a stored background response, retains its ID,
+and polls that exact response for up to 15 minutes. It does not hold a single
+HTTP request open for that duration; Consumption caps that request at 120 seconds.
+Only a completed response without an error is success. POST retries are disabled,
+GET retries retain the original ID, and scheduler runs are serialized.
+Heartbeat admission has an
 840-second monotonic budget including lock acquisition, with two automatic and
 one human-command concurrent slots. Refills obey queue limits and the remaining
 execution allowance. Insufficient allowance stops new claims;

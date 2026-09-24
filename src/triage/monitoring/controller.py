@@ -149,21 +149,17 @@ def heartbeat_budget_seconds(settings: Any) -> int:
     return budget
 
 
-#: Stop starting new units this many seconds before the caller gives up.
-#: Zero disables the bound, for a caller that genuinely waits.
+#: Soft elapsed-time limit for starting additional heartbeat work.
+#: Zero disables it; already admitted work still has to settle.
 HEARTBEAT_RESPONSE_SECONDS = 100
 
 
 def heartbeat_response_seconds(settings: Any) -> int:
-    """How long the heartbeat may take before it must report what it has.
+    """When to stop starting more work, not a hard bound on response latency.
 
-    Separate from the admission deadline, which asks whether a unit can finish.
-    This asks whether the caller is still listening. The shipped caller is a
-    Logic App, and Logic Apps Consumption aborts a synchronous outbound request
-    at 120 seconds whatever its configured timeout says, so a heartbeat that
-    keeps starting units past that point is killed holding its report. Returning
-    a partial result costs nothing: every admitted unit is protected by its
-    lease, and the next invocation continues from the queue.
+    This counter cannot interrupt an admitted SQL operation safely. The scheduler
+    therefore uses stored background Responses and polls their original IDs,
+    rather than relying on this limit to beat a foreground HTTP timeout.
     """
     response = int(getattr(settings, "heartbeat_response_seconds", HEARTBEAT_RESPONSE_SECONDS))
     if response < 0:

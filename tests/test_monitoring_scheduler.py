@@ -31,7 +31,9 @@ def test_heartbeat_authentication_and_ambiguous_write_guards_are_preserved():
     assert workflow["identity"]["type"] == "SystemAssigned"
     assert invoke["inputs"]["authentication"]["type"] == "ManagedServiceIdentity"
     assert invoke["inputs"]["retryPolicy"]["type"] == "none"
-    assert invoke["limit"]["timeout"] == "PT15M"
+    assert workflow["properties"]["definition"]["actions"]["Wait_for_agent"]["limit"]["timeout"] == "PT15M"
+    assert invoke["inputs"]["body"]["background"] is True
+    assert invoke["inputs"]["body"]["store"] is True
     assert HEARTBEAT_BUDGET_SECONDS == 840 < 900
     assert workflow["tags"]["DataClassification"] == "[parameters('dataClassification')]"
     assert template()["parameters"]["dataClassification"]["defaultValue"] != "synthetic"

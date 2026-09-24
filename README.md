@@ -584,22 +584,33 @@ bounded rounds. The separate worker owns discovery, polling, connector
 reconciliation and event intake, so there is no need to create another controller
 timer per target.
 
+The scheduler submits a **stored background response** and retains its response
+ID in the workflow run. It polls that exact ID until completion, rather than
+holding one HTTP request open. A queued or in-progress response is acceptance,
+not success. Only a completed response without an error passes the final gate.
+POST retries are disabled; a failed status read retries only the original ID.
+The polling window is 15 minutes and scheduler runs are serialized.
+
 Two deadlines govern a heartbeat, and they answer different questions:
 
 - `HEARTBEAT_BUDGET_SECONDS` (default 840) is the **admission** deadline: whether
   there is still time for an admitted unit to finish. It is monotonic and
   includes lock wait. A value too short to hold one work allowance is refused at
   startup rather than silently admitting nothing.
-- `HEARTBEAT_RESPONSE_SECONDS` (default 100) is the **response** deadline:
-  whether the caller is still listening. It exists because Azure Logic Apps
-  Consumption aborts a synchronous outbound request at 120 seconds whatever its
-  configured timeout says. Without it, a heartbeat keeps starting units past that
-  point and is killed holding its report.
+- `HEARTBEAT_RESPONSE_SECONDS` (default 100) is a **soft stop for starting more
+  work**. It does not bound an operation already running and is not a substitute
+  for asynchronous hand-off. Logic Apps Consumption caps a synchronous outbound
+  request at 120 seconds regardless of an action's configured timeout.
 
 Reaching either deadline stops new claims; it never cancels admitted work, which
 is protected by its lease. The heartbeat runs two automatic slots — one leading
 deterministic reconciliation, one leading actions — and one human-command slot,
 refilled within queue limits and the remaining allowance.
+
+Background execution survives the submitting client's disconnect. It does not
+provide automatic replay of this custom controller after process loss; recovery
+still follows the original SQL work, receipts and fences. Never resubmit an
+uncertain action because a response is missing.
 
 Portal-only heartbeat health alerts include an optional runtime log query that
 returns a zero-count row when no completed heartbeat is present; absent platform

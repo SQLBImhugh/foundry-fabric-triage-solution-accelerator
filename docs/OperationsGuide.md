@@ -76,9 +76,14 @@ under its existing policy and fences. Target poll cadence
 belongs to the registry. The collector uses durable continuations, leases and
 service/API budgets across replicas; a local semaphore is not a shared limit.
 
-The scheduler's `PT15M` caller timeout exceeds the admission window, but is not
-permission to cancel an effect already admitted. HTTP invocation retries are
-disabled: an ambiguous POST must not create overlapping work.
+The scheduler submits one stored background response and polls the returned ID
+for up to `PT15M`. This avoids the 120-second limit on a single Consumption HTTP
+request. Scheduler runs are serialized. A pending response is not success;
+polling-limit exhaustion or a non-completed terminal status fails the run.
+HTTP invocation retries are disabled: an ambiguous POST must not create
+overlapping work. Read failures retry only the original response ID, and
+application recovery remains tied to SQL work/receipts rather than response
+availability.
 
 The existing platform alerts evaluate `RunsSucceeded < 1` over 15 minutes and
 `RunsFailed > 0` over 5 minutes, every minute. Do not assume absent metric

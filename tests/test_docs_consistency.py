@@ -632,13 +632,7 @@ def test_the_decision_write_is_conditional_and_checked() -> None:
 
 
 def test_the_scheduler_waits_longer_than_the_approval_window() -> None:
-    """A sweep blocks while a human decides, so the caller must outlast them.
-
-    The Logic App timeout was PT3M while APPROVAL_TIMEOUT_SECONDS defaults to
-    300s, so the scheduler abandoned the run ninety seconds before the approval
-    window the card advertises actually closed. Someone could approve well
-    inside the documented five minutes and find the work already gone.
-    """
+    """The stored-response polling window, not one HTTP call, covers approval."""
     import re
     import sys
 
@@ -650,7 +644,7 @@ def test_the_scheduler_waits_longer_than_the_approval_window() -> None:
     )
     timeout = (
         template["resources"][0]["properties"]["definition"]["actions"]
-        ["Invoke_the_agent"]["limit"]["timeout"]
+        ["Wait_for_agent"]["limit"]["timeout"]
     )
     match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", timeout)
     assert match, f"unparsable timeout {timeout!r}"
@@ -703,15 +697,12 @@ def test_scheduler_rejects_failed_responses_even_when_http_succeeds() -> None:
     actions = template["resources"][0]["properties"]["definition"]["actions"]
     assert actions["Invoke_the_agent"]["inputs"]["body"] == {
         "input": "@{parameters('command')}",
+        "background": True, "store": True, "stream": False,
     }
     check = actions["Validate_agent_response"]
     assert check["type"] == "ParseJson"
-    assert check["runAfter"] == {"Invoke_the_agent": ["Succeeded"]}
-    assert check["inputs"]["content"] == (
-        "@if(contains(body('Invoke_the_agent'), '$content'), "
-        "json(base64ToString(body('Invoke_the_agent')['$content'])), "
-        "body('Invoke_the_agent'))"
-    )
+    assert check["runAfter"] == {"Wait_for_agent": ["Succeeded"]}
+    assert check["inputs"]["content"] == "@variables('Agent_response')"
     schema = check["inputs"]["schema"]
     assert "status" in schema["required"]
     assert schema["properties"]["status"]["enum"] == ["completed"]
