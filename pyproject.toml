@@ -46,7 +46,7 @@ monitoring = [
 # deployed container at startup. Bump both files together.
 hosted = [
     "agent-framework-core>=1.17,<2",
-    "agent-framework-foundry-hosting==1.0.0b260903",
+    "agent-framework-foundry-hosting==1.0.0b260918",
     "mssql-python>=1.14",
     "azure-identity>=1.17",
 ]
