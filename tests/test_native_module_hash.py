@@ -128,12 +128,12 @@ def test_utf8_sql_catalogue_and_complete_kernel_abi_remain_unchanged() -> None:
         if obj.kind != "role":
             native_module_hash(obj.ddl)
     assert kernel.statements == before
-    # Pin receipt-bound source-removal supersession; native header projection
-    # must not rewrite the kernel's UTF-8 source or API contract.
+    # The queue-only SELECT view/grant is additive; all original RPCs and
+    # receipt-bound source-removal modules retain their source bytes.
     assert kernel_contract_hash(tables) == (
-        "ca857b72823192d6f094763697f14be75aea0a2539349eea0d71383e520236d0"
+        "d7a07466fbdbfe9a594b4077818d03da7bcdcc003115e9a043c6889d781a8c3f"
     )
     assert fingerprint(kernel_abi(tables)) == kernel_contract_hash(tables)
     assert fingerprint(list(kernel.catalogue())) == (
-        "fc4348594c1260eacddc88a16c064c52b8d9a1e1edbc028da224d1a17900ad38"
+        "a4c771ad554b161f935c9fdc2360a5b1c7a400098a4f70a52afa054384f62cfb"
     )

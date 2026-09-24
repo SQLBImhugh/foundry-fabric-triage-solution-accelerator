@@ -176,7 +176,7 @@ def test_fresh_web_intent_is_claimed_before_hundreds_of_waiting_worker_pages(que
         assert len(selects) == 1
         assert "SELECT TOP (1)" in selects[0]
         assert "JSON_VALUE(r.payload, '$.reconcile_producer')" in selects[0]
-        assert queue.db.names.object("controller_read") in selects[0]
+        assert queue.db.names.object("controller_queue_read") in selects[0]
 
 
 def test_priority_preserves_workspace_shares_and_publication_pool_isolation(queue):

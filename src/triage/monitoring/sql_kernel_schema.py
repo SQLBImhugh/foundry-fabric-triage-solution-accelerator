@@ -17,6 +17,7 @@ from triage.monitoring.sql_kernel_contracts import (
     CONTROLLER_ACTION_KINDS,
     CONTROLLER_IMMUTABLE_KINDS,
     CONTROLLER_PROJECTION_KINDS,
+    CONTROLLER_WORK_KINDS,
     EVIDENCE_KINDS,
     FACT_KINDS,
     FRONTIER_KINDS,
@@ -81,6 +82,11 @@ def _views(names: SqlNames) -> list[KernelObject]:
         _view(names, "web_drafts", "r.record_kind='plan'", writable=True),
         _view(names, "controller_projections", f"r.record_kind IN ({literals(CONTROLLER_PROJECTION_KINDS)})", writable=True, deny_maintenance=False),
         _view(names, "controller_immutable", f"r.record_kind IN ({literals(CONTROLLER_IMMUTABLE_KINDS)})", writable=True, deny_maintenance=False),
+        _view(
+            names, "controller_queue_read",
+            f"(r.record_kind='work' AND r.work_kind IN ({literals(CONTROLLER_WORK_KINDS)})) "
+            "OR r.record_kind='action'",
+        ),
         _view(
             names, "worker_read",
             f"r.record_kind IN ({literals((*facts, 'scope', 'target', 'target_capability', 'connector', 'connector_desired', 'partition_ownership', 'stream_start', 'stream_position', 'stream_checkpoint', 'stream_gap', 'validation_frontier', 'validation_window'))}) "
@@ -215,6 +221,7 @@ def build_kernel(names: SqlNames, contracts: dict[str, RpcContract]) -> Permissi
         allow(component, "SELECT", "approval_read")
         allow(component, "SELECT", "incident_read")
     allow("controller", "SELECT", "processed_read")
+    allow("controller", "SELECT", "controller_queue_read")
     for logical in ("worker_catalogue", "worker_telemetry"):
         allow("worker", "SELECT, INSERT", logical)
         columns = ", ".join(f"[{column}]" for column in MUTABLE_FACT_COLUMNS)

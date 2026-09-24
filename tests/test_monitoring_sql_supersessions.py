@@ -1346,7 +1346,7 @@ def test_sql_supersession_reuses_existing_transaction_routes_and_keeps_inspectio
     publication = next(obj.ddl for obj in kernel.objects if obj.logical_name == "controller.publish_connector")
     observation = next(obj.ddl for obj in kernel.objects if obj.logical_name == "worker.observe_connector")
     claim = next(obj.ddl for obj in kernel.objects if obj.logical_name == "worker.claim_work")
-    assert (len(kernel.rpcs), len(kernel.objects), sum(map(len, kernel.grants.values()))) == (27, 50, 56)
+    assert (len(kernel.rpcs), len(kernel.objects), sum(map(len, kernel.grants.values()))) == (27, 51, 57)
     assert publication.index("IF @prior_payload IS NOT NULL") < publication.index("DECLARE @supersession_intents")
     assert publication.index("Supersession history is missing") < publication.index("SET @superseded_json=N'['")
     assert publication.index("SET @superseded_json=N'['") < publication.index("Pending removal cannot be cancelled")

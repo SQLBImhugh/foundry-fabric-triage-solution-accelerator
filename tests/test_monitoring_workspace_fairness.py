@@ -277,7 +277,6 @@ def test_valid_recent_cursor_cannot_hide_an_older_contradictory_active_workspace
         queue.claim()
     assert (queue.records, queue.receipts) == before
     if queue.db:
-        assert any(sql.startswith("WITH recent AS") for _, sql, _ in queue.db.calls)
         assert not any("ROW_NUMBER()" in sql for _, sql, _ in queue.db.calls)
         assert not any("controller_claim_work" in sql for _, sql, _ in queue.db.calls)
 

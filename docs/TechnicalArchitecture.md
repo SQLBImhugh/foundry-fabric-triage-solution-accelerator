@@ -145,6 +145,20 @@ compatibility. These interfaces improve caller locality; they grant no authority
 Runtime operation checks and native SQL permissions remain mandatory, including
 when Python code bypasses an interface through dynamic attribute access.
 
+Queue selection uses a separate `controller_queue_read` view containing only
+controller work and the action records needed to respect verification deadlines.
+It retains the current tenant/epoch join and has a controller-only SELECT grant.
+It does not expose raw worker evidence or permit queue DML.
+
+The mixed `controller_read` view validates accepted worker facts, including
+original receipt hashes. An actual queue query plan evaluated that evidence
+branch despite returning no queue rows from it. Queue selection must not pay
+that cost or weaken those evidence checks. Empty selections now return before
+reconstructing fairness from historical work/transition receipts; nonempty
+selections retain the existing workspace rotation, quotas and native claim.
+Install the new view and read grant before deploying a caller that requires it;
+a missing projection fails bootstrap rather than selecting the expensive route.
+
 ### SQL writer boundary
 
 Runtime monitoring stores require an explicit component. Database permissions

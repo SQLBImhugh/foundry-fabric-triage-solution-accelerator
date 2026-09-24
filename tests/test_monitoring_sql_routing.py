@@ -162,6 +162,7 @@ class KernelProtocolDatabase:
                 ) for (operation, request_id), receipt in self.receipts.items()
             ])
             translated = sql.replace(self.names.object("controller_read"), "records")
+            translated = translated.replace(self.names.object("controller_queue_read"), "records")
             translated = translated.replace(self.names.object("receipts_controller"), "receipts")
             translated = SqliteConnection.translate(translated)
             translated = translated.replace("JSON_VALUE(", "json_extract(")

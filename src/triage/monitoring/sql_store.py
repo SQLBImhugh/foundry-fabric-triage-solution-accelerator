@@ -275,6 +275,10 @@ class SqlBackend:
             "approvals": self.kernel_names.object("approval_read"),
             "processed": self.kernel_names.object("processed_read"),
         }
+        self.queue_table = (
+            self.kernel_names.object("controller_queue_read")
+            if component == "controller" else self.tables["monitoring_records"]
+        )
         self._local = threading.local()
 
     @property
@@ -295,17 +299,22 @@ class SqlBackend:
                 self._local.collection = None
                 self._local.source_frame = None
                 required = ("monitoring_control", "monitoring_records", "monitoring_receipts")
+                read_objects = [self.tables[name] for name in required]
+                if self.component == "controller":
+                    read_objects.append(self.queue_table)
                 rows = self.db.query(
-                    "SELECT " + ", ".join("OBJECT_ID(?, 'V')" for _ in required),
-                    *(self.tables[name] for name in required),
+                    "SELECT " + ", ".join("OBJECT_ID(?, 'V')" for _ in read_objects),
+                    *read_objects,
                 )
-                if len(rows) != 1 or len(rows[0]) != len(required):
+                if len(rows) != 1 or len(rows[0]) != len(read_objects):
                     raise MonitoringUnavailable("SQL schema inspection returned an invalid shape")
                 present = {name: rows[0][index] is not None for index, name in enumerate(required)}
                 self._local.control_exists = present["monitoring_control"]
                 if present["monitoring_control"] and not all(present.values()):
                     missing = ", ".join(name for name, exists in present.items() if not exists)
                     raise MonitoringNotBootstrapped(f"Monitoring baseline is incomplete: {missing}")
+                if present["monitoring_control"] and self.component == "controller" and rows[0][-1] is None:
+                    raise MonitoringNotBootstrapped("Monitoring baseline is missing controller_queue_read")
                 if present["monitoring_control"] and not write:
                     self.db.query(
                         f"SELECT singleton FROM {self.tables['monitoring_control']} "
@@ -641,7 +650,9 @@ class SqlBackend:
 
     def _fair_workspace(self, request: m.WorkClaimRequest) -> str:
         """Read a scheduling hint from guarded work progress, not a new authority."""
-        table = self.tables["monitoring_records"]
+        # Queue-only reads must not expand controller_read's accepted-fact UNION.
+        # Its empty evidence branch still scanned every retained binding twice.
+        table = self.queue_table
         receipts = self.tables["monitoring_receipts"]
         family = sorted(m.CONTROLLER_WORK_KINDS)
         kinds = ", ".join("?" for _ in family)
@@ -687,7 +698,7 @@ ORDER BY served_at DESC, key_hash DESC""",
         kinds = ", ".join("?" for _ in request.kinds)
         family = sorted(m.WORKER_WORK_KINDS if self.component == "worker" else m.CONTROLLER_WORK_KINDS)
         family_params = ", ".join("?" for _ in family)
-        table = self.tables["monitoring_records"]
+        table = self.queue_table
         if self.component == "controller":
             # Validate before active counts and TOP: a conflicting active row
             # could otherwise charge another workspace and exceed the real cap.
@@ -2770,9 +2781,15 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         for kind in request.kinds:
             self.engine._authorize_work(kind)
         self._sql.lock_context(request)
-        after_workspace = self._sql._fair_workspace(request) if self.engine.component == "controller" else ""
+        candidates = self._sql.due(request, after_workspace="")
+        if not candidates:
+            return ()
+        if self.engine.component == "controller":
+            after_workspace = self._sql._fair_workspace(request)
+            if after_workspace:
+                candidates = self._sql.due(request, after_workspace=after_workspace)
         claimed = []
-        for record in self._sql.due(request, after_workspace=after_workspace):
+        for record in candidates:
             candidate = self.engine._decode(record, m.MonitoringWork)
             if candidate.action_reservation_id is not None:
                 action = self.engine._get("action", candidate.action_reservation_id, request, m.ActionReservation)

@@ -829,5 +829,5 @@ def test_removal_contract_is_fixed_receipt_bound_and_has_no_raw_write_route():
                  "controller_projections", "controller_immutable"):
         assert "connector_source_retirement" not in _sql(kernel, name)
     assert "connector_source_retirement" in _sql(kernel, "controller_read")
-    assert {role: len(grants) for role, grants in kernel.grants.items()} == {"worker": 20, "web": 12, "controller": 24}
+    assert {role: len(grants) for role, grants in kernel.grants.items()} == {"worker": 20, "web": 12, "controller": 25}
     assert integration_contract()["unresolved_cases"] == []
