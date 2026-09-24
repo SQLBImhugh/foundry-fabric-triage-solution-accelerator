@@ -68,3 +68,20 @@ def test_pending_failed_and_malformed_responses_cannot_pass_the_final_gate():
     assert final["properties"]["error"] == {"type": "null"}
     assert actions["Did_it_fail"]["runAfter"]["Validate_agent_response"] == ["Failed", "TimedOut", "Skipped"]
     assert actions["Fail_the_run"]["inputs"]["runStatus"] == "Failed"
+
+
+def test_parse_json_uses_only_supported_identifier_checks():
+    def check(value):
+        if isinstance(value, dict):
+            assert not {"pattern", "patternProperties"} & value.keys(), (
+                "Logic Apps rejects regex schema keywords at runtime even after ARM validation"
+            )
+            for child in value.values():
+                check(child)
+        elif isinstance(value, list):
+            for child in value:
+                check(child)
+
+    check(definition()["actions"])
+    identifier = definition()["actions"]["Validate_accepted_response"]["inputs"]["schema"]["properties"]["id"]
+    assert identifier == {"type": "string", "minLength": 1, "maxLength": 256}

@@ -44,6 +44,9 @@
       "The PT15M budget belongs to the polling loop, not the submission request.",
       "A queued or in-progress response is acceptance, not completion. Never retry",
       "the POST automatically. Read failures only retry the same response ID.",
+      "ParseJson rejects pattern/patternProperties at runtime even after ARM",
+      "validation. Bound the ID, encode it as a path segment and require the",
+      "same ID in every polled response instead of relying on a regex schema.",
       "Stored background execution survives caller disconnect; process-loss recovery",
       "still depends on the hosting SDK and the application's durable SQL receipts.",
       "",
@@ -245,8 +248,7 @@
                     "id": {
                       "type": "string",
                       "minLength": 1,
-                      "maxLength": 256,
-                      "pattern": "^[A-Za-z0-9_-]+$"
+                      "maxLength": 256
                     },
                     "status": {
                       "type": "string",
