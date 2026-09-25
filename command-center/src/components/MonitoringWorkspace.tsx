@@ -533,15 +533,24 @@ export function MonitoringWorkspace({ api, roles, userId, fresh, permissionRevis
   } : null, [tenantId, epoch, revision])
   const loadCatalog = useCallback(async (signal: AbortSignal): Promise<MonitoringCatalog> => {
     if (!expected) throw new ApiError(409, 'monitoring_control_required', 'A current monitoring control record is required.')
-    const [scopes, inventory, targets, workspaces, domains, connectors] = await Promise.all([
-      readMonitoringPages((cursor) => api.scopes({ limit: 100, cursor }, signal), expected, signal, (item) => item.scope_id),
-      readMonitoringPages((cursor) => api.inventory({ limit: 100, cursor }, signal), expected, signal, inventoryKey),
-      readMonitoringPages((cursor) => api.targets({ limit: 100, cursor, include_inactive: true }, signal), expected, signal, (item) => monitoringTargetKey(item.identity)),
-      readMonitoringPages((cursor) => api.workspaces({ limit: 100, cursor }, signal), expected, signal, (item) => item.workspace_id),
-      readMonitoringPages((cursor) => api.domains({ limit: 100, cursor }, signal), expected, signal, (item) => item.domain_id),
-      readMonitoringPages((cursor) => api.connectors({ limit: 100, cursor }, signal), expected, signal, (item) => item.connector_id),
-    ])
-    return { scopes, inventory, targets, workspaces, domains, connectors }
+    const batch = new AbortController()
+    const batchSignal = AbortSignal.any([signal, batch.signal])
+    try {
+      const [scopes, inventory, targets, workspaces, domains, connectors] = await Promise.all([
+        readMonitoringPages((cursor) => api.scopes({ limit: 100, cursor }, batchSignal), expected, batchSignal, (item) => item.scope_id),
+        readMonitoringPages((cursor) => api.inventory({ limit: 100, cursor }, batchSignal), expected, batchSignal, inventoryKey),
+        readMonitoringPages((cursor) => api.targets({ limit: 100, cursor, include_inactive: true }, batchSignal), expected, batchSignal, (item) => monitoringTargetKey(item.identity)),
+        readMonitoringPages((cursor) => api.workspaces({ limit: 100, cursor }, batchSignal), expected, batchSignal, (item) => item.workspace_id),
+        readMonitoringPages((cursor) => api.domains({ limit: 100, cursor }, batchSignal), expected, batchSignal, (item) => item.domain_id),
+        readMonitoringPages((cursor) => api.connectors({ limit: 100, cursor }, batchSignal), expected, batchSignal, (item) => item.connector_id),
+      ])
+      return { scopes, inventory, targets, workspaces, domains, connectors }
+    } catch (error) {
+      // Promise.all rejects before sibling reads finish. Leaving their pages
+      // running lets each failed poll add another estate-wide catalogue scan.
+      batch.abort()
+      throw error
+    }
   }, [api, expected])
   const catalog = useResource(`monitoring-catalog:${securityKey}:${refreshRevision}:${expected ? contextKey(expected) : 'unavailable'}`,
     loadCatalog, 15000, active && Boolean(expected) && !records.error)

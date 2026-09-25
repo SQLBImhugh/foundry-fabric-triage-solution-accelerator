@@ -18,6 +18,19 @@ const response = (value: unknown, status = 200) => new Response(JSON.stringify(v
 const api = () => new MonitoringApiClient(async () => null)
 
 describe('monitoring wire contracts', () => {
+  it('accepts a native scope with no projected update timestamp without inferring one', async () => {
+    const nativeScope = { ...monitoringScope, updated_at: null }
+    vi.mocked(globalThis.fetch).mockResolvedValue(response(monitoringPage([nativeScope])))
+    const result = await api().scopes()
+    expect(result.items).toEqual([nativeScope])
+    expect(result.items[0]?.revision).toBe(monitoringScope.revision)
+  })
+
+  it.each([undefined, '', 'not-a-timestamp', 0, true])('rejects malformed scope update metadata: %j', async (updated_at) => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(response(monitoringPage([{ ...monitoringScope, updated_at }])))
+    await expect(api().scopes()).rejects.toMatchObject({ code: 'invalid_monitoring_response' })
+  })
+
   it('uses current tokens, abort signals and the same-origin no-store transport', async () => {
     const token = vi.fn().mockResolvedValue('unit-test-token')
     const fetch = vi.mocked(globalThis.fetch).mockResolvedValue(response(monitoringSnapshot))

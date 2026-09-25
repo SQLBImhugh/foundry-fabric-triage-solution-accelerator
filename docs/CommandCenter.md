@@ -247,6 +247,11 @@ did not establish a commit; no new native activation acceptance is claimed while
 the combined source/UI review is pending.
 
 The UI clears dependent selections and invalidates stale reads/previews.
+Native SQL scope projections may return `updated_at=null`; this is an unknown
+display timestamp, not a missing policy or permission decision. The UI retains
+the versioned scope and does not invent an update time. If one catalogue request
+fails, its unfinished sibling page reads are cancelled before another polling
+batch, while setup remains locked on the reported error.
 An existing policy can be submitted for disabling with its saved include/exclude
 rules unchanged even if workspace metadata is now unknown or missing. New
 rules, expansion and re-enabling still require current metadata, and the backend

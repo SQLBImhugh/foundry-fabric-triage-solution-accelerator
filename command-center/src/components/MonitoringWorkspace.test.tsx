@@ -5,9 +5,10 @@ import { MONITORING_ACTIVATION_STORAGE_KEY, MonitoringWorkspace } from './Monito
 import type { MonitoringWorkspaceProps } from './MonitoringWorkspace'
 import { ApiError } from '../api/errors'
 import type { AppRole } from '../api/access'
+import { MonitoringApiClient } from '../api/monitoring'
 import type { MonitoringPlan, OwnedConnectorManifest, RecordPage, ScopePolicy, WorkspaceMetadata } from '../api/monitoring'
 import {
-  ids, monitoringBootstrap, monitoringConnector, monitoringFixtureApi, monitoringInventory,
+  ids, monitoringBootstrap, monitoringConnector, monitoringDomains, monitoringFixtureApi, monitoringInventory,
   monitoringPage, monitoringPreview, monitoringReceipt, monitoringSnapshot, monitoringVersion, monitoringWorkspaces,
   monitoringWrongTenantBootstrap, monitoringScope, monitoringSafetyReview, monitoringTarget,
 } from '../test/monitoringFixtures'
@@ -33,6 +34,43 @@ async function preparePreview(user: ReturnType<typeof userEvent.setup>) {
 }
 
 describe('monitoring inspection and readiness', () => {
+  it('opens configuration through the real client when native scopes have a null update timestamp', async () => {
+    const replies: Record<string, unknown> = {
+      bootstrap: monitoringBootstrap, snapshot: monitoringSnapshot,
+      scopes: monitoringPage([{ ...monitoringScope, updated_at: null }]),
+      inventory: monitoringPage(monitoringInventory), targets: monitoringPage([monitoringTarget]),
+      workspaces: monitoringPage(monitoringWorkspaces), domains: monitoringPage(monitoringDomains),
+      connectors: monitoringPage([monitoringConnector]),
+    }
+    vi.mocked(globalThis.fetch).mockImplementation(async (input) => {
+      const name = new URL(String(input), 'https://example.test').pathname.split('/').at(-1)!
+      if (!(name in replies)) throw new Error(`Unexpected monitoring read ${name}`)
+      return new Response(JSON.stringify(replies[name]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    setup({ api: new MonitoringApiClient(async () => null) })
+    const editor = await screen.findByRole('textbox', { name: 'Scope name' })
+    expect(editor.matches(':disabled')).toBe(false)
+    expect(screen.getByRole('button', { name: 'Edit Operations scope' })).toBeTruthy()
+    expect(screen.queryByText(/incomplete, inconsistent or unsupported records/)).toBeNull()
+  })
+
+  it('cancels unfinished catalogue reads when a sibling fails instead of overlapping the next poll', async () => {
+    const api = monitoringFixtureApi()
+    let inventorySignal: AbortSignal | undefined
+    vi.mocked(api.inventory).mockImplementation((_options, signal) => {
+      inventorySignal = signal
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+      })
+    })
+    vi.mocked(api.scopes).mockRejectedValue(new ApiError(503, 'scope_read_failed', 'Scope records are unavailable.'))
+    setup({ api })
+    await screen.findByText('Scope records are unavailable.')
+    expect(inventorySignal?.aborted).toBe(true)
+    expect(screen.queryByRole('textbox', { name: 'Scope name' })).toBeNull()
+    expect(api.activate).not.toHaveBeenCalled()
+  })
+
   it('keeps the current permission-generation editor usable during a slow background catalogue read', async () => {
     vi.useFakeTimers()
     let finish: ((value: RecordPage<WorkspaceMetadata>) => void) | undefined

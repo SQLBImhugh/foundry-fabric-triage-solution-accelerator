@@ -89,7 +89,7 @@ export interface ScopeDefinition extends MonitoringContext {
   rules: ScopeRule[]
   cadence: PollCadence
 }
-export interface ScopePolicy extends ScopeDefinition { revision: number; updated_at: string }
+export interface ScopePolicy extends ScopeDefinition { revision: number; updated_at: string | null }
 export interface InventoryItem extends MonitoringContext {
   generation_id: string
   workspace_id: string
@@ -355,7 +355,8 @@ function scope(value: unknown): value is ScopeDefinition {
     && unique(value.rules.map((entry) => entry.rule_id)) && value.rules.every((entry) => entry.selector.tenant_id === value.tenant_id)
 }
 function policy(value: unknown): value is ScopePolicy {
-  return isRecord(value) && scope(value) && count(value.revision) && instant(value.updated_at)
+  return isRecord(value) && scope(value) && count(value.revision)
+    && (value.updated_at === null || instant(value.updated_at))
 }
 function inventoryItem(value: unknown): value is InventoryItem {
   return isRecord(value) && context(value) && id(value.generation_id) && id(value.workspace_id)
