@@ -908,6 +908,7 @@ def cli_recover(artifact, recovery, arguments):
     ("plan_guides", (1, "leftover", False, 1)),
     ("objects", (123, 1, "triage_sql_bootstrap_receipts", "U", 0, 2, False, None, None, None)),
     ("columns", (123, 1, "operation_id", 56, 4, 10, 0, False, False, False, None)),
+    ("computed_columns", (123, 2, "(CONVERT([binary](32),(0)))", True, False)),
     ("indexes", (123, 1, "changed_key", 1, False, True, False, None)),
     ("index_columns", (123, 1, 1, 2, 1, False, False)),
     ("constraints", (125, 123, "unreviewed_receipt_check", "(1=1)", False)),

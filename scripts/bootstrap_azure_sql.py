@@ -110,6 +110,8 @@ CHECK_SQL = {
         c.precision, c.scale, CONVERT(INT,c.is_nullable),
         CONVERT(INT,c.is_identity), CONVERT(INT,c.is_computed)
         FROM sys.columns c WHERE c.object_id=OBJECT_ID(?) ORDER BY c.column_id""",
+    "computed_columns": """SELECT name,definition,CONVERT(INT,is_persisted)
+        FROM sys.computed_columns WHERE object_id=OBJECT_ID(?) ORDER BY column_id""",
     "principal": """SELECT type, authentication_type_desc, default_schema_name,
         CASE WHEN type IN ('E','X') THEN LOWER(CONVERT(VARCHAR(256),sid,2)) END
         FROM sys.database_principals WHERE name=?""",
@@ -200,6 +202,8 @@ EMPTY_BASELINE_SQL = {
         ORDER BY o.object_id"""),
     "columns": (11, """SELECT object_id,column_id,name,user_type_id,max_length,precision,scale,
         is_nullable,is_identity,is_computed,collation_name FROM sys.columns ORDER BY object_id,column_id"""),
+    "computed_columns": (5, """SELECT object_id,column_id,definition,is_persisted,uses_database_collation
+        FROM sys.computed_columns ORDER BY object_id,column_id"""),
     "indexes": (8, """SELECT object_id,index_id,name,type,is_unique,is_primary_key,
         is_disabled,filter_definition FROM sys.indexes ORDER BY object_id,index_id"""),
     "index_columns": (7, """SELECT object_id,index_id,index_column_id,column_id,key_ordinal,
@@ -306,7 +310,7 @@ class Batch(StrictModel):
 
 
 class Check(StrictModel):
-    kind: Literal["object", "columns", "principal", "permissions", "members", "budget_policies"]
+    kind: Literal["object", "columns", "computed_columns", "principal", "permissions", "members", "budget_policies"]
     name: Annotated[str, Field(pattern=r"^[A-Za-z0-9_.-]{1,128}$")]
     argument: Annotated[str, Field(min_length=1, max_length=256)]
     expected: Annotated[list[list[str | int | None]], Field(max_length=2048)]
@@ -343,6 +347,14 @@ class Bundle(StrictModel):
                 raise ValueError("Each object must have explicit dbo ownership")
             if check.kind == "columns" and not check.expected:
                 raise ValueError("Column readback must describe the expected schema")
+            if check.kind == "computed_columns" and (
+                not check.expected or any(
+                    len(row) != 3 or not isinstance(row[0], str) or not row[0]
+                    or not isinstance(row[1], str) or not row[1] or row[2] != 1
+                    for row in check.expected
+                ) or len({row[0] for row in check.expected}) != len(check.expected)
+            ):
+                raise ValueError("Computed-column readback requires unique names, native definitions and persistence")
             if check.kind == "budget_policies":
                 if check.argument != str(self.identity.tenant_id) or not check.expected:
                     raise ValueError("Budget policy readback requires the bundle tenant and nonempty policies")

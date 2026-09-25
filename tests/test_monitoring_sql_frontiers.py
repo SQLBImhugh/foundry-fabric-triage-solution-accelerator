@@ -317,6 +317,7 @@ def test_producer_handoff_emits_an_empty_evidence_array_not_json_null(kernel):
 
 def test_accepted_catalogue_uses_receipt_hash_index_without_dropping_full_identity_checks(kernel):
     sql = _sql(kernel, "accepted_worker_facts")
+    assert "accepted.accepted_fact_key_hash=r.key_hash" in sql
     assert "receipt.request_hash=HASHBYTES" in sql
     assert "accepted.key_hash=HASHBYTES" in sql
     assert "N'accepted:'+receipt.request_id+N':'+r.record_kind" in sql
@@ -324,6 +325,26 @@ def test_accepted_catalogue_uses_receipt_hash_index_without_dropping_full_identi
     assert "receipt.fingerprint=JSON_VALUE(accepted.payload,'$.batch_fingerprint')" in sql
     assert "JSON_VALUE(accepted.payload,'$.fact_key')=r.full_key" in sql
     assert "JSON_VALUE(accepted.payload,'$.row_hash')" in sql
+
+
+def test_accepted_fact_lookup_index_is_derived_and_not_part_of_record_authority(kernel):
+    from triage.monitoring.schema import schema_statements
+    from triage.monitoring.sql_kernel_contracts import MUTABLE_FACT_COLUMNS, RECORD_COLUMNS
+
+    statements = schema_statements()
+    records = next(sql for sql in statements if "CREATE TABLE [dbo].[triage_monitoring_records]" in sql)
+    assert "accepted_fact_key_hash AS CONVERT(binary(32),CASE" in records
+    assert "record_kind='accepted_fact' AND ISJSON(payload)=1" in records
+    assert "JSON_VALUE(payload,'$.fact_key')" in records
+    assert "Latin1_General_100_BIN2_UTF8" in records
+    assert "END) PERSISTED" in records
+    indexes = [sql for sql in statements if "accepted_fact_key_hash)" in sql]
+    assert len(indexes) == 1
+    assert "(tenant_id, epoch, record_kind, accepted_fact_key_hash)" in indexes[0]
+    assert "WHERE record_kind = 'accepted_fact'" in indexes[0]
+    assert "accepted_fact_key_hash" not in RECORD_COLUMNS
+    assert "accepted_fact_key_hash" not in MUTABLE_FACT_COLUMNS
+    assert not any("accepted_fact_key_hash" in grant for grants in kernel.grants.values() for grant in grants)
 
 
 def _proof_rejected(db, kernel, proof, handoff):

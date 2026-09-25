@@ -99,8 +99,14 @@ class TransactionalSqlFake(AzureSqlDatabase):
             table.name: [
                 (column.name, column.data_type, column.max_length, column.scale, column.nullable,
                  column.collation or ("fixture_collation" if column.data_type in {"nvarchar", "varchar", "char"} else None),
-                 False, False, 0, None)
+                 False, column.computed_definition is not None, 0, None)
                 for column in table.columns
+            ] for table in self.catalogue.tables
+        }
+        self.computed_columns = {
+            table.name: [
+                (column.name, column.computed_definition, 1)
+                for column in table.columns if column.computed_definition is not None
             ] for table in self.catalogue.tables
         }
         self.object_ids = {name: 100 + index for index, name in enumerate(sorted(self.tables))}
@@ -330,6 +336,11 @@ class TransactionalSqlFake(AzureSqlDatabase):
                 ("dbo", name, *row[:5], *row[6:], row[5], column_id) for name in sorted(self.tables)
                 if name in self.columns for column_id, row in enumerate(self.columns[name], 1)
             ]
+        if "deployment-authority:computed-columns" in sql:
+            return [
+                ("dbo", name, *row) for name in sorted(self.tables)
+                if name in self.computed_columns for row in self.computed_columns[name]
+            ]
         if "deployment-authority:triggers" in sql:
             return self.sql_triggers
         if "deployment-authority:queues" in sql:
@@ -390,6 +401,8 @@ class TransactionalSqlFake(AzureSqlDatabase):
             return [(name, principal, 1, False) for name, principal in self.role_ids.items()]
         if "monitoring-reset:columns" in sql:
             return self.columns[self._object(params[0])]
+        if "monitoring-reset:computed-columns" in sql:
+            return self.computed_columns[self._object(params[0])]
         if "monitoring-reset:primary-key" in sql:
             table = next(table for table in self.catalogue.tables if table.name == self._object(params[0]))
             return [(column,) for column in table.primary_key]
@@ -1003,6 +1016,32 @@ def test_unsafe_schema_is_a_blocked_reset_plan(problem):
         db.safety[db.table_name("incidents")] = (0, False, False, 1)
     else:
         db.fks.append(("dbo", "business_orders", "order_id", "dbo", db.table_name("incidents"), "incident_id", 1, 0, False))
+    _, operator, manifest, _, _ = prepare(db)
+    assert manifest.snapshot.blockers
+    with pytest.raises(reset.ResetRefused, match="blocked"):
+        execute(operator, manifest)
+    assert not db.statements
+
+
+@pytest.mark.parametrize("change", ["definition", "persistence", "missing", "extra", "shape"])
+def test_computed_binding_lookup_drift_blocks_reset(change):
+    db = TransactionalSqlFake()
+    table = db.table_name("monitoring_records")
+    name, definition, persisted = db.computed_columns[table][0]
+    if change == "definition":
+        db.computed_columns[table] = [(name, definition.replace("$.fact_key", "$.wrong_key"), persisted)]
+    elif change == "persistence":
+        db.computed_columns[table] = [(name, definition, 0)]
+    elif change == "missing":
+        db.computed_columns[table] = []
+    elif change == "extra":
+        db.computed_columns[table].append(("unreviewed", "(1)", 1))
+    else:
+        db.computed_columns[table] = [(name, definition)]
+        with pytest.raises(reset.ResetRefused, match="computed-column metadata"):
+            prepare(db)
+        assert not db.statements
+        return
     _, operator, manifest, _, _ = prepare(db)
     assert manifest.snapshot.blockers
     with pytest.raises(reset.ResetRefused, match="blocked"):

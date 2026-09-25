@@ -152,7 +152,8 @@ def native_columns(table: reset.TableSpec) -> list[list[str | int | None]]:
                 raise PreparationError("New SQL primitive requires reviewed native metadata")
             length, precision = column.max_length, NATIVE_PRECISION[column.data_type]
         result.append([
-            column.name, column.data_type, length, precision, column.scale, int(column.nullable), 0, 0,
+            column.name, column.data_type, length, precision, column.scale, int(column.nullable),
+            0, int(column.computed_definition is not None),
         ])
     return result
 
@@ -270,6 +271,17 @@ def schema_payload(tenant_id: str) -> tuple[tuple[str, ...], list[bootstrap.Chec
         bootstrap.Check(kind="columns", name=f"columns-{name}", argument=f"dbo.{name}", expected=value)
         for name, value in sorted(layouts.items())
     ]
+    checks.extend(
+        bootstrap.Check(
+            kind="computed_columns", name=f"computed-columns-{table.name}", argument=f"dbo.{table.name}",
+            expected=[
+                [column.name, column.computed_definition, 1]
+                for column in table.columns if column.computed_definition is not None
+            ],
+        )
+        for table in catalogue.tables
+        if any(column.computed_definition is not None for column in table.columns)
+    )
     for component, grants in kernel.grants.items():
         role = kernel.names.role(component)
         checks.extend((

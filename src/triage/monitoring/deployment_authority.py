@@ -241,6 +241,12 @@ FROM sys.tables o JOIN sys.schemas s ON s.schema_id=o.schema_id
 JOIN sys.columns c ON c.object_id=o.object_id JOIN sys.types t ON t.user_type_id=c.user_type_id
 WHERE o.is_ms_shipped=0 ORDER BY s.name,o.name,c.column_id
 """, 13)
+    computed_columns = _rows(database, """/* deployment-authority:computed-columns */
+SELECT s.name,o.name,c.name,c.definition,CONVERT(INT,c.is_persisted)
+FROM sys.tables o JOIN sys.schemas s ON s.schema_id=o.schema_id
+JOIN sys.computed_columns c ON c.object_id=o.object_id
+WHERE o.is_ms_shipped=0 ORDER BY s.name,o.name,c.column_id
+""", 5)
     triggers = _rows(database, """/* deployment-authority:triggers */
 SELECT object_id,parent_class,parent_id,is_disabled FROM sys.triggers
 WHERE is_ms_shipped=0 ORDER BY object_id
@@ -349,7 +355,8 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
             continue
         actual = [row[2:] for row in columns if row[:2] == ("dbo", table.name)]
         expected = [
-            (c.name, c.data_type, c.max_length, c.scale, c.nullable, False, False, 0, None)
+            (c.name, c.data_type, c.max_length, c.scale, c.nullable, False,
+             c.computed_definition is not None, 0, None)
             for c in table.columns
         ]
         # SQL datetime2 storage metadata varies by endpoint; scale must still match.
@@ -360,6 +367,11 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
             for a, e, column in zip(actual, expected, table.columns, strict=False)
         ):
             gaps.add("declared_table_missing_or_incompatible")
+        if [row[2:] for row in computed_columns if row[:2] == ("dbo", table.name)] != [
+            (column.name, column.computed_definition, 1)
+            for column in table.columns if column.computed_definition is not None
+        ]:
+            gaps.add("computed_column_definition_changed")
         if obj is None or obj[3] != "U" or obj[4] != 1:
             gaps.add("table_ownership_or_type_changed")
         if table.name in present_journals and obj[3] == "U":
@@ -576,7 +588,7 @@ FROM sys.foreign_keys WHERE is_ms_shipped=0 ORDER BY object_id
         "server": server, "database": db_name, "database_id": db_id,
         "principals": [[_plain(cell) for cell in row] for row in principals],
         "roles": roles, "permissions": permissions, "schemas": schemas, "objects": objects,
-        "columns": columns, "triggers": triggers, "queues": queues,
+        "columns": columns, "computed_columns": computed_columns, "triggers": triggers, "queues": queues,
         "deployment_journals": journal_layouts,
         "foreign_keys": foreign_keys, "catalogue": catalogue.declaration_hash,
         "kernel": kernel_contract_hash(),

@@ -99,8 +99,9 @@ def _views(names: SqlNames) -> list[KernelObject]:
     ]
     # A raw worker insert is not controller evidence until the corresponding
     # protected binding AND immutable operation receipt exist and still match.
-    # Catalogue reads need both canonical hash keys to avoid rescanning all
-    # accepted JSON bindings per workspace. Full identities and hashes still match.
+    # Seek bindings by the derived fact key before checking their receipts.
+    # Batch-key lookups alone still scanned every retained binding per page.
+    # The index narrows candidates; full identities and hashes still match.
     objects.append(KernelObject("accepted_worker_facts", names.object("accepted_worker_facts"), "view", f"""CREATE OR ALTER VIEW {names.object('accepted_worker_facts')}
 WITH SCHEMABINDING
 AS
@@ -118,6 +119,7 @@ AND EXISTS (
      AND receipt.fingerprint=JSON_VALUE(accepted.payload,'$.batch_fingerprint')
     WHERE accepted.tenant_id=r.tenant_id AND accepted.epoch=r.epoch
       AND accepted.record_kind='accepted_fact'
+      AND accepted.accepted_fact_key_hash=r.key_hash
       AND (r.record_kind NOT IN ({literals(CATALOGUE_KINDS)})
            OR accepted.key_hash={key_hash("N'accepted:'+receipt.request_id+N':'+r.record_kind+N':'+LOWER(CONVERT(char(64),r.key_hash,2))")})
       AND JSON_VALUE(accepted.payload,'$.fact_kind')=r.record_kind

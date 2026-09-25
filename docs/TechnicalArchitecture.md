@@ -83,6 +83,12 @@ rolls back. Lease renewal re-reads the authoritative work revision. Receipt-back
 catalogue reads retain exact accepted-fact identity, fingerprint, payload and
 row-hash evidence while avoiding repeated full-catalogue work. This changes
 metadata-read cost, not admission or permissions.
+The shared records table has a persisted, indexed hash derived from each
+accepted fact's full key. Reads seek candidate bindings by that hash before
+checking their original receipts, full keys, revisions, payload hashes and
+promoted-row hashes. The derived column is not writable through runtime views
+and does not change receipt contents or record hashes. Deployment and reset
+tooling verify its exact native expression and persistence.
 
 Scopes can include or exclude tenant, domain, workspace or item selections.
 Exclusions take precedence; future-resource admission is explicit. Domain

@@ -33,6 +33,21 @@ DEFAULT_MONITORING_TABLES = {
     "monitoring_receipts": "triage_monitoring_receipts",
 }
 
+# This derived lookup is not a promoted record field or part of its receipt hash.
+# Indexing it avoids reparsing every retained binding for each catalogue page.
+ACCEPTED_FACT_KEY_HASH_EXPRESSION = (
+    "CONVERT(binary(32),CASE WHEN record_kind='accepted_fact' AND ISJSON(payload)=1 THEN "
+    "HASHBYTES('SHA2_256', CONVERT(varchar(max), "
+    "(JSON_VALUE(payload,'$.fact_key')) COLLATE Latin1_General_100_BIN2_UTF8)) END)"
+)
+# SQL Server rewrites computed expressions in sys.computed_columns. Deployer
+# readback checks this native form, verified against the same generated DDL.
+ACCEPTED_FACT_KEY_HASH_NATIVE_DEFINITION = (
+    "(CONVERT([binary](32),case when [record_kind]='accepted_fact' AND isjson([payload])=(1) "
+    "then hashbytes('SHA2_256',CONVERT([varchar](max),(json_value([payload],'$.fact_key')) "
+    "collate Latin1_General_100_BIN2_UTF8))  end))"
+)
+
 
 def resolve_tables(
     db: AzureSqlDatabase | None = None, tables: Mapping[str, str] | None = None,
@@ -105,6 +120,7 @@ CREATE TABLE {records} (
     due_at DATETIME2(6) NULL,
     sequence_number BIGINT NULL,
     payload NVARCHAR(MAX) NOT NULL,
+    accepted_fact_key_hash AS {ACCEPTED_FACT_KEY_HASH_EXPRESSION} PERSISTED,
     PRIMARY KEY (tenant_id, epoch, record_kind, key_hash)
 )""",
         f"""IF OBJECT_ID(N'dbo.{names["monitoring_leases"]}', N'U') IS NULL
@@ -138,6 +154,8 @@ CREATE TABLE {receipts} (
         ("target", "tenant_id, epoch, record_kind, target_hash, status, key_hash", ""),
         ("parent", "tenant_id, epoch, record_kind, parent_hash, sequence_number, key_hash", ""),
         ("generation", "tenant_id, epoch, record_kind, generation_id, key_hash", ""),
+        ("accepted_fact", "tenant_id, epoch, record_kind, accepted_fact_key_hash",
+         " WHERE record_kind = 'accepted_fact'"),
     ]
     for suffix, columns, where in index_definitions:
         name = _index_name(names["monitoring_records"], suffix)

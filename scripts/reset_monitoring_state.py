@@ -179,6 +179,7 @@ class ColumnSpec(FrozenModel):
     scale: int = 0
     nullable: bool
     collation: str | None = None
+    computed_definition: str | None = None
 
 
 class ForeignKeySpec(FrozenModel):
@@ -340,6 +341,15 @@ def build_catalogue(registration_names: RegistrationNames = DEFAULT_REGISTRATION
             if re.match(r"(CHECK|INDEX|CONSTRAINT)\b", part, re.I):
                 if re.search(r"FOREIGN\s+KEY", part, re.I):
                     raise ResetRefused("New table-level foreign keys need schema-owner operator support")
+                continue
+            if logical == "monitoring_records" and part == (
+                "accepted_fact_key_hash AS "
+                f"{monitoring_schema.ACCEPTED_FACT_KEY_HASH_EXPRESSION} PERSISTED"
+            ):
+                columns.append(ColumnSpec(
+                    name="accepted_fact_key_hash", data_type="binary", max_length=32, nullable=True,
+                    computed_definition=monitoring_schema.ACCEPTED_FACT_KEY_HASH_NATIVE_DEFINITION,
+                ))
                 continue
             column = re.match(
                 r"(\w+)\s+(NVARCHAR|VARCHAR|CHAR|BINARY|DATETIME2|UNIQUEIDENTIFIER|BIGINT|INT|BIT)"
@@ -993,8 +1003,21 @@ class SqlResetOperator:
                 == (expected.name, expected.data_type, expected.scale, expected.nullable)
                 and width_matches
                 and (expected.collation is None or collation == expected.collation)
-                and not identity and not computed and generated == 0 and encryption is None
+                and not identity and bool(computed) == (expected.computed_definition is not None)
+                and generated == 0 and encryption is None
             )
+        computed_columns = []
+        if any(column.computed_definition is not None for column in table.columns) or any(row[7] for row in rows):
+            computed_columns = self.db.query(
+                "/* monitoring-reset:computed-columns */ SELECT name,definition,CONVERT(INT,is_persisted) "
+                "FROM sys.computed_columns WHERE object_id=? ORDER BY column_id", object_id,
+            )
+            if any(len(row) != 3 for row in computed_columns):
+                raise ResetRefused("SQL computed-column metadata has an unexpected shape")
+            compatible &= computed_columns == [
+                (column.name, column.computed_definition, 1)
+                for column in table.columns if column.computed_definition is not None
+            ]
         primary = self.db.query(
             "/* monitoring-reset:primary-key */ SELECT c.name "
             "FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id=i.object_id AND ic.index_id=i.index_id "
@@ -1028,10 +1051,13 @@ class SqlResetOperator:
             except DeploymentError as exc:
                 raise ResetRefused(str(exc)) from exc
             compatible &= journal_valid
-        return _hash({
+        layout = {
             "columns": actual, "primary_key": primary, "safety": modifiers,
             "constraints": constraints, "indexes": indexes, "deployment_journal": journal,
-        }), bool(compatible)
+        }
+        if computed_columns:
+            layout["computed_columns"] = computed_columns
+        return _hash(layout), bool(compatible)
 
     def _contents(self, table: TableSpec) -> tuple[int, str, int]:
         quoted = quote_identifier(table.name)

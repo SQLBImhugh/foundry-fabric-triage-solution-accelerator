@@ -152,6 +152,8 @@ class BootstrapHandoffSqlFake(JournalSqlFake):
             return []
         if sql == bootstrap.CHECK_SQL["columns"]:
             return [tuple(row) for row in self.native_columns[unqualified(params[0])]]
+        if sql == bootstrap.CHECK_SQL["computed_columns"]:
+            return self.computed_columns[unqualified(params[0])]
         if sql == bootstrap.CHECK_SQL["principal"]:
             return [("R", "NONE", None, None)] if params[0] in self.role_ids else []
         if sql == bootstrap.CHECK_SQL["members"]:
@@ -286,6 +288,40 @@ def test_current_native_column_expectations_are_not_reset_storage_guesses():
     )})
     with pytest.raises(prepare.PreparationError, match="native metadata"):
         prepare.native_columns(unknown)
+
+
+def test_indexed_fact_key_requires_native_computed_definition_readback():
+    catalogue = reset.build_catalogue()
+    records = catalogue.table("monitoring_records")
+    columns = prepare.native_columns(records)
+    assert next(row for row in columns if row[0] == "accepted_fact_key_hash") == [
+        "accepted_fact_key_hash", "binary", 32, 0, 0, 1, 0, 1,
+    ]
+    _, checks, _ = prepare.schema_payload(TENANT)
+    check = next(check for check in checks if check.kind == "computed_columns")
+    assert check.argument == f"dbo.{records.name}"
+    declared = next(column for column in records.columns if column.name == "accepted_fact_key_hash")
+    assert check.expected == [["accepted_fact_key_hash", declared.computed_definition, 1]]
+    assert "sys.computed_columns" in bootstrap.CHECK_SQL["computed_columns"]
+    assert "computed_columns" in bootstrap.EMPTY_BASELINE_SQL
+
+
+@pytest.mark.parametrize("old,new", [
+    ("$.fact_key", "$.wrong_key"),
+    ("accepted_fact_key_hash AS", "other_hash AS"),
+    (" END) PERSISTED", " END)"),
+    ("binary(32)", "binary(16)"),
+])
+def test_computed_fact_key_parser_refuses_unreviewed_declarations(monkeypatch, old, new):
+    original = reset.monitoring_schema.schema_statements()
+    changed = tuple(
+        ddl.replace(old, new) if "CREATE TABLE [dbo].[triage_monitoring_records]" in ddl else ddl
+        for ddl in original
+    )
+    assert changed != original
+    monkeypatch.setattr(reset.monitoring_schema, "schema_statements", lambda: changed)
+    with pytest.raises(reset.ResetRefused, match="column type needs explicit operator support"):
+        reset.build_catalogue()
 
 
 @pytest.mark.parametrize("change", [

@@ -128,12 +128,12 @@ def test_utf8_sql_catalogue_and_complete_kernel_abi_remain_unchanged() -> None:
         if obj.kind != "role":
             native_module_hash(obj.ddl)
     assert kernel.statements == before
-    # The receipt-bound pending-window acknowledgement changes only the
-    # frontier resolver; native header projection cannot change source bytes.
+    # Indexed fact-key lookup changes only the accepted-facts view; native
+    # header projection cannot change source bytes or the remaining kernel ABI.
     assert kernel_contract_hash(tables) == (
-        "aecd875c50898006970a0df5c7b5ced46cbb6b0050550ba4c48918537bab094c"
+        "9cdf4d288ff36952a7263fc59b0787bf26fb8f82190ef5f3dc1e71de18848c41"
     )
     assert fingerprint(kernel_abi(tables)) == kernel_contract_hash(tables)
     assert fingerprint(list(kernel.catalogue())) == (
-        "5eaabac224b5c55dcd5e73fa81496de5716ce598bdb1e7bae1f98e7d37b5850a"
+        "1766c22ad6ec89d4557181523c3d1127ca15ecb344581c753e9a04ead9df4313"
     )

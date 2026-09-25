@@ -55,6 +55,7 @@ from triage.monitoring.memory import (
     key_digest,
 )
 from triage.monitoring.schema import (
+    ACCEPTED_FACT_KEY_HASH_EXPRESSION,
     initialize_monitoring_schema,
     resolve_tables,
     runtime_table_permissions,
@@ -134,6 +135,10 @@ class SqliteConnection:
         self.native.create_function("JSON_MODIFY", 3, self.json_modify)
         self.native.create_function("UTC_TIME", 1, self.utc_time)
         self.native.create_function("HASHBYTES", 2, self.hashbytes)
+        self.native.create_function(
+            "KEY_HASH", 1, lambda value: bytes.fromhex(key_digest(value)) if value is not None else None,
+            deterministic=True,
+        )
 
     def now(self) -> str:
         return self.db.clock().replace(tzinfo=None).isoformat(timespec="microseconds")
@@ -173,7 +178,12 @@ class SqliteConnection:
 
     @staticmethod
     def translate(sql: str) -> str:
-        translated = sql.strip()
+        translated = sql.strip().replace(
+            f"accepted_fact_key_hash AS {ACCEPTED_FACT_KEY_HASH_EXPRESSION} PERSISTED",
+            "accepted_fact_key_hash BLOB GENERATED ALWAYS AS "
+            "(CASE WHEN record_kind='accepted_fact' AND json_valid(payload)=1 THEN "
+            "KEY_HASH(json_extract(payload,'$.fact_key')) END) STORED",
+        )
         if translated.upper().startswith("IF "):
             create = re.search(r"\bCREATE (?:UNIQUE )?(?:TABLE|INDEX)\b", translated, re.I)
             if create is None:
@@ -612,6 +622,26 @@ def test_sql_catalogue_names_are_paginated_and_tied_to_inventory_generation(tmp_
     assert all(domain.generation_id == generation_id for domain in domains.items)
     assert other.get_inventory_generation(m.MonitoringContext(**h.context()), generation_id).completeness == "complete"
     assert other.coverage(m.MonitoringContext(**h.context())).discovered_count == 0
+
+
+@pytest.mark.parametrize("key", ["fixture-key", "fixture-key  ", "\u6d4b\u8bd5-key"])
+def test_sql_protocol_fixture_derives_fact_hash_without_promoting_it(tmp_path: Path, key: str) -> None:
+    h = SqlHarness(tmp_path / "derived-binding.sqlite")
+    table = quote_identifier(resolve_tables(h.db)["monitoring_records"])
+    with h.db.transaction():
+        h.db.execute(
+            f"INSERT INTO {table} (tenant_id,epoch,record_kind,key_hash,full_key,revision,payload) "
+            "VALUES (?,?,?,?,?,?,?)",
+            h.control.tenant_id, h.control.epoch, "accepted_fact", bytes.fromhex(key_digest("binding")),
+            "binding", 1, json.dumps({"fact_key": key}),
+        )
+        assert h.db.query(
+            f"SELECT accepted_fact_key_hash FROM {table} WHERE record_kind='accepted_fact'",
+        ) == [(bytes.fromhex(key_digest(key)),)]
+        h.db.execute(f"UPDATE {table} SET payload='{{}}' WHERE record_kind='accepted_fact'")
+        assert h.db.query(
+            f"SELECT accepted_fact_key_hash FROM {table} WHERE record_kind='accepted_fact'",
+        ) == [(None,)]
 
 
 def test_sql_inventory_commits_require_current_atomic_owner_and_position(tmp_path: Path) -> None:
