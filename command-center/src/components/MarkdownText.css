@@ -10,7 +10,7 @@
 .markdown-text li { padding-left: .2em; margin: .35em 0; }
 .markdown-text li > p { margin-bottom: .4em; }
 .markdown-text li > ul, .markdown-text li > ol { margin-top: .4em; }
-.markdown-text code, .markdown-preview code { font: inherit; font-size: .93em; color: var(--ink); background: var(--panel2); border: 1px solid var(--line); padding: .05em .3em; border-radius: var(--radius); }
+.markdown-text code, .markdown-preview code { font: inherit; font-family: var(--mono-font); font-size: .93em; color: var(--ink); background: var(--panel2); border: 1px solid var(--line); padding: .05em .3em; border-radius: var(--radius); }
 .markdown-text pre { font-size: .9em; margin: 1em 0; padding: 14px 16px; white-space: pre-wrap; line-height: 1.65; }
 .markdown-text pre code { padding: 0; border: 0; background: var(--transparent); }
 .markdown-text a { color: var(--accent-text); text-decoration: underline; text-underline-offset: 3px; }

@@ -477,9 +477,11 @@ Use the same tracking projection for the queue, counts and full incident record.
 
 Preserve the shared safe Markdown renderer for explanations and answers:
 no raw HTML, images or unsafe links. Presentation tokens live in
-`command-center/src/styles.css`; the current design prefers system Georgia,
-with DejaVu Serif and self-hosted DejaVu Serif Condensed fallbacks, Onyx
-dark/light colors and Ink-style geometry and shadows.
+`command-center/src/styles.css`; `--font` and `--heading-font` select self-hosted
+Source Sans 3, and `--mono-font` selects self-hosted IBM Plex Mono. The body uses
+18px/1.30, headings use weight 400 with -0.030em tracking, and attention counters
+use tabular figures. Keep code spans in the Markdown renderer on `--mono-font`.
+Onyx dark/light colors and Ink-style geometry and shadows are separate tokens.
 Keep the supplied PNG logo and packaged font assets unless a deliberate branding
 change updates the asset checks too. The Command Center is the operational UI.
 The separate Rayfin cockpit remains a read-only sample, not an alternative

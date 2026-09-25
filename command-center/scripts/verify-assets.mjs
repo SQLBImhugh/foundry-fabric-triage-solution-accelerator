@@ -20,17 +20,24 @@ for (const name of ['triage-logo.png', 'favicon.png']) {
 }
 assert(index.includes('/favicon.png'), 'The supplied artwork is not used for the browser icon')
 assert(scripts.includes('/triage-logo.png'), 'The supplied artwork is not used by the application')
-for (const name of ['DejaVuSerifCondensed.ttf', 'DejaVuSerifCondensed-Bold.ttf']) {
+for (const [name, licenseName, copyrightHolder] of [
+  ['SourceSans3-Variable.ttf', 'SourceSans3-OFL.txt', 'Adobe'],
+  ['IBMPlexMono-Regular.ttf', 'IBMPlexMono-OFL.txt', 'IBM Corp.'],
+]) {
   const original = await readFile(new URL(`public/fonts/${name}`, root))
   const built = await readFile(new URL(`dist/fonts/${name}`, root))
   assert(original.length > 1000, `${name} is not a complete font asset`)
+  assert.equal(original.readUInt32BE(0), 0x00010000, `${name} is not a TrueType font`)
   assert.equal(createHash('sha256').update(original).digest('hex'), createHash('sha256').update(built).digest('hex'), `${name} differs from its source`)
   assert(index.includes(`/fonts/${name}`), `${name} is not preloaded`)
   assert(css.includes(`/fonts/${name}`), `${name} is not used by the production stylesheet`)
+  const originalLicense = await readFile(new URL(`public/fonts/${licenseName}`, root), 'utf8')
+  const builtLicense = await readFile(new URL(`dist/fonts/${licenseName}`, root), 'utf8')
+  assert.equal(builtLicense, originalLicense, `${licenseName} differs from its source`)
+  assert(builtLicense.includes('SIL OPEN FONT LICENSE Version 1.1') && builtLicense.includes(copyrightHolder), `${name} is missing its distribution license`)
 }
-const license = await readFile(new URL('dist/fonts/LICENSE.txt', root), 'utf8')
-assert(license.includes('Bitstream Vera Fonts Copyright') && license.includes('DejaVu changes are in public domain'), 'The font distribution license is missing')
+assert(!/DejaVu|Georgia/.test(css), 'The production stylesheet still uses the replaced serif font stack')
 assert(!/@import[^;]*https?:|url\(["']?https?:/i.test(css), 'The production stylesheet requests an external asset')
 assert(index.includes('data-theme="dark"'), 'Dark is not the default theme')
-console.log(`Verified licensed, self-hosted regular and bold fonts in ${join('dist', 'fonts')}.`)
+console.log(`Verified licensed, self-hosted Source Sans 3 and IBM Plex Mono in ${join('dist', 'fonts')}.`)
 console.log('Verified the supplied triage logo and browser icon in the production assets.')

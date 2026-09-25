@@ -1026,9 +1026,11 @@ API sources, scheduling and operator reconciliation.
 `triage.command_center.api`. The browser calls that API, not SQL or the
 actionable Foundry agent endpoint. Its primary workspace is a queue and
 inspector; a separate Incidents workspace provides searchable full records.
-The UI prefers system Georgia, with DejaVu Serif and self-hosted DejaVu Serif
-Condensed fallbacks, Onyx dark/light colors,
-Ink-style geometry and offset shadows, and the supplied triage PNG logo.
+The UI self-hosts Source Sans 3 for interface text and headings, and IBM Plex
+Mono for code. Shared typography tokens define an 18px/1.30 body, weight-400
+headings with -0.030em tracking, and tabular attention counters. It retains
+Onyx dark/light colors, Ink-style geometry and offset shadows, and the supplied
+triage PNG logo.
 
 ### Entra authorization
 
