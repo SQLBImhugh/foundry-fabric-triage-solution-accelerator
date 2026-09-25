@@ -20,6 +20,14 @@ for (const name of ['triage-logo.png', 'favicon.png']) {
 }
 assert(index.includes('/favicon.png'), 'The supplied artwork is not used for the browser icon')
 assert(scripts.includes('/triage-logo.png'), 'The supplied artwork is not used by the application')
+const backgroundName = 'command-center-background.svg'
+const originalBackground = await readFile(new URL(`public/${backgroundName}`, root), 'utf8')
+const builtBackground = await readFile(new URL(`dist/${backgroundName}`, root), 'utf8')
+assert.equal(builtBackground, originalBackground, 'The background differs from its source')
+assert(originalBackground.startsWith('<svg ') && originalBackground.includes('viewBox="0 0 1544 1111"'), 'The abstract background is not the expected SVG')
+assert(!/<(?:script|image|foreignObject|text)\b|\b(?:href|on[a-z]+)\s*=|data:/i.test(originalBackground), 'The background must contain only self-contained abstract shapes, not screenshot content or active elements')
+assert(css.includes(`/${backgroundName}`), 'The production stylesheet does not use the background')
+assert(/--page-background:\s*none/.test(css), 'The light theme must disable the dark background')
 for (const [name, licenseName, copyrightHolder] of [
   ['SourceSans3-Variable.ttf', 'SourceSans3-OFL.txt', 'Adobe'],
   ['IBMPlexMono-Regular.ttf', 'IBMPlexMono-OFL.txt', 'IBM Corp.'],
@@ -41,3 +49,4 @@ assert(!/@import[^;]*https?:|url\(["']?https?:/i.test(css), 'The production styl
 assert(index.includes('data-theme="dark"'), 'Dark is not the default theme')
 console.log(`Verified licensed, self-hosted Source Sans 3 and IBM Plex Mono in ${join('dist', 'fonts')}.`)
 console.log('Verified the supplied triage logo and browser icon in the production assets.')
+console.log('Verified the self-hosted abstract dark-mode background.')

@@ -482,6 +482,9 @@ Source Sans 3, and `--mono-font` selects self-hosted IBM Plex Mono. The body use
 18px/1.30, headings use weight 400 with -0.030em tracking, and attention counters
 use tabular figures. Keep code spans in the Markdown renderer on `--mono-font`.
 Onyx dark/light colors and Ink-style geometry and shadows are separate tokens.
+`--page-background` selects the self-hosted abstract SVG in dark mode and `none`
+in light mode. Keep decorative artwork behind the reading surfaces, and never
+package screenshots containing sign-in controls or account details as artwork.
 Keep the supplied PNG logo and packaged font assets unless a deliberate branding
 change updates the asset checks too. The Command Center is the operational UI.
 The separate Rayfin cockpit remains a read-only sample, not an alternative

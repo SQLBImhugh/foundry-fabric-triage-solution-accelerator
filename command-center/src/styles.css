@@ -19,7 +19,8 @@
   --font: "Source Sans 3", "Segoe UI", sans-serif;
   --heading-font: "Source Sans 3", "Segoe UI", sans-serif;
   --mono-font: "IBM Plex Mono", Consolas, monospace;
-  --bg: #000000;
+  --bg: #14171b;
+  --page-background: url("/command-center-background.svg");
   --panel: #0b0f16;
   --panel2: #111821;
   --ink: #ffffff;
@@ -55,6 +56,7 @@
 :root[data-theme="light"] {
   color-scheme: light;
   --bg: #f3f6f9;
+  --page-background: none;
   --panel: #ffffff;
   --panel2: #f7f9fc;
   --ink: #1c2025;
@@ -83,7 +85,7 @@
 
 * { box-sizing: border-box; }
 html { min-width: 320px; scroll-behavior: smooth; scrollbar-color: var(--line-strong) var(--panel); }
-body { margin: 0; background: var(--bg); color: var(--ink); font: 18px/1.30 var(--font); }
+body { margin: 0; background-color: var(--bg); background-image: var(--page-background); background-position: center; background-size: cover; background-repeat: no-repeat; background-attachment: fixed; color: var(--ink); font: 18px/1.30 var(--font); }
 button, input, textarea, select { font: inherit; }
 button, a, input, textarea, select, summary { -webkit-tap-highlight-color: var(--transparent); }
 button { cursor: pointer; color: inherit; }
@@ -462,7 +464,7 @@ summary:hover { color: var(--accent-text); }
 .context-list code { font-size: 9px; display: block; margin-top: 7px; }
 .context-list > li > .eyebrow { display: block; margin-top: 7px; }
 .context-list .split-line { gap: 12px; }
-.boot-screen { display: grid; place-items: center; min-height: 100dvh; padding: 30px; background: var(--bg); }
+.boot-screen { display: grid; place-items: center; min-height: 100dvh; padding: 30px; }
 .boot-panel { width: min(480px, 100%); padding: 38px; background: var(--panel); background-image: var(--sheen); border: 1px solid var(--line-strong); box-shadow: var(--shadow); border-radius: var(--radius); }
 .boot-panel .brand-mark { margin-bottom: 29px; }
 .boot-panel > .eyebrow { color: var(--accent-text); margin-bottom: 10px; }

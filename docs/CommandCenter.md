@@ -13,8 +13,10 @@ The interface and headings use self-hosted Source Sans 3; code and preformatted
 text use self-hosted IBM Plex Mono. The body defaults to 18px with a 1.30 line
 height. Headings use weight 400 and -0.030em tracking; attention counters use
 tabular figures. Component-specific text sizes remain explicit.
-Onyx dark/light colors and Ink geometry (2px corners and 7px offset shadows)
-are unchanged. Both SIL Open Font Licenses are included with the frontend assets.
+Dark mode uses a self-hosted charcoal abstract background behind the interface
+and sign-in screen. Reading panels remain opaque, and light mode keeps its
+plain background. Onyx panel colors and Ink geometry (2px corners and 7px offset
+shadows) remain. Both SIL Open Font Licenses are included with the frontend assets.
 The supplied triage artwork appears in the sidebar, sign-in view and favicon.
 
 Workspace choices come from the collector's accepted catalogue, not the

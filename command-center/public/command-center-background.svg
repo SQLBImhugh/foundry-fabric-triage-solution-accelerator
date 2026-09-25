@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1544" height="1111" viewBox="0 0 1544 1111" fill="none">
+  <title>Dark abstract background</title>
+  <desc>Layered charcoal ribbons with subdued blue and warm edges.</desc>
+  <defs>
+    <linearGradient id="base" x1="154" y1="0" x2="1435" y2="1111" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#171d22"/>
+      <stop offset=".47" stop-color="#17171b"/>
+      <stop offset="1" stop-color="#171311"/>
+    </linearGradient>
+    <linearGradient id="upper-fold" x1="649" y1="0" x2="725" y2="812" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1c222c"/>
+      <stop offset=".27" stop-color="#1a1e27"/>
+      <stop offset=".58" stop-color="#141619"/>
+      <stop offset="1" stop-color="#111315"/>
+    </linearGradient>
+    <linearGradient id="upper-edge" x1="594" y1="69" x2="641" y2="763" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1e2632"/>
+      <stop offset=".45" stop-color="#13202c"/>
+      <stop offset="1" stop-color="#161419"/>
+    </linearGradient>
+    <linearGradient id="corner-fold" x1="1233" y1="-64" x2="1181" y2="359" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#222630"/>
+      <stop offset=".56" stop-color="#1c1c21"/>
+      <stop offset="1" stop-color="#1c181a"/>
+    </linearGradient>
+    <linearGradient id="lower-fold" x1="577" y1="622" x2="1285" y2="822" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1d1e25"/>
+      <stop offset=".52" stop-color="#211e27"/>
+      <stop offset=".83" stop-color="#17191e"/>
+      <stop offset="1" stop-color="#0e1113"/>
+    </linearGradient>
+    <linearGradient id="front-fold" x1="97" y1="616" x2="738" y2="949" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1b2029"/>
+      <stop offset=".36" stop-color="#171a21"/>
+      <stop offset=".72" stop-color="#151419"/>
+      <stop offset="1" stop-color="#141112"/>
+    </linearGradient>
+    <linearGradient id="front-edge" x1="139" y1="534" x2="880" y2="989" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#101b25"/>
+      <stop offset=".37" stop-color="#24212a"/>
+      <stop offset="1" stop-color="#1b1414"/>
+    </linearGradient>
+    <radialGradient id="cool-shade" cx="0" cy="0" r="1" gradientTransform="translate(58 79) rotate(49) scale(572 414)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0c181b" stop-opacity=".38"/>
+      <stop offset="1" stop-color="#0c181b" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="warm-shade" cx="0" cy="0" r="1" gradientTransform="translate(475 342) rotate(67) scale(424 195)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#211414" stop-opacity=".48"/>
+      <stop offset="1" stop-color="#211414" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="grain" x="0" y="0" width="100%" height="100%">
+      <feTurbulence type="fractalNoise" baseFrequency=".72" numOctaves="3" seed="21" stitchTiles="stitch"/>
+      <feColorMatrix type="saturate" values="0"/>
+      <feComponentTransfer>
+        <feFuncR type="linear" slope=".12"/>
+        <feFuncG type="linear" slope=".12"/>
+        <feFuncB type="linear" slope=".12"/>
+        <feFuncA type="linear" slope=".11"/>
+      </feComponentTransfer>
+    </filter>
+  </defs>
+  <path fill="url(#base)" d="M0 0h1544v1111H0z"/>
+  <path fill="url(#cool-shade)" d="M0 0h1544v1111H0z"/>
+  <path d="M351-32h501c18 107 39 184 78 266 14 28 14 36-2 63-95 158-168 321-252 507-11 24-23 23-42 2C435 589 324 246 351-32Z" fill="url(#upper-fold)" stroke="url(#upper-edge)" stroke-width="2"/>
+  <path d="M851-32c20 109 42 194 79 271 13 26 14 33-2 59l-46 82" stroke="#182b3d" stroke-opacity=".75" stroke-width="3"/>
+  <path fill="url(#warm-shade)" d="M0 0h1544v1111H0z"/>
+  <path d="M978-35h601v261l-529 121c-16 4-25-5-27-22L978-35Z" fill="url(#corner-fold)" stroke="#14222c" stroke-width="1.5"/>
+  <path d="M605 427c181 17 355 44 497 91 72 24 106 49 123 98l181 538H628l-40-667c-2-39 2-62 17-60Z" fill="url(#lower-fold)" stroke="#0f1419" stroke-width="2"/>
+  <path d="m-27 699 180-160c14-12 25-7 36 6 176 196 412 319 702 383 25 5 26 14 16 30l-121 185H-27V699Z" fill="url(#front-fold)" stroke="url(#front-edge)" stroke-width="2"/>
+  <path fill="#111418" filter="url(#grain)" d="M0 0h1544v1111H0z"/>
+</svg>
