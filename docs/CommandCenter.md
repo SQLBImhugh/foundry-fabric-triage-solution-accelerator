@@ -245,9 +245,10 @@ after re-evaluating the original scope inside the locked activation transaction
 and confirming identical reviewed material effects. New targets, changed
 capabilities/subscriptions, gaps or permissions, expired TTL, epoch drift or
 policy changes refuse activation. This is not a blanket stale-plan retry rule.
-The first native attempt returned a conflict and its original operation lookup
-did not establish a commit; no new native activation acceptance is claimed while
-the combined source/UI review is pending.
+Native SQL receipt replay and a workspace-scoped UI activation have been
+verified with the original preview identity. This does not establish native
+Eventstream delivery, domain-only admission, source restoration or completion
+of the broader native acceptance matrix.
 
 The UI clears dependent selections and invalidates stale reads/previews.
 Native SQL scope projections may return `updated_at=null`; this is an unknown
