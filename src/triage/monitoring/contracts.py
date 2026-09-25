@@ -717,6 +717,10 @@ class ControllerMonitoringStore(MonitoringWorkStore, Protocol):
         Published stays published; only rejection carries window_rejection_request_id.
         It completes only that owned work;
         it cannot rewrite the window, frontier, page decisions or old receipts.
+        A previously decided page whose evidence advances inside a still-open
+        current-policy window receives a pending_window_acknowledgement tied to
+        its original decision receipt. It retains the window fence and defers
+        owned work; it is neither a new publication nor completed validation.
         """
         ...
 

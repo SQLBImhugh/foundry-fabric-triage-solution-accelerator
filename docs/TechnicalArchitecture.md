@@ -198,6 +198,17 @@ Completing producer collection does not validate its facts: a protected pending
 source-validation frontier continues to fence new actions until the controller
 publishes the original evidence.
 
+A page decision and window completion are separate facts. Inventory pagination
+can advance a generation after the controller has published an earlier page.
+Retrying that page must not reinterpret the newer generation as a reason to
+replace the original decision. While the same-policy window remains unfinished,
+`pending_window_acknowledgement` proves the original intake and page-decision
+receipts under the current work fence, returns `pending_validation`, and defers
+the work. It does not change the handoff, window, frontier, source or action
+authority. A later complete page or an explicit current whole-window rejection
+still has to close the window. Missing or contradictory original receipts fail
+closed; an acknowledgement is not a repair route.
+
 An accepted safety-review intent has `publication_status=pending_validation`;
 it is not a verified review. Pending revocation immediately denies new action
 reservations, while existing reservations can still verify and finalize without

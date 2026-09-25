@@ -2897,7 +2897,10 @@ class ReconciliationResult(MonitoringContext):
     state: Literal["published", "rejected", "pending_validation"]
     detail: Detail
     published_at: UtcDateTime
-    resolution_scope: Literal["handoff", "window", "window_acknowledgement", "handoff_acknowledgement"] = "handoff"
+    resolution_scope: Literal[
+        "handoff", "window", "window_acknowledgement", "handoff_acknowledgement",
+        "pending_window_acknowledgement",
+    ] = "handoff"
     handoff_revision: PositiveRevision | None = None
     handoff_resolution_request_id: CanonicalId | None = None
     handoff_resolution_work_fence: PositiveRevision | None = None
@@ -3050,9 +3053,15 @@ class FrontierValidation(MonitoringModel):
     closing_request_id: CanonicalId | None = None
     reject_whole_window: StrictBool = False
     acknowledge_handoff: StrictBool = False
+    acknowledge_pending_window: StrictBool = False
 
     @model_validator(mode="after")
     def validate_closure(self) -> FrontierValidation:
+        if self.acknowledge_pending_window and (
+            self.acknowledge_handoff or self.reject_whole_window
+            or self.window_complete or self.closing_request_id is not None
+        ):
+            raise ValueError("Pending-window acknowledgement cannot publish, reject or close a window")
         if self.acknowledge_handoff and (
             self.reject_whole_window or self.window_complete or self.closing_request_id is not None
         ):
@@ -3074,7 +3083,10 @@ class FrontierResolution(MonitoringModel):
     validated_revision: Revision
     state: Literal["published", "rejected", "pending_validation"]
     handoff_decision: Literal["published", "rejected", "pending_validation"]
-    resolution_scope: Literal["handoff", "window", "window_acknowledgement", "handoff_acknowledgement"]
+    resolution_scope: Literal[
+        "handoff", "window", "window_acknowledgement", "handoff_acknowledgement",
+        "pending_window_acknowledgement",
+    ]
     handoff_resolution_request_id: CanonicalId | None
     handoff_resolution_work_fence: PositiveRevision | None
     frontier_resolution_request_id: CanonicalId | None
@@ -3093,6 +3105,13 @@ class FrontierResolution(MonitoringModel):
                 or self.handoff_resolution_work_fence is None or self.handoff_resolution_work_fence > self.work_fence
             ):
                 raise ValueError("Handoff acknowledgement must retain its original decision, fence and committed prefix")
+        elif self.resolution_scope == "pending_window_acknowledgement":
+            if (
+                self.state != "pending_validation" or self.validated_revision >= self.frontier_revision
+                or self.handoff_decision not in {"published", "rejected"}
+                or self.handoff_resolution_work_fence is None or self.handoff_resolution_work_fence > self.work_fence
+            ):
+                raise ValueError("Pending-window acknowledgement retains the original page and cannot complete validation")
         elif self.state != "pending_validation" and self.validated_revision != self.frontier_revision:
             raise ValueError("Terminal frontier resolution requires the full accepted prefix")
         _validate_handoff_resolution(
@@ -3112,7 +3131,14 @@ def _validate_handoff_resolution(
     original_id: str | None, original_fence: int | None, frontier_id: str | None, frontier_revision: int | None,
 ) -> None:
     references = (original_id, original_fence, frontier_id, frontier_revision)
-    if scope == "handoff_acknowledgement":
+    if scope == "pending_window_acknowledgement":
+        if (
+            state != "pending_validation" or original_id is None or original_fence is None
+            or handoff_revision is None or handoff_revision > accepted_revision
+            or frontier_id is not None or frontier_revision is not None
+        ):
+            raise ValueError("Pending-window acknowledgement needs its original page receipt, not a completed prefix")
+    elif scope == "handoff_acknowledgement":
         if (
             state not in {"published", "rejected"} or any(value is None for value in references)
             or handoff_revision is None or not handoff_revision <= frontier_revision <= accepted_revision

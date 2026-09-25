@@ -573,6 +573,46 @@ class MonitoringEngine:
                 ):
                     current = False
                     break
+            if (
+                not current and not control.maintenance and producer.policy_revision == control.revision
+                and producer.topic in {"inventory", "rest_page"} and frontier.pending
+            ):
+                page = self._get("reconcile_acceptance", producer.request_id, control, m.ReconciliationResult)
+                if page is not None and page.state == "pending_validation":
+                    original = self._receipt("reconciliation", page.request_id, control, m.ReconciliationResult)
+                    proof = self._get(
+                        "frontier_validation", stable_id(control, f"frontier-proof:{page.request_id}"),
+                        control, m.FrontierValidation,
+                    )
+                    if (
+                        original != page or page.resolution_scope != "handoff" or proof is None
+                        or page.work_id != work.work_id or page.producer_request_id != producer.request_id
+                        or page.frontier_key != frontier.frontier_key or page.policy_revision != control.revision
+                        or page.frontier_revision != producer.frontier_revision
+                        or proof.work_id != work.work_id or proof.producer_request_id != producer.request_id
+                        or proof.producer_fingerprint != producer.fingerprint
+                        or proof.evidence_digest != key_digest(_json([
+                            binding.model_dump(mode="json") for binding in producer.evidence
+                        ]))
+                        or proof.policy_revision != control.revision or proof.frontier_key != frontier.frontier_key
+                        or proof.lease_fence > work.lease.fence or proof.through_revision > frontier.accepted_revision
+                        or proof.through_revision < producer.frontier_revision
+                        or proof.decision != "published"
+                    ):
+                        raise MonitoringUnavailable("Pending-window acknowledgement lost its original page decision")
+                    result = m.ReconciliationResult(
+                        **_stamp(control), request_id=request.request_id, work_id=work.work_id,
+                        producer_request_id=producer.request_id, policy_revision=control.revision,
+                        frontier_key=frontier.frontier_key, frontier_revision=frontier.accepted_revision,
+                        state="pending_validation", resolution_scope="pending_window_acknowledgement",
+                        handoff_revision=producer.frontier_revision,
+                        handoff_resolution_request_id=page.request_id,
+                        handoff_resolution_work_fence=proof.lease_fence,
+                        detail="Retain the original page decision while its unfinished window remains fenced.",
+                        published_at=self._now(),
+                    )
+                    self._finish_reconciliation(work, result)
+                    return result
             if control.maintenance or producer.policy_revision != control.revision or not current:
                 state, detail = "rejected", "Accepted evidence was superseded, changed policy, or met deployment maintenance."
             else:
@@ -583,6 +623,17 @@ class MonitoringEngine:
                 frontier_key=frontier.frontier_key, frontier_revision=producer.frontier_revision,
                 state=state, detail=detail, published_at=self._now(),
             )
+            if state == "pending_validation" and producer.topic in {"inventory", "rest_page"}:
+                key = stable_id(control, f"frontier-proof:{request.request_id}")
+                self._put("frontier_validation", key, control, m.FrontierValidation(
+                    validation_id=key, work_id=work.work_id, lease_owner_id=work.lease.owner_id,
+                    lease_fence=work.lease.fence, expected_work_revision=work.revision,
+                    policy_revision=control.revision, frontier_key=frontier.frontier_key,
+                    through_revision=frontier.accepted_revision, producer_request_id=producer.request_id,
+                    producer_fingerprint=producer.fingerprint,
+                    evidence_digest=key_digest(_json([binding.model_dump(mode="json") for binding in producer.evidence])),
+                    decision="published", detail=detail,
+                ), parent_key=work.work_id)
             self._put(
                 "reconcile_acceptance", producer.request_id, control, result,
                 parent_key=frontier.frontier_key, status=state, sequence_number=producer.frontier_revision,

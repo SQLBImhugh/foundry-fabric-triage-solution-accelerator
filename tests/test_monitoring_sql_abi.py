@@ -35,6 +35,7 @@ from triage.monitoring.sql_kernel_frontiers import (
     handoff_decision_change_sql,
     nonwindow_handoff_authority_sql,
     page_publication_required_sql,
+    pending_window_handoff_authority_sql,
     stale_page_policy_sql,
 )
 from triage.monitoring.sql_kernel_work import (
@@ -257,13 +258,15 @@ class AbiDatabase(KernelProtocolDatabase):
             connection.create_function("JSON_VALUE", 2, _value)
             connection.create_function("JSON_QUERY", 2, _query)
             connection.create_function("TRY_CONVERT", 2, _convert)
+            connection.create_function("KEY_DIGEST", 1, lambda value: bytes.fromhex(key_digest(value)))
             connection.create_collation("Latin1_General_100_BIN2", lambda a, b: (a > b) - (a < b))
             records, receipts = self.names.table("monitoring_records"), self.names.table("monitoring_receipts")
             connection.execute(f"CREATE TABLE {records} "
-                               "(tenant_id,epoch,record_kind,full_key,revision,status,parent_key,sequence_number,payload)")
-            connection.executemany(f"INSERT INTO {records} VALUES (?,?,?,?,?,?,?,?,?)", [
+                               "(tenant_id,epoch,record_kind,full_key,revision,status,parent_key,sequence_number,payload,key_hash)")
+            connection.executemany(f"INSERT INTO {records} VALUES (?,?,?,?,?,?,?,?,?,?)", [
                 (row.context.tenant_id, row.context.epoch, row.kind, row.key, row.version, row.status,
-                 row.parent_key, row.sequence_number, row.payload) for row in self.records.values()
+                 row.parent_key, row.sequence_number, row.payload, bytes.fromhex(key_digest(row.key)))
+                for row in self.records.values()
             ])
             connection.execute(f"CREATE TABLE {receipts} "
                                "(tenant_id,epoch,operation,request_id,fingerprint,payload)")
@@ -354,7 +357,8 @@ class AbiDatabase(KernelProtocolDatabase):
         window = json.loads(window_row.payload) if window_row else None
         whole = proof.reject_whole_window
         window_ack = window_row is not None and window_row.status in {"rejected", "validated"} and not whole
-        handoff_ack = proof.acknowledge_handoff
+        pending_ack = proof.acknowledge_pending_window
+        handoff_ack = proof.acknowledge_handoff or pending_ack
         params = {
             **args, "frontier_key": key, "accepted": frontier["accepted_revision"],
             "validated": frontier["validated_revision"], "handoff_key": handoff.key,
@@ -369,7 +373,20 @@ class AbiDatabase(KernelProtocolDatabase):
         ))
         window_resolution = None
         resolved_state = None
-        if handoff_ack:
+        if pending_ack:
+            if (
+                window_row is None or window_row.status not in {"collecting", "awaiting_validation"}
+                or handoff.status not in {"published", "rejected"} or proof.decision != handoff.status
+            ):
+                raise RuntimeError("Pending-window acknowledgement requires its original decided page (51072)")
+            authority = self.native_rows(pending_window_handoff_authority_sql(self.names), params)
+            if not authority:
+                raise RuntimeError("Pending-window acknowledgement lacks the original page decision receipt (51072)")
+            references.update(dict(min(authority, key=lambda row: (
+                row["handoff_resolution_work_fence"], row["handoff_resolution_request_id"],
+            ))))
+            resolved_state = "pending_validation"
+        elif handoff_ack:
             if window is not None or handoff.status not in {"published", "rejected"} or proof.decision != handoff.status:
                 raise RuntimeError("Handoff acknowledgement requires one non-window terminal decision (51072)")
             authority = self.native_rows(nonwindow_handoff_authority_sql(self.names), params)
@@ -415,6 +432,7 @@ class AbiDatabase(KernelProtocolDatabase):
         )[0][0])
         state = resolved_state if window_ack or handoff_ack else proof.decision if close else "pending_validation"
         scope = (
+            "pending_window_acknowledgement" if pending_ack else
             "handoff_acknowledgement" if handoff_ack else "window_acknowledgement" if window_ack
             else "window" if whole else "handoff"
         )

@@ -400,6 +400,17 @@ def integration_contract(tables: Mapping[str, str] | None = None) -> dict:
                 "source, action, budget or approval. Complete/disposition validates both original references. "
                 "The caller routes acknowledgement before stale publication callbacks. No window is created."
             ),
+            "pending_window_acknowledgement": (
+                "acknowledge_pending_window is an optional strict JSON boolean on frontier_validation, "
+                "exclusive with acknowledgement of a non-window handoff and every closure/rejection flag. "
+                "It retains a terminal page decision in a current-policy unfinished collection window "
+                "after mutable evidence advances. SQL requires the exact original intake and page-decision "
+                "receipts with the current work owner/fence/revision. Return pending_validation with "
+                "resolution_scope=pending_window_acknowledgement and the original page receipt/fence. "
+                "No committed-prefix reference, handoff mutation, source publication or window closure "
+                "is permitted. Work is deferred, not completed; a later complete page or explicit current "
+                "whole-window rejection must still resolve the window."
+            ),
             "connector_publication": (
                 "INSERT-only plan: connector_id, ownership_id, work_id, lease_owner_id, lease_fence, "
                 "expected_work_revision, expected_connector_revision(0 only when absent), policy_revision, "

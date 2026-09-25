@@ -291,6 +291,59 @@ WHERE f.tenant_id=@tenant_id AND f.epoch=@epoch AND f.record_kind='validation_fr
       )=fc.sequence_number"""
 
 
+def pending_window_handoff_authority_sql(names: SqlNames) -> str:
+    """A decided page can wait without revalidating mutable collection projections."""
+    records, receipts = names.table("monitoring_records"), names.table("monitoring_receipts")
+    return f"""SELECT original.request_id AS handoff_resolution_request_id,
+    TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.work_fence')) AS handoff_resolution_work_fence
+FROM {records} AS f
+JOIN {records} AS w ON w.tenant_id=f.tenant_id AND w.epoch=f.epoch
+  AND w.record_kind='validation_window' AND w.full_key=f.full_key AND w.key_hash=f.key_hash
+  AND w.status IN ('collecting','awaiting_validation')
+JOIN {records} AS own_handoff ON own_handoff.tenant_id=f.tenant_id AND own_handoff.epoch=f.epoch
+  AND own_handoff.record_kind='validation_handoff' AND own_handoff.parent_key=f.full_key
+  AND own_handoff.full_key=@handoff_key AND own_handoff.key_hash={key_hash('@handoff_key')}
+  AND own_handoff.sequence_number=@handoff_revision
+  AND own_handoff.status=@decision AND own_handoff.status IN ('published','rejected')
+  AND JSON_VALUE(own_handoff.payload,'$.requires_window')='true'
+  AND JSON_VALUE(own_handoff.payload,'$.work_id')=@work_id
+  AND JSON_VALUE(own_handoff.payload,'$.producer_request_id')=@producer_request_id
+  AND TRY_CONVERT(bigint,JSON_VALUE(own_handoff.payload,'$.frontier_revision'))=@handoff_revision
+  AND TRY_CONVERT(bigint,JSON_VALUE(own_handoff.payload,'$.policy_revision'))=@current_revision
+JOIN {receipts} AS intake ON intake.tenant_id=f.tenant_id AND intake.epoch=f.epoch
+  AND intake.operation=JSON_VALUE(own_handoff.payload,'$.producer_operation')
+  AND intake.request_id=@producer_request_id
+  AND intake.fingerprint=JSON_VALUE(own_handoff.payload,'$.producer_fingerprint')
+  AND JSON_VALUE(intake.payload,'$.binding_hash')=JSON_VALUE(own_handoff.payload,'$.producer_binding_hash')
+  AND JSON_VALUE(intake.payload,'$.result.reconcile_work_id')=@work_id
+  AND JSON_VALUE(intake.payload,'$.result.frontier_key')=f.full_key
+  AND TRY_CONVERT(bigint,JSON_VALUE(intake.payload,'$.result.frontier_revision'))=@handoff_revision
+JOIN {receipts} AS original ON original.tenant_id=f.tenant_id AND original.epoch=f.epoch
+  AND original.operation='controller.resolve_frontier'
+  AND JSON_VALUE(original.payload,'$.result.work_id')=@work_id
+  AND JSON_VALUE(original.payload,'$.result.producer_request_id')=@producer_request_id
+  AND JSON_VALUE(original.payload,'$.result.frontier_key')=f.full_key
+  AND JSON_VALUE(original.payload,'$.result.resolution_scope')='handoff'
+  AND JSON_VALUE(original.payload,'$.result.state')='pending_validation'
+  AND JSON_VALUE(original.payload,'$.result.handoff_decision')=own_handoff.status
+  AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.handoff_revision'))=@handoff_revision
+  AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.work_fence')) BETWEEN 1 AND @fence
+WHERE f.tenant_id=@tenant_id AND f.epoch=@epoch AND f.record_kind='validation_frontier'
+  AND f.full_key=@frontier_key AND f.key_hash={key_hash('@frontier_key')}
+  AND f.parent_key=f.full_key AND f.status='pending_validation'
+  AND f.sequence_number=@accepted
+  AND TRY_CONVERT(bigint,JSON_VALUE(f.payload,'$.accepted_revision'))=@accepted
+  AND TRY_CONVERT(bigint,JSON_VALUE(f.payload,'$.validated_revision'))=@validated
+  AND @validated<@accepted AND @handoff_revision BETWEEN 1 AND @accepted
+  AND @maintenance=0
+  AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.frontier_revision'))
+      BETWEEN @handoff_revision AND @accepted
+  AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.validated_revision'))
+      BETWEEN 0 AND @validated
+  AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.validated_revision'))
+      <TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.frontier_revision'))"""
+
+
 def closed_window_authority_sql(names: SqlNames) -> str:
     """A sibling acknowledges the exact protected terminal window outcome."""
     records, receipts = names.table("monitoring_records"), names.table("monitoring_receipts")
@@ -349,6 +402,7 @@ DECLARE @producer_request_id nvarchar(256)=JSON_VALUE(@stored_work,'$.reconcile_
     @decision varchar(24),@window_decision varchar(24),@can_close bit=0,
     @all_resolved bit=0,@result_state varchar(24),@whole_window_rejection bit=0,
     @prefix_committed bit=0,@window_state varchar(40),@window_ack bit=0,@handoff_ack bit=0,
+    @pending_window_ack bit=0,
     @handoff_resolution_request_id nvarchar(256),@handoff_resolution_work_fence bigint,
     @frontier_resolution_request_id nvarchar(256),@frontier_resolution_revision bigint,
     @window_rejection_request_id nvarchar(256),@window_resolution_request_id nvarchar(256),
@@ -405,6 +459,28 @@ IF @proof IS NULL OR COALESCE(@decision,'') NOT IN ('published','rejected')
 IF EXISTS (SELECT 1 FROM OPENJSON(@proof) WHERE [key]='acknowledge_handoff' AND type<>3)
    OR (SELECT COUNT(*) FROM OPENJSON(@proof) WHERE [key]='acknowledge_handoff')>1
     THROW 51073, 'Handoff acknowledgement mode must be one strict JSON boolean', 1;
+IF EXISTS (SELECT 1 FROM OPENJSON(@proof) WHERE [key]='acknowledge_pending_window' AND type<>3)
+   OR (SELECT COUNT(*) FROM OPENJSON(@proof) WHERE [key]='acknowledge_pending_window')>1
+    THROW 51073, 'Pending-window acknowledgement mode must be one strict JSON boolean', 1;
+IF JSON_VALUE(@proof,'$.acknowledge_pending_window')='true'
+BEGIN
+    IF @window IS NULL OR @window_state NOT IN ('collecting','awaiting_validation')
+       OR COALESCE(JSON_VALUE(@handoff,'$.requires_window'),'')<>'true'
+       OR @handoff_state NOT IN ('published','rejected') OR @decision<>@handoff_state
+       OR COALESCE(JSON_VALUE(@proof,'$.acknowledge_handoff'),'false')<>'false'
+       OR COALESCE(JSON_VALUE(@proof,'$.reject_whole_window'),'false')<>'false'
+       OR COALESCE(JSON_VALUE(@proof,'$.window_complete'),'false')<>'false'
+       OR JSON_VALUE(@proof,'$.closing_request_id') IS NOT NULL
+        THROW 51072, 'Pending-window acknowledgement cannot replace a decision or close its window', 1;
+    SELECT TOP (1) @handoff_resolution_request_id=authority.handoff_resolution_request_id,
+        @handoff_resolution_work_fence=authority.handoff_resolution_work_fence
+    FROM ({pending_window_handoff_authority_sql(names)}) AS authority
+    ORDER BY authority.handoff_resolution_work_fence,authority.handoff_resolution_request_id;
+    IF @handoff_resolution_request_id IS NULL
+        THROW 51072, 'Pending-window acknowledgement lacks the original page decision receipt', 1;
+    SET @pending_window_ack=1;
+    SET @handoff_ack=1;
+END;
 IF JSON_VALUE(@proof,'$.acknowledge_handoff')='true'
 BEGIN
     IF @window IS NOT NULL OR COALESCE(JSON_VALUE(@handoff,'$.requires_window'),'')<>'false'
@@ -496,7 +572,8 @@ IF @window_ack=0 AND @handoff_ack=0 AND ({frontier_can_close_sql()}) SET @can_cl
 IF @whole_window_rejection=1
     SET @window_decision='rejected';
 -- Producer completion and per-page acknowledgement never close a collecting window.
-SET @result_state=CASE WHEN @window_ack=1 THEN @window_resolution_state
+SET @result_state=CASE WHEN @pending_window_ack=1 THEN 'pending_validation'
+    WHEN @window_ack=1 THEN @window_resolution_state
     WHEN @handoff_ack=1 THEN @handoff_state
     WHEN @can_close=1 THEN @window_decision ELSE 'pending_validation' END;
 IF @can_close=1
@@ -524,7 +601,8 @@ SET @result=(SELECT @work_id AS work_id,@fence AS work_fence,@producer_request_i
     @handoff_revision AS handoff_revision,
     @result_state AS state,
     CASE WHEN @whole_window_rejection=1 OR @window_ack=1 OR @handoff_ack=1 THEN @handoff_state ELSE @decision END AS handoff_decision,
-    CASE WHEN @handoff_ack=1 THEN 'handoff_acknowledgement'
+    CASE WHEN @pending_window_ack=1 THEN 'pending_window_acknowledgement'
+         WHEN @handoff_ack=1 THEN 'handoff_acknowledgement'
          WHEN @window_ack=1 THEN 'window_acknowledgement'
          WHEN @whole_window_rejection=1 THEN 'window' ELSE 'handoff' END AS resolution_scope,
     @handoff_resolution_request_id AS handoff_resolution_request_id,

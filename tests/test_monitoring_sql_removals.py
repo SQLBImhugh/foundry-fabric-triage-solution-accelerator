@@ -117,7 +117,7 @@ def _adapt(kernel, sql, *, concatenate=False):
     ):
         sql = sql.replace(canonical_guid(expression), f"IS_GUID({expression})=1")
     for expression in (
-        "@connector_id", "@partition_key", "@work_key", "@request_id", "@acceptance_key", "@frontier_key",
+        "@connector_id", "@partition_key", "@work_key", "@request_id", "@acceptance_key", "@frontier_key", "@handoff_key",
         "@connector_id+N':removal:'+retired.removal_id",
     ):
         sql = sql.replace(key_hash(expression), f"KEY_DIGEST({expression})")

@@ -128,12 +128,12 @@ def test_utf8_sql_catalogue_and_complete_kernel_abi_remain_unchanged() -> None:
         if obj.kind != "role":
             native_module_hash(obj.ddl)
     assert kernel.statements == before
-    # The queue-only SELECT view/grant is additive; all original RPCs and
-    # receipt-bound source-removal modules retain their source bytes.
+    # The receipt-bound pending-window acknowledgement changes only the
+    # frontier resolver; native header projection cannot change source bytes.
     assert kernel_contract_hash(tables) == (
-        "d7a07466fbdbfe9a594b4077818d03da7bcdcc003115e9a043c6889d781a8c3f"
+        "aecd875c50898006970a0df5c7b5ced46cbb6b0050550ba4c48918537bab094c"
     )
     assert fingerprint(kernel_abi(tables)) == kernel_contract_hash(tables)
     assert fingerprint(list(kernel.catalogue())) == (
-        "a4c771ad554b161f935c9fdc2360a5b1c7a400098a4f70a52afa054384f62cfb"
+        "5eaabac224b5c55dcd5e73fa81496de5716ce598bdb1e7bae1f98e7d37b5850a"
     )

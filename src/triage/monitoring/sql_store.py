@@ -2593,6 +2593,12 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         acknowledge_handoff = (
             window_row is None and handoff_row is not None and handoff_row.status in {"published", "rejected"}
         )
+        acknowledge_pending_window = (
+            not request.reject_whole_window and not current and not control.maintenance
+            and handoff.policy_revision == control.revision
+            and window_row is not None and window_row.status in {"collecting", "awaiting_validation"}
+            and handoff_row is not None and handoff_row.status in {"published", "rejected"}
+        )
         if request.reject_whole_window:
             if window_row is None or window_row.status not in {"collecting", "awaiting_validation"}:
                 raise MonitoringConflict("Whole-window rejection requires a current unfinished window")
@@ -2602,6 +2608,9 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         elif acknowledge_handoff:
             decision = handoff_row.status
             detail = "Acknowledge the original non-window handoff under its committed prefix without republishing it."
+        elif acknowledge_pending_window:
+            decision = handoff_row.status
+            detail = "Retain the original page decision while its unfinished window remains fenced."
         elif not current:
             decision, detail = "rejected", "Accepted intent or raw evidence was superseded or changed policy."
             if handoff.policy_revision != control.revision and window_row is not None and window_row.status in {
@@ -2630,6 +2639,7 @@ class SqlMonitoringAdapter(MonitoringAdapter):
             evidence_digest=handoff.evidence_digest, decision=decision, detail=detail,
             window_complete=complete, reject_whole_window=reject_window,
             acknowledge_handoff=acknowledge_handoff,
+            acknowledge_pending_window=acknowledge_pending_window,
             closing_request_id=window.get("closing_request_id") if window and complete and not reject_window else None,
         )
         proof = self.engine._persisted(validation).model_dump(mode="json", exclude={"validation_id"})
@@ -2677,6 +2687,7 @@ class SqlMonitoringAdapter(MonitoringAdapter):
             or proof.producer_request_id != value.producer_request_id
             or (value.resolution_scope == "window") != proof.reject_whole_window
             or (value.resolution_scope == "handoff_acknowledgement") != proof.acknowledge_handoff
+            or (value.resolution_scope == "pending_window_acknowledgement") != proof.acknowledge_pending_window
         ):
             raise MonitoringUnavailable("Original frontier resolution does not match its immutable work/frontier proof")
         if value.resolution_scope == "window_acknowledgement":
@@ -2692,6 +2703,25 @@ class SqlMonitoringAdapter(MonitoringAdapter):
                 or resolution.validated_revision != value.validated_revision
             ):
                 raise MonitoringUnavailable("Window acknowledgement does not match the original terminal window/prefix")
+        elif value.resolution_scope == "pending_window_acknowledgement":
+            original_receipt = self._sql.get_receipt(
+                "controller.resolve_frontier", value.handoff_resolution_request_id, request,
+            )
+            if original_receipt is None:
+                raise MonitoringUnavailable("Pending-window acknowledgement lost the original page receipt")
+            original = _kernel_model(m.FrontierResolution, self._receipt_result(original_receipt))
+            if (
+                proof.decision != value.handoff_decision
+                or original.resolution_scope != "handoff" or original.state != "pending_validation"
+                or original.work_id != value.work_id or original.work_fence != value.handoff_resolution_work_fence
+                or original.producer_request_id != value.producer_request_id
+                or original.handoff_revision != value.handoff_revision
+                or original.handoff_decision != value.handoff_decision
+                or original.frontier_key != value.frontier_key
+                or not original.frontier_revision <= value.frontier_revision
+                or not original.validated_revision <= value.validated_revision
+            ):
+                raise MonitoringUnavailable("Pending-window acknowledgement differs from its original page decision")
         elif value.resolution_scope == "handoff_acknowledgement":
             original_receipt = self._sql.get_receipt(
                 "controller.resolve_frontier", value.handoff_resolution_request_id, request,
