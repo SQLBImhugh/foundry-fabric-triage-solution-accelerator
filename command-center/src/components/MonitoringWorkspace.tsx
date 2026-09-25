@@ -646,7 +646,8 @@ export function MonitoringWorkspace({ api, roles, userId, fresh, permissionRevis
     try {
       const plan = await api.plan(submission.planId, controller.signal)
       if (controller.signal.aborted) return
-      if (plan.scope.scope_id !== submission.scopeId || !sameMonitoringVersion(plan.expected, submission.request.expected)) {
+      if (plan.scope.scope_id !== submission.scopeId || plan.idempotency_id !== submission.request.idempotency_id
+        || !sameMonitoringVersion(plan.expected, submission.request.expected)) {
         throw new ApiError(409, 'monitoring_recovery_plan_mismatch', 'The saved activation pointer does not match the server plan. No activation was retried.')
       }
       setRecoveredPlan(plan)
@@ -672,7 +673,8 @@ export function MonitoringWorkspace({ api, roles, userId, fresh, permissionRevis
     setReceipt(null)
     const submission: PendingActivation = {
       planId: plan.plan_id, scopeId: plan.scope.scope_id, userId,
-      request: { expected: plan.expected, idempotency_id: crypto.randomUUID() }, state: 'submitting',
+      // Preview and activation share this identity, but have separate receipt namespaces.
+      request: { expected: plan.expected, idempotency_id: plan.idempotency_id }, state: 'submitting',
     }
     try {
       // Only a receipt pointer is stored in the browser; server state remains authoritative.

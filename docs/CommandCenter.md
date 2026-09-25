@@ -224,7 +224,10 @@ control can grant an app role.
    subscription changes. A preview can persist a plan, but performs no Fabric
    provisioning, permission grant or workload remediation.
 7. Activate the current, unexpired preview using its expected tenant, epoch and
-   registry revision. Activation queues work. **Configuring** is not a readiness
+   registry revision and its original idempotency ID. Preview and activation
+   have separate receipt namespaces; generating a new activation ID would
+   break the stored-plan binding and be refused. Activation queues work.
+   **Configuring** is not a readiness
    result; refresh coverage and connector proof after the worker processes it.
 
 These choices bound inventory and polling scope. They are not wildcard

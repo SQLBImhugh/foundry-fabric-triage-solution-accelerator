@@ -481,7 +481,7 @@ describe('monitoring activation and discovery submissions', () => {
     const [planId, input] = vi.mocked(api.activate).mock.calls[0]!
     expect(planId).toBe(ids.plan)
     expect(input.expected).toEqual(monitoringVersion)
-    expect(input.idempotency_id).toMatch(/^[a-f0-9-]{36}$/)
+    expect(input.idempotency_id).toBe(vi.mocked(api.preview).mock.calls[0]![0].idempotency_id)
     expect(props.onChanged).toHaveBeenCalledOnce()
     expect(screen.getByText(/No remediation was approved by this activation/)).toBeTruthy()
     expect(api.activation).not.toHaveBeenCalled()
@@ -562,6 +562,27 @@ describe('monitoring activation and discovery submissions', () => {
     } finally {
       storage.mockRestore()
     }
+  })
+
+  it('refuses a restored preview whose original request identity differs from the saved activation', async () => {
+    const { api, user, unmount } = setup()
+    vi.mocked(api.activate).mockRejectedValueOnce(new ApiError(0, 'network_error', 'Activation response was lost.'))
+    vi.mocked(api.activation).mockRejectedValue(new ApiError(404, 'activation_not_found', 'No receipt yet.'))
+    await preparePreview(user)
+    await user.click(screen.getByRole('button', { name: 'Activate current preview' }))
+    await screen.findByText('Activation outcome is unconfirmed')
+    const original = vi.mocked(api.activate).mock.calls[0]!
+    vi.spyOn(api, 'plan').mockResolvedValue({
+      ...monitoringPreview(vi.mocked(api.preview).mock.calls[0]![0]), idempotency_id: crypto.randomUUID(),
+    })
+    unmount()
+    setup({ api })
+    await screen.findByRole('textbox', { name: 'Scope name' })
+    await user.click(screen.getByRole('button', { name: 'Load original preview' }))
+    await screen.findByText(/saved activation pointer does not match the server plan/)
+    expect(screen.queryByRole('button', { name: 'Activate current preview' })).toBeNull()
+    expect(api.activate).toHaveBeenCalledOnce()
+    expect(window.sessionStorage.getItem(MONITORING_ACTIVATION_STORAGE_KEY)).toContain(original[1].idempotency_id)
   })
 
   it('does not silently discard a malformed recovery pointer and send a new activation', async () => {

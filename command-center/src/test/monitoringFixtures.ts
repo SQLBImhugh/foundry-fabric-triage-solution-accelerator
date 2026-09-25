@@ -187,7 +187,7 @@ export function monitoringReceipt(planId: string, input: ActivationRequest, scop
 }
 export function monitoringFixtureApi(roles: AppRole[] = ['reader', 'admin']) {
   const api = new MonitoringApiClient(async () => null)
-  let previewedScope: ScopeDefinition = monitoringScope
+  let previewedPlan: MonitoringPlan | null = null
   let targetRows = monitoringTargets
   const reviews = new Map<string, SafetyReview>()
   const reviewOperations = new Map<string, SafetyReviewOperationReceipt>()
@@ -201,8 +201,16 @@ export function monitoringFixtureApi(roles: AppRole[] = ['reader', 'admin']) {
   vi.spyOn(api, 'workspaces').mockResolvedValue(monitoringPage(monitoringWorkspaces))
   vi.spyOn(api, 'domains').mockResolvedValue(monitoringPage(monitoringDomains))
   vi.spyOn(api, 'connectors').mockResolvedValue(monitoringPage([monitoringConnector]))
-  vi.spyOn(api, 'preview').mockImplementation(async (input) => { previewedScope = input.scope; return monitoringPreview(input) })
-  vi.spyOn(api, 'activate').mockImplementation(async (planId, input) => monitoringReceipt(planId, input, previewedScope))
+  vi.spyOn(api, 'preview').mockImplementation(async (input) => {
+    previewedPlan = monitoringPreview(input)
+    return previewedPlan
+  })
+  vi.spyOn(api, 'activate').mockImplementation(async (planId, input) => {
+    if (!previewedPlan || previewedPlan.plan_id !== planId || previewedPlan.idempotency_id !== input.idempotency_id) {
+      throw new ApiError(409, 'monitoring_conflict', 'The activation must use the reviewed preview identity.')
+    }
+    return monitoringReceipt(planId, input, previewedPlan.scope)
+  })
   vi.spyOn(api, 'activation').mockRejectedValue(new Error('No receipt lookup was expected.'))
   vi.spyOn(api, 'refreshInventory').mockResolvedValue({ work_id: ids.work, status: 'queued' })
   vi.spyOn(api, 'safetyReview').mockImplementation(async (id) => {
