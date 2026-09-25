@@ -90,6 +90,12 @@ promoted-row hashes. The derived column is not writable through runtime views
 and does not change receipt contents or record hashes. Deployment and reset
 tooling verify its exact native expression and persistence.
 
+Polling retains a current queued, leased or waiting work item and its original
+fence. If admission returns after a poll was dispositioned, or a policy change
+makes its slot obsolete, the controller queues a deterministic successor without
+rewriting the old work or receipt. The successor reads a current history window;
+checkpoints still advance only after durable acceptance and validation.
+
 Scopes can include or exclude tenant, domain, workspace or item selections.
 Exclusions take precedence; future-resource admission is explicit. Domain
 membership is metadata, not a permission grant. A complete empty scope differs

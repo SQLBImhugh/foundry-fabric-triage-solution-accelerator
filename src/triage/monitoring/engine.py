@@ -3092,11 +3092,25 @@ class MonitoringEngine:
             progress.next_poll_at if progress is not None and progress.policy_revision == target.policy_revision
             else target.next_poll_at or self._now()
         )
-        return self._enqueue(m.MonitoringWorkDraft(
-            **_stamp(target.identity), work_id=stable_id(target.identity, f"poll:{target.key}:{due.isoformat()}"),
-            kind="poll", policy_revision=target.policy_revision, due_at=due, created_at=self._now(),
-            reason="Durable due monitoring poll.", target=target.identity,
-        ))
+        slot = f"poll:{target.key}:{due.isoformat()}"
+        work_id = stable_id(target.identity, slot)
+        now, scheduled_for = self._now(), due
+        for _ in range(SCAN_BUDGET):
+            work = self._enqueue(m.MonitoringWorkDraft(
+                **_stamp(target.identity), work_id=work_id,
+                kind="poll", policy_revision=target.policy_revision, due_at=scheduled_for, created_at=now,
+                reason="Durable due monitoring poll.", target=target.identity,
+            ))
+            if work.policy_revision == target.policy_revision and work.state not in {"completed", "dispositioned"}:
+                return work
+            # Re-enrollment can retain a due slot whose poll was already refused,
+            # or belongs to the old policy. Keep that receipt/fence unchanged and
+            # deduplicate a successor instead of reporting terminal work as queued.
+            work_id = stable_id(
+                target.identity, f"{slot}:policy:{target.policy_revision}:after:{work.work_id}",
+            )
+            scheduled_for = max(due, now)
+        raise MonitoringUnavailable("Poll resumption exceeded the bounded work history")
 
     def _schedule_connector(self, target: m.MonitoringTarget, control: m.DeploymentControl) -> m.MonitoringWork | None:
         return self._adapter.schedule_connector(target, control)
