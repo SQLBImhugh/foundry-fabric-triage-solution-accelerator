@@ -114,8 +114,10 @@ Scopes select tenant, domain, workspace or item metadata. Explicit exclusions
 win. Domain descendants and workspace moves must be reconciled; domain membership
 does not grant resource access. Core listings are caller-visible, not
 tenant-complete. Admin Items is preview and needs explicit adapter selection and
-read-admin prerequisites. Unsupported items remain visible with a reason and
-do not count as monitored pipelines.
+read-admin prerequisites. Both Fabric listing adapters search only
+`DataPipeline` and `SemanticModel` types, with filters retained on every page.
+Other item types are absent from operational inventory and coverage displays.
+Historical observations and receipts remain intact.
 
 An Admin previews and activates a versioned scope. New resources require review
 unless automatic **detection-only** enrolment was explicitly selected. Neither

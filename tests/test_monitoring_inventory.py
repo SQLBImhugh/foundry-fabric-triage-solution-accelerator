@@ -465,10 +465,125 @@ async def collect_inventory(client, selector):
     pytest.fail("Fixture inventory did not terminate")
 
 
+@pytest.mark.parametrize("admin", [False, True])
+async def test_inventory_searches_supported_types_at_the_service_boundary_on_every_page(rest_factory, admin):
+    calls = []
+
+    def handler(request):
+        expected_path = "/v1/admin/items" if admin else f"/v1/workspaces/{WORKSPACE}/items"
+        assert request.url.path == expected_path
+        item_type = request.url.params.get("type")
+        assert item_type in {"DataPipeline", "SemanticModel"}, "Discovery made an unfiltered item search"
+        if admin:
+            assert request.url.params["workspaceId"] == WORKSPACE
+        token = request.url.params.get("continuationToken")
+        calls.append((item_type, token))
+        return httpx.Response(200, json={
+            "itemEntities" if admin else "value": [],
+            "continuationUri": (
+                f"https://api.fabric.microsoft.com{expected_path}?continuationToken=next-{item_type}"
+                if token is None else None
+            ),
+        })
+
+    client = FabricInventoryClient(rest_factory(handler), options=InventoryApiOptions(
+        admin_workspaces=admin, admin_items_preview=admin, powerbi_datasets=False,
+    ))
+    selector = m.ScopeSelector(tenant_id=TENANT, kind="workspace", workspace_id=WORKSPACE)
+    cursor = json.loads(client.initial_cursor(CONTEXT, selector, GENERATION))
+    cursor.update(phase="fabric_items", active_id=WORKSPACE)
+    continuation = json.dumps(cursor)
+    for _ in range(8):
+        page = await client.read_page(
+            CONTEXT, selector, generation_id=GENERATION, observed_at=NOW, continuation=continuation,
+            workspaces=(workspace(),), domains=(domain(),),
+        )
+        assert not page.items and not page.gaps
+        if page.finished:
+            break
+        continuation = page.continuation
+    else:
+        pytest.fail("Supported-type pagination did not terminate")
+    assert calls == [
+        ("DataPipeline", None), ("DataPipeline", "next-DataPipeline"),
+        ("SemanticModel", None), ("SemanticModel", "next-SemanticModel"),
+    ]
+
+
+@pytest.mark.parametrize("item_type", ["Notebook", "Report", "SemanticModel"])
+async def test_provider_filter_mismatch_is_incomplete_not_an_unsupported_inventory_item(rest_factory, item_type):
+    def handler(request):
+        assert request.url.params["type"] == "DataPipeline"
+        return httpx.Response(200, json={"value": [
+            {"id": ITEM, "displayName": "Unexpected result", "type": item_type},
+        ]})
+
+    client = FabricInventoryClient(rest_factory(handler), options=InventoryApiOptions(powerbi_datasets=False))
+    selector = m.ScopeSelector(tenant_id=TENANT, kind="workspace", workspace_id=WORKSPACE)
+    cursor = json.loads(client.initial_cursor(CONTEXT, selector, GENERATION))
+    cursor.update(phase="fabric_items", active_id=WORKSPACE)
+    page = await client.read_page(
+        CONTEXT, selector, generation_id=GENERATION, observed_at=NOW, continuation=json.dumps(cursor),
+        workspaces=(workspace(),),
+    )
+    assert page.items == ()
+    assert {gap.code for gap in page.gaps} == {"inventory_type_filter_mismatch"}
+    assert page.continuation is not None
+    assert all(item_type not in gap.detail for gap in page.gaps)
+
+
+async def test_old_unfiltered_cursor_requires_a_new_generation_before_any_rest_request(rest_factory):
+    client = FabricInventoryClient(rest_factory(lambda _: pytest.fail("Old cursor must not make a service call")))
+    selector = m.ScopeSelector(tenant_id=TENANT, kind="workspace", workspace_id=WORKSPACE)
+    cursor = json.loads(client.initial_cursor(CONTEXT, selector, GENERATION))
+    cursor.update(version=1, phase="fabric_items", active_id=WORKSPACE)
+    cursor.pop("item_type")
+    with pytest.raises(RestReadError) as caught:
+        await client.read_page(
+            CONTEXT, selector, generation_id=GENERATION, observed_at=NOW, continuation=json.dumps(cursor),
+        )
+    assert caught.value.code == "inventory_adapter_changed"
+    cursor["generation_id"] = str(UUID(int=100))
+    with pytest.raises(RestReadError) as caught:
+        await client.read_page(
+            CONTEXT, selector, generation_id=GENERATION, observed_at=NOW, continuation=json.dumps(cursor),
+        )
+    assert caught.value.code == "invalid_continuation"
+
+
+async def test_filtered_item_selection_does_not_probe_an_untyped_item_endpoint(rest_factory):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        assert request.url.path == f"/v1/workspaces/{WORKSPACE}/items"
+        kind = request.url.params["type"]
+        rows = [] if kind == "SemanticModel" else [
+            {"id": str(UUID(int=100)), "displayName": "Other pipeline", "type": kind},
+            {"id": ITEM, "displayName": "Selected pipeline", "type": kind},
+        ]
+        return httpx.Response(200, json={"value": rows})
+
+    client = FabricInventoryClient(rest_factory(handler), options=InventoryApiOptions(powerbi_datasets=False))
+    selector = m.ScopeSelector(tenant_id=TENANT, kind="item", workspace_id=WORKSPACE, item_id=ITEM)
+    cursor = json.loads(client.initial_cursor(CONTEXT, selector, GENERATION))
+    cursor.update(phase="fabric_items", active_id=WORKSPACE)
+    first = await client.read_page(
+        CONTEXT, selector, generation_id=GENERATION, observed_at=NOW,
+        continuation=json.dumps(cursor), workspaces=(workspace(),), domains=(domain(),),
+    )
+    second = await client.read_page(
+        CONTEXT, selector, generation_id=GENERATION, observed_at=NOW,
+        continuation=first.continuation, workspaces=(workspace(),), domains=(domain(),), known_items=first.items,
+    )
+    assert [item.item_id for item in first.items] == [ITEM]
+    assert not first.gaps and not second.gaps and not second.items
+    assert len(calls) == 2
+
+
 async def test_admin_inventory_pages_domains_display_names_and_supported_mapping(rest_factory):
     calls = []
     second_item = str(UUID(int=101))
-    unsupported_item = str(UUID(int=102))
 
     def handler(request):
         calls.append(request)
@@ -491,15 +606,17 @@ async def test_admin_inventory_pages_domains_display_names_and_supported_mapping
             return httpx.Response(200, json={"value": [{"id": WORKSPACE}]})
         if path == "/v1/admin/items":
             assert request.url.params["workspaceId"] == WORKSPACE
+            if request.url.params["type"] == "SemanticModel":
+                return httpx.Response(200, json={"itemEntities": [
+                    {"id": second_item, "name": "Model", "type": "SemanticModel", "workspaceId": WORKSPACE},
+                ]})
+            assert request.url.params["type"] == "DataPipeline"
             if "continuationToken" not in request.url.params:
                 return httpx.Response(200, json={
                     "itemEntities": [{"id": ITEM, "name": "Pipeline", "type": "DataPipeline", "workspaceId": WORKSPACE}],
                     "continuationToken": "items-two",
                 })
-            return httpx.Response(200, json={"itemEntities": [
-                {"id": second_item, "name": "Model", "type": "SemanticModel", "workspaceId": WORKSPACE},
-                {"id": unsupported_item, "name": "Notebook", "type": "Notebook", "workspaceId": WORKSPACE},
-            ]})
+            return httpx.Response(200, json={"itemEntities": []})
         if path == f"/v1.0/myorg/groups/{WORKSPACE}/datasets":
             return httpx.Response(200, json={"value": [{"id": second_item, "name": "Model"}]})
         pytest.fail(f"Unexpected fixture route {path}")
@@ -512,15 +629,14 @@ async def test_admin_inventory_pages_domains_display_names_and_supported_mapping
     assert workspaces[WORKSPACE].name == "Named workspace"
     assert workspaces[WORKSPACE].domain_id == CHILD
     assert domains[CHILD].parent_domain_id == DOMAIN
-    assert len(items) == 3
+    assert len(items) == 2
     assert items[(WORKSPACE, ITEM)].workload == "fabric_pipeline"
     assert items[(WORKSPACE, second_item)].workload == "powerbi"
-    assert items[(WORKSPACE, unsupported_item)].workload is None
     assert items[(WORKSPACE, ITEM)].domain_ids == (CHILD,)
     assert items[(WORKSPACE, ITEM)].domain_ancestor_ids == (DOMAIN,)
-    assert sum(len(page.items) for page in pages) == 3
-    assert {gap.code for page in pages for gap in page.gaps} == {"unsupported_item_type"}
-    assert len(calls) == 8
+    assert sum(len(page.items) for page in pages) == 2
+    assert not any(page.gaps for page in pages)
+    assert len(calls) == 9
 
 
 async def test_core_inventory_is_never_tenant_complete_or_silent_preview_fallback(rest_factory):
@@ -546,7 +662,7 @@ async def test_inventory_keeps_known_rows_when_a_page_is_partial_or_denied(rest_
         "value": [
             {"id": ITEM, "type": "DataPipeline", "displayName": "Known"},
             {"id": str(UUID(int=100)), "type": "DataPipeline"},
-            {"displayName": "Missing identity", "type": "Notebook"},
+            {"displayName": "Missing identity", "type": "DataPipeline"},
         ],
     })), options=InventoryApiOptions(powerbi_datasets=False))
     selector = m.ScopeSelector(tenant_id=TENANT, kind="workspace", workspace_id=WORKSPACE)
@@ -623,7 +739,10 @@ async def test_denied_domain_metadata_marks_items_unknown_instead_of_bypassing_e
             return httpx.Response(200, json={"workspaces": [{"id": WORKSPACE, "name": "Workspace"}]})
         if request.url.path == "/v1/admin/items":
             return httpx.Response(200, json={
-                "itemEntities": [{"id": ITEM, "workspaceId": WORKSPACE, "type": "DataPipeline", "name": "Pipeline"}],
+                "itemEntities": (
+                    [{"id": ITEM, "workspaceId": WORKSPACE, "type": "DataPipeline", "name": "Pipeline"}]
+                    if request.url.params["type"] == "DataPipeline" else []
+                ),
             })
         pytest.fail(f"Unexpected fixture route {request.url.path}")
 

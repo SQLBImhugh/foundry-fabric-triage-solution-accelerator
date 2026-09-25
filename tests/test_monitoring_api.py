@@ -248,7 +248,7 @@ class RecordingStore:
                 **self.version.model_dump(), as_of=NOW, inventory_completeness="partial",
                 capability_completeness="unknown", scope_item_count=None,
                 discovered_count=3, access_verified_count=1, admitted_count=1,
-                current_count=0, action_enabled_count=0, unsupported_count=1, backlog_count=2,
+                current_count=0, action_enabled_count=0, unsupported_count=0, backlog_count=2,
                 checkpoint_lag_seconds=None, gaps=(self.gap,),
             ),
         )
@@ -271,8 +271,8 @@ class RecordingStore:
             ),
             InventoryItem(
                 tenant_id=query.tenant_id, epoch=query.epoch, generation_id=GENERATION,
-                workspace_id=WORKSPACE, item_id=OTHER, name="Synthetic notebook",
-                item_type="Notebook", unsupported_reason="Standalone notebooks are unsupported.",
+                workspace_id=WORKSPACE, item_id=OTHER, name="Synthetic pipeline",
+                item_type="DataPipeline", workload="fabric_pipeline",
                 state="unknown", observed_at=NOW,
             ),
         )
@@ -883,13 +883,15 @@ def test_target_queries_use_typed_server_context_and_wire_identity(
         assert "target" not in item
 
 
-def test_unsupported_inventory_does_not_disappear_or_become_a_pipeline(client, store, signing):
+def test_inventory_exposes_supported_detector_types_without_inventing_admission(client, store, signing):
     response = send(client, store, signing, "inventory")
-    unsupported = response.json()["items"][1]
-    assert unsupported["workload"] is None
-    assert unsupported["item_type"] == "Notebook"
-    assert unsupported["state"] == "unknown"
-    assert unsupported["unsupported_reason"] == "Standalone notebooks are unsupported."
+    rows = response.json()["items"]
+    assert {(row["item_type"], row["workload"]) for row in rows} == {
+        ("SemanticModel", "powerbi"), ("DataPipeline", "fabric_pipeline"),
+    }
+    assert all(row["unsupported_reason"] is None for row in rows)
+    assert rows[1]["state"] == "unknown"
+    assert all("action" not in row and "observation" not in row for row in rows)
 
 
 @pytest.mark.parametrize("path,params", [

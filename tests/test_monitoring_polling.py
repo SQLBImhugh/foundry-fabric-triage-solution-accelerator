@@ -968,6 +968,62 @@ async def test_explicit_inventory_work_before_any_scope_is_not_replaced_with_leg
     assert all(request.method == "GET" for request in calls)
 
 
+async def test_old_unfiltered_generation_finishes_incomplete_and_queues_a_fresh_scan(rest_factory):
+    clock = Clock()
+    control = m.DeploymentControl(
+        **CONTEXT.model_dump(), revision=0, activation_cutoff=NOW, maintenance=False, updated_at=NOW,
+    )
+    store = TrackingStore(clock=clock, state=InMemoryMonitoringState.empty(control))
+    expected = m.RegistryVersion(**CONTEXT.model_dump(), revision=0)
+    selector = m.ScopeSelector(tenant_id=TENANT, kind="workspace", workspace_id=WORKSPACE)
+    draft = store.request_discovery(expected, selector, request_id=REQUEST)
+    owned, = store.claim_work(m.WorkClaimRequest(
+        **CONTEXT.model_dump(), owner_id=OWNER, kinds=("inventory",), limit=1, per_workspace_limit=1,
+    ))
+    rest = rest_factory(lambda _: pytest.fail("An old unfiltered cursor must not make another service request"), clock=clock)
+    client = FabricInventoryClient(rest)
+    old_cursor = json.loads(client.initial_cursor(CONTEXT, selector, owned.work_id))
+    old_cursor.update(version=1, phase="fabric_items", active_id=WORKSPACE)
+    old_cursor.pop("item_type")
+    original = m.InventoryGeneration(
+        **CONTEXT.model_dump(), generation_id=owned.work_id, selector=selector,
+        adapter=client.adapter, authority=client.authority, completeness="partial",
+        started_at=NOW, continuation=json.dumps(old_cursor),
+        gaps=(m.CoverageGap(code="inventory_in_progress", detail="The original broad scan was interrupted."),),
+    )
+    store.record_inventory(m.InventoryBatch(
+        request_id=str(UUID(int=80_001)), expected=expected, generation=original,
+        items=(m.InventoryItem(
+            **CONTEXT.model_dump(), generation_id=owned.work_id, workspace_id=WORKSPACE, item_id=ITEM,
+            name="Retained pipeline", item_type="DataPipeline", workload="fabric_pipeline", observed_at=NOW,
+        ),),
+        commit=m.InventoryCommit(
+            work_id=owned.work_id, lease=owned.lease, expected_work_revision=owned.revision,
+            expected_generation_revision=0,
+        ),
+    ))
+    worker = MonitoringCollector(
+        store, CONTEXT, client, FabricPipelinePollingClient(rest), PowerBIPollingClient(rest),
+        IDENTITY, OWNER, clock=clock,
+    )
+    result = await worker._collect(owned)
+    assert result.state == "recorded"
+    assert "inventory_adapter_changed" in {gap.code for gap in result.gaps}
+    finished = store.get_inventory_generation(CONTEXT, draft.work_id)
+    assert finished.completeness == "partial" and finished.completed_at == clock()
+    assert finished.continuation is None and finished.next_scan_at > clock()
+    assert finished.recorded_item_count == 1
+    retained, = store.list_inventory(m.TargetQuery(**CONTEXT.model_dump())).items
+    assert retained.state == "present"
+    assert store.get_work(CONTEXT, owned.work_id).state == "dispositioned"
+    clock.advance(int((finished.next_scan_at - clock()).total_seconds()))
+    fresh, = store.claim_work(m.WorkClaimRequest(
+        **CONTEXT.model_dump(), owner_id=OWNER, kinds=("inventory",), limit=1, per_workspace_limit=1,
+    ))
+    assert fresh.work_id != owned.work_id and fresh.discovery_selector == selector
+    assert store.get_inventory_generation(CONTEXT, fresh.work_id) is None
+
+
 async def test_domain_inventory_round_trips_named_containers_without_inflating_items(rest_factory):
     clock = Clock()
     control = m.DeploymentControl(
@@ -994,10 +1050,10 @@ async def test_domain_inventory_round_trips_named_containers_without_inflating_i
         if path == f"/v1/admin/domains/{CHILD}/workspaces":
             return httpx.Response(200, json={"value": [{"id": WORKSPACE}]})
         if path == "/v1/admin/items":
+            assert request.url.params["type"] in {"DataPipeline", "SemanticModel"}
             return httpx.Response(200, json={"itemEntities": [
                 {"id": ITEM, "workspaceId": WORKSPACE, "name": "Pipeline", "type": "DataPipeline"},
-                {"id": str(UUID(int=900)), "workspaceId": WORKSPACE, "name": "Notebook", "type": "Notebook"},
-            ]})
+            ] if request.url.params["type"] == "DataPipeline" else []})
         if path.endswith("/jobs/instances"):
             return httpx.Response(200, json={"value": []})
         if path == f"/v1/workspaces/{WORKSPACE}/items/{ITEM}":
@@ -1019,13 +1075,13 @@ async def test_domain_inventory_round_trips_named_containers_without_inflating_i
         if generation.completed_at is not None:
             break
         clock.advance(15)
-    assert generation.completeness == "complete" and generation.discovered_count == 2
+    assert generation.completeness == "complete" and generation.discovered_count == 1
     assert store.list_workspaces(m.PageQuery(**CONTEXT.model_dump())).items[0].name == "Named workspace"
     domains = store.list_domains(m.PageQuery(**CONTEXT.model_dump())).items
     assert {value.name for value in domains} == {"Parent", "Child"}
     items = store.list_inventory(m.TargetQuery(**CONTEXT.model_dump())).items
-    assert len(items) == 2 and all(value.domain_ancestor_ids == (DOMAIN,) for value in items)
-    assert store.coverage(CONTEXT).unsupported_count == 1
+    assert len(items) == 1 and all(value.domain_ancestor_ids == (DOMAIN,) for value in items)
+    assert store.coverage(CONTEXT).unsupported_count == 0
 
 
 async def test_inventory_checks_database_lease_again_after_the_source_read(rest_factory):
@@ -1102,7 +1158,7 @@ async def test_overlapping_collectors_keep_generation_membership_and_exclusions(
         if request.url.path == "/v1/admin/items":
             return httpx.Response(200, json={"itemEntities": [
                 {"id": ITEM, "workspaceId": WORKSPACE, "name": "Excluded pipeline", "type": "DataPipeline"},
-            ]})
+            ] if request.url.params["type"] == "DataPipeline" else []})
         pytest.fail(f"Unexpected inventory route: {request.url.path}")
 
     rest = rest_factory(handler, clock=clock)

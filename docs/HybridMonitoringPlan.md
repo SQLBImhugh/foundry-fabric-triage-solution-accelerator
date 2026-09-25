@@ -91,7 +91,7 @@ not belong in this public document or override the current public baseline.
 | Failed scheduled Fabric pipelines | Discovery, configuration, polling, native job-event intake and the existing activity-aware triage/rerun policy. |
 | Power BI semantic-model refresh failures | Discovery and refresh-history polling, feeding the existing Power BI triage boundary. Resolve an exact refresh attempt before any action; an ambiguous history match is not an executable incident. |
 | Pipeline notebook activities | Retain them as pipeline evidence. |
-| Standalone notebooks and other Fabric item types | Show discovered items as unsupported unless a detector contract exists. Do not silently treat them as pipelines. Standalone triage/remediation is outside this implementation. |
+| Standalone notebooks and other Fabric item types | Do not search or show them as monitoring inventory. Send supported-type filters to the service; standalone triage/remediation is outside this implementation. |
 | Missing expected starts and disabled schedules | Outside the initial hybrid release. These need a separate expected-slot detector, timezone handling and workload-specific grace rules. Event silence alone is insufficient. |
 | Successful-but-stale or incorrect data | Preserve existing explicitly configured deterministic checks; do not advertise tenant-wide quality monitoring. Broader checks need their own expectations and data access. |
 | Audit, report usage, gateways and capacity | Not a universal activity-monitoring feature. Additional collectors would be separate work. |
@@ -209,7 +209,7 @@ executable IDs.
 | Includes/excludes | Explicit exclusions win. Store which rule and inventory generation admitted each target. |
 | Overlapping rules | One effective target and poll schedule. Overlap never creates another incident budget or an extra event subscription. |
 | Future resources | Default to review required. An administrator can explicitly enable automatic detection-only admission within a selected scope. |
-| Unsupported items | Keep them visible with the unsupported workload reason; do not include them in the monitored count. |
+| Unsupported items | Exclude them from source searches, operational inventory, selectors, counters and item-type warnings. Retain original historical evidence and receipts without claiming unsearched resources were deleted. |
 | Partial enumeration | Preserve known inventory and expose gaps. A failed page, denied workspace or unavailable domain API is not evidence of deletion. |
 | Scoped completeness | A complete chosen workspace is evaluated independently of an unrelated partial tenant generation. Initial partial tenant inventory with zero scopes is still not complete. |
 | Removal or movement | Recompute eligibility using completed inventory and explicit policy changes. Pause uncertain admissions rather than granting broader access. |
@@ -220,11 +220,12 @@ Exhaust valid continuation tokens within a controlled workload budget. When a
 budget is reached, persist continuation state and show incomplete coverage; do
 not return a successful empty or silently truncated list.
 
-A bounded priority correction processed an original fresh web-discovery request
+An earlier broad-inventory proof processed an original fresh web-discovery request
 on attempt 1 without manual requeue behind a 579-waiting/207-queued snapshot.
 The chosen workspace completed ten pages and three items, including one
 unsupported Eventstream. This does not close first-scope activation or the
-remaining partial-window replay churn.
+remaining partial-window replay churn. Current discovery is supported-type-only;
+that historical Eventstream observation is not operational inventory.
 
 Reuse the previously examined resource-picker behavior: display names with
 ID-backed selection, clear dependent choices, cancel stale requests and save
@@ -593,7 +594,7 @@ Retain the current font, colors, geometry, logo and permission-refresh lock.
 | Surface | Planned behavior |
 |---|---|
 | Scope builder | Tenant/domain/workspace/item selection, includes/excludes, workload capability filter and future-resource rule. |
-| Preview | Exact additions/removals, required permissions, unsupported items, inventory completeness and expected subscription/poll changes. |
+| Preview | Exact supported-target additions/removals, required permissions, inventory completeness and expected subscription/poll changes. |
 | Activation | An Admin saves an expected revision and a preview identity. Queue provisioning; show "Configuring" until its evidence checks succeed. |
 | Target detail | Discovery source, scope reason, service access, poll/event status, last evidence, backlog and separate remediation-review state. |
 | Coverage overview | Separate discovered, access-verified, current and action-enabled counts; denominators include incomplete/unknown scope. |

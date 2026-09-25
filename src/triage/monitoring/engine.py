@@ -1000,6 +1000,10 @@ class MonitoringEngine:
             filters["workload"] = query.workload
         if generation_id is not None:
             return self._generation_page("inventory_seen", query, m.InventoryItem, generation_id, filters)
+        # Preserve original generation evidence for receipt reconciliation; the
+        # operational catalogue contains only the workloads this app monitors.
+        if query.workload is None:
+            filters["workload_in"] = m.SUPPORTED_WORKLOADS
         return self._page("inventory", query, m.InventoryItem, filters)
 
     @atomic()
@@ -1485,7 +1489,9 @@ class MonitoringEngine:
                 )
                 if seen_count != generation.discovered_count:
                     raise MonitoringConflict("Complete inventory count does not match durable observed items")
-                for prior in self._all("inventory", control, m.InventoryItem):
+                for prior in self._all(
+                    "inventory", control, m.InventoryItem, filters={"workload_in": m.SUPPORTED_WORKLOADS},
+                ):
                     if (
                         generation.enumeration == "items" and prior.generation_id != generation.generation_id
                         and prior.observed_at <= generation.started_at
@@ -1537,7 +1543,9 @@ class MonitoringEngine:
 
     def _publish_inventory(self, generation: m.InventoryGeneration, control: m.DeploymentControl) -> None:
         policies = self._all("scope", control, m.ScopePolicy, budget=1_000)
-        for item in self._all("inventory", control, m.InventoryItem):
+        for item in self._all(
+            "inventory", control, m.InventoryItem, filters={"workload_in": m.SUPPORTED_WORKLOADS},
+        ):
             if generation.enumeration == "items" and not self._selector_matches(generation.selector, item):
                 continue
             self._reconcile_item(item, control, policies)
@@ -1670,19 +1678,11 @@ class MonitoringEngine:
                     reason=target.reason, basis="explicit_policy",
                 ))
                 poll_delta += int(target.observation.enabled) - int(prior.observation.enabled)
-        for item in (() if disabling else self._all("inventory", control, m.InventoryItem)):
+        for item in (() if disabling else self._all(
+            "inventory", control, m.InventoryItem, filters={"workload_in": m.SUPPORTED_WORKLOADS},
+        )):
             matches, excluded = self._scope_matches(scopes, item)
             if item.target is None:
-                if any(
-                    policy.enabled and any(
-                        rule.effect == "include" and self._selector_matches(rule.selector, item)
-                        for rule in policy.rules
-                    ) for policy in scopes
-                ):
-                    gaps.append(m.CoverageGap(
-                        code="unsupported", detail=item.unsupported_reason,
-                        workspace_id=item.workspace_id, item_id=item.item_id,
-                    ))
                 continue
             prior = self._get("target", item.target.key, control, m.MonitoringTarget)
             wanted = bool(matches) and not excluded and item.state == "present"
@@ -2974,8 +2974,9 @@ class MonitoringEngine:
     def _coverage(self, context: m.MonitoringContext) -> m.CoverageView:
         control = self._control(context)
         now = self._now()
-        discovered = self._backend.count("inventory", context, filters={"status_in": ("present", "unknown")})
-        inventory_rows = self._backend.scan("inventory", context, limit=SCAN_BUDGET, filters={"status_in": ("present", "unknown")})
+        inventory_filters = {"status_in": ("present", "unknown"), "workload_in": m.SUPPORTED_WORKLOADS}
+        discovered = self._backend.count("inventory", context, filters=inventory_filters)
+        inventory_rows = self._backend.scan("inventory", context, limit=SCAN_BUDGET, filters=inventory_filters)
         items = [self._decode(row, m.InventoryItem) for row in inventory_rows]
         target_rows = self._backend.scan("target", context, limit=SCAN_BUDGET, filters={"status_in": ("current", "paused", "review_required")})
         targets = [self._effective_target(self._decode(row, m.MonitoringTarget)) for row in target_rows]
@@ -2991,7 +2992,7 @@ class MonitoringEngine:
             gap for generation in latest_generations.values()
             if generation.completeness != "complete" for gap in generation.gaps
         ]
-        # These counters cover the deployment's inventory, not just enabled
+        # These counters cover supported deployment inventory, not just enabled
         # scopes. A complete scope preview cannot certify an unfinished estate.
         complete = self._inventory_complete(scopes, generations) and all(
             generation.completeness == "complete" for generation in latest_generations.values()
@@ -3067,7 +3068,7 @@ class MonitoringEngine:
             last_inventory_completed_at=max(completed_generations, default=None),
             last_poll_window_end=min(completed_windows, default=None),
             last_receiver_activity_at=max(receiver_times, default=None), next_due_at=min(due_times, default=None),
-            gaps=self._bounded_gaps(gaps),
+            gaps=self._bounded_gaps([gap for gap in gaps if gap.code not in m.UNSUPPORTED_INVENTORY_GAPS]),
         )
 
     @atomic()

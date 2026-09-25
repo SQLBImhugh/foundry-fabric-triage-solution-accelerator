@@ -30,9 +30,9 @@ export const monitoringSnapshot: MonitoringSnapshot = {
   },
   coverage: {
     ...monitoringVersion, as_of: monitoringTime, inventory_completeness: 'partial',
-    capability_completeness: 'partial', scope_item_count: null, discovered_count: 4,
+    capability_completeness: 'partial', scope_item_count: null, discovered_count: 3,
     access_verified_count: 1, admitted_count: 2, current_count: 1, action_enabled_count: 0,
-    unsupported_count: 1, backlog_count: 2, checkpoint_lag_seconds: null,
+    unsupported_count: 0, backlog_count: 2, checkpoint_lag_seconds: null,
     last_inventory_completed_at: null, last_poll_window_end: null, last_receiver_activity_at: null, next_due_at: null,
     gaps: [{ code: 'workspace_access_denied', detail: 'The collector cannot enumerate a workspace. Known inventory is retained.', workspace_id: ids.otherWorkspace }],
   },
@@ -83,6 +83,7 @@ export const monitoringInventory: InventoryItem[] = [
     unsupported_reason: null, domain_ids: [ids.domain], state: 'present', observed_at: monitoringTime, definition_hash: null,
   },
   {
+    // Retain one old all-types row to exercise the presentation boundary.
     tenant_id: ids.tenant, epoch: ids.epoch, generation_id: ids.generation, workspace_id: ids.workspace,
     item_id: ids.notebook, name: 'Notebook analysis', item_type: 'Notebook', workload: null,
     unsupported_reason: 'Standalone notebooks have no monitoring detector contract.',

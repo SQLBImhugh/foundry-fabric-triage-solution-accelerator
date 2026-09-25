@@ -100,6 +100,11 @@ class ScopeCase:
             kind=kind, key=key, context=m.MonitoringContext(**self.h.context()),
             version=1, payload=value.model_dump_json(),
         )
+        if isinstance(value, m.InventoryItem):
+            row = replace(
+                row, workload=value.workload, status=value.state, workspace_id=value.workspace_id,
+                item_id=value.item_id, generation_id=value.generation_id,
+            )
         if self.db:
             self.db.records[(kind, key)] = row
             self.db.fixture_facts[(kind, key)] = self.db.row_hash(row)
@@ -332,8 +337,8 @@ def test_truncated_gaps_do_not_authorize_effect_equivalence_after_inventory_chan
     for _ in range(201):
         item = m.InventoryItem(
             **h.context(), generation_id=case.generation_id,
-            workspace_id=case.target.workspace_id, item_id=h.next_id(), name="Unsupported fixture item",
-            item_type="Unsupported", unsupported_reason="No supported workload contract.", observed_at=h.clock(),
+            workspace_id=case.target.workspace_id, item_id=h.next_id(), name="Unverified fixture pipeline",
+            item_type="DataPipeline", workload="fabric_pipeline", observed_at=h.clock(),
         )
         case.put("inventory", f"{item.workspace_id}:{item.item_id}", item)
     plan = case.preview()
@@ -348,12 +353,10 @@ def test_truncated_gaps_do_not_authorize_effect_equivalence_after_inventory_chan
 def test_scope_comparison_uses_the_store_redaction_boundary(case, monkeypatch):
     h = case.h
     monkeypatch.setattr(case.web, "_redactor", lambda text: text.replace("private-fixture-detail", "[REDACTED]"))
-    item = m.InventoryItem(
-        **h.context(), generation_id=case.generation_id,
-        workspace_id=case.target.workspace_id, item_id=h.next_id(), name="Unsupported fixture item",
-        item_type="Unsupported", unsupported_reason="private-fixture-detail", observed_at=h.clock(),
-    )
-    case.put("inventory", f"{item.workspace_id}:{item.item_id}", item)
+    probe = m.CapabilityObservation.model_validate_json(case.row("target_capability", case.target.key).payload)
+    case.put("target_capability", case.target.key, probe.model_copy(update={
+        "required_permissions": ("private-fixture-detail",),
+    }))
     plan = case.preview()
     assert "private-fixture-detail" not in plan.model_dump_json()
     assert "[REDACTED]" in plan.model_dump_json()

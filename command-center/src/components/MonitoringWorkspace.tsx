@@ -21,9 +21,10 @@ import { MonitoringSafetyReview } from './MonitoringSafetyReview'
 import type { SafetyReviewSelection } from './MonitoringSafetyReview'
 import './MonitoringWorkspace.css'
 
+type SupportedInventoryItem = InventoryItem & { workload: MonitoringWorkload }
 interface MonitoringCatalog {
   scopes: ScopePolicy[]
-  inventory: InventoryItem[]
+  inventory: SupportedInventoryItem[]
   targets: MonitoringTarget[]
   workspaces: WorkspaceMetadata[]
   domains: DomainMetadata[]
@@ -76,6 +77,8 @@ const workloadName = (value: MonitoringWorkload) => value === 'powerbi' ? 'Power
 const date = (value?: string | null) => value ? <time dateTime={value}>{formatDate(value)}</time> : 'Not reported'
 const contextKey = (value: RegistryVersion) => `${value.tenant_id}:${value.epoch}:${value.revision}`
 const inventoryKey = (value: InventoryItem) => `${value.workspace_id}:${value.item_id}`
+const operationalGaps = (gaps: CoverageGap[]) => gaps.filter((gap) =>
+  gap.code !== 'unsupported_item_type' && gap.code !== 'unsupported')
 const workspaceName = (catalog: MonitoringCatalog, id: string) =>
   catalog.workspaces.find((item) => item.workspace_id === id)?.name ?? `Workspace ${id} (metadata unavailable)`
 const itemName = (catalog: MonitoringCatalog, workspaceId: string, itemId: string) =>
@@ -126,7 +129,8 @@ function rejectedBeforeCommit(error: ApiError): boolean {
 }
 
 function GapList({ gaps, catalog }: { gaps: CoverageGap[]; catalog?: MonitoringCatalog }) {
-  return gaps.length ? <ul className="monitoring-gaps">{gaps.map((gap, index) => <li key={`${gap.code}:${gap.workspace_id}:${gap.item_id}:${index}`}>
+  const visible = operationalGaps(gaps)
+  return visible.length ? <ul className="monitoring-gaps">{visible.map((gap, index) => <li key={`${gap.code}:${gap.workspace_id}:${gap.item_id}:${index}`}>
     <strong>{humanize(gap.code)}</strong><p>{gap.detail}</p>
     {gap.workspace_id && <p className="small">{catalog ? workspaceName(catalog, gap.workspace_id) : `Workspace ${gap.workspace_id}`}
       {gap.item_id && ` / ${catalog ? itemName(catalog, gap.workspace_id, gap.item_id) : `Item ${gap.item_id}`}`}</p>}
@@ -157,30 +161,31 @@ function MonitoringTable<T>({
 function CoverageOverview({ snapshot, catalog }: { snapshot: MonitoringSnapshot; catalog: MonitoringCatalog | null }) {
   const id = useId()
   const value = snapshot.coverage
+  const gaps = operationalGaps(value.gaps)
   let state: { label: string; tone: Tone } = { label: 'Coverage reported', tone: 'info' }
   if (value.inventory_completeness === 'blocked' || value.capability_completeness === 'blocked'
     || catalog?.connectors.some((item) => item.state === 'blocked')) state = { label: 'Blocked', tone: 'danger' }
   else if (catalog?.connectors.some((item) => item.state === 'planned' || item.state === 'provisioning')) state = { label: 'Configuring', tone: 'warning' }
-  else if (value.inventory_completeness !== 'complete' || value.capability_completeness !== 'complete' || value.gaps.length
+  else if (value.inventory_completeness !== 'complete' || value.capability_completeness !== 'complete' || gaps.length
     || value.current_count < value.admitted_count || catalog?.connectors.some((item) => item.state === 'degraded')
     || (value.current_count > 0 && (!value.last_poll_window_end || !catalog?.connectors.some((item) => item.state === 'ready')))) {
     state = { label: 'Partial', tone: 'warning' }
   } else if (catalog && !catalog.scopes.some((scope) => scope.enabled)) state = { label: 'Not configured', tone: 'neutral' }
   return <section className="monitoring-panel" aria-labelledby={`${id}-coverage`}>
     <div className="panel-heading"><div><h2 id={`${id}-coverage`}>Monitoring coverage</h2>
-      <p>Configuration, collection access, observation and action admission are separate records.</p></div>
+      <p>Coverage includes only Power BI semantic models and scheduled Fabric pipelines. Collection access and action admission are separate.</p></div>
       <Badge tone={state.tone}>{state.label}</Badge></div>
     <dl className="monitoring-counts">
       {([
         ['Discovered', value.discovered_count], ['Access verified', value.access_verified_count],
         ['Admitted', value.admitted_count], ['Current', value.current_count],
-        ['Action enabled', value.action_enabled_count], ['Unsupported', value.unsupported_count],
+        ['Action enabled', value.action_enabled_count],
       ] as const).map(([label, count]) => <div key={label}><dt>{label}</dt><dd>{count}</dd></div>)}
     </dl>
     <div className="monitoring-panel-body">
       <p><strong>Inventory total: {value.scope_item_count === null ? 'Unknown' : value.scope_item_count}</strong>.
         {' '}Inventory {humanize(value.inventory_completeness).toLowerCase()}; capability checks {humanize(value.capability_completeness).toLowerCase()}.
-        {value.scope_item_count === null && ' Discovered items are not a complete tenant count.'}</p>
+        {value.scope_item_count === null && ' Discovered supported items are not a complete tenant count.'}</p>
       <dl className="monitoring-facts">
         <div><dt>Coverage as of</dt><dd>{date(value.as_of)}</dd></div>
         <div><dt>Last completed inventory</dt><dd>{date(value.last_inventory_completed_at)}</dd></div>
@@ -190,7 +195,7 @@ function CoverageOverview({ snapshot, catalog }: { snapshot: MonitoringSnapshot;
         <div><dt>Work backlog</dt><dd>{value.backlog_count}</dd></div>
         <div><dt>Next due work</dt><dd>{date(value.next_due_at)}</dd></div>
       </dl>
-      <GapList gaps={value.gaps} catalog={catalog ?? undefined} />
+      <GapList gaps={gaps} catalog={catalog ?? undefined} />
       <p className="monitoring-help">An enabled scope is not proof of current polling or event delivery. A receiver heartbeat alone
         does not prove failure detection. Action-enabled targets still require the controller&apos;s policy and any applicable approval.</p>
     </div>
@@ -238,9 +243,9 @@ function RuleFields({ value, catalog, label, onChange }: {
       onChange={(event) => setSelector({ ...selector, item_id: event.target.value || null })}>
       <option value="">Choose an item</option>
       {selectedItems.map((item) => <option key={inventoryKey(item)} value={item.item_id}
-        disabled={item.state !== 'present' || item.workload === null || !value.workloads.includes(item.workload)}>
+        disabled={item.state !== 'present' || !value.workloads.includes(item.workload)}>
         {item.name} / {item.item_type} ({item.item_id.slice(0, 8)})
-        {item.workload === null ? ` - Unsupported: ${item.unsupported_reason}` : !value.workloads.includes(item.workload) ? ' - Workload not selected' : item.state !== 'present' ? ` - ${humanize(item.state)}` : ''}
+        {!value.workloads.includes(item.workload) ? ' - Workload not selected' : item.state !== 'present' ? ` - ${humanize(item.state)}` : ''}
       </option>)}
     </select></label>}
     <fieldset className="monitoring-workloads"><legend>{label} workloads</legend>
@@ -393,7 +398,7 @@ function ScopeEditor({ api, expected, catalog, allowed, pending, onActivate, onR
           workloads: ['powerbi', 'fabric_pipeline'], auto_enrol_detection_only: false,
         }] })}><Plus size={14} aria-hidden="true" />Add exclusion</button>
         <p className="monitoring-help">Future items require review unless detection-only enrollment is explicitly selected.
-          A domain does not grant service access. Standalone notebooks and other unsupported types are never admitted by these rules.</p>
+          A domain does not grant service access. These rules monitor semantic models and scheduled pipelines only.</p>
         <div className="monitoring-cadence">
           <label>Polling interval (seconds)<input type="number" min={15} max={86400} step={1} required value={draft.cadence.poll_seconds || ''}
             onChange={(event) => change({ ...draft, cadence: { ...draft.cadence, poll_seconds: Number(event.target.value) } })} /></label>
@@ -544,7 +549,10 @@ export function MonitoringWorkspace({ api, roles, userId, fresh, permissionRevis
         readMonitoringPages((cursor) => api.domains({ limit: 100, cursor }, batchSignal), expected, batchSignal, (item) => item.domain_id),
         readMonitoringPages((cursor) => api.connectors({ limit: 100, cursor }, batchSignal), expected, batchSignal, (item) => item.connector_id),
       ])
-      return { scopes, inventory, targets, workspaces, domains, connectors }
+      return {
+        scopes, inventory: inventory.filter((item): item is SupportedInventoryItem => item.workload !== null),
+        targets, workspaces, domains, connectors,
+      }
     } catch (error) {
       // Promise.all rejects before sibling reads finish. Leaving their pages
       // running lets each failed poll add another estate-wide catalogue scan.
@@ -817,7 +825,7 @@ export function MonitoringWorkspace({ api, roles, userId, fresh, permissionRevis
         allowed={baseAdmin && !safetyBusy} pending={Boolean(pending)} onActivate={activate} onRefresh={refresh} />
         : <p className="monitoring-help">Monitoring configuration is read-only for your current app roles. Setup changes require Admin; they are not Operator or Approver actions.</p>}
       <section className="monitoring-panel" aria-labelledby={`${id}-inventory`}>
-        <div className="panel-heading"><div><h2 id={`${id}-inventory`}>Discovered inventory</h2><p>Supported workloads are selectable. Unsupported items remain visible with their reasons.</p></div>
+        <div className="panel-heading"><div><h2 id={`${id}-inventory`}>Discovered inventory</h2><p>Only semantic models and scheduled-pipeline candidates are collected and shown.</p></div>
           {roles.includes('admin') && current.can_admin && <button type="button" className="button secondary" disabled={!baseAdmin || safetyBusy || inventoryBusy || Boolean(pending)}
             onClick={() => void refreshInventory()}><RefreshCw size={15} aria-hidden="true" />
             {inventoryBusy ? 'Queueing discovery' : inventoryRequest ? 'Retry same inventory request' : 'Queue inventory refresh'}</button>}</div>
@@ -826,19 +834,18 @@ export function MonitoringWorkspace({ api, roles, userId, fresh, permissionRevis
             <option value="">All returned workspaces</option>{data.workspaces.map((item) => <option key={item.workspace_id} value={item.workspace_id}>{item.name} ({item.workspace_id.slice(0, 8)})</option>)}
           </select></label>
           <label>Inventory workload<select value={inventoryWorkload} onChange={(event) => setInventoryWorkload(event.target.value)}>
-            <option value="all">All workloads and unsupported items</option><option value="powerbi">Power BI and unsupported items</option>
-            <option value="fabric_pipeline">Fabric pipelines and unsupported items</option>
+            <option value="all">All supported workloads</option><option value="powerbi">Power BI semantic models</option>
+            <option value="fabric_pipeline">Fabric pipelines</option>
           </select></label>
         </div>
         <p className="monitoring-help monitoring-inset">Inventory refresh queues discovery for the selected workspace, or the deployment tenant when all workspaces are selected.
           Names come from server inventory; no resource IDs need to be copied into setup. A filtered empty list does not prove complete discovery.</p>
         <MonitoringTable key={`${editorKey}:${inventoryWorkspace}:${inventoryWorkload}`} items={data.inventory.filter((item) => (!inventoryWorkspace || item.workspace_id === inventoryWorkspace)
-          && (inventoryWorkload === 'all' || item.workload === null || item.workload === inventoryWorkload))}
-          columns={['Item', 'Workspace', 'Support', 'Last observed']} caption="Discovered monitoring inventory"
+          && (inventoryWorkload === 'all' || item.workload === inventoryWorkload))}
+          columns={['Item', 'Workspace', 'Workload', 'Last observed']} caption="Discovered monitoring inventory"
           empty={current.coverage.inventory_completeness === 'complete' ? 'No returned inventory items match these filters.' : 'No matching items have been returned. Inventory coverage is incomplete; this is not proof of an empty scope.'}
           row={(item) => <tr key={inventoryKey(item)}><th scope="row">{item.name}<span className="monitoring-cell-detail">{item.item_type} / {humanize(item.state)}</span></th>
-            <td>{workspaceName(data, item.workspace_id)}</td><td>{item.workload === null
-              ? <><Badge tone="warning">Unsupported</Badge><p>{item.unsupported_reason}</p></> : workloadName(item.workload)}</td><td>{date(item.observed_at)}</td></tr>} />
+            <td>{workspaceName(data, item.workspace_id)}</td><td>{workloadName(item.workload)}</td><td>{date(item.observed_at)}</td></tr>} />
       </section>
       <section className="monitoring-panel" aria-labelledby={`${id}-targets`}>
         <div className="panel-heading"><div><h2 id={`${id}-targets`}>Admitted targets</h2><p>Current, review-required, paused and removed records are shown separately by their recorded state.</p></div></div>

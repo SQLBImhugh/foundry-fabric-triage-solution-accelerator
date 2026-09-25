@@ -99,8 +99,12 @@ checkpoints still advance only after durable acceptance and validation.
 Scopes can include or exclude tenant, domain, workspace or item selections.
 Exclusions take precedence; future-resource admission is explicit. Domain
 membership is metadata, not a permission grant. A complete empty scope differs
-from one that could not be enumerated. Unsupported item types remain visible
-as unsupported rather than being treated as operationally monitored.
+from one that could not be enumerated. Discovery searches only the supported
+Fabric types, `DataPipeline` and `SemanticModel`, and the typed Power BI datasets
+API. Each continuation retains its original type filter. Unsupported types are
+excluded from operational inventory, counts, selectors and item-type warnings.
+Original generation evidence remains available for receipt reconciliation;
+not searching a type does not establish its deletion.
 
 Power BI refreshes and scheduled Fabric pipeline executions are the supported
 failure workloads. Notebook activities can supply pipeline evidence; this is

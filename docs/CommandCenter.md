@@ -274,9 +274,10 @@ exposure before activation; this app does not add per-workspace human ACLs.
 
 ### Coverage, inventory and connector proof
 
-Coverage separates deployment/estate-wide **discovered**, **supported**,
-**access verified**, **admitted**, **current** and **action enabled** counts.
-Unsupported items are reported separately. The UI denominator is **Inventory
+Coverage counts supported workloads only, separating deployment/estate-wide
+**discovered**, **access verified**, **admitted**, **current** and **action enabled**.
+Unsupported types are absent from the inventory, selectors, counters and
+coverage/preview warnings. The UI denominator is **Inventory
 total**, not a scope denominator: it remains **Unknown** until every latest
 discovery generation is complete. For example, a complete A with three items
 plus a partial B with five cannot make eight a known complete inventory total.
@@ -295,10 +296,19 @@ different namespaces. Equal-looking values are not proof of the same execution;
 their correlation requires authoritative source evidence.
 
 Only semantic models/datasets and Data Pipelines have the current failure
-detector contracts. Other returned item types, including Notebook, Report,
-Lakehouse and Warehouse, remain visible with their unsupported reason.
+detector contracts. Fabric discovery sends separate `type=SemanticModel` and
+`type=DataPipeline` requests, including every continuation page; Power BI
+discovery uses its typed datasets endpoint. It never retries a rejected
+filtered request as an all-types listing. A service response that violates its
+requested type filter is an incomplete read, not additional inventory.
 Notebook activity evidence belongs to its monitored pipeline; standalone
 notebook-job monitoring is not implemented.
+
+Historical unsupported observations remain in original generation evidence and
+receipts, but not in operational catalogue reads or counts. A filtered scan
+cannot claim an unsearched item type was deleted. Pre-filter inventory cursors
+finish as incomplete and schedule a fresh generation through the normal
+controller; access failures, incomplete coverage and action fences remain visible.
 
 Discovery does not provide all Fabric operational telemetry. Missing expected
 starts, disabled pipeline schedules, tenant-wide data quality, audit, report

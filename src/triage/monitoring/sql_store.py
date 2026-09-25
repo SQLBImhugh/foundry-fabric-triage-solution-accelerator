@@ -590,11 +590,11 @@ class SqlBackend:
                 }[name]
                 clauses.append(f"{column} {operator} ?")
                 params.append(_db_time(value) if isinstance(value, datetime) else value)
-            elif name == "status_in":
+            elif name in {"status_in", "workload_in"}:
                 if not value:
                     clauses.append("1 = 0")
                 else:
-                    clauses.append("status IN (" + ", ".join("?" for _ in value) + ")")
+                    clauses.append(name.removesuffix("_in") + " IN (" + ", ".join("?" for _ in value) + ")")
                     params.extend(value)
             elif name in FILTER_COLUMNS:
                 column = FILTER_COLUMNS[name]

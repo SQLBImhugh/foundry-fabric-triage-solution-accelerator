@@ -223,8 +223,12 @@ revision used for human tracking. Power BI numeric history IDs
 (`powerbi_refresh`) and request IDs (`powerbi_request`) remain separate
 namespaces; only authoritative REST evidence can establish their alias.
 
-Collectors remain evidence-only. Unsupported item types stay visible with
-reasons; standalone notebooks do not become pipelines. A failed-job stream
+Collectors remain evidence-only and search only the supported item types at the
+service boundary. Keep Fabric `type` filters on all continuation requests and
+use the typed Power BI datasets API. Unsupported rows and their historical
+item-type warnings do not belong in operational inventory or coverage counts;
+retain original generation records and receipts for reconciliation.
+Standalone notebooks do not become pipelines. A failed-job stream
 cannot detect a job that never existed. Missing expected starts need explicit
 schedule/timezone/grace contracts, and broad data-quality monitoring needs
 business expectations and source data access.

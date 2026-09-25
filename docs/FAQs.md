@@ -108,11 +108,11 @@ See [Monitoring setup](CommandCenter.md#monitoring-setup).
 
 ## Does discovery cover all Fabric operational telemetry?
 
-No. Discovery lists resource metadata. Failure monitoring currently has
-contracts for Power BI semantic models/datasets and scheduled Fabric Data
-Factory pipelines. Other item types, including Notebook, Report, Lakehouse and
-Warehouse, remain visible with an unsupported reason; they are not counted as
-monitored simply because the service can list them.
+No. Discovery searches only Power BI semantic models/datasets and Fabric Data
+Pipelines. Fabric list requests are type-filtered before collection, and Power BI
+uses the typed datasets API. Other item types are not shown in monitoring lists,
+selectors, counts or coverage warnings. Original historical observations remain
+available to receipt reconciliation, not as monitoring candidates.
 
 Notebook activity failures are evidence inside a monitored pipeline.
 Standalone notebook-job monitoring is not implemented. Missing expected starts,

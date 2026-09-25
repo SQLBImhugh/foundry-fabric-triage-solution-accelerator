@@ -1416,8 +1416,11 @@ Runtime absence can reflect scheduler, controller or telemetry failure; inspect
 those boundaries rather than replaying an uncertain workload action.
 
 Live pipeline eligibility and cadence come from the monitoring registry, not
-`PIPELINE_SWEEP_ENABLED` or `FABRIC_PIPELINE_TARGETS`. Discovery may identify
-unsupported items, but only admitted workload targets are polled and dispatched.
+`PIPELINE_SWEEP_ENABLED` or `FABRIC_PIPELINE_TARGETS`. Discovery searches only
+semantic models and Data Pipelines, using type-filtered Fabric requests and the
+typed Power BI datasets API. Operational inventory excludes older unsupported
+observations without deleting their original evidence. Only admitted workload
+targets are polled and dispatched.
 A notebook activity remains pipeline evidence, not standalone notebook
 monitoring. Full-pipeline reruns require current review, explicit approval and
 atomic reservation; HTTP submission is not recovery. See

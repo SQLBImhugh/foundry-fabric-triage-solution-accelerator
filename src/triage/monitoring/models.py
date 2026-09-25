@@ -47,6 +47,11 @@ MAX_POWERBI_WINDOW_ROWS = 5_000
 MAX_RECONCILIATION_BINDINGS = MAX_POWERBI_WINDOW_ROWS + MAX_INTAKE_BATCH + 1
 
 Workload = Literal["powerbi", "fabric_pipeline"]
+SUPPORTED_WORKLOADS: tuple[Workload, ...] = ("powerbi", "fabric_pipeline")
+SUPPORTED_INVENTORY_TYPES: dict[str, Workload] = {
+    "SemanticModel": "powerbi", "Dataset": "powerbi", "DataPipeline": "fabric_pipeline",
+}
+UNSUPPORTED_INVENTORY_GAPS = frozenset({"unsupported_item_type", "unsupported"})
 RuntimeComponent = Literal["worker", "web", "controller", "fixture"]
 ProducerComponent = Literal["worker", "web"]
 WORKER_WORK_KINDS = frozenset({"inventory", "capability_probe", "poll", "connector_reconcile"})
@@ -485,8 +490,7 @@ class InventoryItem(MonitoringContext):
             if self.unsupported_reason is None:
                 raise ValueError("Unsupported inventory must explain the missing workload contract")
         else:
-            supported = {"powerbi": {"SemanticModel", "Dataset"}, "fabric_pipeline": {"DataPipeline"}}
-            if self.item_type not in supported[self.workload] or self.unsupported_reason is not None:
+            if SUPPORTED_INVENTORY_TYPES.get(self.item_type) != self.workload or self.unsupported_reason is not None:
                 raise ValueError("Inventory item type and supported workload disagree")
         return self
 
@@ -745,7 +749,7 @@ class ActivationReceipt(MonitoringModel):
 
 
 class CoverageView(RegistryVersion):
-    """Deployment-wide inventory counters; scope-preview readiness is separate."""
+    """Deployment-wide supported-inventory counters; scope readiness is separate."""
 
     as_of: UtcDateTime
     inventory_completeness: Completeness

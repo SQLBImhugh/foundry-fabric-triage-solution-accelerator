@@ -101,7 +101,7 @@ describe('monitoring inspection and readiness', () => {
     setup({ api, roles: [role] })
     const coverage = within(await screen.findByRole('region', { name: 'Monitoring coverage' }))
     await screen.findByRole('region', { name: 'Admitted monitoring targets' })
-    for (const [label, value] of [['Discovered', '4'], ['Access verified', '1'], ['Admitted', '2'], ['Current', '1'], ['Action enabled', '0']]) {
+    for (const [label, value] of [['Discovered', '3'], ['Access verified', '1'], ['Admitted', '2'], ['Current', '1'], ['Action enabled', '0']]) {
       expect(coverage.getByText(label!).parentElement?.querySelector('dd')?.textContent).toBe(value)
     }
     expect(coverage.getByText('Inventory total: Unknown')).toBeTruthy()
@@ -338,13 +338,13 @@ describe('monitoring scope editor', () => {
     expect(api.activate).not.toHaveBeenCalled()
   })
 
-  it('clears dependent item/domain selections and keeps unsupported items visible but unselectable', async () => {
+  it('clears dependent selections and never shows retained unsupported inventory', async () => {
     const { user } = setup()
     await fillScope(user)
     await user.selectOptions(screen.getByRole('combobox', { name: 'Include scope' }), 'item')
     await user.selectOptions(screen.getByRole('combobox', { name: 'Include workspace' }), ids.workspace)
     const items = screen.getByRole<HTMLSelectElement>('combobox', { name: 'Include item' })
-    expect(within(items).getByRole<HTMLOptionElement>('option', { name: /Notebook analysis.*Unsupported/ }).disabled).toBe(true)
+    expect(within(items).queryByRole('option', { name: /Notebook analysis/ })).toBeNull()
     await user.selectOptions(items, ids.model)
     await user.selectOptions(screen.getByRole('combobox', { name: 'Include workspace' }), ids.otherWorkspace)
     expect(items.value).toBe('')
@@ -362,9 +362,38 @@ describe('monitoring scope editor', () => {
     expect(screen.getByRole<HTMLInputElement>('checkbox', { name: 'Include descendant domains for include' }).checked).toBe(false)
     await user.selectOptions(screen.getByRole('combobox', { name: 'Inventory workload' }), 'fabric_pipeline')
     const inventory = within(screen.getByRole('region', { name: 'Discovered monitoring inventory' }))
-    expect(inventory.getByText('Notebook analysis')).toBeTruthy()
-    expect(inventory.getByText('Standalone notebooks have no monitoring detector contract.')).toBeTruthy()
+    expect(inventory.queryByText('Notebook analysis')).toBeNull()
+    expect(inventory.queryByText('Standalone notebooks have no monitoring detector contract.')).toBeNull()
     expect(inventory.queryByText('Operations model')).toBeNull()
+  })
+
+  it('omits unsupported counters and historical item-type gaps but retains service failures and partial coverage', async () => {
+    const api = monitoringFixtureApi()
+    vi.mocked(api.snapshot).mockResolvedValue({
+      ...monitoringSnapshot, coverage: {
+        ...monitoringSnapshot.coverage, gaps: [
+          { code: 'unsupported_item_type', detail: 'No detector contract for Fabric Report' },
+          { code: 'http_401', detail: 'REST evidence read returned HTTP 401', workspace_id: ids.workspace },
+        ],
+      },
+    })
+    const { user } = setup({ api })
+    await fillScope(user)
+    const coverage = within(screen.getByRole('region', { name: 'Monitoring coverage' }))
+    expect(coverage.queryByText('Unsupported', { selector: 'dt' })).toBeNull()
+    expect(coverage.queryByText('No detector contract for Fabric Report')).toBeNull()
+    expect(coverage.getByText('REST evidence read returned HTTP 401')).toBeTruthy()
+    expect(coverage.getByText('Inventory total: Unknown')).toBeTruthy()
+    vi.mocked(api.preview).mockImplementation(async (input) => ({
+      ...monitoringPreview(input), gaps: [
+        { code: 'unsupported', detail: 'Retained unsupported preview detail' },
+        { code: 'access_unverified', detail: 'Service read access is unverified.' },
+      ],
+    }))
+    await user.click(screen.getByRole('button', { name: 'Preview scope changes' }))
+    const preview = within(await screen.findByRole('region', { name: 'Scope preview' }))
+    expect(preview.queryByText('Retained unsupported preview detail')).toBeNull()
+    expect(preview.getByText('Service read access is unverified.')).toBeTruthy()
   })
 
   it('loads every metadata page so later named workspaces remain selectable', async () => {

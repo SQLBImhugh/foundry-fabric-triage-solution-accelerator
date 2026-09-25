@@ -158,8 +158,8 @@ def _matches(record: StoredRecord, filters: dict[str, object]) -> bool:
         elif name == "due_before":
             if record.due_at is None or record.due_at > value:
                 return False
-        elif name == "status_in":
-            if record.status not in value:
+        elif name in {"status_in", "workload_in"}:
+            if getattr(record, name.removesuffix("_in")) not in value:
                 return False
         elif getattr(record, name) != value:
             return False

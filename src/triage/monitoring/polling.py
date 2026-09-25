@@ -45,6 +45,7 @@ from triage.monitoring.contracts import (
 )
 from triage.monitoring.inventory import (
     FabricInventoryClient,
+    InventoryReadPage,
     RestReadError,
     RestRoute,
     TenantBoundRestClient,
@@ -929,10 +930,19 @@ class MonitoringCollector:
                 )
                 return CollectorWorkResult(work.work_id, "deferred", pages=pages, gaps=generation.gaps)
             now = self._clock()
-            result = await self.inventory_client.read_page(
-                self.context, selector, generation_id=generation.generation_id, observed_at=now,
-                continuation=generation.continuation, workspaces=workspaces, domains=domains, known_items=items,
-            )
+            try:
+                result = await self.inventory_client.read_page(
+                    self.context, selector, generation_id=generation.generation_id, observed_at=now,
+                    continuation=generation.continuation, workspaces=workspaces, domains=domains, known_items=items,
+                )
+            except RestReadError as exc:
+                if exc.code != "inventory_adapter_changed":
+                    raise
+                # An unfiltered continuation cannot become proof of a filtered
+                # scan. Close it as incomplete and let normal controller
+                # publication schedule a fresh generation, retaining its evidence.
+                logger.warning("Inventory generation requires a fresh supported-type scan (%s)", work.work_id)
+                result = InventoryReadPage(finished=True, gaps=(exc.gap(),))
             work = await self._renew(work)
             gaps = bounded_gaps((
                 *(gap for gap in generation.gaps if gap.code not in _TRANSIENT_INVENTORY_GAPS),

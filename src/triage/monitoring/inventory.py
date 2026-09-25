@@ -32,6 +32,7 @@ import httpx
 from pydantic import Field, TypeAdapter, ValidationError
 
 from triage.monitoring.models import (
+    SUPPORTED_INVENTORY_TYPES,
     CanonicalId,
     CoverageGap,
     Cursor,
@@ -77,9 +78,6 @@ API_POLICIES = {
     "powerbi.datasets": RatePolicy(60, 60),
     "powerbi.dataset": RatePolicy(60, 60),
     "powerbi.refreshes": RatePolicy(60, 60),
-}
-_WORKLOADS = {
-    "SemanticModel": "powerbi", "Dataset": "powerbi", "DataPipeline": "fabric_pipeline",
 }
 _CURSOR_ADAPTER = TypeAdapter(Cursor)
 _JSON_ADAPTER = TypeAdapter(JsonObject)
@@ -551,12 +549,13 @@ class InventoryApiOptions:
 
 
 class _InventoryCursor(MonitoringContext):
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     generation_id: CanonicalId
     selector_hash: str
     adapter: str
     options_hash: str
     phase: Literal["domains", "workspaces", "memberships", "fabric_items", "powerbi_items"]
+    item_type: Literal["DataPipeline", "SemanticModel"] = "DataPipeline"
     after_id: CanonicalId | None = None
     active_id: CanonicalId | None = None
     url: str | None = None
@@ -622,8 +621,8 @@ class FabricInventoryClient:
       /v1/admin/domains?preview=false             (domains)
       /v1/admin/domains/{id}/workspaces           (value)
       /v1/admin/workspaces                       (workspaces)
-      /v1/admin/items?workspaceId={id}            (itemEntities; explicit preview)
-      /v1/workspaces[/{id}]/items[/{id}]          (caller-visible core)
+      /v1/admin/items?workspaceId={id}&type={type} (itemEntities; explicit preview)
+      /v1/workspaces/{id}/items?type={type}       (caller-visible core)
       /v1.0/myorg/groups/{id}/datasets[/{id}]     (Power BI inventory)
 
     Options select APIs to attempt, not grants or claims that those APIs work.
@@ -662,10 +661,21 @@ class FabricInventoryClient:
         if context != self.rest.context or selector.tenant_id != context.tenant_id:
             raise RestReadError("wrong_tenant", "Inventory selection differs from the pinned REST context")
         try:
-            cursor = _InventoryCursor.model_validate_json(
-                continuation or self.initial_cursor(context, selector, generation_id),
-            )
-        except ValidationError as exc:
+            raw = json.loads(continuation or self.initial_cursor(context, selector, generation_id))
+            if isinstance(raw, dict) and type(raw.get("version")) is int and raw["version"] == 1:
+                if (
+                    (raw.get("tenant_id"), raw.get("epoch"), raw.get("generation_id"))
+                    != (context.tenant_id, context.epoch, generation_id)
+                    or raw.get("selector_hash") != _selector_hash(selector)
+                    or raw.get("adapter") != self.adapter or raw.get("options_hash") != self._options_hash
+                ):
+                    raise RestReadError("invalid_continuation", "Inventory continuation belongs to another scan")
+                raise RestReadError(
+                    "inventory_adapter_changed",
+                    "An older unfiltered inventory cursor cannot resume supported-type discovery; a fresh scan is required",
+                )
+            cursor = _InventoryCursor.model_validate(raw)
+        except (ValidationError, json.JSONDecodeError) as exc:
             raise RestReadError("invalid_continuation", "Inventory continuation is malformed") from exc
         if (
             (cursor.tenant_id, cursor.epoch, cursor.generation_id)
@@ -689,10 +699,13 @@ class FabricInventoryClient:
             return self._advance(cursor, phase="memberships", active_id=None, after_id=None)
         if cursor.phase == "memberships":
             return self._advance(cursor, after_id=cursor.active_id, active_id=None)
-        if cursor.phase == "fabric_items" and self.options.powerbi_datasets:
-            return self._advance(cursor, phase="powerbi_items")
+        if cursor.phase == "fabric_items":
+            if cursor.item_type == "DataPipeline":
+                return self._advance(cursor, item_type="SemanticModel")
+            if self.options.powerbi_datasets:
+                return self._advance(cursor, phase="powerbi_items")
         return self._advance(
-            cursor, phase="fabric_items", after_id=cursor.active_id, active_id=None,
+            cursor, phase="fabric_items", item_type="DataPipeline", after_id=cursor.active_id, active_id=None,
         )
 
     def _route(
@@ -781,7 +794,7 @@ class FabricInventoryClient:
                         ), None)
                         if known is not None and known.workload != "powerbi":
                             cursor = self._advance(
-                                cursor, phase="fabric_items", after_id=active, active_id=None,
+                                cursor, phase="fabric_items", item_type="DataPipeline", after_id=active, active_id=None,
                             )
                             continue
                         return cursor, RestRoute(
@@ -791,16 +804,14 @@ class FabricInventoryClient:
                     return cursor, RestRoute(
                         "powerbi", "powerbi.datasets", f"/groups/{active}/datasets",
                     ), gaps
-                if selector.kind == "item":
-                    return cursor, RestRoute(
-                        "fabric", "fabric.item", f"/workspaces/{active}/items/{selector.item_id}", None,
-                    ), gaps
                 if self.options.admin_items_preview:
                     return cursor, RestRoute(
                         "fabric", "fabric.admin_items_preview", "/admin/items", "itemEntities",
-                        (("workspaceId", active),),
+                        (("workspaceId", active), ("type", cursor.item_type)),
                     ), gaps
-                return cursor, RestRoute("fabric", "fabric.items", f"/workspaces/{active}/items"), gaps
+                return cursor, RestRoute(
+                    "fabric", "fabric.items", f"/workspaces/{active}/items", query=(("type", cursor.item_type),),
+                ), gaps
 
     async def read_page(
         self, context: MonitoringContext, selector: ScopeSelector, *,
@@ -873,6 +884,11 @@ class FabricInventoryClient:
                 if not isinstance(raw, dict):
                     raise RestReadError("malformed_inventory_row", "Inventory returned a non-object record")
                 _assert_payload_tenant(raw, context)
+                if cursor.phase == "fabric_items" and raw.get("type") != cursor.item_type:
+                    raise RestReadError(
+                        "inventory_type_filter_mismatch",
+                        "Source inventory did not honor the requested supported type filter; coverage is incomplete",
+                    )
                 common = {
                     **context.model_dump(), "generation_id": generation_id, "observed_at": observed_at,
                 }
@@ -935,6 +951,8 @@ class FabricInventoryClient:
                     if raw.get("workspaceId") is not None and _raw_id(raw, "workspaceId") != cursor.active_id:
                         raise RestReadError("wrong_workspace", "Item metadata belongs to another workspace")
                     if selector.item_id is not None and resource_id != selector.item_id:
+                        if cursor.phase == "fabric_items":
+                            continue
                         raise RestReadError("wrong_item", "Item metadata belongs to another selection")
                     is_powerbi = cursor.phase == "powerbi_items"
                     item_type = "Dataset" if is_powerbi else _name(raw, "type")
@@ -947,7 +965,7 @@ class FabricInventoryClient:
                             raise RestReadError("item_type_conflict", "Source inventories disagree about item type")
                         continue
                     if existing is not None and (
-                        existing.workload != _WORKLOADS.get(item_type)
+                        existing.workload != SUPPORTED_INVENTORY_TYPES.get(item_type)
                         or existing.workload is None and existing.item_type != item_type
                     ):
                         items[(cursor.active_id, resource_id)] = existing.model_copy(update={
@@ -961,12 +979,11 @@ class FabricInventoryClient:
                         workspace is not None and workspace.domain_id is not None
                     ) else ((), ())
                     gaps.extend(hierarchy_gaps)
-                    workload = _WORKLOADS.get(item_type)
+                    workload = SUPPORTED_INVENTORY_TYPES[item_type]
                     item = InventoryItem(
                         **common, workspace_id=cursor.active_id, item_id=resource_id,
                         name=_name(raw, "name" if is_powerbi or route.collection == "itemEntities" else "displayName"),
                         item_type=item_type, workload=workload,
-                        unsupported_reason=None if workload else f"No detector contract for Fabric {item_type}",
                         domain_ids=(workspace.domain_id,) if workspace and workspace.domain_id else (),
                         domain_ancestor_ids=ancestors[1:],
                         state="unknown" if (
@@ -975,11 +992,6 @@ class FabricInventoryClient:
                         ) else _state(raw),
                     )
                     items[(item.workspace_id, item.item_id)] = item
-                    if item.workload is None:
-                        gaps.append(CoverageGap(
-                            code="unsupported_item_type", detail=item.unsupported_reason,
-                            workspace_id=item.workspace_id, item_id=item.item_id,
-                        ))
                 if _state(raw) == "unknown":
                     if cursor.phase in {"domains", "workspaces", "memberships"}:
                         cursor = cursor.model_copy(update={"metadata_complete": False})
