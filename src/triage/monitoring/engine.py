@@ -716,6 +716,9 @@ class MonitoringEngine:
             observation = self._get("capability", payload["capability_id"], control, m.CapabilityObservation)
             if observation is None:
                 raise MonitoringUnavailable("Accepted capability evidence is absent")
+            superseded = self._superseded_capability(observation, control)
+            if superseded is not None:
+                return superseded
             self._publish_capability(observation, control)
         elif request.topic == "scope":
             plan = self._get("plan", payload["plan_id"], control, m.ActivationPlan)
@@ -877,6 +880,24 @@ class MonitoringEngine:
             ))
             self._schedule_poll(target)
             return "rejected", "Incomplete terminal source history was rejected; no source or action authority was published."
+        prior = self._get("rest_checkpoint", request.target.key, control, m.RestCheckpoint)
+        coverage = prior.coverage_through if prior else None
+        if coverage is not None and request.window.start_at > coverage:
+            # A window that skips validated coverage can never validate. Raising
+            # here left the handoff leased and retried forever, and it failed
+            # every controller heartbeat that claimed it. Reject it before any
+            # staging or ingestion so no source row is admitted, and poll again:
+            # the next window starts at validated coverage.
+            self._save_target(_update(
+                target, action=_update(target.action, enabled=False),
+                reason="Complete source history must be controller-validated before another action.",
+            ))
+            self._schedule_poll(target)
+            logger.warning(
+                "rest_window_skips_coverage workload=%s target=%s",
+                request.target.workload, key_digest(request.target.key)[:16],
+            )
+            return "rejected", "The source window starts after validated coverage; no source or action authority was published."
         staged = None
         if request.target.workload == "powerbi":
             staged, _, _ = self._stage_powerbi_page(request, control, stage_rows=False)
@@ -885,12 +906,8 @@ class MonitoringEngine:
                 "rest_observation", control, m.SourceRunObservation, filters={"parent_key": producer.reference_id},
             ):
                 self._ingest(observation, control)
-        prior = self._get("rest_checkpoint", request.target.key, control, m.RestCheckpoint)
-        coverage = prior.coverage_through if prior else None
         valid = not quarantines and (staged is None or staged.state == "validated")
         if valid:
-            if coverage is not None and request.window.start_at > coverage:
-                raise MonitoringConflict("Validated REST coverage cannot skip an unobserved window")
             coverage = max(coverage, request.window.end_at) if coverage else request.window.end_at
             if target.action.review_id is not None and target.admission_basis == "reviewed":
                 review = self._get("review", target.action.review_id, control, m.SafetyReview)
@@ -1625,6 +1642,50 @@ class MonitoringEngine:
              "commit": commit.model_dump(mode="json") if commit else None},
             m.CapabilityObservation, apply,
         )
+
+    def _superseded_capability(
+        self, observation: m.CapabilityObservation, control: m.DeploymentControl,
+    ) -> Rejection | None:
+        """Reject capability evidence taken against a replaced inventory generation, once.
+
+        The worker probes against the generation an item has at probe time.
+        Publication compares it with the generation the item has now, and a
+        newer inventory can re-stamp the item before the controller publishes.
+        Raising that refusal left the handoff leased and retried. A deployed
+        controller retried 244 of them up to 15 times each over two days,
+        about a third of its heartbeats failed, and every admitted target
+        stayed paused because no current access evidence could be published.
+
+        Nothing can make this evidence current. Reject the handoff and queue a
+        probe of the generation the item has now. Inventory publication uses
+        the same probe ID for that generation, so the two paths produce one
+        probe. The exact generation fence in ``_publish_capability`` is
+        unchanged.
+        """
+        item = self._get(
+            "inventory", f"{observation.target.workspace_id}:{observation.target.item_id}",
+            control, m.InventoryItem,
+        )
+        same_item = item is not None and item.target == observation.target
+        if same_item and item.generation_id == observation.inventory_generation:
+            return None
+        if same_item and item.state == "present":
+            now = self._now()
+            self._enqueue(m.MonitoringWorkDraft(
+                **_stamp(control), work_id=stable_id(control, f"probe:{item.generation_id}:{item.target.key}"),
+                kind="capability_probe", target=item.target, policy_revision=control.revision,
+                created_at=now, due_at=now,
+                reason="Superseded capability evidence requires a probe of the current inventory generation.",
+            ))
+            detail = "Capability evidence named a replaced inventory generation; the current generation is probed."
+        else:
+            detail = "Capability evidence no longer matches present inventory; nothing was published."
+        logger.info(
+            "capability_evidence_superseded workload=%s target=%s reprobed=%s",
+            observation.target.workload, key_digest(observation.target.key)[:16],
+            same_item and item.state == "present",
+        )
+        return "rejected", detail
 
     def _publish_capability(self, observation: m.CapabilityObservation, control: m.DeploymentControl) -> None:
         prior = self._get("target_capability", observation.target.key, control, m.CapabilityObservation)

@@ -2593,11 +2593,18 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         acknowledge_handoff = (
             window_row is None and handoff_row is not None and handoff_row.status in {"published", "rejected"}
         )
+        stale_closing_page = (
+            not request.reject_whole_window and not current and not control.maintenance
+            and handoff.policy_revision == control.revision
+            and window_row is not None and window_row.status in {"collecting", "awaiting_validation"}
+            and self._closes_collected_window(window, handoff.frontier_revision)
+        )
         acknowledge_pending_window = (
             not request.reject_whole_window and not current and not control.maintenance
             and handoff.policy_revision == control.revision
             and window_row is not None and window_row.status in {"collecting", "awaiting_validation"}
             and handoff_row is not None and handoff_row.status in {"published", "rejected"}
+            and not stale_closing_page
         )
         if request.reject_whole_window:
             if window_row is None or window_row.status not in {"collecting", "awaiting_validation"}:
@@ -2608,6 +2615,15 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         elif acknowledge_handoff:
             decision = handoff_row.status
             detail = "Acknowledge the original non-window handoff under its committed prefix without republishing it."
+        elif stale_closing_page:
+            # The kernel closes a window only through its published closing page
+            # or a whole-window rejection. A closing page whose evidence changed
+            # can never publish, and rejecting just that page left the window
+            # open: every later attempt was a pending acknowledgement, retried
+            # every 15 seconds indefinitely. 102 such windows accumulated in one
+            # workspace, ahead of new work in the same partition.
+            decision, complete, reject_window = "rejected", True, True
+            detail = "The closing page's evidence changed before publication; the window is rejected as a whole."
         elif acknowledge_pending_window:
             decision = handoff_row.status
             detail = "Retain the original page decision while its unfinished window remains fenced."
@@ -2669,6 +2685,14 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         )
         self._sql.operation_identity("controller.resolve_frontier", request.request_id)
         return resolved
+
+    @staticmethod
+    def _closes_collected_window(window: dict | None, handoff_revision: int) -> bool:
+        """True when this handoff is the closing page of a fully collected window."""
+        return bool(
+            window is not None and window.get("collection_complete") is True
+            and window.get("closing_revision") == handoff_revision
+        )
 
     def _reconciliation_response(self, request, native):
         value = _kernel_model(m.FrontierResolution, native)

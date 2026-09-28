@@ -225,6 +225,29 @@ authority. A later complete page or an explicit current whole-window rejection
 still has to close the window. Missing or contradictory original receipts fail
 closed; an acknowledgement is not a repair route.
 
+The window's closing page is the only page that can publish it. If the
+evidence of a closing page changes before publication (for example, a later
+poll page rewrites the poll progress it is bound to), that page can never
+publish. The controller then rejects the whole window, keeps earlier page
+decisions, and completes the work. Before this rule, such a window was
+acknowledged as pending every 15 seconds indefinitely.
+
+REST coverage cannot skip time. The worker starts each poll window at
+`min(due - lookback, validated coverage)`, reading the controller-validated
+`rest_checkpoint` through `worker_read`. A complete window that still starts
+after validated coverage is rejected before any Power BI staging or source
+ingestion, actions stay disabled, and the target is polled again from
+validated coverage. Deterministic outcomes like these are rejections, not
+exceptions. An exception leaves the handoff leased, so it is claimed again
+and fails every controller heartbeat that reaches it.
+
+Capability evidence is bound to the inventory generation it was probed
+against. If a newer generation re-stamps the item before publication, the
+controller rejects the evidence and queues a probe of the item's current
+generation. Inventory publication uses the same probe identity for that
+generation, so both paths produce one probe. The exact generation check for
+publication is unchanged.
+
 An accepted safety-review intent has `publication_status=pending_validation`;
 it is not a verified review. Pending revocation immediately denies new action
 reservations, while existing reservations can still verify and finalize without

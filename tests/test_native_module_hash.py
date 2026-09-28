@@ -128,12 +128,13 @@ def test_utf8_sql_catalogue_and_complete_kernel_abi_remain_unchanged() -> None:
         if obj.kind != "role":
             native_module_hash(obj.ddl)
     assert kernel.statements == before
-    # Indexed fact-key lookup changes only the accepted-facts view; native
-    # header projection cannot change source bytes or the remaining kernel ABI.
+    # Worker reads of the validated REST watermark change only the worker_read
+    # view; native header projection cannot change source bytes or the remaining
+    # kernel ABI.
     assert kernel_contract_hash(tables) == (
-        "9cdf4d288ff36952a7263fc59b0787bf26fb8f82190ef5f3dc1e71de18848c41"
+        "cce88b1ae112acb932868f484631c67bece3dc4747fb0444a79ebd238b706499"
     )
     assert fingerprint(kernel_abi(tables)) == kernel_contract_hash(tables)
     assert fingerprint(list(kernel.catalogue())) == (
-        "1766c22ad6ec89d4557181523c3d1127ca15ecb344581c753e9a04ead9df4313"
+        "718401a670e53b2402a7990f2fd2c7c6d20803ae6ee00445b78117f0c15638b4"
     )
