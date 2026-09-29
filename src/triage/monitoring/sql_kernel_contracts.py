@@ -407,6 +407,10 @@ def rpc_contracts(tables: Mapping[str, str] | None = None) -> dict[str, RpcContr
         parameter("subject_work_id", "nvarchar(128)", nullable=True),
         parameter("expected_subject_revision", "bigint", nullable=True),
     ), ("controller",), "Atomically persist a proven non-effect source disposition, processed marker and original receipt; never bypass a reservation.")
+    add("controller.retire_inventory", CONTEXT + (
+        parameter("request_id", "nvarchar(256)"), parameter("fingerprint", "char(64)"),
+        parameter("limit", "int"), parameter("generation_ids_json", "nvarchar(max)"),
+    ), ("controller",), "Delete proposed inventory passes older than the fixed retention window that no scan, catalogue record, active work or open collection window still needs, with their sightings and bindings; count each deleted row in its kind's retirement offset.")
     from dataclasses import replace
 
     result["controller.reserve_action"] = replace(
@@ -463,6 +467,10 @@ def rpc_contracts(tables: Mapping[str, str] | None = None) -> dict[str, RpcContr
         "controller.finalize": ("work_id", "finalization_id", "incident_id", "state", "incident", "source_disposition"),
         "controller.publish_source": ("source_key", "observation"),
         "controller.disposition_source": ("source_key", "disposition"),
+        "controller.retire_inventory": (
+            "tenant_id", "epoch", "request_id", "limit", "retain_after", "retired_generation_ids",
+            "refused_generation_ids", "deferred_generation_ids", "retired_sightings", "retired_bindings",
+        ),
     }
     for operation, required in fields.items():
         not_acquired = (

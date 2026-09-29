@@ -21,6 +21,7 @@ from triage.monitoring.adapters import MonitoringAdapter, Rejection
 from triage.monitoring.contracts import (
     MonitoringComponentDenied,
     MonitoringConflict,
+    MonitoringKernelUnsupported,
     MonitoringLeaseLost,
     MonitoringUnavailable,
 )
@@ -158,7 +159,7 @@ def _matches(record: StoredRecord, filters: dict[str, object]) -> bool:
         elif name == "due_before":
             if record.due_at is None or record.due_at > value:
                 return False
-        elif name in {"status_in", "workload_in"}:
+        elif name in {"status_in", "workload_in", "generation_id_in"}:
             if getattr(record, name.removesuffix("_in")) not in value:
                 return False
         elif getattr(record, name) != value:
@@ -255,10 +256,21 @@ class MemoryBackend:
         )
 
     def change_counter(self, kind: str, context: m.MonitoringContext) -> int:
-        return sum(
+        # Retired rows keep counting: each adds its revisions plus one to the
+        # kind's offset, so deleting history can never repeat an earlier value.
+        retired = self.state.records.get(_record_id("record_retirement", kind, context))
+        return (retired.sequence_number or 0 if retired is not None else 0) + sum(
             record.version for (tenant, epoch, record_kind, _), record in self.state.records.items()
             if (tenant, epoch, record_kind) == (context.tenant_id, context.epoch, kind)
         )
+
+    def delete(self, kind: str, key: str, context: m.MonitoringContext) -> StoredRecord:
+        """Remove one record for inventory retirement; the adapter re-checked it first."""
+        record = self.get(kind, key, context)
+        if record is None:
+            raise MonitoringConflict("A record selected for retirement is already absent")
+        del self.state.records[_record_id(kind, key, context)]
+        return record
 
     def due(self, request: m.WorkClaimRequest, *, after_workspace: str) -> list[StoredRecord]:
         now = self.now()
@@ -920,6 +932,66 @@ class MemoryMonitoringAdapter(MonitoringAdapter):
 
     def action_commit_work(self, context: m.MonitoringContext, commit: m.CollectionCommit) -> m.MonitoringWork:
         return self.engine._owned_work(context, commit.work_id, commit.lease, commit.expected_work_revision)
+
+    def open_inventory_collections(self, control: m.DeploymentControl) -> set[str]:
+        prefix = f"validation:v1:{control.epoch}:{control.tenant_id}:inventory:"
+        return {
+            frontier.frontier_key.removeprefix(prefix)
+            for frontier in self.engine._all("validation_frontier", control, m.ValidationFrontier)
+            if frontier.frontier_key.startswith(prefix) and frontier.validated_revision < frontier.accepted_revision
+        }
+
+    def retire_inventory(
+        self, control: m.DeploymentControl, request: m.InventoryRetirementRequest,
+        candidates: tuple[str, ...],
+    ) -> m.InventoryRetirementResult:
+        engine = self.engine
+        backend = engine._backend
+        if not isinstance(backend, MemoryBackend):
+            raise MonitoringKernelUnsupported("Offline retirement requires the explicit memory backend")
+
+        def apply() -> m.InventoryRetirementResult:
+            now = engine._now()
+            generations = engine._all("generation", control, m.InventoryGeneration)
+            # Candidates arrive oldest first, and the sighting budget is spent
+            # in that order, as the SQL kernel spends it.
+            eligible = [
+                generation_id for generation_id in candidates
+                if engine._inventory_pass_retirable(control, generation_id, generations, now)
+            ]
+            budget = m.INVENTORY_RETIREMENT_SIGHTINGS
+            deleted: dict[str, list[StoredRecord]] = {}
+            retired: list[str] = []
+            for generation_id in eligible:
+                sightings = sorted((
+                    row for kind in ("workspace_seen", "inventory_seen", "domain_seen")
+                    for row in backend.scan(kind, control, limit=len(backend.state.records), filters={"parent_key": generation_id})
+                ), key=lambda row: (row.kind, key_digest(row.key)))
+                for row in sightings[:budget]:
+                    deleted.setdefault(row.kind, []).append(backend.delete(row.kind, row.key, control))
+                # The pass record goes with its last sighting and stays
+                # eligible until then.
+                if len(sightings) <= budget:
+                    deleted.setdefault("generation", []).append(backend.delete("generation", generation_id, control))
+                    retired.append(generation_id)
+                budget -= min(budget, len(sightings))
+            for kind, rows in sorted(deleted.items()):
+                prior = engine._get("record_retirement", kind, control, m.RecordRetirement)
+                offset = (prior.counter_offset if prior else 0) + sum(row.version + 1 for row in rows)
+                engine._put("record_retirement", kind, control, m.RecordRetirement(
+                    **_stamp(control), record_kind=kind, retired_rows=(prior.retired_rows if prior else 0) + len(rows),
+                    counter_offset=offset, updated_at=now,
+                ), sequence_number=offset)
+            return m.InventoryRetirementResult(
+                **_stamp(control), request_id=request.request_id, limit=request.limit,
+                retain_after=now - m.INVENTORY_RETENTION, retired_generation_ids=tuple(sorted(retired)),
+                refused_generation_ids=tuple(sorted(set(candidates) - set(eligible))),
+                deferred_generation_ids=tuple(sorted(set(eligible) - set(retired))),
+                retired_sightings=sum(len(rows) for kind, rows in deleted.items() if kind != "generation"),
+            )
+        return self.idempotent(
+            "inventory_retirement", request.request_id, control, request, m.InventoryRetirementResult, apply,
+        )
 
 
 class InMemoryMonitoringStore(MonitoringEngine):

@@ -535,8 +535,10 @@ async def test_hosted_heartbeat_budget_begins_before_lock_wait(hosted_module, mo
         def release(self):
             pass
 
-    async def heartbeat(runner, *, started_at):
+    async def heartbeat(runner, *, started_at, retention):
         starts.append(started_at)
+        # The hosted controller retires old inventory history in its heartbeat.
+        assert retention == runner.retire_monitoring_history
         await asyncio.sleep(0)
         return []
 
@@ -544,7 +546,7 @@ async def test_hosted_heartbeat_budget_begins_before_lock_wait(hosted_module, mo
     monkeypatch.setattr(app, "controller_heartbeat", heartbeat)
     agent = app.TriageControllerAgent.__new__(app.TriageControllerAgent)
     agent._lock = SlowLock()
-    agent._runner = object()
+    agent._runner = SimpleNamespace(retire_monitoring_history=lambda budget=None: [])
     await agent._run_once("heartbeat")
     assert starts == [100.0]
 
@@ -601,7 +603,8 @@ async def test_hosted_lock_timeout_does_not_wrap_the_executing_heartbeat(hosted_
     monkeypatch.setattr(app, "HEARTBEAT_BUDGET_SECONDS", 0.01)
     monkeypatch.setattr(app, "controller_heartbeat", heartbeat)
     agent = app.TriageControllerAgent.__new__(app.TriageControllerAgent)
-    agent._lock, agent._runner = asyncio.Lock(), object()
+    agent._lock = asyncio.Lock()
+    agent._runner = SimpleNamespace(retire_monitoring_history=lambda budget=None: [])
     response = await asyncio.wait_for(agent._run_once("heartbeat"), 1)
     assert response.messages[0].text == "completed once"
     assert completed == ["original work settled"] and not agent._lock.locked()

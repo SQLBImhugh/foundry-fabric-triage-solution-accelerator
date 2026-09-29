@@ -148,3 +148,19 @@ class MonitoringAdapter(ABC):
     def action_commit_work(
         self, context: m.MonitoringContext, commit: m.CollectionCommit,
     ) -> m.MonitoringWork: ...
+
+    @abstractmethod
+    def open_inventory_collections(self, control: m.DeploymentControl) -> set[str]:
+        """Collections, including inventory passes, with pages still waiting for controller publication."""
+
+    @abstractmethod
+    def retire_inventory(
+        self, control: m.DeploymentControl, request: m.InventoryRetirementRequest,
+        candidates: tuple[str, ...],
+    ) -> m.InventoryRetirementResult:
+        """Re-check each proposed pass, then delete it with its sightings and bindings.
+
+        A proposed pass that is still needed is refused, not deleted. Every
+        deleted row adds its revisions plus one to its kind's retirement offset,
+        so ``change_counter`` never returns to an earlier value.
+        """

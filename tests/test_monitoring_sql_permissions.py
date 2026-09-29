@@ -45,7 +45,7 @@ def test_kernel_is_pure_deterministic_and_has_fixed_roles_and_objects(kernel) ->
     assert kernel.statements == schema_statements()
     assert kernel.catalogue() == object_catalogue()
     assert len([obj for obj in kernel.objects if obj.kind == "role"]) == 3
-    assert len(kernel.rpcs) == 27
+    assert len(kernel.rpcs) == 28
     assert len({obj.name for obj in kernel.objects}) == len(kernel.objects)
     assert all(rpc.implemented for rpc in kernel.rpcs.values())
     assert all(rpc.result_columns == ("result_json",) for rpc in kernel.rpcs.values())
@@ -326,7 +326,7 @@ def test_deployer_budget_seed_does_not_reset_or_update_existing_limits() -> None
 
 def test_machine_readable_integration_handoff_is_explicit() -> None:
     contract = integration_contract()
-    assert len(contract["rpcs"]) == 27
+    assert len(contract["rpcs"]) == 28
     assert contract["native_sql_proven"] is False
     assert "db.query" in contract["rpc_call"]
     assert "never await" in contract["rpc_call"].lower()
@@ -349,6 +349,7 @@ def test_new_generators_parse_on_the_declared_python_floor() -> None:
         "sql_kernel_connectors.py",
         "sql_kernel_arguments.py", "sql_kernel_retention.py", "sql_kernel_sources.py", "sql_kernel_proposals.py",
         "sql_kernel_correlation.py", "sql_kernel_removals.py", "sql_kernel_supersessions.py",
+        "sql_kernel_inventory_retention.py",
     )
     for name in names:
         ast.parse((root / name).read_text("utf-8"), filename=name, feature_version=(3, 11))

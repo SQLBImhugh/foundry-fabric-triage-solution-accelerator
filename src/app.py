@@ -256,7 +256,9 @@ class TriageControllerAgent(BaseAgent):
 
     async def _heartbeat(self, *, started_at: float | None = None) -> str:
         """Give automatic source work and human commands one slot per round."""
-        lines = await controller_heartbeat(self._runner, started_at=started_at)
+        lines = await controller_heartbeat(
+            self._runner, started_at=started_at, retention=self._runner.retire_monitoring_history,
+        )
         return "\n".join(lines) if lines else "No due controller or human command work; monitoring coverage is reported separately."
 
     async def _triage_text(self, text: str) -> str:

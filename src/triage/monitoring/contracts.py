@@ -50,6 +50,8 @@ from triage.monitoring.models import (
     InventoryDomain,
     InventoryGeneration,
     InventoryItem,
+    InventoryRetirementRequest,
+    InventoryRetirementResult,
     InventoryWorkspace,
     LeaseRenewal,
     LeaseToken,
@@ -737,6 +739,19 @@ class ControllerMonitoringStore(MonitoringWorkStore, Protocol):
         and connector-only follow-up enqueue join this transaction; they never
         open a nested transaction, reserve an action or borrow a target lease.
         None selects the same standard controller publisher used by the runner.
+        """
+        ...
+
+    def retire_inventory_history(self, request: InventoryRetirementRequest) -> InventoryRetirementResult:
+        """Delete inventory passes older than seven days that no reader needs.
+
+        A retired pass takes its sightings and their accepted-evidence bindings
+        with it. The latest, latest finished and latest complete pass of each
+        scan, the finished pass a collecting scan defers to, any pass a
+        workspace, domain or item record names, and any pass with active work
+        or an open collection window are kept. Each deleted row still counts as
+        a change, so change counters never return to an earlier value. The
+        same request ID returns its original result.
         """
         ...
 

@@ -79,10 +79,7 @@ EVIDENCE_REJECTION_REASONS = frozenset({
     "overtaken", "inspection_expired", "inspection_expired_during_preparation",
 })
 SCAN_BUDGET = 5_000
-#: How long a still-collecting inventory pass defers to the previous finished
-#: pass for the same selector. Passes finish in minutes; one that collects for
-#: longer is treated as unverified rather than trusted indefinitely.
-INVENTORY_COLLECTION_GRACE = timedelta(hours=1)
+INVENTORY_COLLECTION_GRACE = m.INVENTORY_COLLECTION_GRACE
 PLAN_TTL_SECONDS = 900
 SOURCE_FRESHNESS_SECONDS = 300
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -99,6 +96,7 @@ CONTROLLER_OPERATIONS = frozenset({
     "enqueue_work", "observe_source", "bind_approval", "reserve_action",
     "record_action_submission", "record_action_rejection", "record_action_outcome",
     "finalize_work", "reconcile_state", "reconcile_work", "publish_connector",
+    "retire_inventory_history",
 })
 SHARED_WORK_OPERATIONS = frozenset({"claim_work", "renew_lease", "disposition_work"})
 CONNECTOR_PUBLICATION_OPERATIONS = frozenset({
@@ -153,6 +151,11 @@ def _inventory_absence_matches(
         and generation.continuation is None
         and generation.started_at <= item.observed_at <= generation.completed_at
     )
+
+
+def _pass_order(generation: m.InventoryGeneration) -> tuple[datetime, str]:
+    """Newer passes sort later; pass IDs break ties, as the SQL kernel does."""
+    return generation.started_at, generation.generation_id
 
 
 def inventory_confirms_deletion(
@@ -1220,8 +1223,8 @@ class MonitoringEngine:
             other for other in generations
             if other.completed_at is not None and other.selector == generation.selector
             and other.enumeration == generation.enumeration
-            and (other.started_at, other.generation_id) < (generation.started_at, generation.generation_id)
-        ), key=lambda other: (other.started_at, other.generation_id), default=None)
+            and _pass_order(other) < _pass_order(generation)
+        ), key=_pass_order, default=None)
 
     def _workspace_verified(
         self, workspace: m.InventoryWorkspace, generations: list[m.InventoryGeneration],
@@ -1265,9 +1268,7 @@ class MonitoringEngine:
             ):
                 continue
             key = _json(selector.model_dump(mode="json"))
-            if key not in latest or (
-                generation.started_at, generation.generation_id
-            ) > (latest[key].started_at, latest[key].generation_id):
+            if key not in latest or _pass_order(generation) > _pass_order(latest[key]):
                 latest[key] = generation
         if settled:
             verdicts = [self._settled_pass(generation, generations) for generation in latest.values()]
@@ -1318,7 +1319,7 @@ class MonitoringEngine:
             ]
             if not covering:
                 return False
-            latest = max(covering, key=lambda generation: (generation.started_at, generation.generation_id))
+            latest = max(covering, key=_pass_order)
             if latest.completeness != "complete":
                 return False
         return True
@@ -1327,6 +1328,125 @@ class MonitoringEngine:
         return sum(self._backend.change_counter(kind, context) for kind in (
             "generation", "inventory", "workspace", "domain", "target_capability",
         ))
+
+    @atomic(write=True)
+    def retire_inventory_history(self, request: m.InventoryRetirementRequest) -> m.InventoryRetirementResult:
+        """Delete old inventory passes, with their sightings, once nothing reads them.
+
+        Every scan adds a pass record, and admission checks read all of them
+        against SCAN_BUDGET. In the MorkNet lab 363 accumulated in eleven days
+        and 3 still had a reader, so without retention the budget is spent in
+        about 100 days and every admission check fails. The engine proposes
+        candidates; each adapter re-checks every candidate before it deletes,
+        and the SQL kernel does so natively under its own authority.
+        """
+        control = self._control(request)
+        prior = self._receipt("inventory_retirement", request.request_id, control, m.InventoryRetirementResult)
+        if prior is not None:
+            if (prior.tenant_id, prior.epoch, prior.limit) != (request.tenant_id, request.epoch, request.limit):
+                raise MonitoringConflict("Idempotency ID was reused for different validated content")
+            return _update(prior, replayed=True)
+        now = self._now()
+        # Maintenance stops new effects, and the kernel refuses them as well.
+        # The refusal is not recorded, so the request can run after maintenance.
+        if control.maintenance:
+            return m.InventoryRetirementResult(
+                **_stamp(control), request_id=request.request_id, limit=request.limit,
+                retain_after=now - m.INVENTORY_RETENTION, status="maintenance",
+            )
+        # An operation with nothing to retire is recorded as well, so later
+        # heartbeats in the interval replay it instead of reading every pass.
+        candidates = self._inventory_retirement_candidates(control, now=now, limit=request.limit)
+        return self._adapter.retire_inventory(control, request, tuple(candidates))
+
+    def _inventory_retirement_candidates(
+        self, control: m.DeploymentControl, *, now: datetime, limit: int,
+    ) -> list[str]:
+        """The oldest ``limit`` passes that nothing reads.
+
+        The scan-order rules need only the pass records already read. The
+        remaining rules are one read each for all candidates, not per pass:
+        per-pass reads cost about a second each from a remote client. The
+        adapter bounds how many sightings one operation deletes.
+        """
+        generations = self._all("generation", control, m.InventoryGeneration)
+        superseded = [
+            generation for generation in sorted(generations, key=_pass_order)
+            if self._inventory_pass_superseded(generation, generations, now)
+        ]
+        in_use = self._inventory_passes_in_use(control, [generation.generation_id for generation in superseded])
+        return [generation.generation_id for generation in superseded if generation.generation_id not in in_use][:limit]
+
+    def _inventory_pass_retirable(
+        self, control: m.DeploymentControl, generation_id: str,
+        generations: list[m.InventoryGeneration], now: datetime,
+    ) -> bool:
+        """Whether no reader needs this pass. The SQL kernel applies the same rules."""
+        generation = next((value for value in generations if value.generation_id == generation_id), None)
+        return (
+            generation is not None and self._inventory_pass_superseded(generation, generations, now)
+            and not self._inventory_passes_in_use(control, [generation_id])
+        )
+
+    def _inventory_pass_superseded(
+        self, generation: m.InventoryGeneration, generations: list[m.InventoryGeneration], now: datetime,
+    ) -> bool:
+        """Old enough, and newer passes of its scan have taken over every role it had.
+
+        Coverage, scope previews and admission use the latest pass of each scan
+        and its latest finished and latest complete passes. A scan still
+        collecting within INVENTORY_COLLECTION_GRACE defers to the finished pass
+        before it (see _settled_pass).
+        """
+        if generation.started_at >= now - m.INVENTORY_RETENTION:
+            return False
+        scan = [
+            value for value in generations
+            if value.enumeration == generation.enumeration and value.selector == generation.selector
+        ]
+        newer = [value for value in scan if _pass_order(value) > _pass_order(generation)]
+        finished = generation.completed_at is not None
+        return not (
+            not newer
+            or finished and not any(value.completed_at is not None for value in newer)
+            or generation.completeness == "complete" and not any(value.completeness == "complete" for value in newer)
+            or finished and any(
+                value.completed_at is None and now - value.started_at <= m.INVENTORY_COLLECTION_GRACE
+                and not any(
+                    between.completed_at is not None
+                    and _pass_order(generation) < _pass_order(between) < _pass_order(value)
+                    for between in scan
+                )
+                for value in newer
+            )
+        )
+
+    def _inventory_passes_in_use(self, control: m.DeploymentControl, generation_ids: list[str]) -> set[str]:
+        """The passes among these that a reader outside scan order still needs.
+
+        A workspace, domain or item record resolves the pass that last saw it,
+        and a deleted item's pass is its deletion evidence. A worker resumes a
+        pass through its active work, and the controller publishes a pass
+        through its open collection window.
+        """
+        wanted = set(generation_ids)
+        if not wanted:
+            return set()
+        in_use = {
+            work.work_id for work in self._all(
+                "work", control, m.MonitoringWork,
+                filters={"work_kind": "inventory", "status_in": m.ACTIVE_WORK_STATES},
+            )
+        } | self._adapter.open_inventory_collections(control)
+        remaining = sorted(wanted - in_use)
+        for kind, model in (
+            ("inventory", m.InventoryItem), ("workspace", m.InventoryWorkspace), ("domain", m.InventoryDomain),
+        ):
+            for offset in range(0, len(remaining), 200):
+                in_use.update(record.generation_id for record in self._all(
+                    kind, control, model, filters={"generation_id_in": tuple(remaining[offset:offset + 200])},
+                ))
+        return in_use & wanted
 
     def _scope_disable_targets(
         self, control: m.DeploymentControl, scopes: list[m.ScopeDefinition],
@@ -1774,7 +1894,9 @@ class MonitoringEngine:
         latest: dict[str, m.InventoryGeneration] = {}
         for generation in generations:
             key = generation.enumeration + ":" + _json(generation.selector.model_dump(mode="json"))
-            if key not in latest or latest[key].started_at < generation.started_at:
+            # Ties break on the pass ID, as retention orders passes. Backend
+            # order let two readers name different latest passes.
+            if key not in latest or _pass_order(latest[key]) < _pass_order(generation):
                 latest[key] = generation
         disabling = not request.scope.enabled
         complete = self._inventory_complete(scopes, list(latest.values())) and all(
@@ -3109,7 +3231,10 @@ class MonitoringEngine:
         for generation in generations:
             selector_key = generation.enumeration + ":" + _json(generation.selector.model_dump(mode="json"))
             prior_generation = latest_generations.get(selector_key)
-            if prior_generation is None or generation.started_at >= prior_generation.started_at:
+            # Same order as retention: with equal start times, backend order
+            # chose the latest pass, and retiring the other one changed coverage
+            # without new evidence.
+            if prior_generation is None or _pass_order(generation) > _pass_order(prior_generation):
                 latest_generations[selector_key] = generation
         gaps = [
             gap for generation in latest_generations.values()

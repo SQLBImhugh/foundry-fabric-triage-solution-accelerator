@@ -46,8 +46,11 @@ from triage.monitoring.controller import (
     settled_thread,
 )
 from triage.monitoring.models import (
+    INVENTORY_RETENTION,
     SUPERSESSION_EVIDENCE_TTL_SECONDS,
     IncidentIdentity,
+    InventoryRetirementRequest,
+    InventoryRetirementResult,
     LeaseRenewal,
     MonitoringContext,
     MonitoringWork,
@@ -2106,6 +2109,54 @@ class TriageRunner:
                 break
             lines.append(await self.execute_monitoring_work(work))
         return lines
+
+    async def retire_monitoring_history(self, budget: HeartbeatBudget | None = None) -> list[str]:
+        """Run this interval's inventory retirement once; later heartbeats replay it.
+
+        The heartbeat calls this after its queue workers finish their turn,
+        whether or not they emptied their queues: a sustained backlog must not
+        stop retention. Every heartbeat in one INVENTORY_RETIREMENT_INTERVAL
+        sends the same request, so an uncertain commit is reconciled by its
+        own receipt and the other heartbeats read only that receipt. A refused
+        pass means the engine and the SQL kernel disagree about a reader; it
+        is logged, and the pass is kept.
+        """
+        if budget is not None and not budget.can_claim():
+            return []
+        context = await settled_thread(lambda: self.monitoring_context)
+        now = fixture_clock(self.monitoring)() if self.fixture else datetime.now(UTC)
+        request = InventoryRetirementRequest.for_interval(context, now)
+
+        def retire(request: InventoryRetirementRequest) -> InventoryRetirementResult | None:
+            # Recheck right before the durable write: the context read above
+            # can end after the admission deadline.
+            if budget is not None and not budget.can_claim():
+                return None
+            return self.monitoring.retire_inventory_history(request)
+
+        result = await settled_thread(retire, request)
+        if result is None or result.replayed or result.status != "completed":
+            return []
+        retired, refused = len(result.retired_generation_ids), len(result.refused_generation_ids)
+        deferred = len(result.deferred_generation_ids)
+        if not (retired or refused or deferred):
+            return []
+        heartbeat_logger = logging.getLogger("triage.telemetry.heartbeat")
+        heartbeat_logger.log(
+            logging.WARNING if refused else logging.INFO,
+            "inventory_retention retired=%d refused=%d deferred=%d sightings=%d bindings=%d",
+            retired, refused, deferred, result.retired_sightings, result.retired_bindings,
+        )
+        days = INVENTORY_RETENTION.days
+        line = (
+            f"- Inventory history: retired {retired} inventory passes older than {days} days "
+            f"({result.retired_sightings} sightings, {result.retired_bindings} evidence bindings)."
+        )
+        if deferred:
+            line += f" {deferred} more eligible passes continue in a later interval."
+        if refused:
+            line += f" Kept {refused} proposed passes that a reader still needs."
+        return [line]
 
     async def execute_monitoring_work(
         self, work: MonitoringWork, *, pipeline_client: FabricPipelineClient | None = None,

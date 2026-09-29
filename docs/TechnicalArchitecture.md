@@ -103,8 +103,8 @@ from one that could not be enumerated. Discovery searches only the supported
 Fabric types, `DataPipeline` and `SemanticModel`, and the typed Power BI datasets
 API. Each continuation retains its original type filter. Unsupported types are
 excluded from operational inventory, counts, selectors and item-type warnings.
-Original generation evidence remains available for receipt reconciliation;
-not searching a type does not establish its deletion.
+Operation receipts and per-page acceptance records keep what each pass
+observed; not searching a type does not establish its deletion.
 
 Every periodic inventory pass re-stamps workspace and item records page by
 page. While a pass is still collecting, membership stays as the previous
@@ -136,6 +136,68 @@ their local records were cleared.
 The hybrid implementation and its live acceptance are tracked in
 [HybridMonitoringPlan.md](HybridMonitoringPlan.md). Successful infrastructure
 provisioning does not establish event delivery or durable end-to-end operation.
+
+### Inventory pass retention
+
+Every scan writes a pass record (`generation`), plus a sighting per workspace,
+domain and item it saw. Admission checks read every pass record against the
+5,000-record `SCAN_BUDGET`; in the MorkNet lab 363 accumulated in eleven days,
+and 3 still had a reader. The controller heartbeat therefore runs one
+retirement operation per 15-minute `INVENTORY_RETIREMENT_INTERVAL`: at most 50
+passes, oldest first, and at most 1,000 sightings
+(`INVENTORY_RETIREMENT_SIGHTINGS`). A pass is retired, with its sightings and
+their accepted-evidence bindings, when it is more than seven days old and none
+of these applies:
+
+| Kept pass | Reader |
+|---|---|
+| Latest, latest finished or latest complete pass of its scan (selector and enumeration) | Coverage, scope preview, catalogue completeness |
+| Finished pass that a scan still collecting defers to, within `INVENTORY_COLLECTION_GRACE` | Admission during a re-inventory |
+| Pass named by a workspace, domain or item record | Catalogue lookups; a deleted item names the pass that proved the deletion |
+| Pass whose inventory work is queued, leased, waiting or finalizing | The worker resumes it |
+| Pass whose collection window is still open | Controller publication |
+
+A deleted item's evidence is always kept: every later complete scan that
+covers the item proves the deletion again and becomes the pass it names.
+Operation receipts and per-page acceptance records (`intake_disposition`),
+which copy each page's pass details, are not retired.
+
+The engine proposes the passes and `controller.retire_inventory` re-checks each
+one natively before deleting. The procedure is the only delete path in the
+kernel, runs only for the controller role, fixes the seven-day window, the
+collection grace and the sighting budget in its own text, and refuses any
+proposed pass that is still needed; the heartbeat logs refusals as a warning.
+The engine reads its candidates without the control lock; the procedure takes
+the lock for its re-check and deletes.
+
+The control lock is held while sightings are deleted, and a tenant pass can
+have one for every workspace and item in the tenant. When an operation reaches
+the sighting budget, the remaining eligible passes are deferred: a partly
+deleted pass keeps its record and stays eligible, and the pass record goes with
+its last sighting in a later operation. Each sighting also has one or more
+accepted-evidence bindings, which are deleted with it.
+
+Every heartbeat in an interval sends the same request ID
+(`InventoryRetirementRequest.for_interval`). The first completes the operation
+and stores its receipt, including when there was nothing to retire; the others
+replay that receipt without reading the passes. After an uncertain commit, the
+next heartbeat in the interval therefore reconciles the original receipt
+instead of starting another operation. A later interval is a new operation
+computed from current state, and every deletion is re-checked, so it cannot
+repeat an effect. Maintenance refuses the operation without recording it, so
+the same request runs once maintenance ends.
+
+The procedure compares `VARCHAR` columns such as `record_kind` and `status`
+with `VARCHAR` literals. With `N'...'` literals, the
+`SQL_Latin1_General_CP1_CI_AS` collation rules out an index seek: on the
+MorkNet database the reference check took 8,184 ms for 25 passes instead of
+14 ms, while the procedure held the control lock.
+
+Change counters (`change_counter`) add a per-kind offset from
+`record_retirement` records to the sum of live revisions. Each deleted row adds
+its revisions plus one to that offset, so retirement raises a counter instead
+of returning it to an earlier value. Scope-activation staleness checks and page
+cursors depend on counters never repeating.
 
 ### Monitoring engine and persistence adapters
 
@@ -205,7 +267,7 @@ table-level DML grant over mixed state is not that boundary.
 |---|---|
 | Worker | Checked inventory, REST, stream and topology observations, with lease and receipt checks |
 | Web | Validated human configuration/review intents and their immutable operation receipts |
-| Controller | Deterministic publication, admission, source disposition, action reservation and terminal finalization |
+| Controller | Deterministic publication, admission, source disposition, action reservation, terminal finalization and inventory pass retirement |
 | Deployment operator | Schema installation, protected writer registration and separately reviewed reset |
 
 Checked single-writer views and fixed ownership-chained procedures expose these

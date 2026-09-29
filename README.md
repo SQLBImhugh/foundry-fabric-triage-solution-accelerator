@@ -605,7 +605,12 @@ Two deadlines govern a heartbeat, and they answer different questions:
 Reaching either deadline stops new claims; it never cancels admitted work, which
 is protected by its lease. The heartbeat runs two automatic slots — one leading
 deterministic reconciliation, one leading actions — and one human-command slot,
-refilled within queue limits and the remaining allowance.
+refilled within queue limits and the remaining allowance. When the workers
+finish their turn with time to spare, it runs the current 15-minute interval's
+inventory retirement: the first heartbeat of the interval deletes up to 50
+inventory pass records that are more than seven days old and no longer read,
+and later heartbeats replay its stored result (see
+[Inventory pass retention](docs/TechnicalArchitecture.md#inventory-pass-retention)).
 
 Background execution survives the submitting client's disconnect. It does not
 provide automatic replay of this custom controller after process loss; recovery

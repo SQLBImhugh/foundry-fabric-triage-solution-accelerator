@@ -227,7 +227,9 @@ Collectors remain evidence-only and search only the supported item types at the
 service boundary. Keep Fabric `type` filters on all continuation requests and
 use the typed Power BI datasets API. Unsupported rows and their historical
 item-type warnings do not belong in operational inventory or coverage counts;
-retain original generation records and receipts for reconciliation.
+operation receipts and per-page acceptance records keep what each pass saw.
+Pass records and their sightings are retired after seven days once nothing
+reads them (see [Inventory pass retention](TechnicalArchitecture.md#inventory-pass-retention)).
 Standalone notebooks do not become pipelines. A failed-job stream
 cannot detect a job that never existed. Missing expected starts need explicit
 schedule/timezone/grace contracts, and broad data-quality monitoring needs

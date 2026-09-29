@@ -38,6 +38,10 @@ from triage.monitoring.sql_kernel_frontiers import (
     pending_window_handoff_authority_sql,
     stale_page_policy_sql,
 )
+from triage.monitoring.sql_kernel_inventory_retention import (
+    inventory_passes_sql,
+    inventory_retirement_eligible_sql,
+)
 from triage.monitoring.sql_kernel_work import (
     connector_collection_completion_sql,
     reconciliation_completion_sql,
@@ -371,12 +375,14 @@ class AbiDatabase(KernelProtocolDatabase):
                         status="pending_validation", target_key=target.key if target else None, sequence_number=ordinal,
                         parent_key=frontier_key if topic in {"inventory", "poll"} else None)
         if topic in {"inventory", "poll"}:
+            # The kernel keys each collection window to its collection (the
+            # inventory pass or poll work), which inventory retirement reads.
             self.native_put("validation_window", frontier_key, {
                 "frontier_key": frontier_key, "collection_id": reference, "collection_complete": complete,
                 "closing_request_id": args["request_id"] if complete else None,
                 "closing_revision": ordinal if complete else None,
                 "window": window.model_dump(mode="json") if window else None,
-            }, status="awaiting_validation" if complete else "collecting")
+            }, status="awaiting_validation" if complete else "collecting", parent_key=reference)
         work = m.MonitoringWork(
             **self.context.model_dump(), work_id=work_id, kind="reconcile_state", policy_revision=self.control.revision,
             created_at=self.clock(), due_at=self.clock(), target=target, revision=1, state="queued",
@@ -519,7 +525,10 @@ class AbiDatabase(KernelProtocolDatabase):
             frontier["validated_revision"] = frontier["accepted_revision"]
             self.native_put("validation_frontier", key, frontier, status=state, sequence_number=frontier["accepted_revision"])
             if window is not None:
-                self.native_put("validation_window", key, window, status="rejected" if state == "rejected" else "validated")
+                self.native_put(
+                    "validation_window", key, window, status="rejected" if state == "rejected" else "validated",
+                    parent_key=window.get("collection_id"),
+                )
             self.native_put("frontier_commit", key, {
                 "request_id": args["request_id"], "validation_id": args["validation_id"],
                 "frontier_key": key, "frontier_revision": frontier["accepted_revision"], "decision": state,
@@ -539,6 +548,8 @@ class AbiDatabase(KernelProtocolDatabase):
         return result
 
     def apply_rpc(self, operation, args):
+        if operation == "controller.retire_inventory":
+            return self._retire_inventory(args)
         if operation not in {
             "worker.accept_facts", "web.commit_intent", "worker.transition_work",
             "controller.resolve_frontier", "controller.transition_work",
@@ -651,6 +662,128 @@ class AbiDatabase(KernelProtocolDatabase):
             self.fail_after_native = None
             raise RuntimeError("Injected after guarded operation (51072)")
         return {"kernel_version": KERNEL_VERSION, "operation": operation, "status": "applied", "affected_rows": 1, "result": result}
+
+    def retirement_eligible(self, requested, *, cutoff, grace_start):
+        """Run the kernel's own retirement predicate over these records in SQLite."""
+        from test_monitoring_sql_removals import _query, _value
+
+        def adapt(sql):
+            return re.sub(r"\bN'", "'", sql).replace("TRY_CONVERT(datetime2(6),", "READ_UTC(")
+
+        def instant(value):
+            return value.astimezone(UTC).replace(tzinfo=None).isoformat(timespec="microseconds")
+
+        records = self.names.table("monitoring_records")
+        params = {
+            **self.context.model_dump(), "retain_after": instant(cutoff), "grace_start": instant(grace_start),
+            "generation_ids_json": json.dumps(requested),
+        }
+        with sqlite3.connect(":memory:") as connection:
+            connection.execute("ATTACH DATABASE ':memory:' AS dbo")
+            connection.create_function("JSON_VALUE", 2, _value)
+            connection.create_function("JSON_QUERY", 2, _query)
+            connection.create_function("READ_UTC", 1, self._read_utc)
+            connection.create_function("KEY_DIGEST", 1, lambda value: bytes.fromhex(key_digest(value)))
+            connection.create_function(
+                "HASHBYTES", 2, lambda algorithm, value: hashlib.sha256(value.encode("utf-16-le")).digest(),
+            )
+            connection.create_function("CONCAT", -1, lambda *values: "".join("" if v is None else str(v) for v in values))
+            connection.create_collation("Latin1_General_100_BIN2", lambda a, b: (a > b) - (a < b))
+            columns = "tenant_id,epoch,record_kind,full_key,key_hash,status,parent_key,parent_hash,generation_id,payload"
+            connection.execute(f"CREATE TABLE {records} ({columns})")
+            connection.execute(f"CREATE TABLE accepted_generations ({columns})")
+            rows = [(
+                row.context.tenant_id, row.context.epoch, row.kind, row.key, bytes.fromhex(key_digest(row.key)),
+                row.status, row.parent_key, bytes.fromhex(key_digest(row.parent_key)) if row.parent_key else None,
+                row.generation_id, row.payload,
+            ) for row in self.records.values()]
+            connection.executemany(f"INSERT INTO {records} VALUES ({','.join('?' * 10)})", rows)
+            # The kernel compares only passes the controller can read: accepted evidence.
+            connection.executemany(f"INSERT INTO accepted_generations VALUES ({','.join('?' * 10)})", [
+                values for values, row in zip(rows, self.records.values(), strict=True)
+                if row.kind == "generation" and self.accepted(row)
+            ])
+            connection.execute(
+                "CREATE TABLE passes (generation_id,scan_hash,started_at,finished,complete)",
+            )
+            connection.execute(
+                f"INSERT INTO passes {adapt(inventory_passes_sql('accepted_generations'))}", params,
+            )
+            predicate = inventory_retirement_eligible_sql(
+                self.names, passes="passes", generation="c.value", key_hash="KEY_DIGEST(c.value)",
+            )
+            return {
+                value for (value,) in connection.execute(
+                    f"SELECT c.value FROM json_each(@generation_ids_json) AS c WHERE {adapt(predicate)}", params,
+                ).fetchall()
+            }
+
+    def _retire_inventory(self, args):
+        """Emulate controller.retire_inventory; eligibility is the kernel's SQL, run in SQLite."""
+        from test_monitoring_sql_removals import _guid
+
+        operation = "controller.retire_inventory"
+        identity, binding = (operation, args["request_id"]), self.rpc_binding(args)
+        prior = self.receipts.get(identity)
+        if prior is not None:
+            if prior["fingerprint"] != args["fingerprint"] or prior["payload"]["binding_hash"] != binding:
+                raise RuntimeError("Original operation identity was reused with different input (51072)")
+            return {"kernel_version": KERNEL_VERSION, "operation": operation, "status": "replayed",
+                    "affected_rows": 0, "result": prior["payload"]["result"]}
+        if self.control.maintenance:
+            raise RuntimeError("Maintenance forbids this new operation (51071)")
+        requested = json.loads(args["generation_ids_json"])
+        if (
+            not 1 <= args["limit"] <= m.MAX_INVENTORY_RETIREMENT_BATCH or not isinstance(requested, list)
+            or len(requested) > args["limit"] or len(set(requested)) != len(requested)
+            or not all(_guid(value) for value in requested)
+        ):
+            raise RuntimeError("Inventory retirement input is outside its contract (51073)")
+        now = self.clock()
+        cutoff = now - m.INVENTORY_RETENTION
+        eligible = self.retirement_eligible(
+            requested, cutoff=cutoff, grace_start=now - m.INVENTORY_COLLECTION_GRACE,
+        ) if requested else set()
+        # The kernel spends its sighting budget in proposal order and deletes a
+        # pass record only with its last sighting.
+        sighting_kinds = {"workspace_seen", "inventory_seen", "domain_seen"}
+        budget, facts, retired = m.INVENTORY_RETIREMENT_SIGHTINGS, set(), []
+        for generation_id in (value for value in requested if value in eligible):
+            sightings = sorted((
+                (row.kind, row.key) for row in self.records.values()
+                if row.kind in sighting_kinds and row.parent_key == generation_id
+            ), key=lambda fact: (fact[0], key_digest(fact[1])))
+            facts.update(sightings[:budget])
+            if len(sightings) <= budget:
+                facts.add(("generation", generation_id))
+                retired.append(generation_id)
+            budget -= min(budget, len(sightings))
+        deleted = [
+            self.records.pop(key) for key, row in list(self.records.items())
+            if row.kind == "accepted_fact"
+            and (json.loads(row.payload)["fact_kind"], json.loads(row.payload)["fact_key"]) in facts
+        ] + [self.records.pop(fact) for fact in sorted(facts)]
+        for kind in sorted({row.kind for row in deleted}):
+            rows = [row for row in deleted if row.kind == kind]
+            prior_row = self.records.get(("record_retirement", kind))
+            offset = (prior_row.sequence_number if prior_row else 0) + sum(row.version + 1 for row in rows)
+            self.native_put("record_retirement", kind, {
+                **self.context.model_dump(), "record_kind": kind,
+                "retired_rows": (json.loads(prior_row.payload)["retired_rows"] if prior_row else 0) + len(rows),
+                "counter_offset": offset, "updated_at": now.isoformat(),
+            }, sequence_number=offset)
+        result = {
+            **self.context.model_dump(), "request_id": args["request_id"], "limit": args["limit"],
+            "retain_after": cutoff.isoformat(), "retired_generation_ids": sorted(retired),
+            "refused_generation_ids": sorted(set(requested) - eligible),
+            "deferred_generation_ids": sorted(eligible - set(retired)),
+            "retired_sightings": sum(row.kind in sighting_kinds for row in deleted),
+            "retired_bindings": sum(row.kind == "accepted_fact" for row in deleted),
+        }
+        self.receipts[identity] = {"fingerprint": args["fingerprint"], "recorded_at": now,
+                                  "payload": {"binding_hash": binding, "result": result}}
+        return {"kernel_version": KERNEL_VERSION, "operation": operation, "status": "applied",
+                "affected_rows": len(deleted), "result": result}
 
     def source_operation(self, operation, args):
         work = m.MonitoringWork.model_validate_json(self.records[("work", args["work_id"])].payload)

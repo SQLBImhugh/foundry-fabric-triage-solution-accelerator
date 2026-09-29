@@ -10,8 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Generic, Literal, TypeVar
+from uuid import UUID, uuid5
 
 from pydantic import (
     AfterValidator,
@@ -45,6 +46,31 @@ MAX_JSON_NODES = 4_096
 MAX_INTAKE_BATCH = 200
 MAX_POWERBI_WINDOW_ROWS = 5_000
 MAX_RECONCILIATION_BINDINGS = MAX_POWERBI_WINDOW_ROWS + MAX_INTAKE_BATCH + 1
+#: Inventory pass records older than this are deleted once nothing reads them.
+#: The window is kept for troubleshooting; the kernel fixes the same value.
+INVENTORY_RETENTION = timedelta(days=7)
+#: How long a still-collecting inventory pass defers to the previous finished
+#: pass for the same selector. Passes finish in minutes; one that collects for
+#: longer is treated as unverified rather than trusted indefinitely.
+INVENTORY_COLLECTION_GRACE = timedelta(hours=1)
+MAX_INVENTORY_RETIREMENT_BATCH = 50
+#: One retirement operation runs per interval. Every heartbeat inside it sends
+#: the same request ID, so a later heartbeat replays the stored receipt instead
+#: of reading every pass again or starting a second operation after an
+#: uncertain commit. At 50 passes per operation this retires up to 4,800
+#: passes a day.
+INVENTORY_RETIREMENT_INTERVAL = timedelta(minutes=15)
+#: Sightings one operation deletes. The control lock is held while it deletes,
+#: and a tenant pass can have a sighting for every workspace and item in the
+#: tenant, so a larger pass loses its sightings over several operations and its
+#: pass record goes with the last of them. Each sighting also has one or more
+#: accepted-evidence bindings.
+INVENTORY_RETIREMENT_SIGHTINGS = 1_000
+#: Record kinds inventory retirement deletes: a pass record, its sightings and
+#: the accepted-evidence bindings for those rows.
+RETIRED_RECORD_KINDS = ("generation", "workspace_seen", "inventory_seen", "domain_seen", "accepted_fact")
+#: Work states in which an inventory pass may still record pages.
+ACTIVE_WORK_STATES = ("queued", "leased", "waiting", "finalizing")
 
 Workload = Literal["powerbi", "fabric_pipeline"]
 SUPPORTED_WORKLOADS: tuple[Workload, ...] = ("powerbi", "fabric_pipeline")
@@ -550,6 +576,74 @@ class InventoryBatch(MonitoringModel):
         _unique(tuple(entry.workspace_id for entry in self.workspaces), "Workspace identities")
         _unique(tuple(entry.domain_id for entry in self.domains), "Domain identities")
         return self
+
+
+class InventoryRetirementRequest(MonitoringContext):
+    """Retire old inventory passes that no reader needs (controller only)."""
+
+    request_id: CanonicalId
+    limit: Annotated[int, Field(strict=True, ge=1, le=MAX_INVENTORY_RETIREMENT_BATCH)] = MAX_INVENTORY_RETIREMENT_BATCH
+
+    @classmethod
+    def for_interval(cls, context: MonitoringContext, at: datetime) -> InventoryRetirementRequest:
+        """The one request of the INVENTORY_RETIREMENT_INTERVAL that contains ``at``.
+
+        A request ID per heartbeat lost its identity when a commit was
+        uncertain: the next heartbeat started a new operation instead of
+        reconciling the original receipt.
+        """
+        seconds = int(INVENTORY_RETIREMENT_INTERVAL.total_seconds())
+        start = datetime.fromtimestamp(int(at.timestamp()) // seconds * seconds, UTC)
+        purpose = f"{context.tenant_id}:inventory-retirement:{start.isoformat()}"
+        return cls(tenant_id=context.tenant_id, epoch=context.epoch, request_id=str(uuid5(UUID(context.epoch), purpose)))
+
+
+class InventoryRetirementResult(MonitoringContext):
+    """What one retirement operation deleted, and which proposed passes it kept.
+
+    Every completed operation is recorded, including one with nothing to
+    retire, so a request ID has one answer. A ``maintenance`` answer is a
+    refusal: nothing is deleted or recorded, and the request can run once
+    maintenance ends.
+    """
+
+    request_id: CanonicalId
+    limit: Annotated[int, Field(strict=True, ge=1, le=MAX_INVENTORY_RETIREMENT_BATCH)]
+    retain_after: UtcDateTime
+    status: Literal["completed", "maintenance"] = "completed"
+    #: The stored answer of an earlier call with this request ID.
+    replayed: StrictBool = False
+    retired_generation_ids: Annotated[tuple[CanonicalId, ...], Field(max_length=MAX_INVENTORY_RETIREMENT_BATCH)] = ()
+    #: Proposed passes that a reader still needs; they are kept.
+    refused_generation_ids: Annotated[tuple[CanonicalId, ...], Field(max_length=MAX_INVENTORY_RETIREMENT_BATCH)] = ()
+    #: Eligible passes left for a later operation because the sighting budget
+    #: ran out. Some of their sightings may already be deleted.
+    deferred_generation_ids: Annotated[tuple[CanonicalId, ...], Field(max_length=MAX_INVENTORY_RETIREMENT_BATCH)] = ()
+    retired_sightings: Count = 0
+    retired_bindings: Count = 0
+
+    @model_validator(mode="after")
+    def validate_retirement(self) -> InventoryRetirementResult:
+        proposed = self.retired_generation_ids + self.refused_generation_ids + self.deferred_generation_ids
+        _unique(proposed, "Retired, refused and deferred passes")
+        if len(proposed) > self.limit:
+            raise ValueError("A retirement result cannot exceed its request limit")
+        if not (self.retired_generation_ids or self.deferred_generation_ids) and (
+            self.retired_sightings or self.retired_bindings
+        ):
+            raise ValueError("Sightings and bindings are retired only for an eligible pass")
+        if self.status == "maintenance" and (proposed or self.retired_sightings or self.retired_bindings or self.replayed):
+            raise ValueError("Maintenance refuses retirement without deleting or recording anything")
+        return self
+
+
+class RecordRetirement(MonitoringContext):
+    """Cumulative deletions of one record kind; its offset keeps change counters rising."""
+
+    record_kind: Literal["generation", "workspace_seen", "inventory_seen", "domain_seen", "accepted_fact"]
+    retired_rows: Count
+    counter_offset: Count
+    updated_at: UtcDateTime
 
 
 class EventCapabilityEvidence(MonitoringModel):

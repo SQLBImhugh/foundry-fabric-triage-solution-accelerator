@@ -18,6 +18,20 @@ def literals(values: Iterable[str]) -> str:
     return ", ".join("N'" + value.replace("'", "''") + "'" for value in values)
 
 
+def varchar_literals(values: Iterable[str]) -> str:
+    """Literals for VARCHAR columns such as record_kind, status and work_kind.
+
+    An N'...' literal converts the VARCHAR column to NVARCHAR, and under the
+    SQL_Latin1_General_CP1_CI_AS database collation that rules out an index
+    seek. On the MorkNet database the inventory reference check for 25 passes
+    took 8,184 ms with N'...' literals and 14 ms with these.
+    """
+    values = tuple(values)
+    if not values or any(not value.isascii() or "'" in value for value in values):
+        raise ValueError("VARCHAR literals must be nonempty ASCII values without quotes")
+    return ", ".join(f"'{value}'" for value in values)
+
+
 def key_hash(expression: str) -> str:
     if expression == "NULL":
         return "NULL"

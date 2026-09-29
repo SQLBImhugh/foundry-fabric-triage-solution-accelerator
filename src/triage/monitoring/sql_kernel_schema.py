@@ -95,7 +95,7 @@ def _views(names: SqlNames) -> list[KernelObject]:
             # validated coverage and the controller refused it. The worker's
             # coverage snapshot then reads each Power BI checkpoint's
             # powerbi_window and fails closed when that row is not visible.
-            f"r.record_kind IN ({literals((*facts, 'scope', 'target', 'target_capability', 'rest_checkpoint', 'powerbi_window', 'connector', 'connector_desired', 'partition_ownership', 'stream_start', 'stream_position', 'stream_checkpoint', 'stream_gap', 'validation_frontier', 'validation_window'))}) "
+            f"r.record_kind IN ({literals((*facts, 'scope', 'target', 'target_capability', 'rest_checkpoint', 'powerbi_window', 'connector', 'connector_desired', 'partition_ownership', 'stream_start', 'stream_position', 'stream_checkpoint', 'stream_gap', 'validation_frontier', 'validation_window', 'record_retirement'))}) "
             f"OR (r.record_kind='work' AND r.work_kind IN ({literals(WORKER_WORK_KINDS)}))",
         ),
         _view(
@@ -103,8 +103,10 @@ def _views(names: SqlNames) -> list[KernelObject]:
             # The Command Center's coverage view reads validated REST
             # checkpoints, the Power BI window each one references, and pinned
             # stream starts. Without them it showed no completed poll window
-            # and no stream gaps while the controller saw both.
-            f"r.record_kind IN ({literals(('plan', 'scope', 'review_request', 'review', 'target', 'target_capability', 'connector', 'receiver_heartbeat', 'web_reconcile_request', 'discovery_request', 'validation_frontier', 'validation_window', 'reconcile_acceptance', 'rest_checkpoint', 'powerbi_window', 'stream_start'))})",
+            # and no stream gaps while the controller saw both. Every reader
+            # sees record_retirement: change counters add its offsets so that
+            # retiring old inventory never lowers them.
+            f"r.record_kind IN ({literals(('plan', 'scope', 'review_request', 'review', 'target', 'target_capability', 'connector', 'receiver_heartbeat', 'web_reconcile_request', 'discovery_request', 'validation_frontier', 'validation_window', 'reconcile_acceptance', 'rest_checkpoint', 'powerbi_window', 'stream_start', 'record_retirement'))})",
         ),
     ]
     # The web counts queue work for its backlog but never reads work rows:
@@ -153,7 +155,7 @@ AND EXISTS (
         *FRONTIER_KINDS, *SOURCE_KINDS, "accepted_fact", "connector_desired", "stream_gap", "connector_source_retirement",
         "scope", "review_request", "plan", "connector", "work", "scheduler", "discovery_request",
         "web_reconcile_request", "worker_reconcile_request", "partition_ownership",
-        "stream_start", "stream_position", "stream_checkpoint",
+        "stream_start", "stream_position", "stream_checkpoint", "record_retirement",
     )
     objects.append(KernelObject("controller_read", names.object("controller_read"), "view", f"""CREATE OR ALTER VIEW {names.object('controller_read')}
 AS
@@ -195,6 +197,7 @@ def build_kernel(names: SqlNames, contracts: dict[str, RpcContract]) -> Permissi
     from triage.monitoring.sql_kernel_frontiers import frontier_procedures
     from triage.monitoring.sql_kernel_intake import intake_procedures
     from triage.monitoring.sql_kernel_intents import intent_procedures
+    from triage.monitoring.sql_kernel_inventory_retention import inventory_retention_procedures
     from triage.monitoring.sql_kernel_json import json_equal_function, json_string_function
     from triage.monitoring.sql_kernel_retention import retention_procedures
     from triage.monitoring.sql_kernel_sources import source_procedures
@@ -209,7 +212,7 @@ def build_kernel(names: SqlNames, contracts: dict[str, RpcContract]) -> Permissi
     for factory in (
         intent_procedures, work_procedures, intake_procedures, action_procedures,
         frontier_procedures, connector_procedures,
-        retention_procedures, source_procedures,
+        retention_procedures, source_procedures, inventory_retention_procedures,
     ):
         for logical, definition in factory(names, contracts).items():
             if logical in implementations:

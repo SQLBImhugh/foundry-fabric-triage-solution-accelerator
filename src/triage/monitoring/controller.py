@@ -215,8 +215,16 @@ class HeartbeatBudget:
 async def controller_heartbeat(
     runner: Any, *, rounds: int = 10, command_drain: Any = None,
     started_at: float | None = None, clock: Callable[[], float] | None = None,
+    retention: Callable[[HeartbeatBudget], Awaitable[list[str]]] | None = None,
 ) -> list[str]:
-    """Refill two automatic slots and one human slot before the shared admission deadline."""
+    """Refill two automatic slots and one human slot before the shared admission deadline.
+
+    ``retention`` runs once after the queue workers finish their turn, whether
+    they emptied their queues or used their quota, and only if the admission
+    budget still allows new work and no worker failed. A sustained backlog
+    cannot stop retention, and retention never takes a claim from detection
+    work. Its operation is bounded and runs once per retirement interval.
+    """
     if command_drain is None:
         from triage.command_center.worker import drain_commands
 
@@ -278,6 +286,8 @@ async def controller_heartbeat(
             for result in results:
                 if isinstance(result, BaseException):
                     raise result
+            if retention is not None and budget.can_claim() and still_listening():
+                lines.extend(await retention(budget))
         except BaseException as exc:
             status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
             error_type = type(exc).__name__

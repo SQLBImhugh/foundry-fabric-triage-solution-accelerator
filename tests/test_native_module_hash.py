@@ -129,12 +129,14 @@ def test_utf8_sql_catalogue_and_complete_kernel_abi_remain_unchanged() -> None:
             native_module_hash(obj.ddl)
     assert kernel.statements == before
     # The web reads REST checkpoints, their Power BI windows and stream starts
-    # through web_read and counts queue work through web_work_status; native
-    # header projection cannot change source bytes or the remaining kernel ABI.
+    # through web_read and counts queue work through web_work_status. The
+    # controller retires old inventory passes through its own procedure, and
+    # every read view exposes the retirement offsets; native header projection
+    # cannot change source bytes or the remaining kernel ABI.
     assert kernel_contract_hash(tables) == (
-        "67f26f52e2adf1618217f5c186b6385f8334ed71591a997159c177f491dad250"
+        "f12f33430644a87ff29c044d04d708c4c8ac3dadb1efa29b94f04982cf724601"
     )
     assert fingerprint(kernel_abi(tables)) == kernel_contract_hash(tables)
     assert fingerprint(list(kernel.catalogue())) == (
-        "e5d3b0e75552d6f17d55fd4f5226324cc90c080006a9bf90da1b062d56d3e3ce"
+        "860ada35411e164c3508116cdf6a0cd5c72ca3728908475b1481b5f07b8d84f6"
     )

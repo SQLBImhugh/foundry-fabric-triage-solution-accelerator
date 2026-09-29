@@ -304,8 +304,10 @@ requested type filter is an incomplete read, not additional inventory.
 Notebook activity evidence belongs to its monitored pipeline; standalone
 notebook-job monitoring is not implemented.
 
-Historical unsupported observations remain in original generation evidence and
-receipts, but not in operational catalogue reads or counts. A filtered scan
+Historical unsupported observations remain in operation receipts and per-page
+acceptance records, but not in operational catalogue reads or counts. Inventory
+pass records and their sightings are kept for seven days and then retired once
+nothing reads them. A filtered scan
 cannot claim an unsearched item type was deleted. Pre-filter inventory cursors
 finish as incomplete and schedule a fresh generation through the normal
 controller; access failures, incomplete coverage and action fences remain visible.

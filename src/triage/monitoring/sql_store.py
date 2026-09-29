@@ -601,7 +601,7 @@ class SqlBackend:
                 }[name]
                 clauses.append(f"{column} {operator} ?")
                 params.append(_db_time(value) if isinstance(value, datetime) else value)
-            elif name in {"status_in", "workload_in"}:
+            elif name in {"status_in", "workload_in", "generation_id_in"}:
                 if not value:
                     clauses.append("1 = 0")
                 else:
@@ -650,10 +650,15 @@ class SqlBackend:
 
     def change_counter(self, kind: str, context: m.MonitoringContext) -> int:
         self._flush_inventory_inserts()
+        # Retired rows keep counting: each adds its revisions plus one to the
+        # kind's offset, so deleting history can never repeat an earlier value.
         rows = self.db.query(
-            f"SELECT COALESCE(SUM(revision), 0) FROM {self.read_route(kind)} "
-            "WHERE tenant_id = ? AND epoch = ? AND record_kind = ?",
-            context.tenant_id, context.epoch, kind,
+            f"SELECT COALESCE((SELECT SUM(revision) FROM {self.read_route(kind)} "
+            "WHERE tenant_id = ? AND epoch = ? AND record_kind = ?), 0) + "
+            f"COALESCE((SELECT MAX(sequence_number) FROM {self.tables['monitoring_records']} "
+            "WHERE tenant_id = ? AND epoch = ? AND record_kind = 'record_retirement' "
+            "AND key_hash = ? AND full_key = ?), 0)",
+            context.tenant_id, context.epoch, kind, context.tenant_id, context.epoch, _digest(kind), kind,
         )
         if len(rows) != 1 or len(rows[0]) != 1:
             raise MonitoringUnavailable("SQL cursor revision did not return one value")
@@ -963,6 +968,11 @@ class SqlMonitoringAdapter(MonitoringAdapter):
                 else args[0].target if method.__name__ == "record_rest_page" else args[0]
             )
             self._sql.lock_context(context)
+            return method(self.engine, *args, **kwargs)
+        if method.__name__ == "retire_inventory_history":
+            # No control lock while the engine reads candidates: the kernel
+            # takes it and re-checks every candidate before it deletes. Reading
+            # every pass under the lock held back every other writer.
             return method(self.engine, *args, **kwargs)
         handlers = {
             "enqueue_work": self._sql_enqueue_work,
@@ -1484,7 +1494,49 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         if operation == "connector":
             receipt = self._sql.get_receipt("worker.observe_connector", request_id, context)
             return _kernel_model(m.ConnectorObservationResult, self._receipt_result(receipt)).connector if receipt else None
+        if operation == "inventory_retirement":
+            receipt = self._sql.get_receipt("controller.retire_inventory", request_id, context)
+            return self._retirement_result(context, self._receipt_result(receipt)) if receipt else None
         return self.engine._read_receipt(operation, request_id, context, model)
+
+    def _retirement_result(self, context: m.MonitoringContext, value: dict) -> m.InventoryRetirementResult:
+        result = _kernel_model(m.InventoryRetirementResult, value)
+        if _stamp(result) != _stamp(context):
+            raise MonitoringUnavailable("Guarded inventory retirement returned another tenant or epoch")
+        return result
+
+    def open_inventory_collections(self, control: m.DeploymentControl) -> set[str]:
+        # The kernel keeps one validation window per collection and keys it to
+        # the collection; for an inventory pass that is the pass ID. A window
+        # closes only when the controller publishes or rejects the whole pass.
+        collections: set[str] = set()
+        after = None
+        while True:
+            rows = self._sql.scan(
+                "validation_window", control, limit=1_000, after=after,
+                filters={"status_in": ("collecting", "awaiting_validation")},
+            )
+            collections.update(row.parent_key for row in rows if row.parent_key)
+            if len(rows) < 1_000:
+                return collections
+            after = key_digest(rows[-1].key)
+
+    def retire_inventory(
+        self, control: m.DeploymentControl, request: m.InventoryRetirementRequest,
+        candidates: tuple[str, ...],
+    ) -> m.InventoryRetirementResult:
+        reply = self._sql.rpc("controller.retire_inventory", {
+            **_stamp(control), "request_id": request.request_id,
+            "fingerprint": key_digest(_json(request.model_dump(mode="json"))),
+            "limit": request.limit, "generation_ids_json": _json(list(candidates)),
+        })
+        result = self._retirement_result(control, reply["result"])
+        answered = (
+            set(result.retired_generation_ids) | set(result.refused_generation_ids) | set(result.deferred_generation_ids)
+        )
+        if result.request_id != request.request_id or result.limit != request.limit or answered != set(candidates):
+            raise MonitoringUnavailable("Guarded inventory retirement answered a different request")
+        return _update(result, replayed=reply["status"] == "replayed")
 
     def _sql_operation_receipt(self, context, operation, request_id):
         self.engine._control(context)
