@@ -79,6 +79,10 @@ EVIDENCE_REJECTION_REASONS = frozenset({
     "overtaken", "inspection_expired", "inspection_expired_during_preparation",
 })
 SCAN_BUDGET = 5_000
+#: How long a still-collecting inventory pass defers to the previous finished
+#: pass for the same selector. Passes finish in minutes; one that collects for
+#: longer is treated as unverified rather than trusted indefinitely.
+INVENTORY_COLLECTION_GRACE = timedelta(hours=1)
 PLAN_TTL_SECONDS = 900
 SOURCE_FRESHNESS_SECONDS = 300
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -1171,9 +1175,12 @@ class MonitoringEngine:
         excluded = False
         uncertain_exclusion = False
         workspace = self._get("workspace", item.workspace_id, item, m.InventoryWorkspace)
-        workspace_known = not require_complete_hierarchy or workspace is None or (
-            self._catalogue_entry_complete(workspace) and self._catalogue_complete(item, "workspaces")
-        )
+        workspace_known = True
+        if require_complete_hierarchy and workspace is not None:
+            generations = self._all("generation", item, m.InventoryGeneration)
+            workspace_known = self._workspace_verified(workspace, generations) and self._catalogue_complete(
+                item, "workspaces", generations, settled=True,
+            )
         for policy in policies:
             if not policy.enabled:
                 continue
@@ -1193,13 +1200,65 @@ class MonitoringEngine:
                         includes.append((policy, rule))
         return includes if workspace_known and not uncertain_exclusion else [], excluded
 
+    def _settled_pass(
+        self, generation: m.InventoryGeneration, generations: list[m.InventoryGeneration],
+    ) -> m.InventoryGeneration | None:
+        """The finished pass whose verdict stands while ``generation`` is still collecting.
+
+        Every periodic pass re-stamps the catalogue page by page. Treating an
+        unfinished pass as the verdict paused every target in the workspace for
+        each refresh: about four minutes of lost detection per pass in the live
+        deployment. An unfinished pass neither confirms nor refutes membership,
+        so the previous finished pass for the same selector stands until it
+        finishes, for at most INVENTORY_COLLECTION_GRACE.
+        """
+        if generation.completed_at is not None:
+            return generation
+        if self._now() - generation.started_at > INVENTORY_COLLECTION_GRACE:
+            return None
+        return max((
+            other for other in generations
+            if other.completed_at is not None and other.selector == generation.selector
+            and other.enumeration == generation.enumeration
+            and (other.started_at, other.generation_id) < (generation.started_at, generation.generation_id)
+        ), key=lambda other: (other.started_at, other.generation_id), default=None)
+
+    def _workspace_verified(
+        self, workspace: m.InventoryWorkspace, generations: list[m.InventoryGeneration],
+    ) -> bool:
+        # A page that observes the workspace deleted or unknown applies at once.
+        if workspace.state != "present":
+            return False
+        generation = self._get("generation", workspace.generation_id, workspace, m.InventoryGeneration)
+        settled = self._settled_pass(generation, generations) if generation is not None else None
+        if settled is None or settled.completeness != "complete":
+            return False
+        if settled.generation_id == workspace.generation_id:
+            return True
+        seen = self._get(
+            "workspace_seen", f"{settled.generation_id}:{workspace.workspace_id}", workspace, m.InventoryWorkspace,
+        )
+        return seen is not None and seen.state == "present"
+
     def _catalogue_entry_complete(self, entry: m.InventoryWorkspace | m.InventoryDomain) -> bool:
         generation = self._get("generation", entry.generation_id, entry, m.InventoryGeneration)
         return entry.state == "present" and generation is not None and generation.completeness == "complete"
 
-    def _catalogue_complete(self, item: m.InventoryItem, enumeration: str) -> bool:
+    def _catalogue_complete(
+        self, item: m.InventoryItem, enumeration: str,
+        generations: list[m.InventoryGeneration] | None = None, *, settled: bool = False,
+    ) -> bool:
+        """Whether the latest pass of every matching selector completed.
+
+        With ``settled``, a pass that is still collecting defers to the
+        previous finished pass for its selector (see _settled_pass). Domain
+        membership never uses this: page data can move a workspace between
+        domains before its pass finishes.
+        """
+        if generations is None:
+            generations = self._all("generation", item, m.InventoryGeneration)
         latest: dict[str, m.InventoryGeneration] = {}
-        for generation in self._all("generation", item, m.InventoryGeneration):
+        for generation in generations:
             selector = generation.selector
             if generation.enumeration != enumeration or (
                 selector.kind in {"workspace", "item"} and not self._selector_matches(selector, item)
@@ -1210,6 +1269,9 @@ class MonitoringEngine:
                 generation.started_at, generation.generation_id
             ) > (latest[key].started_at, latest[key].generation_id):
                 latest[key] = generation
+        if settled:
+            verdicts = [self._settled_pass(generation, generations) for generation in latest.values()]
+            return all(verdict is not None and verdict.completeness == "complete" for verdict in verdicts)
         return all(generation.completeness == "complete" for generation in latest.values())
 
     def _domain_membership_complete(self, selector: m.ScopeSelector, item: m.InventoryItem) -> bool:

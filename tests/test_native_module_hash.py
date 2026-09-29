@@ -128,13 +128,13 @@ def test_utf8_sql_catalogue_and_complete_kernel_abi_remain_unchanged() -> None:
         if obj.kind != "role":
             native_module_hash(obj.ddl)
     assert kernel.statements == before
-    # Worker reads of the validated REST watermark change only the worker_read
-    # view; native header projection cannot change source bytes or the remaining
-    # kernel ABI.
+    # The web reads REST checkpoints, their Power BI windows and stream starts
+    # through web_read and counts queue work through web_work_status; native
+    # header projection cannot change source bytes or the remaining kernel ABI.
     assert kernel_contract_hash(tables) == (
-        "cce88b1ae112acb932868f484631c67bece3dc4747fb0444a79ebd238b706499"
+        "67f26f52e2adf1618217f5c186b6385f8334ed71591a997159c177f491dad250"
     )
     assert fingerprint(kernel_abi(tables)) == kernel_contract_hash(tables)
     assert fingerprint(list(kernel.catalogue())) == (
-        "718401a670e53b2402a7990f2fd2c7c6d20803ae6ee00445b78117f0c15638b4"
+        "e5d3b0e75552d6f17d55fd4f5226324cc90c080006a9bf90da1b062d56d3e3ce"
     )

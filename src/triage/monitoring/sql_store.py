@@ -302,6 +302,8 @@ class SqlBackend:
                 read_objects = [self.tables[name] for name in required]
                 if self.component == "controller":
                     read_objects.append(self.queue_table)
+                elif self.component == "web":
+                    read_objects.append(self.kernel_names.object("web_work_status"))
                 rows = self.db.query(
                     "SELECT " + ", ".join("OBJECT_ID(?, 'V')" for _ in read_objects),
                     *read_objects,
@@ -315,6 +317,8 @@ class SqlBackend:
                     raise MonitoringNotBootstrapped(f"Monitoring baseline is incomplete: {missing}")
                 if present["monitoring_control"] and self.component == "controller" and rows[0][-1] is None:
                     raise MonitoringNotBootstrapped("Monitoring baseline is missing controller_queue_read")
+                if present["monitoring_control"] and self.component == "web" and rows[0][-1] is None:
+                    raise MonitoringNotBootstrapped("Monitoring baseline is missing web_work_status")
                 if present["monitoring_control"] and not write:
                     self.db.query(
                         f"SELECT singleton FROM {self.tables['monitoring_control']} "
@@ -408,6 +412,13 @@ class SqlBackend:
         if self.component == "web" and kind in (*CATALOGUE_KINDS, *EVIDENCE_KINDS, *TELEMETRY_KINDS):
             return self.kernel_names.object("accepted_worker_facts")
         return self.tables["monitoring_records"]
+
+    def count_route(self, kind: str) -> str:
+        # The web counts queue work for its backlog through a status-only
+        # projection; it cannot read work rows, which carry lease fences.
+        if self.component == "web" and kind == "work":
+            return self.kernel_names.object("web_work_status")
+        return self.read_route(kind)
 
     def write_route(self, kind: str, *, insert: bool) -> str:
         if self.component == "worker":
@@ -629,7 +640,7 @@ class SqlBackend:
         self._flush_inventory_inserts()
         where, params = self._filters(filters)
         rows = self.db.query(
-            f"SELECT COUNT(*) FROM {self.read_route(kind)} "
+            f"SELECT COUNT(*) FROM {self.count_route(kind)} "
             "WHERE tenant_id = ? AND epoch = ? AND record_kind = ?" + where,
             context.tenant_id, context.epoch, kind, *params,
         )

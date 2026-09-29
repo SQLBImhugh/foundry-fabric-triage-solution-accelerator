@@ -100,9 +100,23 @@ def _views(names: SqlNames) -> list[KernelObject]:
         ),
         _view(
             names, "web_read",
-            f"r.record_kind IN ({literals(('plan', 'scope', 'review_request', 'review', 'target', 'target_capability', 'connector', 'receiver_heartbeat', 'web_reconcile_request', 'discovery_request', 'validation_frontier', 'validation_window', 'reconcile_acceptance'))})",
+            # The Command Center's coverage view reads validated REST
+            # checkpoints, the Power BI window each one references, and pinned
+            # stream starts. Without them it showed no completed poll window
+            # and no stream gaps while the controller saw both.
+            f"r.record_kind IN ({literals(('plan', 'scope', 'review_request', 'review', 'target', 'target_capability', 'connector', 'receiver_heartbeat', 'web_reconcile_request', 'discovery_request', 'validation_frontier', 'validation_window', 'reconcile_acceptance', 'rest_checkpoint', 'powerbi_window', 'stream_start'))})",
         ),
     ]
+    # The web counts queue work for its backlog but never reads work rows:
+    # they carry lease fences and action reservations. This projection
+    # exposes only the columns a status count filters on.
+    objects.append(KernelObject("web_work_status", names.object("web_work_status"), "view", f"""CREATE OR ALTER VIEW {names.object('web_work_status')}
+WITH SCHEMABINDING
+AS
+SELECT r.[tenant_id], r.[epoch], r.[record_kind], r.[status], r.[work_kind], r.[due_at] FROM {names.table('monitoring_records')} AS r
+JOIN {names.table('monitoring_control')} AS c
+  ON c.singleton=1 AND c.tenant_id=r.tenant_id AND c.epoch=r.epoch
+WHERE (r.record_kind=N'work');"""))
     # A raw worker insert is not controller evidence until the corresponding
     # protected binding AND immutable operation receipt exist and still match.
     # Seek bindings by the derived fact key before checking their receipts.
@@ -225,6 +239,7 @@ def build_kernel(names: SqlNames, contracts: dict[str, RpcContract]) -> Permissi
         allow(component, "SELECT", f"{component}_read")
         allow(component, "SELECT", f"receipts_{component}")
     allow("web", "SELECT", "accepted_worker_facts")
+    allow("web", "SELECT", "web_work_status")
     for component in ("web", "controller"):
         allow(component, "SELECT", "approval_read")
         allow(component, "SELECT", "incident_read")

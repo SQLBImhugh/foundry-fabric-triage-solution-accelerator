@@ -106,6 +106,17 @@ excluded from operational inventory, counts, selectors and item-type warnings.
 Original generation evidence remains available for receipt reconciliation;
 not searching a type does not establish its deletion.
 
+Every periodic inventory pass re-stamps workspace and item records page by
+page. While a pass is still collecting, membership stays as the previous
+finished pass of the same selector verified it: that pass must be complete and
+must have seen the workspace present. The deferral lasts at most one hour
+(`INVENTORY_COLLECTION_GRACE`). Only a complete pass can establish deletion; a
+collecting page that reports the workspace unknown applies at once, and a pass
+that finishes incomplete leaves membership unverified. Domain membership is not
+deferred, because a page can move a workspace between domains before its pass
+finishes. Before this rule, each refresh paused every admitted target in the
+workspace, about four minutes per pass in the live deployment.
+
 Power BI refreshes and scheduled Fabric pipeline executions are the supported
 failure workloads. Notebook activities can supply pipeline evidence; this is
 not standalone notebook monitoring or a universal Fabric audit subscription.
@@ -247,6 +258,16 @@ controller rejects the evidence and queues a probe of the item's current
 generation. Inventory publication uses the same probe identity for that
 generation, so both paths produce one probe. The exact generation check for
 publication is unchanged.
+
+The web reads coverage through `web_read`, which includes validated REST
+checkpoints, the Power BI window each checkpoint references, and pinned stream
+starts. It counts queue work through `web_work_status`, a projection of tenant,
+epoch, kind, status, work kind and due time. It cannot read work rows, which
+carry lease fences and action reservations. Without these the Command Center
+always showed an empty backlog, no completed poll window and no stream gaps,
+while the controller saw all three. The offline SQL test double applies each
+deployed read view's column list, predicate and SELECT grant, so a kind missing
+from a component's view fails offline as it does live.
 
 An accepted safety-review intent has `publication_status=pending_validation`;
 it is not a verified review. Pending revocation immediately denies new action

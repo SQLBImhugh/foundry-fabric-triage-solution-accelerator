@@ -59,8 +59,16 @@ class AnchorCase:
             self.db.principal = component
 
     def connector(self):
-        return next(value for value in self.controller.list_connectors(m.PageQuery(**self.h.context())).items
-                    if value.connector_id == self.connector_id)
+        # An oracle read through the controller's own SQL role: the worker role
+        # cannot select from controller_read, as in a live database.
+        prior = self.db.principal if self.db else None
+        self.principal("controller")
+        try:
+            return next(value for value in self.controller.list_connectors(m.PageQuery(**self.h.context())).items
+                        if value.connector_id == self.connector_id)
+        finally:
+            if prior is not None:
+                self.principal(prior)
 
     def web_work(self):
         h = self.h

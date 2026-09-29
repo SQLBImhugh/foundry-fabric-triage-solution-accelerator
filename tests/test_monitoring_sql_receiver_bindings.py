@@ -779,8 +779,11 @@ def test_worker_component_name_cannot_impersonate_the_sql_principal(receiver):
     h, db, store = receiver
     db.principal = "controller"
     before = deepcopy((db.records, db.receipts))
-    with pytest.raises(MonitoringComponentDenied):
+    # SQL refuses the first read through a view the controller role is not
+    # granted (error 229), before any procedure can check the component.
+    with pytest.raises(MonitoringUnavailable) as refused:
         claim(h, store)
+    assert "refused SELECT" in str(refused.value.__cause__)
     assert (db.records, db.receipts) == before
 
 

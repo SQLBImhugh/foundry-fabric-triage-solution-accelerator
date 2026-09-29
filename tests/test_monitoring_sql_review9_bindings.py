@@ -570,8 +570,11 @@ def test_component_argument_cannot_grant_sql_connector_publication_authority():
     request = publication(h, work, frontier)
     before = deepcopy(db.records)
     db.principal = "worker"
-    with pytest.raises(MonitoringComponentDenied):
+    # SQL refuses the first read through a view the worker role is not granted
+    # (error 229), before any procedure can check the component.
+    with pytest.raises(MonitoringUnavailable) as refused:
         store.publish_connector(request)
+    assert "refused SELECT" in str(refused.value.__cause__)
     assert db.records == before
 
 

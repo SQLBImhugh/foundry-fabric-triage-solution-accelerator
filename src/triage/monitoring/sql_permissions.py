@@ -116,6 +116,7 @@ def integration_contract(tables: Mapping[str, str] | None = None) -> dict:
             "controller_records": kernel.names.object("controller_read"),
             "controller_queue": kernel.names.object("controller_queue_read"),
             "accepted_worker_facts": kernel.names.object("accepted_worker_facts"),
+            "web_work_status": kernel.names.object("web_work_status"),
             "control": kernel.names.object("control_read"),
             "controller_web_approvals": kernel.names.object("approval_read"),
             "controller_web_incidents": kernel.names.object("incident_read"),

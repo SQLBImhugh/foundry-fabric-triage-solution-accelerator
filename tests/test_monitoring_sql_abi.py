@@ -42,10 +42,64 @@ from triage.monitoring.sql_kernel_work import (
     connector_collection_completion_sql,
     reconciliation_completion_sql,
 )
+from triage.monitoring.sql_permissions import build_permission_kernel
 from triage.monitoring.sql_store import AzureSqlMonitoringStore, KernelRateBudget
 from triage.store.azure_sql import SqlCommitUncertain
 
 FACT_KINDS = (*CATALOGUE_KINDS, *EVIDENCE_KINDS, *TELEMETRY_KINDS, *RPC_FACT_KINDS)
+_OBJECT = re.compile(r"\[dbo\]\.\[[^\]]+\]")
+
+
+def _group(text: str, start: int) -> str:
+    """The contents of the parenthesised group that opens at ``start``."""
+    depth = 0
+    for index in range(start, len(text)):
+        depth += {"(": 1, ")": -1}.get(text[index], 0)
+        if depth == 0:
+            return text[start + 1:index]
+    raise AssertionError("Unbalanced kernel view predicate")
+
+
+def record_view_sql(tables=None) -> dict[str, str]:
+    """A SQLite SELECT for each deployed record view, taken from its kernel DDL.
+
+    Components read records only through these views. Applying each view's own
+    column list and WHERE clause keeps this double from serving rows a live
+    view hides: web_read once omitted queue work and REST checkpoints, so the
+    Command Center showed no backlog and no completed poll window while every
+    offline test passed. Accepted-fact binding stays in ``AbiDatabase.query``.
+    """
+    kernel = build_permission_kernel(tables)
+    source = f" FROM {kernel.names.table('monitoring_records')} AS r\n"
+    accepted = kernel.names.object("accepted_worker_facts")
+    views = {}
+    for obj in kernel.objects:
+        if obj.kind != "view" or source not in obj.ddl:
+            continue
+        head, tail = obj.ddl.split(source, 1)
+        columns = head.rsplit("\nSELECT ", 1)[1]
+        where = tail.split("\nWHERE ", 1)[1]
+        if where.startswith("("):
+            predicate = _group(where, 0)
+        else:
+            kinds = "r.record_kind IN "
+            assert where.startswith(kinds + "("), obj.logical_name
+            predicate = kinds + "(" + _group(where, len(kinds)) + ")"
+        if "\nUNION ALL\n" in obj.ddl and accepted in obj.ddl:
+            predicate = f"({predicate}) OR r.record_kind IN ({', '.join(repr(kind) for kind in FACT_KINDS)})"
+        predicate = re.sub(r"(?<![\w'])N'", "'", predicate)
+        views[obj.name] = f"SELECT {columns} FROM records AS r WHERE ({predicate})"
+    return views
+
+
+def select_grants(principal, tables=None) -> frozenset[str]:
+    """Objects the principal's kernel role may SELECT from."""
+    granted = set()
+    for statement in build_permission_kernel(tables).grants[principal]:
+        permissions, target = statement.removeprefix("GRANT ").split(" ON OBJECT::", 1)
+        if "SELECT" in (value.strip() for value in permissions.split(",")):
+            granted.add(target.split(" TO ", 1)[0])
+    return frozenset(granted)
 
 
 class AbiDatabase(KernelProtocolDatabase):
@@ -62,6 +116,10 @@ class AbiDatabase(KernelProtocolDatabase):
         self.fail_after_native = None
         self.target_leases = {}
         self.processed = set()
+        self.record_views = record_view_sql(self._tables)
+        self.select_grants = {
+            component: select_grants(component, self._tables) for component in ("worker", "web", "controller")
+        }
 
     @contextmanager
     def transaction(self):
@@ -90,6 +148,16 @@ class AbiDatabase(KernelProtocolDatabase):
                     request_id=stable_id(row.context, f"preview:{payload['idempotency_id']}"),
                     policy_revision=payload["expected"]["revision"], revision=row.version,
                 )
+            elif row.kind == "stream_start":
+                # The kernel pins the broker start as a native record whose
+                # sequence column repeats the pinned boundary.
+                payload = {
+                    "partition_key": row.key, "partition": payload["partition"],
+                    "first_sequence_number": payload["first_sequence_number"],
+                    "broker_observed_at": payload["recorded_at"], "recorded_at": payload["recorded_at"],
+                    "history_before_start": payload["history_before_start"], "gaps": payload["gaps"],
+                }
+                row = replace(row, sequence_number=payload["first_sequence_number"])
             self.records[(row.kind, row.key)] = replace(row, payload=json.dumps(payload))
         self.fixture_facts = {
             (row.kind, row.key): self.row_hash(row) for row in self.records.values() if row.kind in FACT_KINDS
@@ -167,7 +235,7 @@ class AbiDatabase(KernelProtocolDatabase):
                         bytes.fromhex(key_digest(row.parent_key)) if row.parent_key else None,
                     ) for row in rows
                 ])
-                translated = re.sub(r"\[dbo\]\.\[[^\]]+\]", "records", sql)
+                translated = _OBJECT.sub(lambda match: self._record_route(connection, match.group(0)), sql)
                 translated = SqliteConnection.translate(translated)
                 translated = translated.replace("JSON_VALUE(", "json_extract(")
                 translated = translated.replace("TRY_CONVERT(datetime2(6), ", "READ_UTC(")
@@ -178,6 +246,17 @@ class AbiDatabase(KernelProtocolDatabase):
                 )
                 return [DriverRow(tuple(row)) for row in connection.execute(translated, bound).fetchall()]
         return super().query(sql, *params)
+
+    def _record_route(self, connection, name):
+        """Read through the named view as its deployed role and predicate allow."""
+        view = self.record_views.get(name)
+        if view is None:
+            return "records"
+        if name not in self.select_grants[self.principal]:
+            raise RuntimeError(f"SQL role refused SELECT on {name} (229)")
+        alias = "view_" + key_digest(name)[:16]
+        connection.execute(f"CREATE TEMP VIEW IF NOT EXISTS {alias} AS {view}")
+        return alias
 
     @staticmethod
     def _read_utc(value):

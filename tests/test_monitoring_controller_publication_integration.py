@@ -30,6 +30,7 @@ from triage.monitoring.contracts import (
     MonitoringCommitUncertain,
     MonitoringComponentDenied,
     MonitoringConflict,
+    MonitoringUnavailable,
 )
 from triage.monitoring.controller import publish_reconciliation_connector, reconcile_monitoring_work
 from triage.monitoring.memory import InMemoryMonitoringStore
@@ -608,8 +609,11 @@ async def test_controller_component_argument_does_not_authorize_the_worker_sql_p
     work = fixture.activate()
     before = deepcopy(fixture.rows())
     fixture.db.principal = "worker"
-    with pytest.raises(MonitoringComponentDenied):
+    # SQL refuses the first read through a view the worker role is not granted
+    # (error 229), before any procedure can check the component.
+    with pytest.raises(MonitoringUnavailable) as refused:
         await fixture.runner.execute_monitoring_work(work)
+    assert "refused SELECT" in str(refused.value.__cause__)
     assert fixture.rows() == before
 
 
