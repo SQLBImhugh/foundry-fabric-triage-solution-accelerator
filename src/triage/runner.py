@@ -2113,9 +2113,9 @@ class TriageRunner:
     async def retire_monitoring_history(self, budget: HeartbeatBudget | None = None) -> list[str]:
         """Run this interval's inventory retirement once; later heartbeats replay it.
 
-        The heartbeat calls this after its queue workers finish their turn,
-        whether or not they emptied their queues: a sustained backlog must not
-        stop retention. Every heartbeat in one INVENTORY_RETIREMENT_INTERVAL
+        The heartbeat runs this as its own task beside the queue workers, so a
+        heartbeat that spends its whole response window on queued work still
+        retires history. Every heartbeat in one INVENTORY_RETIREMENT_INTERVAL
         sends the same request, so an uncertain commit is reconciled by its
         own receipt and the other heartbeats read only that receipt. A refused
         pass means the engine and the SQL kernel disagree about a reader; it

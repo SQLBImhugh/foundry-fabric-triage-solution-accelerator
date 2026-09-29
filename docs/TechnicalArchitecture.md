@@ -187,6 +187,11 @@ computed from current state, and every deletion is re-checked, so it cannot
 repeat an effect. Maintenance refuses the operation without recording it, so
 the same request runs once maintenance ends.
 
+The heartbeat runs retention as its own task beside the queue workers, if the
+admission budget allows new work when the heartbeat starts. It first ran only
+after the workers finished; the first live heartbeats used their whole
+100-second response window on queued reconciliation, so retention never ran.
+
 The procedure compares `VARCHAR` columns such as `record_kind` and `status`
 with `VARCHAR` literals. With `N'...'` literals, the
 `SQL_Latin1_General_CP1_CI_AS` collation rules out an index seek: on the

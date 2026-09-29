@@ -219,11 +219,13 @@ async def controller_heartbeat(
 ) -> list[str]:
     """Refill two automatic slots and one human slot before the shared admission deadline.
 
-    ``retention`` runs once after the queue workers finish their turn, whether
-    they emptied their queues or used their quota, and only if the admission
-    budget still allows new work and no worker failed. A sustained backlog
-    cannot stop retention, and retention never takes a claim from detection
-    work. Its operation is bounded and runs once per retirement interval.
+    ``retention`` runs once, as its own task beside the queue workers, if the
+    admission budget allows new work when the heartbeat starts. It first ran
+    only after the workers finished, and live heartbeats that used their whole
+    100-second response window never reached it, so old inventory passes were
+    never retired. It takes no claim from detection work: most calls replay
+    the current retirement interval's stored receipt, and one bounded
+    operation runs per interval. Its lines follow the workers' lines.
     """
     if command_drain is None:
         from triage.command_center.worker import drain_commands
@@ -239,6 +241,7 @@ async def controller_heartbeat(
     def still_listening() -> bool:
         return not response_seconds or clock() - began < response_seconds
     lines: list[str] = []
+    housekeeping: list[str] = []
     remaining = {"automatic": max(1, min(rounds, 100)), "human": max(1, min(rounds, 100))}
     started = {"automatic": 0, "human": 0}
     completed = {"automatic": 0, "human": 0}
@@ -266,6 +269,15 @@ async def controller_heartbeat(
             failed = True
             raise
 
+    async def retire() -> None:
+        nonlocal failed
+        try:
+            if retention is not None and not failed and budget.can_claim() and still_listening():
+                housekeeping.extend(await retention(budget))
+        except BaseException:
+            failed = True
+            raise
+
     heartbeat_logger.info(
         "heartbeat_started budget_seconds=%d per_queue_limit=%d work_budget_seconds=%s",
         budget_seconds, remaining["human"], work_seconds,
@@ -273,6 +285,9 @@ async def controller_heartbeat(
     with heartbeat_span() as span:
         status, error_type, error_cause = "completed", "", ""
         workers = [
+            # Created first so it checks the admission budget before any
+            # worker has spent it.
+            asyncio.create_task(retire()),
             # One automatic worker leads each pool. They share the automatic
             # quota and borrow when their own pool is empty, so neither pool
             # can be starved by a continuous backlog in the other.
@@ -286,8 +301,7 @@ async def controller_heartbeat(
             for result in results:
                 if isinstance(result, BaseException):
                     raise result
-            if retention is not None and budget.can_claim() and still_listening():
-                lines.extend(await retention(budget))
+            lines.extend(housekeeping)
         except BaseException as exc:
             status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
             error_type = type(exc).__name__

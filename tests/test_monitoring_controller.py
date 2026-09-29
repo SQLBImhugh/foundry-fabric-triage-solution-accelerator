@@ -379,7 +379,13 @@ async def test_heartbeat_does_not_turn_sql_outage_into_an_empty_success(test_set
         await controller_heartbeat(Runner(), command_drain=human)
 
 
-async def test_heartbeat_retires_inventory_history_once_both_queues_settle(test_settings) -> None:
+async def test_heartbeat_retires_inventory_history_even_when_its_workers_use_the_whole_window(test_settings) -> None:
+    """Retention first ran only after the workers finished.
+
+    Live heartbeats used their whole 100-second response window, so it never
+    ran. It now runs once as its own task, and its lines follow the workers'.
+    """
+    now = [0.0]
     order = []
 
     class Runner:
@@ -387,7 +393,8 @@ async def test_heartbeat_retires_inventory_history_once_both_queues_settle(test_
 
         async def drain_monitoring_work(self, *, limit, budget, prefer="reconcile_state"):
             order.append("automatic")
-            return []
+            now[0] += 1_000.0
+            return ["automatic result"]
 
     async def human(_runner, *, limit, budget):
         order.append("human")
@@ -396,15 +403,41 @@ async def test_heartbeat_retires_inventory_history_once_both_queues_settle(test_
     async def retention(budget):
         assert budget.can_claim()
         order.append("retention")
+        await asyncio.sleep(0)
         return ["- Inventory history: retired 2 passes"]
 
-    lines = await controller_heartbeat(Runner(), command_drain=human, retention=retention)
+    lines = await controller_heartbeat(
+        Runner(), command_drain=human, retention=retention, started_at=0.0, clock=lambda: now[0],
+    )
 
-    assert lines == ["- Inventory history: retired 2 passes"]
-    assert order[-1] == "retention" and order.count("retention") == 1
+    assert order[0] == "retention" and order.count("retention") == 1
+    assert lines == ["automatic result", "- Inventory history: retired 2 passes"]
 
 
-async def test_heartbeat_retires_nothing_after_a_failed_claim(test_settings) -> None:
+async def test_heartbeat_fails_and_claims_nothing_when_retention_fails(test_settings) -> None:
+    claims = []
+
+    class Runner:
+        settings = test_settings
+
+        async def drain_monitoring_work(self, *, limit, budget, prefer="reconcile_state"):
+            claims.append(prefer)
+            return []
+
+    async def human(_runner, *, limit, budget):
+        claims.append("human")
+        return []
+
+    async def retention(budget):
+        raise MonitoringUnavailable("Synthetic SQL outage")
+
+    with pytest.raises(MonitoringUnavailable):
+        await controller_heartbeat(Runner(), command_drain=human, retention=retention)
+    # A sibling's SQL failure stops new claims.
+    assert claims == []
+
+
+async def test_heartbeat_still_fails_after_a_failed_claim_when_retention_ran(test_settings) -> None:
     retired = []
 
     class Runner:
@@ -418,11 +451,11 @@ async def test_heartbeat_retires_nothing_after_a_failed_claim(test_settings) -> 
 
     async def retention(budget):
         retired.append(budget)
-        return []
+        return ["- Inventory history: retired 2 passes"]
 
     with pytest.raises(MonitoringUnavailable):
         await controller_heartbeat(Runner(), command_drain=human, retention=retention)
-    assert retired == []
+    assert len(retired) == 1
 
 
 async def test_heartbeat_retires_nothing_once_its_admission_budget_is_spent(test_settings) -> None:
