@@ -20,10 +20,24 @@ from triage.monitoring.sql_kernel_common import (
 from triage.monitoring.sql_kernel_contracts import KernelObject, RpcContract, SqlNames
 
 
+def batch_parent_sql(parent: str | None) -> str:
+    """Extra predicate that seeks a batch's bindings through the parent index.
+
+    A batch's accepted_fact bindings share the parent key its producer wrote
+    (the collection work for worker.accept_facts). Without it, reading the
+    batch by JSON batch_id read every binding in the tenant: 693 ms and about
+    15,700 pages per accepted page on the MorkNet database.
+    """
+    if parent is None:
+        return ""
+    return f"\n      AND parent_hash={key_hash(parent)} AND parent_key={parent}"
+
+
 def raise_frontier_sql(
     names: SqlNames, *, producer: str, operation: str, topic: str, reference: str,
     target: str = "NULL", collection_id: str = "NULL", requires_window: str = "0",
     collection_complete: str = "1", window_start: str = "NULL", window_end: str = "NULL",
+    evidence_parent: str | None = None,
 ) -> str:
     records = names.table("monitoring_records")
     return f"""DECLARE @frontier_topic varchar(32)={topic},@frontier_reference nvarchar(1024)={reference},
@@ -75,7 +89,7 @@ BEGIN
 END;
 SET @frontier_revision=COALESCE(@frontier_prior_revision,0)+1;
 SELECT @frontier_old_window=payload,@frontier_old_window_state=status FROM {records}
-WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_window' AND full_key=@frontier_key;
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_window' AND full_key=@frontier_key AND key_hash={key_hash('@frontier_key')};
 IF (@frontier_prior IS NULL AND @frontier_old_window IS NOT NULL)
    OR (@frontier_prior IS NOT NULL AND @frontier_requires_window=1 AND @frontier_old_window IS NULL)
     THROW 51072, 'Collection/window frontier state is missing; runtime cannot recreate it', 1;
@@ -100,7 +114,7 @@ BEGIN
     ELSE UPDATE {records} SET revision=revision+1,sequence_number=@frontier_revision,
         status=CASE WHEN @frontier_collection_complete=1 THEN 'awaiting_validation' ELSE 'collecting' END,
         payload=@frontier_window_payload
-        WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_window' AND full_key=@frontier_key;
+        WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_window' AND full_key=@frontier_key AND key_hash={key_hash('@frontier_key')};
 END;
 SET @frontier_payload=(SELECT @tenant_id AS tenant_id,@epoch AS epoch,@frontier_key AS frontier_key,
     JSON_QUERY(@frontier_target) AS target,JSON_QUERY(@frontier_window) AS [window],
@@ -114,11 +128,11 @@ END
 ELSE UPDATE {records} SET revision=revision+1,sequence_number=@frontier_revision,
     status='pending_validation',payload=@frontier_payload
     WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_frontier'
-      AND full_key=@frontier_key AND revision=@frontier_row_revision;
+      AND full_key=@frontier_key AND key_hash={key_hash('@frontier_key')} AND revision=@frontier_row_revision;
 IF @@ROWCOUNT<>1 THROW 51072, 'Accepted frontier advance lost its compare-and-set', 1;
 DECLARE @frontier_evidence nvarchar(max)=(SELECT full_key AS binding_key,payload AS binding_payload
     FROM {records} WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='accepted_fact'
-      AND JSON_VALUE(payload,'$.batch_id')=@request_id
+      AND JSON_VALUE(payload,'$.batch_id')=@request_id{batch_parent_sql(evidence_parent)}
     ORDER BY full_key COLLATE Latin1_General_100_BIN2 FOR JSON PATH);
 -- FOR JSON PATH returns NULL, not an empty array, when no accepted_fact rows
 -- match. Concatenating that NULL made the digest NULL, and the handoff payload
@@ -148,7 +162,7 @@ def frontier_snapshot_sql(names: SqlNames, target: str) -> str:
         OR NOT EXISTS (SELECT 1 FROM {receipts} AS receipt
             WHERE receipt.tenant_id=f.tenant_id AND receipt.epoch=f.epoch
               AND receipt.operation='controller.resolve_frontier'
-              AND receipt.request_id=JSON_VALUE(fc.payload,'$.request_id')
+              AND receipt.request_id=JSON_VALUE(fc.payload,'$.request_id') AND receipt.request_hash={key_hash("JSON_VALUE(fc.payload,'$.request_id')")}
               AND JSON_VALUE(receipt.payload,'$.result.frontier_key')=f.full_key
               AND TRY_CONVERT(bigint,JSON_VALUE(receipt.payload,'$.result.validated_revision'))=f.sequence_number
               AND JSON_VALUE(receipt.payload,'$.result.state') IN ('published','rejected'))
@@ -161,9 +175,9 @@ def frontier_snapshot_sql(names: SqlNames, target: str) -> str:
     CAST(({pending}) AS bit) AS pending
     FROM {records} AS f
     LEFT JOIN {records} AS w ON w.tenant_id=f.tenant_id AND w.epoch=f.epoch
-      AND w.record_kind='validation_window' AND w.full_key=f.full_key
+      AND w.record_kind='validation_window' AND w.full_key=f.full_key AND w.key_hash=f.key_hash
     LEFT JOIN {records} AS fc ON fc.tenant_id=f.tenant_id AND fc.epoch=f.epoch
-      AND fc.record_kind='frontier_commit' AND fc.full_key=f.full_key
+      AND fc.record_kind='frontier_commit' AND fc.full_key=f.full_key AND fc.key_hash=f.key_hash
     WHERE f.tenant_id=@tenant_id AND f.epoch=@epoch AND f.record_kind='validation_frontier'
       AND (f.target_key IS NULL OR f.target_key={target})
     ORDER BY f.full_key COLLATE Latin1_General_100_BIN2
@@ -222,7 +236,7 @@ def nonwindow_handoff_authority_sql(names: SqlNames) -> str:
 FROM {records} AS f
 JOIN {records} AS own_handoff ON own_handoff.tenant_id=f.tenant_id AND own_handoff.epoch=f.epoch
   AND own_handoff.record_kind='validation_handoff' AND own_handoff.parent_key=f.full_key
-  AND own_handoff.full_key=@handoff_key AND own_handoff.sequence_number=@handoff_revision
+  AND own_handoff.full_key=@handoff_key AND own_handoff.key_hash={key_hash('@handoff_key')} AND own_handoff.sequence_number=@handoff_revision
   AND own_handoff.status=@decision
   AND JSON_VALUE(own_handoff.payload,'$.requires_window')='false'
   AND JSON_VALUE(own_handoff.payload,'$.work_id')=@work_id
@@ -239,14 +253,14 @@ JOIN {receipts} AS original ON original.tenant_id=f.tenant_id AND original.epoch
   AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.handoff_revision'))=@handoff_revision
   AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.work_fence')) BETWEEN 1 AND @fence
 JOIN {records} AS fc ON fc.tenant_id=f.tenant_id AND fc.epoch=f.epoch
-  AND fc.record_kind='frontier_commit' AND fc.full_key=f.full_key
+  AND fc.record_kind='frontier_commit' AND fc.full_key=f.full_key AND fc.key_hash=f.key_hash
   AND fc.status IN ('published','rejected') AND fc.sequence_number=@validated
   AND JSON_VALUE(fc.payload,'$.frontier_key')=f.full_key
   AND JSON_VALUE(fc.payload,'$.decision')=fc.status
   AND TRY_CONVERT(bigint,JSON_VALUE(fc.payload,'$.frontier_revision'))=fc.sequence_number
 JOIN {receipts} AS root ON root.tenant_id=f.tenant_id AND root.epoch=f.epoch
   AND root.operation='controller.resolve_frontier'
-  AND root.request_id=JSON_VALUE(fc.payload,'$.request_id')
+  AND root.request_id=JSON_VALUE(fc.payload,'$.request_id') AND root.request_hash={key_hash("JSON_VALUE(fc.payload,'$.request_id')")}
   AND JSON_VALUE(root.payload,'$.result.resolution_scope')='handoff'
   AND JSON_VALUE(root.payload,'$.result.state')=fc.status
   AND JSON_VALUE(root.payload,'$.result.frontier_key')=f.full_key
@@ -262,7 +276,7 @@ JOIN {records} AS root_handoff ON root_handoff.tenant_id=f.tenant_id AND root_ha
   AND JSON_VALUE(root_handoff.payload,'$.producer_request_id')=JSON_VALUE(root.payload,'$.result.producer_request_id')
   AND root_handoff.status=JSON_VALUE(root.payload,'$.result.handoff_decision')
 WHERE f.tenant_id=@tenant_id AND f.epoch=@epoch AND f.record_kind='validation_frontier'
-  AND f.full_key=@frontier_key AND f.parent_key IS NULL AND f.sequence_number=@accepted
+  AND f.full_key=@frontier_key AND f.key_hash={key_hash('@frontier_key')} AND f.parent_key IS NULL AND f.sequence_number=@accepted
   AND TRY_CONVERT(bigint,JSON_VALUE(f.payload,'$.accepted_revision'))=@accepted
   AND TRY_CONVERT(bigint,JSON_VALUE(f.payload,'$.validated_revision'))=@validated
   AND @validated BETWEEN @handoff_revision AND @accepted
@@ -271,7 +285,7 @@ WHERE f.tenant_id=@tenant_id AND f.epoch=@epoch AND f.record_kind='validation_fr
   AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.validated_revision'))
       BETWEEN 0 AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.frontier_revision'))
   AND NOT EXISTS (SELECT 1 FROM {records} AS w WHERE w.tenant_id=f.tenant_id AND w.epoch=f.epoch
-      AND w.record_kind='validation_window' AND w.full_key=f.full_key)
+      AND w.record_kind='validation_window' AND w.full_key=f.full_key AND w.key_hash=f.key_hash)
   AND (SELECT COUNT_BIG(*) FROM {records} AS prefix
       WHERE prefix.tenant_id=f.tenant_id AND prefix.epoch=f.epoch
         AND prefix.record_kind='validation_handoff' AND prefix.parent_key=f.full_key
@@ -282,7 +296,7 @@ WHERE f.tenant_id=@tenant_id AND f.epoch=@epoch AND f.record_kind='validation_fr
         AND EXISTS (SELECT 1 FROM {receipts} AS producer_receipt
             WHERE producer_receipt.tenant_id=f.tenant_id AND producer_receipt.epoch=f.epoch
               AND producer_receipt.operation=JSON_VALUE(prefix.payload,'$.producer_operation')
-              AND producer_receipt.request_id=JSON_VALUE(prefix.payload,'$.producer_request_id')
+              AND producer_receipt.request_id=JSON_VALUE(prefix.payload,'$.producer_request_id') AND producer_receipt.request_hash={key_hash("JSON_VALUE(prefix.payload,'$.producer_request_id')")}
               AND producer_receipt.fingerprint=JSON_VALUE(prefix.payload,'$.producer_fingerprint')
               AND JSON_VALUE(producer_receipt.payload,'$.binding_hash')=JSON_VALUE(prefix.payload,'$.producer_binding_hash')
               AND JSON_VALUE(producer_receipt.payload,'$.result.reconcile_work_id')=JSON_VALUE(prefix.payload,'$.work_id')
@@ -312,7 +326,7 @@ JOIN {records} AS own_handoff ON own_handoff.tenant_id=f.tenant_id AND own_hando
   AND TRY_CONVERT(bigint,JSON_VALUE(own_handoff.payload,'$.policy_revision'))=@current_revision
 JOIN {receipts} AS intake ON intake.tenant_id=f.tenant_id AND intake.epoch=f.epoch
   AND intake.operation=JSON_VALUE(own_handoff.payload,'$.producer_operation')
-  AND intake.request_id=@producer_request_id
+  AND intake.request_id=@producer_request_id AND intake.request_hash={key_hash("@producer_request_id")}
   AND intake.fingerprint=JSON_VALUE(own_handoff.payload,'$.producer_fingerprint')
   AND JSON_VALUE(intake.payload,'$.binding_hash')=JSON_VALUE(own_handoff.payload,'$.producer_binding_hash')
   AND JSON_VALUE(intake.payload,'$.result.reconcile_work_id')=@work_id
@@ -352,19 +366,19 @@ def closed_window_authority_sql(names: SqlNames) -> str:
 FROM {records} AS f
 JOIN {records} AS sibling ON sibling.tenant_id=f.tenant_id AND sibling.epoch=f.epoch
   AND sibling.record_kind='validation_handoff' AND sibling.parent_key=f.full_key
-  AND sibling.full_key=@handoff_key AND sibling.sequence_number=@handoff_revision
+  AND sibling.full_key=@handoff_key AND sibling.key_hash={key_hash('@handoff_key')} AND sibling.sequence_number=@handoff_revision
   AND JSON_VALUE(sibling.payload,'$.work_id')=@work_id
   AND JSON_VALUE(sibling.payload,'$.producer_request_id')=@producer_request_id
 JOIN {records} AS w ON w.tenant_id=f.tenant_id AND w.epoch=f.epoch
-  AND w.record_kind='validation_window' AND w.full_key=f.full_key
+  AND w.record_kind='validation_window' AND w.full_key=f.full_key AND w.key_hash=f.key_hash
 JOIN {records} AS fc ON fc.tenant_id=f.tenant_id AND fc.epoch=f.epoch
-  AND fc.record_kind='frontier_commit' AND fc.full_key=f.full_key
+  AND fc.record_kind='frontier_commit' AND fc.full_key=f.full_key AND fc.key_hash=f.key_hash
   AND fc.status=f.status AND fc.sequence_number=f.sequence_number
 JOIN {receipts} AS rejected ON rejected.tenant_id=f.tenant_id AND rejected.epoch=f.epoch
   AND rejected.operation='controller.resolve_frontier'
-  AND rejected.request_id=JSON_VALUE(fc.payload,'$.request_id')
+  AND rejected.request_id=JSON_VALUE(fc.payload,'$.request_id') AND rejected.request_hash={key_hash("JSON_VALUE(fc.payload,'$.request_id')")}
 WHERE f.tenant_id=@tenant_id AND f.epoch=@epoch AND f.record_kind='validation_frontier'
-  AND f.full_key=@frontier_key AND f.sequence_number=@accepted
+  AND f.full_key=@frontier_key AND f.key_hash={key_hash('@frontier_key')} AND f.sequence_number=@accepted
   AND TRY_CONVERT(bigint,JSON_VALUE(f.payload,'$.validated_revision'))=@accepted
   AND ((f.status='rejected' AND w.status='rejected'
         AND JSON_VALUE(rejected.payload,'$.result.state')='rejected'
@@ -386,7 +400,7 @@ def close_frontier_sql(names: SqlNames) -> str:
    return f"""UPDATE {names.table('monitoring_records')} SET revision=revision+1,status=@window_decision,
    payload=JSON_MODIFY(JSON_MODIFY(payload,'$.validated_revision',@validated),'$.updated_at',@resolved_at)
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_frontier'
-  AND full_key=@frontier_key AND sequence_number=@expected_frontier_revision;"""
+  AND full_key=@frontier_key AND key_hash={key_hash('@frontier_key')} AND sequence_number=@expected_frontier_revision;"""
 
 
 def _resolve(names: SqlNames, contract: RpcContract) -> KernelObject:
@@ -421,18 +435,18 @@ IF @handoff IS NULL OR @producer_request IS NULL
    OR COALESCE(JSON_VALUE(@producer_request,'$.fingerprint'),'')
       <>COALESCE(JSON_VALUE(@handoff,'$.producer_fingerprint'),'')
    OR NOT EXISTS (SELECT 1 FROM {receipts} WHERE tenant_id=@tenant_id AND epoch=@epoch
-       AND operation=JSON_VALUE(@handoff,'$.producer_operation') AND request_id=@producer_request_id
+       AND operation=JSON_VALUE(@handoff,'$.producer_operation') AND request_id=@producer_request_id AND request_hash={key_hash("@producer_request_id")}
        AND fingerprint=JSON_VALUE(@handoff,'$.producer_fingerprint')
        AND JSON_VALUE(payload,'$.binding_hash')=JSON_VALUE(@handoff,'$.producer_binding_hash'))
     THROW 51072, 'Reconciliation lost its immutable intent/evidence/receipt binding', 1;
 SELECT @frontier=payload,@accepted=sequence_number FROM {records} WITH (UPDLOCK,HOLDLOCK)
-WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_frontier' AND full_key=@frontier_key;
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_frontier' AND full_key=@frontier_key AND key_hash={key_hash('@frontier_key')};
 SET @validated=TRY_CONVERT(bigint,JSON_VALUE(@frontier,'$.validated_revision'));
 IF @frontier IS NULL OR @accepted<>@expected_frontier_revision OR @validated IS NULL
    OR @handoff_revision>@accepted OR @validated<0 OR @validated>@accepted
     THROW 51072, 'Accepted frontier changed; validation cannot outrun committed intake', 1;
 SELECT @window=payload,@window_state=status FROM {records}
-WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_window' AND full_key=@frontier_key;
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_window' AND full_key=@frontier_key AND key_hash={key_hash('@frontier_key')};
 IF JSON_VALUE(@handoff,'$.requires_window')='true' AND @window IS NULL
     THROW 51072, 'First-page window fence is missing, not complete', 1;
 SELECT @proof=payload FROM {records}
@@ -523,7 +537,7 @@ BEGIN
           AND EXISTS (SELECT 1 FROM {receipts} AS original_receipt
               WHERE original_receipt.tenant_id=@tenant_id AND original_receipt.epoch=@epoch
                 AND original_receipt.operation=JSON_VALUE(accepted_handoff.payload,'$.producer_operation')
-                AND original_receipt.request_id=JSON_VALUE(accepted_handoff.payload,'$.producer_request_id')
+                AND original_receipt.request_id=JSON_VALUE(accepted_handoff.payload,'$.producer_request_id') AND original_receipt.request_hash={key_hash("JSON_VALUE(accepted_handoff.payload,'$.producer_request_id')")}
                 AND original_receipt.fingerprint=JSON_VALUE(accepted_handoff.payload,'$.producer_fingerprint')
                 AND JSON_VALUE(original_receipt.payload,'$.binding_hash')
                     =JSON_VALUE(accepted_handoff.payload,'$.producer_binding_hash')))=@accepted
@@ -559,7 +573,7 @@ IF @whole_window_rejection=0 AND @window_ack=0 AND @handoff_ack=0
 BEGIN
     UPDATE {records} SET status=@decision,revision=revision+1
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_handoff'
-  AND full_key=@handoff_key AND status IN ('pending_validation',@decision);
+  AND full_key=@handoff_key AND key_hash={key_hash('@handoff_key')} AND status IN ('pending_validation',@decision);
     IF @@ROWCOUNT<>1 THROW 51072, 'Handoff acknowledgement lost its current state', 1;
 END;
 IF (SELECT COUNT_BIG(*) FROM {records}
@@ -584,17 +598,17 @@ BEGIN
     IF @@ROWCOUNT<>1 THROW 51072, 'Frontier validation compare-and-set failed', 1;
     IF @window IS NOT NULL
         UPDATE {records} SET revision=revision+1,status=CASE WHEN @window_decision='published' THEN 'validated' ELSE 'rejected' END
-        WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_window' AND full_key=@frontier_key;
+        WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_window' AND full_key=@frontier_key AND key_hash={key_hash('@frontier_key')};
     DECLARE @commit_payload nvarchar(max)=(SELECT @request_id AS request_id,@validation_id AS validation_id,
         @frontier_key AS frontier_key,@accepted AS frontier_revision,@window_decision AS decision
         FOR JSON PATH,WITHOUT_ARRAY_WRAPPER);
     IF NOT EXISTS (SELECT 1 FROM {records} WHERE tenant_id=@tenant_id AND epoch=@epoch
-        AND record_kind='frontier_commit' AND full_key=@frontier_key)
+        AND record_kind='frontier_commit' AND full_key=@frontier_key AND key_hash={key_hash('@frontier_key')})
     BEGIN
         {record_insert(names, 'frontier_commit', '@frontier_key', '@commit_payload', status='@window_decision', sequence='@accepted')}
     END
     ELSE UPDATE {records} SET revision=revision+1,sequence_number=@accepted,status=@window_decision,payload=@commit_payload
-        WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='frontier_commit' AND full_key=@frontier_key;
+        WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='frontier_commit' AND full_key=@frontier_key AND key_hash={key_hash('@frontier_key')};
 END;
 SET @result=(SELECT @work_id AS work_id,@fence AS work_fence,@producer_request_id AS producer_request_id,
     @frontier_key AS frontier_key,@accepted AS frontier_revision,@validated AS validated_revision,

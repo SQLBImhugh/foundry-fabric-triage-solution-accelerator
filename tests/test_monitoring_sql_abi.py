@@ -345,17 +345,19 @@ class AbiDatabase(KernelProtocolDatabase):
             connection.create_collation("Latin1_General_100_BIN2", lambda a, b: (a > b) - (a < b))
             records, receipts = self.names.table("monitoring_records"), self.names.table("monitoring_receipts")
             connection.execute(f"CREATE TABLE {records} "
-                               "(tenant_id,epoch,record_kind,full_key,revision,status,parent_key,sequence_number,payload,key_hash)")
-            connection.executemany(f"INSERT INTO {records} VALUES (?,?,?,?,?,?,?,?,?,?)", [
+                               "(tenant_id,epoch,record_kind,full_key,revision,status,parent_key,sequence_number,payload,key_hash,"
+                               "parent_hash)")
+            connection.executemany(f"INSERT INTO {records} VALUES (?,?,?,?,?,?,?,?,?,?,?)", [
                 (row.context.tenant_id, row.context.epoch, row.kind, row.key, row.version, row.status,
-                 row.parent_key, row.sequence_number, row.payload, bytes.fromhex(key_digest(row.key)))
+                 row.parent_key, row.sequence_number, row.payload, bytes.fromhex(key_digest(row.key)),
+                 bytes.fromhex(key_digest(row.parent_key)) if row.parent_key else None)
                 for row in self.records.values()
             ])
             connection.execute(f"CREATE TABLE {receipts} "
-                               "(tenant_id,epoch,operation,request_id,fingerprint,payload)")
-            connection.executemany(f"INSERT INTO {receipts} VALUES (?,?,?,?,?,?)", [
+                               "(tenant_id,epoch,operation,request_id,fingerprint,payload,request_hash)")
+            connection.executemany(f"INSERT INTO {receipts} VALUES (?,?,?,?,?,?,?)", [
                 (self.context.tenant_id, self.context.epoch, operation, request_id,
-                 value["fingerprint"], json.dumps(value["payload"]))
+                 value["fingerprint"], json.dumps(value["payload"]), bytes.fromhex(key_digest(request_id)))
                 for (operation, request_id), value in self.receipts.items()
             ])
             return connection.execute(_adapt(self, sql).replace("COUNT_BIG(", "COUNT("), params).fetchall()

@@ -41,6 +41,35 @@ def test_empty_claim_does_not_scan_completed_work_or_transition_history(monkeypa
     assert queue.claim() == ()
 
 
+def test_fairness_cursor_seeks_recent_progress_instead_of_reading_work_history(monkeypatch):
+    # Reading completed_at from every work payload and joining every
+    # transition receipt by JSON took about 5 seconds per claim on the MorkNet
+    # database, under the control lock.
+    queue = QueueFixture(True)
+    expected = queue.discovery()
+    query = queue.db.query
+    cursors = []
+
+    def capture(sql, *parameters):
+        if sql.startswith("WITH recent AS"):
+            cursors.append(sql)
+        return query(sql, *parameters)
+
+    monkeypatch.setattr(queue.db, "query", capture)
+    assert [work.work_id for work in queue.claim()] == [expected.work_id]
+    sql, = cursors
+    assert "AND w.status IN ('leased', 'finalizing')" in sql
+    assert "$.completed_at" not in sql
+    operations = ("controller.transition_work", "controller.finalize", "controller.disposition_source")
+    for operation in operations:
+        # One backward seek of the receipts recency index, then its work row.
+        assert f"receipt.operation = '{operation}'" in sql
+        assert f"latest.operation = '{operation}')" in sql
+    assert sql.count("MAX(latest.recorded_at)") == len(operations)
+    assert sql.count("AND w.key_hash = ") == len(operations)
+    assert "N'controller." not in sql
+
+
 def test_queue_projection_is_controller_read_only_and_excludes_raw_evidence():
     kernel = build_permission_kernel()
     view = next(obj for obj in kernel.objects if obj.logical_name == "controller_queue_read")

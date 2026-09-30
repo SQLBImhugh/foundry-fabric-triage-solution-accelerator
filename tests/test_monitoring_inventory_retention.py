@@ -64,7 +64,7 @@ def item_scan(fixture: PublicationHarness, item_id: str | None = None) -> m.Scop
 
 def record_scan_page(
     fixture: PublicationHarness, work: m.MonitoringWork, *, items: tuple[str, ...], finished: bool,
-    complete: bool = True, workspaces: tuple[str, ...] = (),
+    complete: bool = True, workspaces: tuple[str, ...] = (), next_scan_in: int | None = None,
 ) -> m.InventoryGeneration:
     """Record a pass's first page: its workspace entries and the given pipelines."""
     now = fixture.h.clock()
@@ -77,6 +77,7 @@ def record_scan_page(
         completeness="complete" if finished and complete else "partial", started_at=now,
         completed_at=now if finished else None, continuation=None if finished else "page-2",
         discovered_count=len(items), completed_pages=1, gaps=gaps,
+        next_scan_at=now + timedelta(seconds=next_scan_in) if next_scan_in is not None else None,
     )
     return fixture.use("worker").record_inventory(m.InventoryBatch(
         request_id=fixture.h.next_id(), expected=fixture.version("worker"), generation=generation,
@@ -595,7 +596,7 @@ def test_the_sql_kernel_lets_only_the_controller_retire_inventory_history():
     assert "record_kind IN ('workspace_seen', 'inventory_seen', 'domain_seen')" in ddl
     # Every component reads the retirement offsets; none can write them through a view.
     for name in ("web_read", "worker_read", "controller_read"):
-        assert "N'record_retirement'" in views[name], name
+        assert "'record_retirement'" in views[name], name
     for name in (
         "worker_catalogue", "worker_evidence", "worker_telemetry", "web_drafts",
         "controller_projections", "controller_immutable",

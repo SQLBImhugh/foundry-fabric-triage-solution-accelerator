@@ -113,7 +113,7 @@ FROM @facts AS f JOIN {records} AS r
   ON r.tenant_id=@tenant_id AND r.epoch=@epoch AND r.record_kind=f.fact_kind
  AND r.key_hash=f.fact_key_hash AND r.full_key=f.full_key;
 SET @affected=@@ROWCOUNT;
-{handoff_sql(names, producer='worker', operation='worker.accept_facts', topic="CASE @stored_work_kind WHEN 'poll' THEN 'rest_page' WHEN 'capability_probe' THEN 'capability' WHEN 'connector_reconcile' THEN 'connector' ELSE 'inventory' END", reference='@work_id', target="JSON_QUERY(@stored_work,'$.target')", collection_id='@work_id', requires_window="CASE WHEN @stored_work_kind IN ('inventory','poll') THEN 1 ELSE 0 END", collection_complete='@collection_complete', window_start='@window_start_at', window_end='@window_end_at')}
+{handoff_sql(names, producer='worker', operation='worker.accept_facts', topic="CASE @stored_work_kind WHEN 'poll' THEN 'rest_page' WHEN 'capability_probe' THEN 'capability' WHEN 'connector_reconcile' THEN 'connector' ELSE 'inventory' END", reference='@work_id', target="JSON_QUERY(@stored_work,'$.target')", collection_id='@work_id', requires_window="CASE WHEN @stored_work_kind IN ('inventory','poll') THEN 1 ELSE 0 END", collection_complete='@collection_complete', window_start='@window_start_at', window_end='@window_end_at', evidence_parent='@work_id')}
 SET @result=(SELECT @request_id AS batch_id,@work_id AS work_id,@fence AS work_fence,
     @work_revision AS work_revision,@reconcile_id AS reconcile_work_id,
     @frontier_key AS frontier_key,@frontier_revision AS frontier_revision,
@@ -375,7 +375,7 @@ WHERE p.tenant_id=@tenant_id AND p.epoch=@epoch AND p.record_kind='stream_positi
   AND p.status IN ('accepted','quarantined')
   AND EXISTS (SELECT 1 FROM {receipts} AS r
       WHERE r.tenant_id=@tenant_id AND r.epoch=@epoch AND r.operation='worker.commit_positions'
-        AND r.request_id=JSON_VALUE(p.payload,'$.batch_id')
+        AND r.request_id=JSON_VALUE(p.payload,'$.batch_id') AND r.request_hash={key_hash("JSON_VALUE(p.payload,'$.batch_id')")}
         AND JSON_VALUE(r.payload,'$.result.partition_key')=@partition_key
         AND EXISTS (
             SELECT 1 FROM {records} AS fact JOIN {records} AS accepted

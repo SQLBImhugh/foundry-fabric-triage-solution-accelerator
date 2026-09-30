@@ -171,6 +171,15 @@ CREATE TABLE {receipts} (
         f"CREATE UNIQUE INDEX [{position_index}] ON {records} "
         "(tenant_id, epoch, parent_hash, sequence_number) WHERE record_kind = 'stream_position'",
     )
+    # The controller's claim reads the newest receipt of each operation that
+    # finishes claimed work to rotate workspaces. Without this index it read
+    # every transition receipt: about 5 seconds per claim on the MorkNet database.
+    recent_index = _index_name(names["monitoring_receipts"], "recent")
+    statements.append(
+        f"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{recent_index}' "
+        f"AND object_id = OBJECT_ID(N'dbo.{names['monitoring_receipts']}')) "
+        f"CREATE INDEX [{recent_index}] ON {receipts} (tenant_id, epoch, operation, recorded_at)",
+    )
     return tuple(statements)
 
 

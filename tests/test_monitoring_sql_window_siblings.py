@@ -12,7 +12,7 @@ import re
 import sqlite3
 
 import pytest
-from test_monitoring_sql_retry_finalization import _json
+from test_monitoring_sql_retry_finalization import _json, key_digest_sql
 from test_monitoring_sql_retry_finalization import db as db
 
 from triage.monitoring.sql_kernel_common import key_hash
@@ -28,12 +28,14 @@ def _digest(value):
 def _scalar_sql(statement):
     for variable in ("@work_key", "@work_id"):
         statement = statement.replace(key_hash(variable), f"KEY_DIGEST({variable})")
+    statement = key_digest_sql(statement)
     statement = statement.replace(" WITH (UPDLOCK,HOLDLOCK)", "")
     statement = statement.replace("CONVERT(nvarchar(40),@now,127)+N'Z'", "@completed_at")
     return re.sub(r"\bN'", "'", statement)
 
 
 def _typed_query(statement):
+    statement = key_digest_sql(statement)
     return statement.replace(
         "\nWHERE ", "\nCROSS JOIN (SELECT 'bigint' AS bigint) AS scalar_types WHERE ", 1,
     )
@@ -45,12 +47,12 @@ def sibling_case(db):
     records = kernel.names.table("monitoring_records")
     receipts = kernel.names.table("monitoring_receipts")
     leases = kernel.names.table("monitoring_leases")
-    db.create_function("KEY_DIGEST", 1, _digest)
     db.execute(f"""CREATE TABLE {records} (
         tenant_id TEXT,epoch TEXT,record_kind TEXT,full_key TEXT,key_hash BLOB,revision INTEGER,
         sequence_number INTEGER,status TEXT,parent_key TEXT,target_key TEXT,work_kind TEXT,due_at TEXT,payload TEXT)""")
     db.execute(f"""CREATE TABLE {receipts} (
         tenant_id TEXT,epoch TEXT,operation TEXT,request_id TEXT,fingerprint TEXT,payload TEXT,
+        request_hash BLOB GENERATED ALWAYS AS (KEY_DIGEST(request_id)) VIRTUAL,
         PRIMARY KEY (tenant_id,epoch,operation,request_id))""")
     db.execute(f"""CREATE TABLE {leases} (
         tenant_id TEXT,epoch TEXT,key_hash BLOB,full_key TEXT,owner_id TEXT,fence INTEGER,
@@ -101,7 +103,7 @@ def sibling_case(db):
         "resolution_scope": "handoff",
     })
     # A's current-fenced policy-2 whole-window rejection preserves both page rows.
-    assert db.execute(close_frontier_sql(kernel.names), {
+    assert db.execute(key_digest_sql(close_frontier_sql(kernel.names)), {
         "tenant_id": "tenant", "epoch": "epoch", "frontier_key": "window",
         "expected_frontier_revision": 2, "validated": 2, "window_decision": "rejected",
         "resolved_at": "2026-09-16T12:00:00Z",

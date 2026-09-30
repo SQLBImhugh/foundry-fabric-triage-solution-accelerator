@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from triage.monitoring.sql_kernel_common import canonical_guid, exact_text_equal, payload_hash
+from triage.monitoring.sql_kernel_common import (
+    canonical_guid,
+    exact_text_equal,
+    key_hash,
+    payload_hash,
+)
 from triage.monitoring.sql_kernel_contracts import SqlNames
 from triage.monitoring.sql_kernel_removals import (
     confirm_removals_sql,
@@ -18,7 +23,7 @@ from triage.monitoring.sql_kernel_supersessions import (
 def binding_receipt_sql(names: SqlNames) -> str:
     return f"""SELECT payload,fingerprint FROM {names.table('monitoring_receipts')}
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND operation='worker.observe_connector'
-  AND request_id=@binding_receipt_id AND JSON_VALUE(payload,'$.result.connector_id')=@connector_id
+  AND request_id=@binding_receipt_id AND request_hash={key_hash("@binding_receipt_id")} AND JSON_VALUE(payload,'$.result.connector_id')=@connector_id
   AND TRY_CONVERT(bigint,JSON_VALUE(payload,'$.result.connector.revision'))=@expected_connector_revision"""
 
 

@@ -164,6 +164,15 @@ class KernelProtocolDatabase:
             translated = sql.replace(self.names.object("controller_read"), "records")
             translated = translated.replace(self.names.object("controller_queue_read"), "records")
             translated = translated.replace(self.names.object("receipts_controller"), "receipts")
+            # The kernel's key_hash() hashes the UTF-8 bytes of its text, as
+            # the stored key_hash column does; SQLite needs a function for it.
+            connection.create_function(
+                "KEY_HASH", 1, lambda value: bytes.fromhex(key_digest(value)) if value is not None else None,
+            )
+            translated = re.sub(
+                r"HASHBYTES\('SHA2_256', CONVERT\(varchar\(max\), \((.+?)\) COLLATE Latin1_General_100_BIN2_UTF8\)\)",
+                r"KEY_HASH(\1)", translated,
+            )
             translated = SqliteConnection.translate(translated)
             translated = translated.replace("JSON_VALUE(", "json_extract(")
             translated = translated.replace("TRY_CONVERT(datetime2(6), ", "READ_UTC(")

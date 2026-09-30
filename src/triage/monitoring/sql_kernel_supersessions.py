@@ -117,7 +117,7 @@ def supersession_original_removal_invalid_sql(names: SqlNames) -> str:
       AND publication.key_hash={key_hash("JSON_VALUE(selected.payload,'$.publication_id')")}
     WHERE original.tenant_id=@tenant_id AND original.epoch=@epoch
       AND original.operation='controller.publish_connector'
-      AND original.request_id=JSON_VALUE(selected.payload,'$.request_id')
+      AND original.request_id=JSON_VALUE(selected.payload,'$.request_id') AND original.request_hash={key_hash("JSON_VALUE(selected.payload,'$.request_id')")}
       AND original.request_hash={key_hash("JSON_VALUE(selected.payload,'$.request_id')")}
       AND JSON_VALUE(original.payload,'$.result.connector_id')=@connector_id
       AND JSON_VALUE(original.payload,'$.result.connector.ownership_id')=@ownership_id
@@ -403,7 +403,7 @@ OR EXISTS (SELECT 1 FROM {names.table('monitoring_receipts')} AS effect
           JOIN {names.table('monitoring_receipts')} AS original
             ON original.tenant_id=@tenant_id AND original.epoch=@epoch
            AND original.operation='controller.publish_connector'
-           AND original.request_id=JSON_VALUE(selected.payload,'$.request_id')
+           AND original.request_id=JSON_VALUE(selected.payload,'$.request_id') AND original.request_hash={key_hash("JSON_VALUE(selected.payload,'$.request_id')")}
           WHERE TODATETIMEOFFSET(effect.recorded_at,'+00:00')>=TRY_CONVERT(datetimeoffset,JSON_VALUE(selected.payload,'$.requested_at'))
              OR TRY_CONVERT(bigint,JSON_VALUE(effect.payload,'$.result.connector.revision'))
                  BETWEEN TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.connector.revision')) AND @expected_connector_revision)
@@ -428,7 +428,7 @@ AND TRY_CONVERT(bigint,JSON_VALUE(history.payload,'$.result.connector.revision')
     SELECT 1 FROM {receipts} AS original
     WHERE original.tenant_id=@tenant_id AND original.epoch=@epoch
       AND original.operation='controller.publish_connector'
-      AND original.request_id=JSON_VALUE(selected.payload,'$.request_id')
+      AND original.request_id=JSON_VALUE(selected.payload,'$.request_id') AND original.request_hash={key_hash("JSON_VALUE(selected.payload,'$.request_id')")}
       AND JSON_VALUE(original.payload,'$.result.connector_id')=@connector_id
       AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.connector.revision'))
           BETWEEN 1 AND @expected_connector_revision-1
@@ -586,7 +586,7 @@ AND EXISTS (SELECT 1 FROM {records} AS desired
       AND NOT EXISTS (SELECT 1 FROM {receipts} AS publication
           WHERE publication.tenant_id=@tenant_id AND publication.epoch=@epoch
             AND publication.operation='controller.publish_connector'
-            AND publication.request_id=JSON_VALUE(desired.payload,'$.supersession_request_id')
+            AND publication.request_id=JSON_VALUE(desired.payload,'$.supersession_request_id') AND publication.request_hash={key_hash("JSON_VALUE(desired.payload,'$.supersession_request_id')")}
             AND JSON_VALUE(publication.payload,'$.result.connector_id')=@connector_id
             AND JSON_VALUE(publication.payload,'$.result.connector.ownership_id')=JSON_VALUE(@connector,'$.ownership_id')
             AND (SELECT COUNT(*) FROM OPENJSON(publication.payload,'$.result.superseded_source_removals'))>0

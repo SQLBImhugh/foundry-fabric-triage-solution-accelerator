@@ -1767,13 +1767,30 @@ class MonitoringEngine:
                         target, state="paused", observation=m.ObservationPolicy(),
                         action=m.ActionPolicy(), reason="Domain membership is incomplete; admission is paused.",
                     ))
-        if generation.next_scan_at is not None:
+        if generation.next_scan_at is not None and not self._inventory_scan_scheduled(control, generation):
             self._enqueue(m.MonitoringWorkDraft(
                 **_stamp(control), work_id=stable_id(control, f"next-inventory:{generation.generation_id}"),
                 kind="inventory", discovery_selector=generation.selector, policy_revision=control.revision,
                 created_at=self._now(), due_at=generation.next_scan_at,
                 reason="Controller-published periodic inventory for the accepted explicit selector.",
             ))
+
+    def _inventory_scan_scheduled(self, control: m.DeploymentControl, generation: m.InventoryGeneration) -> bool:
+        """Whether other active inventory work already scans this pass's selector.
+
+        Each finished pass queued its own successor, so every extra pass of a
+        selector (a discovery request or a scope activation) started another
+        periodic chain. In the MorkNet lab two chains scanned the monitored
+        workspace about 20 minutes apart. The pass's own work does not count:
+        the controller can publish a finished pass before its work is closed.
+        """
+        return any(
+            work.work_id != generation.generation_id and work.discovery_selector == generation.selector
+            for work in self._all(
+                "work", control, m.MonitoringWork,
+                filters={"work_kind": "inventory", "status_in": m.ACTIVE_WORK_STATES},
+            )
+        )
 
     @atomic(write=True)
     def record_capability(
@@ -3698,23 +3715,14 @@ class MonitoringEngine:
             return self._dispose_unclaimed(work, request.disposition, request.detail)
         return self._idempotent("work_disposition", request.request_id, request, request, m.MonitoringWork, apply)
 
-    @atomic(write=True)
-    def complete_collection_work(
-        self, context: m.MonitoringContext, *, work_id: str, lease: m.LeaseToken, expected_work_revision: int,
-    ) -> m.MonitoringWork:
-        work = self._owned_work(context, m.canonical_id(work_id), lease, expected_work_revision)
-        if work.kind not in {"inventory", "capability_probe", "connector_reconcile"}:
-            raise MonitoringConflict("Only evidence collection uses this completion boundary")
-        if self.component != "fixture" and work.kind in {"inventory", "capability_probe"}:
-            accepted = self._all("worker_reconcile_request", context, m.ReconciliationRequest)
-            if not any(
-                entry.producer_commit is not None
-                and entry.producer_commit.work_id == work.work_id
-                and entry.producer_commit.lease.owner_id == lease.owner_id
-                and entry.producer_commit.lease.fence == lease.fence
-                for entry in accepted
-            ):
-                raise MonitoringConflict("Collection completion requires acceptance under this exact work fence")
+    def _collection_evidence_current(self, context: m.MonitoringContext, work: m.MonitoringWork) -> None:
+        """Refuse completion until the collected evidence is durable and current.
+
+        Shared by both adapters. The SQL kernel requires an accepted batch under
+        the work fence but not these conditions, so a partial or unfinished
+        pass, or a capability checked before its probe was created, completed
+        the work in SQL while the memory adapter refused it.
+        """
         if work.kind == "inventory":
             explicit = self._inventory_scope(work)
             selectors = [explicit] if explicit else []
@@ -3736,6 +3744,26 @@ class MonitoringEngine:
             )
             if not any(capability.checked_at >= work.created_at for capability in capabilities):
                 raise MonitoringConflict("Capability work has no durable current probe result")
+
+    @atomic(write=True)
+    def complete_collection_work(
+        self, context: m.MonitoringContext, *, work_id: str, lease: m.LeaseToken, expected_work_revision: int,
+    ) -> m.MonitoringWork:
+        work = self._owned_work(context, m.canonical_id(work_id), lease, expected_work_revision)
+        if work.kind not in {"inventory", "capability_probe", "connector_reconcile"}:
+            raise MonitoringConflict("Only evidence collection uses this completion boundary")
+        if self.component != "fixture" and work.kind in {"inventory", "capability_probe"}:
+            accepted = self._all("worker_reconcile_request", context, m.ReconciliationRequest)
+            if not any(
+                entry.producer_commit is not None
+                and entry.producer_commit.work_id == work.work_id
+                and entry.producer_commit.lease.owner_id == lease.owner_id
+                and entry.producer_commit.lease.fence == lease.fence
+                for entry in accepted
+            ):
+                raise MonitoringConflict("Collection completion requires acceptance under this exact work fence")
+        if work.kind in {"inventory", "capability_probe"}:
+            self._collection_evidence_current(context, work)
         elif self.component == "fixture":
             connector = self._get("connector", work.connector_id, context, m.OwnedConnectorManifest)
             if connector is None or connector.state in {"planned", "provisioning"} or connector.updated_at < work.created_at:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -59,12 +60,19 @@ def decision_db(kernel):
     connection = sqlite3.connect(":memory:")
     connection.create_function("JSON_VALUE", 2, _json_value)
     connection.create_function("TRY_CONVERT", 2, _try_convert)
+    # The key hashes the kernel seeks by: the UTF-8 digest of their text.
+    connection.create_function(
+        "KEY_DIGEST", 1, lambda value: hashlib.sha256(value.encode("utf-8")).digest() if value is not None else None,
+        deterministic=True,
+    )
     connection.execute("ATTACH DATABASE ':memory:' AS dbo")
     connection.execute(f"""CREATE TABLE {kernel.names.table('monitoring_records')} (
         tenant_id TEXT,epoch TEXT,record_kind TEXT,full_key TEXT,sequence_number INTEGER,
-        revision INTEGER,status TEXT,parent_key TEXT,target_key TEXT,payload TEXT)""")
+        revision INTEGER,status TEXT,parent_key TEXT,target_key TEXT,payload TEXT,
+        key_hash BLOB GENERATED ALWAYS AS (KEY_DIGEST(full_key)) VIRTUAL)""")
     connection.execute(f"""CREATE TABLE {kernel.names.table('monitoring_receipts')} (
-        tenant_id TEXT,epoch TEXT,operation TEXT,request_id TEXT,payload TEXT)""")
+        tenant_id TEXT,epoch TEXT,operation TEXT,request_id TEXT,payload TEXT,
+        request_hash BLOB GENERATED ALWAYS AS (KEY_DIGEST(request_id)) VIRTUAL)""")
     yield connection
     connection.close()
 
@@ -104,7 +112,11 @@ def _pending(db, kernel, target="target"):
     scope = source[start:end].replace(
         "    WHERE f.tenant_id", "    CROSS JOIN (SELECT 'bigint' AS bigint) AS types WHERE f.tenant_id",
     )
-    rows = db.execute(f"SELECT {predicate} AS pending {scope}", {
+    sql = re.sub(
+        r"HASHBYTES\('SHA2_256', CONVERT\(varchar\(max\), \((.+?)\) COLLATE Latin1_General_100_BIN2_UTF8\)\)",
+        r"KEY_DIGEST(\1)", f"SELECT {predicate} AS pending {scope}",
+    )
+    rows = db.execute(sql, {
         "tenant_id": "tenant", "epoch": "epoch", "target_key": target,
     }).fetchall()
     return any(row[0] for row in rows)
@@ -202,8 +214,8 @@ def test_only_kernel_procedures_can_mutate_frontier_acknowledgements(kernel):
     for view in ("worker_catalogue", "worker_evidence", "worker_telemetry", "web_drafts",
                  "controller_projections", "controller_immutable"):
         for kind in FRONTIER_KINDS:
-            assert f"N'{kind}'" not in _sql(kernel, view)
-    assert "N'frontier_validation'" in _sql(kernel, "controller_immutable")
+            assert f"'{kind}'" not in _sql(kernel, view)
+    assert "'frontier_validation'" in _sql(kernel, "controller_immutable")
     assert kernel.rpcs["controller.resolve_frontier"].components == ("controller",)
     assert "frontier_validation" not in _sql(kernel, "worker_evidence")
 

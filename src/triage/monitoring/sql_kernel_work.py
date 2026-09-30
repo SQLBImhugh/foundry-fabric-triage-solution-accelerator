@@ -59,7 +59,7 @@ BEGIN
       AND full_key=JSON_VALUE(@stored_work,'$.retry_of');
     SELECT @claim_parent=payload FROM {records}
     WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='work'
-      AND full_key=JSON_VALUE(@claim_predecessor,'$.request.work_id');
+      AND full_key=JSON_VALUE(@claim_predecessor,'$.request.work_id') AND key_hash={key_hash("JSON_VALUE(@claim_predecessor,'$.request.work_id')")};
     IF @claim_predecessor IS NULL
        OR COALESCE(JSON_VALUE(@claim_predecessor,'$.state'),'')<>'rejected'
        OR COALESCE(JSON_VALUE(@claim_predecessor,'$.rejection.reason'),'')<>'throttled'
@@ -84,7 +84,7 @@ BEGIN
                 '$.completed_at',CONVERT(nvarchar(40),@now,127)+N'Z'),
                 '$.disposition','Current scope/review no longer admits this linked retry.')
         WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='work'
-          AND full_key=@work_id AND revision=@stored_work_revision;
+          AND full_key=@work_id AND key_hash={key_hash('@work_id')} AND revision=@stored_work_revision;
         IF @@ROWCOUNT<>1 THROW 51072, 'Retry disposition lost its current revision', 1;
         SET @affected=1; SET @status='not_acquired';
         SET @result=N'{{"reason":"retry_no_longer_admitted"}}';
@@ -137,7 +137,7 @@ END;
 DECLARE @prior_fence bigint,@prior_owner nvarchar(128),@prior_expires datetime2(6),
     @due datetime2(6),@expires datetime2(6)=DATEADD(second,@lease_seconds,@now);
 SELECT @due=due_at FROM {records}
-WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='work' AND full_key=@work_id;
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='work' AND full_key=@work_id AND key_hash={key_hash('@work_id')};
 SELECT @prior_fence=fence,@prior_owner=owner_id,@prior_expires=expires_at
 FROM {leases} WITH (UPDLOCK,HOLDLOCK)
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND full_key=@work_key AND key_hash={key_hash('@work_key')};
@@ -194,6 +194,7 @@ WHERE resolution.tenant_id=@tenant_id AND resolution.epoch=@epoch
              AND rejected.operation='controller.resolve_frontier'
              AND rejected.request_id=COALESCE(JSON_VALUE(resolution.payload,'$.result.window_resolution_request_id'),
                  JSON_VALUE(resolution.payload,'$.result.window_rejection_request_id'))
+             AND rejected.request_hash={key_hash("COALESCE(JSON_VALUE(resolution.payload,'$.result.window_resolution_request_id'),JSON_VALUE(resolution.payload,'$.result.window_rejection_request_id'))")}
              AND JSON_VALUE(rejected.payload,'$.result.state')=JSON_VALUE(resolution.payload,'$.result.state')
              AND ((JSON_VALUE(rejected.payload,'$.result.state')='rejected'
                    AND JSON_VALUE(rejected.payload,'$.result.resolution_scope')='window')
@@ -211,7 +212,7 @@ def handoff_acknowledgement_receipts_sql(names: SqlNames) -> str:
     return f"""SELECT 1 FROM {receipts} AS original
 JOIN {receipts} AS root ON root.tenant_id=original.tenant_id AND root.epoch=original.epoch
   AND root.operation='controller.resolve_frontier'
-  AND root.request_id=JSON_VALUE(resolution.payload,'$.result.frontier_resolution_request_id')
+  AND root.request_id=JSON_VALUE(resolution.payload,'$.result.frontier_resolution_request_id') AND root.request_hash={key_hash("JSON_VALUE(resolution.payload,'$.result.frontier_resolution_request_id')")}
   AND JSON_VALUE(root.payload,'$.result.resolution_scope')='handoff'
   AND JSON_VALUE(root.payload,'$.result.state') IN ('published','rejected')
   AND JSON_VALUE(root.payload,'$.result.frontier_key')=JSON_VALUE(resolution.payload,'$.result.frontier_key')
@@ -239,7 +240,7 @@ JOIN {records} AS root_handoff ON root_handoff.tenant_id=root.tenant_id AND root
   AND root_handoff.status=JSON_VALUE(root.payload,'$.result.handoff_decision')
 WHERE original.tenant_id=@tenant_id AND original.epoch=@epoch
   AND original.operation='controller.resolve_frontier'
-  AND original.request_id=JSON_VALUE(resolution.payload,'$.result.handoff_resolution_request_id')
+  AND original.request_id=JSON_VALUE(resolution.payload,'$.result.handoff_resolution_request_id') AND original.request_hash={key_hash("JSON_VALUE(resolution.payload,'$.result.handoff_resolution_request_id')")}
   AND JSON_VALUE(original.payload,'$.result.resolution_scope')='handoff'
   AND JSON_VALUE(original.payload,'$.result.work_id')=@work_id
   AND JSON_VALUE(original.payload,'$.result.producer_request_id')=JSON_VALUE(resolution.payload,'$.result.producer_request_id')
@@ -291,7 +292,7 @@ BEGIN
     IF @finalization_id IS NULL OR NOT EXISTS (
         SELECT 1 FROM {receipts}
         WHERE tenant_id=@tenant_id AND epoch=@epoch AND operation='controller.finalize'
-          AND request_id=@finalization_id
+          AND request_id=@finalization_id AND request_hash={key_hash("@finalization_id")}
           AND JSON_VALUE(payload,'$.result.work_id')=@work_id
           AND JSON_VALUE(payload,'$.result.state')='completed'
     ) THROW 51072, 'Controller completion requires its original finalization receipt', 1;
@@ -584,7 +585,7 @@ IF @kind='connector_reconcile' AND NOT EXISTS (SELECT 1 FROM {records}
       AND full_key=JSON_VALUE(@draft_json,'$.connector_id'))
     THROW 51072, 'Connector work needs an owned desired manifest', 1;
 IF EXISTS (SELECT 1 FROM {records} WHERE tenant_id=@tenant_id AND epoch=@epoch
-    AND record_kind='work' AND full_key=@work_id)
+    AND record_kind='work' AND full_key=@work_id AND key_hash={key_hash('@work_id')})
     THROW 51072, 'Enqueue never updates or adopts an existing work row', 1;
 DECLARE @clean nvarchar(max)=JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(JSON_MODIFY(
     @draft_json,'$.state','queued'),'$.revision',1),'$.attempts',0),'$.retry_attempt',0),

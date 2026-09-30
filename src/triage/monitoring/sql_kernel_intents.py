@@ -10,7 +10,7 @@ from triage.monitoring.sql_kernel_common import (
     save_receipt,
 )
 from triage.monitoring.sql_kernel_contracts import KernelObject, RpcContract, SqlNames
-from triage.monitoring.sql_kernel_frontiers import raise_frontier_sql
+from triage.monitoring.sql_kernel_frontiers import batch_parent_sql, raise_frontier_sql
 
 
 def _invalid_selector(expression: str) -> str:
@@ -37,6 +37,7 @@ def handoff_sql(
     names: SqlNames, *, producer: str, operation: str, topic: str, reference: str,
     target: str = "NULL", collection_id: str = "NULL", requires_window: str = "0",
     collection_complete: str = "1", window_start: str = "NULL", window_end: str = "NULL",
+    evidence_parent: str | None = None,
 ) -> str:
     if producer not in {"worker", "web"}:
         raise ValueError("Only fixed producer handoffs are supported")
@@ -44,7 +45,7 @@ def handoff_sql(
     # Native FOR JSON can return NULL for an empty set; typed evidence is an array.
     request_kind = f"{producer}_reconcile_request"
     return f"""DECLARE @reconcile_id nvarchar(36)=LOWER(CONVERT(nvarchar(36),NEWID()));
-{raise_frontier_sql(names, producer=producer, operation=operation, topic=topic, reference=reference, target=target, collection_id=collection_id, requires_window=requires_window, collection_complete=collection_complete, window_start=window_start, window_end=window_end)}
+{raise_frontier_sql(names, producer=producer, operation=operation, topic=topic, reference=reference, target=target, collection_id=collection_id, requires_window=requires_window, collection_complete=collection_complete, window_start=window_start, window_end=window_end, evidence_parent=evidence_parent)}
 DECLARE @handoff_payload nvarchar(max)=(
     SELECT @tenant_id AS tenant_id,@epoch AS epoch,@request_id AS request_id,
            N'{producer}' AS producer,{topic} AS topic,{reference} AS reference_id,
@@ -58,7 +59,7 @@ DECLARE @handoff_payload nvarchar(max)=(
                LOWER(JSON_VALUE(payload,'$.payload_hash')) AS payload_hash
                FROM {names.table('monitoring_records')}
                WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='accepted_fact'
-                 AND JSON_VALUE(payload,'$.batch_id')=@request_id
+                 AND JSON_VALUE(payload,'$.batch_id')=@request_id{batch_parent_sql(evidence_parent)}
                ORDER BY full_key COLLATE Latin1_General_100_BIN2 FOR JSON PATH),N'[]')) AS evidence,
            CONVERT(nvarchar(40),@now,127)+N'Z' AS created_at
     FOR JSON PATH, INCLUDE_NULL_VALUES, WITHOUT_ARRAY_WRAPPER);

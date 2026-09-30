@@ -81,6 +81,18 @@ def _convert(kind, value):
         return None
 
 
+def _key_digest(value):
+    return hashlib.sha256(value.encode("utf-8")).digest() if value is not None else None
+
+
+def key_digest_sql(statement: str) -> str:
+    """SQLite form of the kernel's key_hash() seek predicates: the UTF-8 digest of their text."""
+    return re.sub(
+        r"HASHBYTES\('SHA2_256', CONVERT\(varchar\(max\), \((.+?)\) COLLATE Latin1_General_100_BIN2_UTF8\)\)",
+        r"KEY_DIGEST(\1)", statement,
+    )
+
+
 @pytest.fixture
 def db():
     conn = sqlite3.connect(":memory:")
@@ -90,6 +102,8 @@ def db():
     conn.create_function("TRY_CONVERT", 2, _convert)
     conn.create_function("TODATETIMEOFFSET", 2, lambda value, zone: _convert("datetimeoffset", value))
     conn.create_function("HASHBYTES", 2, lambda algorithm, value: hashlib.sha256(value.encode("utf-16-le")).digest())
+    # Deterministic, so fixture tables can derive key_hash/request_hash columns.
+    conn.create_function("KEY_DIGEST", 1, _key_digest, deterministic=True)
     conn.create_collation("Latin1_General_100_BIN2", lambda a, b: (a > b) - (a < b))
     conn.execute("ATTACH DATABASE ':memory:' AS dbo")
     yield conn

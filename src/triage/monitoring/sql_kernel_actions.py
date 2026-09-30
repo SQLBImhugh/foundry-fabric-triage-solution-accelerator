@@ -264,12 +264,12 @@ BEGIN
     WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='action' AND full_key=@retry_of;
     SELECT @retry_parent_work=payload FROM {table}
     WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='work'
-      AND full_key=JSON_VALUE(@retry_parent,'$.request.work_id');
+      AND full_key=JSON_VALUE(@retry_parent,'$.request.work_id') AND key_hash={key_hash("JSON_VALUE(@retry_parent,'$.request.work_id')")};
     IF NOT ({successor_predicate()})
         THROW 51072, 'Retry is not the unused bounded successor of the exact finalized rejected action', 1;
     IF NOT EXISTS (SELECT 1 FROM {names.table('monitoring_receipts')}
         WHERE tenant_id=@tenant_id AND epoch=@epoch AND operation='controller.finalize'
-          AND request_id=JSON_VALUE(@retry_parent_work,'$.finalization_id')
+          AND request_id=JSON_VALUE(@retry_parent_work,'$.finalization_id') AND request_hash={key_hash("JSON_VALUE(@retry_parent_work,'$.finalization_id')")}
           AND JSON_VALUE(payload,'$.result.work_id')=JSON_VALUE(@retry_parent,'$.request.work_id')
           AND JSON_VALUE(payload,'$.result.state')='completed')
         THROW 51072, 'The rejected predecessor has no committed original finalization', 1;
@@ -394,7 +394,7 @@ BEGIN
 END;
 SET @stored_work=JSON_MODIFY(JSON_MODIFY(@stored_work,'$.action_reservation_id',@reservation_id),'$.revision',@work_revision+1);
 UPDATE {table} SET revision=revision+1,payload=@stored_work WHERE tenant_id=@tenant_id AND epoch=@epoch
-    AND record_kind='work' AND full_key=@work_id AND revision=@work_revision;
+    AND record_kind='work' AND full_key=@work_id AND key_hash={key_hash('@work_id')} AND revision=@work_revision;
 IF @@ROWCOUNT<>1 THROW 51072, 'Work reservation attachment lost its revision', 1;
 SET @affected=1;
 SET @result=(SELECT @reservation_id AS reservation_id,JSON_QUERY(@action_json) AS reservation
@@ -690,7 +690,7 @@ ELSE
 SET @stored_work=JSON_MODIFY(@stored_work,'$.revision',@work_revision+1);
 UPDATE {records} SET revision=revision+1,status=JSON_VALUE(@stored_work,'$.state'),payload=@stored_work
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='work'
-  AND full_key=@work_id AND revision=@work_revision;
+  AND full_key=@work_id AND key_hash={key_hash('@work_id')} AND revision=@work_revision;
 IF @@ROWCOUNT<>1 THROW 51072, 'Finalization work update lost its revision', 1;
 SET @affected=1;
 SET @result=(SELECT @work_id AS work_id,@finalization_id AS finalization_id,@incident_id AS incident_id,

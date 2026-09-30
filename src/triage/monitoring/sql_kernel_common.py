@@ -165,7 +165,7 @@ DECLARE @binding_hash char(64) = {payload_hash('@binding_json')},
 SELECT @prior_fingerprint=fingerprint, @prior_payload=payload,@prior_request_id=request_id
 FROM {names.table('monitoring_receipts')}
 WHERE tenant_id=@tenant_id AND epoch=@epoch
-  AND operation=N'{contract.operation}' AND request_hash={key_hash('@request_id')};
+  AND operation={varchar_literals((contract.operation,))} AND request_hash={key_hash('@request_id')};
 IF @prior_payload IS NOT NULL
 BEGIN
     IF @prior_fingerprint<>@fingerprint OR @prior_request_id<>@request_id

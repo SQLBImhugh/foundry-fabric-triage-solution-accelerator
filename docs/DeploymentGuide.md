@@ -432,6 +432,11 @@ application tables or approval procedure. The rate-budget module supplies its
 own deployment-only DDL. Apply the application schema separately, then the
 monitoring baseline. Missing/incompatible bootstrap is a visible error.
 Do not grant a runtime identity `db_ddladmin` to hide a missed deployment step.
+Its table and index statements are idempotent (`IF ... IS NULL`, `IF NOT EXISTS`):
+when a release adds an index, such as the receipts recency index
+(`tenant_id, epoch, operation, recorded_at`) that the controller's claim uses,
+the deployer applies the new statement to an existing database. Build it with
+`ONLINE = ON` so receipt writes continue.
 
 The current SQL ownership contract also declares checked views, functions,
 static RPCs and three component roles through

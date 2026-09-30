@@ -81,6 +81,51 @@ def protected_completion(queue, work, *, waiting=False):
     return saved
 
 
+def finished_without_transition(queue, work, operation):
+    """Finish claimed work the way controller.finalize or disposition_source do.
+
+    Neither records a controller.transition_work receipt. Each clears the lease,
+    stamps completed_at and records its own receipt at the same instant.
+    """
+    queue.h.clock.value += timedelta(microseconds=1)
+    saved = m.MonitoringWork.model_validate({
+        **work.model_dump(), "lease": None, "revision": work.revision + 1, "completed_at": queue.h.clock(),
+        **({"state": "completed"} if operation == "controller.finalize" else
+           {"state": "dispositioned", "disposition": "Refused by current deterministic validation."}),
+    })
+    row = row_for(queue, work)
+    queue.put(replace(row, status=saved.state, payload=saved.model_dump_json(), version=saved.revision))
+    if queue.db:
+        result = {"work_id": saved.work_id, "finalization_id": queue.h.next_id(), "state": "completed"} if (
+            operation == "controller.finalize"
+        ) else {"source_key": queue.h.next_id(), "disposition": {"disposition": "refused"},
+                "work": saved.model_dump(mode="json")}
+        queue.db.receipts[(operation, queue.h.next_id())] = {
+            "fingerprint": "1" * 64, "recorded_at": queue.h.clock(),
+            "payload": {"binding_hash": "2" * 64, "result": result},
+        }
+    return saved
+
+
+@pytest.mark.parametrize("operation", ["controller.finalize", "controller.disposition_source"])
+def test_rotation_continues_after_completions_without_a_transition_receipt(queue, operation):
+    # Every workspace keeps due work, so a cursor that forgets the last
+    # completion serves the first workspace again and starves the others.
+    for workspace in (uid(100), uid(200), uid(300)):
+        for _ in range(3):
+            native_work(queue, workspace=workspace, due_offset=-200)
+    seen = []
+    for _ in range(4):
+        queue.store = (
+            AzureSqlMonitoringStore(db=queue.db, component="controller") if queue.db else
+            InMemoryMonitoringStore(clock=queue.h.clock, state=queue.h.state, component="controller")
+        )
+        work = queue.claim()[0]
+        seen.append(work.target.workspace_id)
+        finished_without_transition(queue, work, operation)
+    assert seen == [uid(100), uid(200), uid(300), uid(100)]
+
+
 def test_native_null_promotion_cannot_hide_capability_under_1000_targetless_handoffs(queue):
     for _ in range(1_000):
         queue.partial_page(decision="rejected")

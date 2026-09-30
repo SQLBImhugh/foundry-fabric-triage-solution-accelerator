@@ -6,10 +6,10 @@ from dataclasses import replace
 
 from triage.monitoring.sql_kernel_common import (
     key_hash,
-    literals,
     payload_hash,
     procedure,
     record_hash,
+    varchar_literals,
 )
 from triage.monitoring.sql_kernel_contracts import (
     CATALOGUE_KINDS,
@@ -76,15 +76,15 @@ WHERE ({predicate}){maintenance}{identity}{check};""")
 def _views(names: SqlNames) -> list[KernelObject]:
     facts = FACT_KINDS
     objects = [
-        _view(names, "worker_catalogue", f"r.record_kind IN ({literals(CATALOGUE_KINDS)})", writable=True),
-        _view(names, "worker_evidence", f"r.record_kind IN ({literals(EVIDENCE_KINDS)})", writable=True),
-        _view(names, "worker_telemetry", f"r.record_kind IN ({literals(TELEMETRY_KINDS)})", writable=True),
+        _view(names, "worker_catalogue", f"r.record_kind IN ({varchar_literals(CATALOGUE_KINDS)})", writable=True),
+        _view(names, "worker_evidence", f"r.record_kind IN ({varchar_literals(EVIDENCE_KINDS)})", writable=True),
+        _view(names, "worker_telemetry", f"r.record_kind IN ({varchar_literals(TELEMETRY_KINDS)})", writable=True),
         _view(names, "web_drafts", "r.record_kind='plan'", writable=True),
-        _view(names, "controller_projections", f"r.record_kind IN ({literals(CONTROLLER_PROJECTION_KINDS)})", writable=True, deny_maintenance=False),
-        _view(names, "controller_immutable", f"r.record_kind IN ({literals(CONTROLLER_IMMUTABLE_KINDS)})", writable=True, deny_maintenance=False),
+        _view(names, "controller_projections", f"r.record_kind IN ({varchar_literals(CONTROLLER_PROJECTION_KINDS)})", writable=True, deny_maintenance=False),
+        _view(names, "controller_immutable", f"r.record_kind IN ({varchar_literals(CONTROLLER_IMMUTABLE_KINDS)})", writable=True, deny_maintenance=False),
         _view(
             names, "controller_queue_read",
-            f"(r.record_kind='work' AND r.work_kind IN ({literals(CONTROLLER_WORK_KINDS)})) "
+            f"(r.record_kind='work' AND r.work_kind IN ({varchar_literals(CONTROLLER_WORK_KINDS)})) "
             "OR r.record_kind='action'",
         ),
         _view(
@@ -95,8 +95,8 @@ def _views(names: SqlNames) -> list[KernelObject]:
             # validated coverage and the controller refused it. The worker's
             # coverage snapshot then reads each Power BI checkpoint's
             # powerbi_window and fails closed when that row is not visible.
-            f"r.record_kind IN ({literals((*facts, 'scope', 'target', 'target_capability', 'rest_checkpoint', 'powerbi_window', 'connector', 'connector_desired', 'partition_ownership', 'stream_start', 'stream_position', 'stream_checkpoint', 'stream_gap', 'validation_frontier', 'validation_window', 'record_retirement'))}) "
-            f"OR (r.record_kind='work' AND r.work_kind IN ({literals(WORKER_WORK_KINDS)}))",
+            f"r.record_kind IN ({varchar_literals((*facts, 'scope', 'target', 'target_capability', 'rest_checkpoint', 'powerbi_window', 'connector', 'connector_desired', 'partition_ownership', 'stream_start', 'stream_position', 'stream_checkpoint', 'stream_gap', 'validation_frontier', 'validation_window', 'record_retirement'))}) "
+            f"OR (r.record_kind='work' AND r.work_kind IN ({varchar_literals(WORKER_WORK_KINDS)}))",
         ),
         _view(
             names, "web_read",
@@ -106,7 +106,7 @@ def _views(names: SqlNames) -> list[KernelObject]:
             # and no stream gaps while the controller saw both. Every reader
             # sees record_retirement: change counters add its offsets so that
             # retiring old inventory never lowers them.
-            f"r.record_kind IN ({literals(('plan', 'scope', 'review_request', 'review', 'target', 'target_capability', 'connector', 'receiver_heartbeat', 'web_reconcile_request', 'discovery_request', 'validation_frontier', 'validation_window', 'reconcile_acceptance', 'rest_checkpoint', 'powerbi_window', 'stream_start', 'record_retirement'))})",
+            f"r.record_kind IN ({varchar_literals(('plan', 'scope', 'review_request', 'review', 'target', 'target_capability', 'connector', 'receiver_heartbeat', 'web_reconcile_request', 'discovery_request', 'validation_frontier', 'validation_window', 'reconcile_acceptance', 'rest_checkpoint', 'powerbi_window', 'stream_start', 'record_retirement'))})",
         ),
     ]
     # The web counts queue work for its backlog but never reads work rows:
@@ -118,7 +118,7 @@ AS
 SELECT r.[tenant_id], r.[epoch], r.[record_kind], r.[status], r.[work_kind], r.[due_at] FROM {names.table('monitoring_records')} AS r
 JOIN {names.table('monitoring_control')} AS c
   ON c.singleton=1 AND c.tenant_id=r.tenant_id AND c.epoch=r.epoch
-WHERE (r.record_kind=N'work');"""))
+WHERE (r.record_kind='work');"""))
     # A raw worker insert is not controller evidence until the corresponding
     # protected binding AND immutable operation receipt exist and still match.
     # Seek bindings by the derived fact key before checking their receipts.
@@ -130,7 +130,7 @@ AS
 SELECT {_columns()} FROM {names.table('monitoring_records')} AS r
 JOIN {names.table('monitoring_control')} AS c
   ON c.singleton=1 AND c.tenant_id=r.tenant_id AND c.epoch=r.epoch
-WHERE r.record_kind IN ({literals(facts)})
+WHERE r.record_kind IN ({varchar_literals(facts)})
 AND EXISTS (
     SELECT 1 FROM {names.table('monitoring_records')} AS accepted
     JOIN {names.table('monitoring_receipts')} AS receipt
@@ -142,7 +142,7 @@ AND EXISTS (
     WHERE accepted.tenant_id=r.tenant_id AND accepted.epoch=r.epoch
       AND accepted.record_kind='accepted_fact'
       AND accepted.accepted_fact_key_hash=r.key_hash
-      AND (r.record_kind NOT IN ({literals(CATALOGUE_KINDS)})
+      AND (r.record_kind NOT IN ({varchar_literals(CATALOGUE_KINDS)})
            OR accepted.key_hash={key_hash("N'accepted:'+receipt.request_id+N':'+r.record_kind+N':'+LOWER(CONVERT(char(64),r.key_hash,2))")})
       AND JSON_VALUE(accepted.payload,'$.fact_kind')=r.record_kind
       AND JSON_VALUE(accepted.payload,'$.fact_key')=r.full_key
@@ -162,7 +162,7 @@ AS
 SELECT {_columns()} FROM {names.table('monitoring_records')} AS r
 JOIN {names.table('monitoring_control')} AS c
   ON c.singleton=1 AND c.tenant_id=r.tenant_id AND c.epoch=r.epoch
-WHERE r.record_kind IN ({literals(owned)})
+WHERE r.record_kind IN ({varchar_literals(owned)})
 UNION ALL
 SELECT {_columns('a')} FROM {names.object('accepted_worker_facts')} AS a;"""))
     objects.append(KernelObject("control_read", names.object("control_read"), "view", f"""CREATE OR ALTER VIEW {names.object('control_read')}

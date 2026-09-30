@@ -131,12 +131,14 @@ def test_utf8_sql_catalogue_and_complete_kernel_abi_remain_unchanged() -> None:
     # The web reads REST checkpoints, their Power BI windows and stream starts
     # through web_read and counts queue work through web_work_status. The
     # controller retires old inventory passes through its own procedure, and
-    # every read view exposes the retirement offsets; native header projection
-    # cannot change source bytes or the remaining kernel ABI.
+    # every read view exposes the retirement offsets. Views and lookups compare
+    # VARCHAR columns with VARCHAR literals and pair text keys with their hash
+    # seeks; native header projection cannot change source bytes or the
+    # remaining kernel ABI.
     assert kernel_contract_hash(tables) == (
-        "f12f33430644a87ff29c044d04d708c4c8ac3dadb1efa29b94f04982cf724601"
+        "ca6dcb8639d5adc9a3842426913c9f46f6e8b368f7d08e1b19d20586367af9d5"
     )
     assert fingerprint(kernel_abi(tables)) == kernel_contract_hash(tables)
     assert fingerprint(list(kernel.catalogue())) == (
-        "860ada35411e164c3508116cdf6a0cd5c72ca3728908475b1481b5f07b8d84f6"
+        "198337efe871aa6660248e46358dcd96a5a816e7dbfe8244942098d4ebcb8f4a"
     )

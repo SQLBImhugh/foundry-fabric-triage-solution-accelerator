@@ -121,6 +121,11 @@ def _adapt(kernel, sql, *, concatenate=False):
         "@connector_id+N':removal:'+retired.removal_id",
     ):
         sql = sql.replace(key_hash(expression), f"KEY_DIGEST({expression})")
+    # Every other key_hash() seek predicate: the UTF-8 digest of its text.
+    sql = re.sub(
+        r"HASHBYTES\('SHA2_256', CONVERT\(varchar\(max\), \((.+?)\) COLLATE Latin1_General_100_BIN2_UTF8\)\)",
+        r"KEY_DIGEST(\1)", sql,
+    )
     for expression in (
         "@remove_binding", "@binding_receipt_payload",
         "JSON_QUERY(@binding_observation,'$.observed_definition')",

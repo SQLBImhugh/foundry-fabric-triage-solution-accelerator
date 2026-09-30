@@ -7,7 +7,7 @@ import json
 import re
 
 import pytest
-from test_monitoring_sql_retry_finalization import _eval, _json, _modify
+from test_monitoring_sql_retry_finalization import _eval, _json, _modify, key_digest_sql
 from test_monitoring_sql_retry_finalization import db as db
 
 from triage.monitoring.sql_kernel_common import exact_text_equal, receipt_content_expression
@@ -40,7 +40,8 @@ def test_published_partial_page_can_be_rejected_as_a_window_after_policy_advance
     records = kernel.names.table("monitoring_records")
     db.execute(f"""CREATE TABLE {records} (
         tenant_id TEXT,epoch TEXT,record_kind TEXT,full_key TEXT,revision INTEGER,
-        sequence_number INTEGER,status TEXT,payload TEXT)""")
+        sequence_number INTEGER,status TEXT,payload TEXT,
+        key_hash BLOB GENERATED ALWAYS AS (KEY_DIGEST(full_key)) VIRTUAL)""")
     db.execute("CREATE TABLE dbo.control (epoch TEXT,revision INTEGER)")
     db.execute("INSERT INTO dbo.control VALUES ('epoch',2)")
     db.execute("CREATE TABLE dbo.leases (work_id TEXT,owner TEXT,fence INTEGER)")
@@ -82,7 +83,7 @@ def test_published_partial_page_can_be_rejected_as_a_window_after_policy_advance
                 raise ValueError("epoch changed")
             if db.execute("SELECT fence FROM dbo.leases WHERE work_id='work' AND owner='owner'").fetchone()[0] != fence:
                 raise ValueError("lease lost")
-            count = db.execute(close_frontier_sql(kernel.names), {
+            count = db.execute(key_digest_sql(close_frontier_sql(kernel.names)), {
                 "tenant_id": "tenant", "epoch": epoch, "frontier_key": "frontier",
                 "expected_frontier_revision": 1, "validated": 1, "window_decision": "rejected",
                 "resolved_at": "2026-09-16T12:00:00Z",

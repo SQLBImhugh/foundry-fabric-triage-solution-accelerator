@@ -63,6 +63,7 @@ from triage.monitoring.records import (
     stable_id,
 )
 from triage.monitoring.schema import resolve_kernel_tables
+from triage.monitoring.sql_kernel_common import key_hash
 from triage.monitoring.sql_kernel_contracts import (
     CATALOGUE_KINDS,
     CONTROLLER_IMMUTABLE_KINDS,
@@ -253,6 +254,17 @@ class _StreamPositionEnvelope(m.MonitoringModel):
 _STREAM_POSITIONS = TypeAdapter(Annotated[
     tuple[_StreamPositionEnvelope, ...], Field(min_length=1, max_length=m.MAX_INTAKE_BATCH),
 ])
+
+#: Controller operations that finish claimed work, with the result fields that
+#: must each name that work. Each clears the lease and stamps completed_at at
+#: its receipt's recorded_at, so the newest receipt of each is the latest
+#: completion that path made. Finalization and source disposition complete
+#: work without a controller.transition_work receipt.
+_PROGRESS_RECEIPTS = (
+    ("controller.transition_work", ("$.result.work_id", "$.result.work.work_id")),
+    ("controller.finalize", ("$.result.work_id",)),
+    ("controller.disposition_source", ("$.result.work.work_id",)),
+)
 
 
 class SqlBackend:
@@ -672,31 +684,39 @@ class SqlBackend:
         receipts = self.tables["monitoring_receipts"]
         family = sorted(m.CONTROLLER_WORK_KINDS)
         kinds = ", ".join("?" for _ in family)
-        # SQL has no writable scheduler route. Active leases and original
-        # transition receipts retain progress across controller reconstruction.
+        # SQL has no writable scheduler route. Active leases and the original
+        # receipts of finished work retain progress across controller
+        # reconstruction. Only the newest receipt of each finishing operation
+        # can hold the latest completion, so read each through the receipts
+        # recency index and seek its work row. Joining every transition
+        # receipt to every work row by JSON, and reading completed_at from
+        # every work payload, took about 5 seconds per claim on the MorkNet
+        # database, under the control lock.
+        branches = [f"""    SELECT w.*, TRY_CONVERT(datetime2(6), JSON_VALUE(w.payload, '$.lease.acquired_at')) AS served_at
+    FROM {table} AS w
+    WHERE w.tenant_id = ? AND w.epoch = ? AND w.record_kind = 'work'
+      AND w.work_kind IN ({kinds}) AND w.status IN ('leased', 'finalizing')"""]
+        params: list[object] = [request.tenant_id, request.epoch, *family]
+        for operation, paths in _PROGRESS_RECEIPTS:
+            named = "".join(f"\n        AND JSON_VALUE(receipt.payload, '{path}') = w.full_key" for path in paths)
+            branches.append(f"""    SELECT w.*, receipt.recorded_at AS served_at
+    FROM {receipts} AS receipt
+    JOIN {table} AS w ON w.tenant_id = receipt.tenant_id AND w.epoch = receipt.epoch
+        AND w.record_kind = 'work'
+        AND w.key_hash = {key_hash(f"JSON_VALUE(receipt.payload, '{paths[0]}')")}{named}
+    WHERE receipt.tenant_id = ? AND receipt.epoch = ? AND receipt.operation = '{operation}'
+      AND w.work_kind IN ({kinds})
+      AND receipt.recorded_at = (
+          SELECT MAX(latest.recorded_at) FROM {receipts} AS latest
+          WHERE latest.tenant_id = ? AND latest.epoch = ? AND latest.operation = '{operation}')""")
+            params += [request.tenant_id, request.epoch, *family, request.tenant_id, request.epoch]
         rows = self.db.query(
-            f"""WITH recent AS (
-    SELECT w.*, COALESCE(
-        TRY_CONVERT(datetime2(6), JSON_VALUE(w.payload, '$.lease.acquired_at')),
-        TRY_CONVERT(datetime2(6), JSON_VALUE(w.payload, '$.completed_at'))
-    ) AS served_at
-    FROM {table} AS w
-    WHERE w.tenant_id = ? AND w.epoch = ? AND w.record_kind = 'work'
-      AND w.work_kind IN ({kinds})
-    UNION ALL
-    SELECT w.*, receipt.recorded_at AS served_at
-    FROM {table} AS w
-    JOIN {receipts} AS receipt ON receipt.tenant_id = w.tenant_id AND receipt.epoch = w.epoch
-        AND receipt.operation = 'controller.transition_work'
-        AND JSON_VALUE(receipt.payload, '$.result.work_id') = w.full_key
-        AND JSON_VALUE(receipt.payload, '$.result.work.work_id') = w.full_key
-    WHERE w.tenant_id = ? AND w.epoch = ? AND w.record_kind = 'work'
-      AND w.work_kind IN ({kinds})
+            "WITH recent AS (\n" + "\n    UNION ALL\n".join(branches) + f"""
 )
 SELECT TOP (1) {RECORD_COLUMNS}
 FROM recent WHERE served_at IS NOT NULL
 ORDER BY served_at DESC, key_hash DESC""",
-            request.tenant_id, request.epoch, *family, request.tenant_id, request.epoch, *family,
+            *params,
         )
         if not rows:
             return ""
@@ -3043,10 +3063,17 @@ class SqlMonitoringAdapter(MonitoringAdapter):
             "lease": lease.model_dump(mode="json"), "expected_work_revision": expected_work_revision,
         }
         identity = key_digest(_json(payload))
+        request_id = stable_id(context, f"collection-complete:{identity}")
+        # A replay returns the original receipt; only a new completion needs
+        # current evidence. The kernel requires the accepted batch natively.
+        if self._rpc_replay(f"{self.engine.component}.transition_work", request_id, context, identity) is None:
+            work = self.engine._get("work", m.canonical_id(work_id), context, m.MonitoringWork)
+            if work is None:
+                raise MonitoringLeaseLost("Guarded transition requires its existing work")
+            self.engine._collection_evidence_current(context, work)
         return self._sql_transition(
             context, work_id=work_id, lease=lease, expected_work_revision=expected_work_revision,
-            request_id=stable_id(context, f"collection-complete:{identity}"),
-            fingerprint=identity, transition="complete",
+            request_id=request_id, fingerprint=identity, transition="complete",
         )
 
     @staticmethod

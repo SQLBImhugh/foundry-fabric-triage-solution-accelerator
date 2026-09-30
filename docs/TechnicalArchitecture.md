@@ -117,6 +117,21 @@ deferred, because a page can move a workspace between domains before its pass
 finishes. Before this rule, each refresh paused every admitted target in the
 workspace, about four minutes per pass in the live deployment.
 
+A finished pass carries `next_scan_at`, and the controller queues the next pass
+of its selector when it publishes the pass, unless other active inventory work
+already scans that selector. Each pass used to queue its own successor, so every
+extra pass of a selector (a discovery request or a scope activation) started
+another periodic chain: from 2026-09-25 two chains scanned the MorkNet monitored
+workspace about 20 minutes apart. Existing duplicate chains end at their next
+publication.
+
+A worker completes an inventory work item only when every selector it declared
+has a finished, complete pass started after the work was created, and a
+capability probe only when a capability was checked after the probe was created.
+Both adapters apply the same rule (`MonitoringEngine._collection_evidence_current`)
+and require the batch to have been accepted under the work fence, which the SQL
+kernel checks natively.
+
 Power BI refreshes and scheduled Fabric pipeline executions are the supported
 failure workloads. Notebook activities can supply pipeline evidence; this is
 not standalone notebook monitoring or a universal Fabric audit subscription.
@@ -252,6 +267,46 @@ reconstructing fairness from historical work/transition receipts; nonempty
 selections retain the existing workspace rotation, quotas and native claim.
 Install the new view and read grant before deploying a caller that requires it;
 a missing projection fails bootstrap rather than selecting the expensive route.
+
+The rotation cursor is the workspace of the most recent service: a controller
+work lease that is still active, or the newest receipt of an operation that
+finishes claimed controller work (`controller.transition_work`,
+`controller.finalize` or `controller.disposition_source`). Each of these clears
+the lease and stamps `completed_at` at its receipt's `recorded_at`, so the
+cursor is the same one the earlier query derived from every work payload. Each
+newest receipt is read through the receipts recency index
+(`tenant_id, epoch, operation, recorded_at`, created by `schema.py`) and its work
+row by `key_hash`. Joining every transition receipt to every work row by JSON,
+and reading `completed_at` from every work payload, took about 5 seconds per
+claim on the MorkNet database, inside the claim's control-row lock. Reading
+only transition receipts would leave the cursor on an older workspace after a
+finalized or disposed completion, and with single-slot claims one workspace
+with steady due work would then be served first every time.
+`tests\test_monitoring_workspace_fairness.py` covers both completion paths.
+
+### Kernel lookups and the control-row lock
+
+Every mutating kernel procedure locks the control row (`UPDLOCK, HOLDLOCK`) and
+keeps the lock until its transaction commits, so a statement that scans also
+makes every other caller wait. On the MorkNet database (S1, 20 DTU) Query Store
+recorded 13.8 million ms of control-row lock waits in two hours, and heartbeats
+took 100 to 140 seconds for three to seven reconciliations. The causes, and the
+rules the kernel now follows:
+
+| Rule | Why |
+|---|---|
+| Compare `VARCHAR` columns (`record_kind`, `status`, `work_kind`, `workload`, `operation`) with `VARCHAR` literals (`varchar_literals()`) | An `N'...'` literal converts the column, which rules out an index seek under `SQL_Latin1_General_CP1_CI_AS`. The replay lookup read about 76,700 pages per call; 12 lookups took 15.9 s and 0 ms with `VARCHAR` literals |
+| Pair every receipts `request_id` predicate with `request_hash` | The receipts key is `(tenant_id, epoch, operation, request_hash)` |
+| Pair `full_key` lookups of large kinds with `key_hash` | The records key is `(tenant_id, epoch, record_kind, key_hash)`; `full_key` alone reads every record of the kind |
+| Seek accepted-evidence bindings by `accepted_fact_key_hash`, a batch's bindings by their parent, and a batch's handoff through the frontier its receipt recorded | Source publication took 6.8 s per call and 2.8 ms after the change; reading a batch's own bindings took 1.3 s per accepted page and 2.8 ms after |
+
+Each added hash predicate is implied by the text predicate it accompanies:
+stored hashes are `key_hash()` of their text columns, which the writable views
+enforce. A live check found no exceptions in 144,921 records and 142,500
+receipts, and the rewritten lookups returned the same answers as before for
+80 live evidence/work pairs and 40 live batches.
+`tests\test_monitoring_sql_seekable_predicates.py` keeps these rules for every
+generated view and procedure.
 
 Heartbeat context lookup, queue claims and synchronous reconciliation run off
 the event loop. The human-command drain uses the same cancellation-settlement

@@ -159,7 +159,7 @@ WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='signal' AND status=
   AND key_hash={key_hash("JSON_VALUE(@delivery_proof,'$.receipt_key')")};
 SELECT @delivery_batch=payload,@delivery_batch_recorded_at=recorded_at FROM {receipts}
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND operation='worker.commit_positions'
-  AND request_id=JSON_VALUE(@delivery_proof,'$.request_id');
+  AND request_id=JSON_VALUE(@delivery_proof,'$.request_id') AND request_hash={key_hash("JSON_VALUE(@delivery_proof,'$.request_id')")};
 SELECT @delivery_desired=payload FROM {records}
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='connector_desired'
   AND full_key=@connector_id AND key_hash={key_hash('@connector_id')};
@@ -266,7 +266,7 @@ IF @plan IS NULL OR EXISTS (SELECT 1 FROM OPENJSON(@plan) WHERE [key] NOT IN ({a
     THROW 51072, 'Connector publication is not the fixed current-work/controller plan', 1;
 IF NOT EXISTS (SELECT 1 FROM {records} AS h JOIN {records} AS f
     ON f.tenant_id=h.tenant_id AND f.epoch=h.epoch AND f.record_kind='validation_frontier'
-   AND f.full_key=h.parent_key
+   AND f.full_key=h.parent_key AND f.key_hash=h.parent_hash
     WHERE h.tenant_id=@tenant_id AND h.epoch=@epoch AND h.record_kind='validation_handoff'
       AND JSON_VALUE(h.payload,'$.work_id')=@work_id
       AND JSON_VALUE(h.payload,'$.producer_request_id')=JSON_VALUE(@plan,'$.producer_request_id')
@@ -276,7 +276,7 @@ IF NOT EXISTS (SELECT 1 FROM {records} AS h JOIN {records} AS f
       AND f.sequence_number=TRY_CONVERT(bigint,JSON_VALUE(@plan,'$.frontier_revision'))
       AND EXISTS (SELECT 1 FROM {receipts} AS r WHERE r.tenant_id=@tenant_id AND r.epoch=@epoch
           AND r.operation=JSON_VALUE(h.payload,'$.producer_operation')
-          AND r.request_id=JSON_VALUE(h.payload,'$.producer_request_id')
+          AND r.request_id=JSON_VALUE(h.payload,'$.producer_request_id') AND r.request_hash={key_hash("JSON_VALUE(h.payload,'$.producer_request_id')")}
           AND r.fingerprint=JSON_VALUE(h.payload,'$.producer_fingerprint')
           AND JSON_VALUE(r.payload,'$.binding_hash')=JSON_VALUE(h.payload,'$.producer_binding_hash')))
     THROW 51072, 'Connector source-intent/frontier/receipt binding changed', 1;
@@ -462,7 +462,7 @@ BEGIN
         THROW 51072, 'Readiness must reconcile the exact existing desired connector observation', 1;
     DECLARE @observation nvarchar(max);
     SELECT @observation=JSON_QUERY(payload,'$.result.observation') FROM {receipts}
-    WHERE tenant_id=@tenant_id AND epoch=@epoch AND operation='worker.observe_connector' AND request_id=@readiness_id
+    WHERE tenant_id=@tenant_id AND epoch=@epoch AND operation='worker.observe_connector' AND request_id=@readiness_id AND request_hash={key_hash("@readiness_id")}
       AND JSON_VALUE(payload,'$.result.connector_id')=@connector_id
       AND TRY_CONVERT(bigint,JSON_VALUE(payload,'$.result.connector.revision'))=@expected_connector_revision;
     IF @observation IS NULL OR COALESCE(JSON_VALUE(@observation,'$.state'),'')<>'ready'
