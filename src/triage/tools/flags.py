@@ -12,7 +12,7 @@ from typing import Protocol
 
 from triage.models import DataQualityFlag
 from triage.redaction import redact_text
-from triage.store.azure_sql import AzureSqlDatabase, SqlUnavailable, quote_identifier
+from triage.store.azure_sql import AzureSqlDatabase, SqlUnavailable, quote_identifier, read_rows
 
 logger = logging.getLogger("triage.tools.flags")
 
@@ -104,7 +104,7 @@ class AzureSqlFlagTable:
             raise SqlUnavailable("Stored data quality flag is unreadable.") from exc
 
     def read_all(self) -> list[dict[str, str]]:
-        rows = self._db.query(f"SELECT payload FROM {self._table} ORDER BY flagged_at, flag_id")
+        rows = read_rows(self._db, f"SELECT payload FROM {self._table} ORDER BY flagged_at, flag_id")
         return [
             {key: str(value) for key, value in self._decode(raw).model_dump().items()}
             for (raw,) in rows
@@ -124,8 +124,8 @@ class AzureSqlFlagTable:
                 return flag
             if changed != 0:
                 raise SqlUnavailable("Data quality flag write returned an unconfirmed row count.")
-            rows = self._db.query(
-                f"SELECT payload FROM {self._table} WHERE flag_id = ?", flag.flag_id,
+            rows = read_rows(
+                self._db, f"SELECT payload FROM {self._table} WHERE flag_id = ?", flag.flag_id,
             )
             if len(rows) != 1:
                 raise SqlUnavailable("The original data quality flag could not be reconciled.")
@@ -142,7 +142,7 @@ class AzureSqlFlagTable:
 
     @property
     def row_count(self) -> int:
-        rows = self._db.query(f"SELECT COUNT(*) FROM {self._table}")
+        rows = read_rows(self._db, f"SELECT COUNT(*) FROM {self._table}")
         if len(rows) != 1 or len(rows[0]) != 1 or type(rows[0][0]) is not int or rows[0][0] < 0:
             raise SqlUnavailable("Data quality flag count could not be verified.")
         return rows[0][0]

@@ -474,7 +474,7 @@ def _probe_azure_sql(args: argparse.Namespace | None = None) -> tuple[str, str, 
             server=_s.azure_sql_server, database=_s.azure_sql_database,
             credential=_operator_credential(args or argparse.Namespace(), required=True),
         )
-        rows = db.query("SELECT 1")
+        rows = db.read("SELECT 1")
         if rows and rows[0][0] == 1:
             return ("  \u2514 connection", "SELECT 1 succeeded", "[green]ok[/green]")
         return ("  \u2514 connection", "unexpected result", "[red]failed[/red]")

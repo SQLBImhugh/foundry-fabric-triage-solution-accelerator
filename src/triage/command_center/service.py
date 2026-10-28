@@ -43,7 +43,7 @@ from triage.prompts import load_prompt
 from triage.providers import get_provider
 from triage.redaction import redact_text
 from triage.store.approvals import AzureSqlApprovalChannel
-from triage.store.azure_sql import quote_identifier
+from triage.store.azure_sql import quote_identifier, read_rows
 from triage.store.durability import select_state_database
 
 logger = logging.getLogger("triage.command_center.service")
@@ -259,14 +259,14 @@ class CommandCenterService:
         table = quote_identifier(self.settings.incident_table_name)
         return [
             Incident.model_validate_json(row[0])
-            for row in self.db.query(f"SELECT TOP ({_LIMIT}) payload FROM {table} ORDER BY updated_at DESC")
+            for row in read_rows(self.db, f"SELECT TOP ({_LIMIT}) payload FROM {table} ORDER BY updated_at DESC")
         ]
 
     def incident(self, incident_id: str) -> Incident | None:
         if self.incidents is not None:
             return self.incidents.get(incident_id)
         table = quote_identifier(self.settings.incident_table_name)
-        rows = self.db.query(f"SELECT payload FROM {table} WHERE incident_id = ?", incident_id)
+        rows = read_rows(self.db, f"SELECT payload FROM {table} WHERE incident_id = ?", incident_id)
         return Incident.model_validate_json(rows[0][0]) if rows else None
 
     def approval(self, request_id: str) -> dict[str, Any] | None:
@@ -338,7 +338,7 @@ class CommandCenterService:
         items.sort(key=lambda row: (rank.get(row["status"], 3), row["updated_at"]), reverse=False)
         if self.db is not None:
             rerun_table = quote_identifier(self.settings.pipeline_rerun_table_name)
-            verification = self.db.query(f"SELECT COUNT(*) FROM {rerun_table} WHERE state = 'submitted'")[0][0]
+            verification = read_rows(self.db, f"SELECT COUNT(*) FROM {rerun_table} WHERE state = 'submitted'")[0][0]
         elif self.demo_runner is not None:
             verification = sum(
                 len(self.demo_runner.reruns.pending(target.workspace_id, target.pipeline_id))

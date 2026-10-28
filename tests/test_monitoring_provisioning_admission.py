@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
+from dataclasses import replace
 from datetime import timedelta
 from uuid import UUID
 
 import pytest
+from monitoring_supersession_protocol import SupersessionProtocolDatabase
+from test_monitoring_connector_retirement_store import scoped_connector
 from test_monitoring_connector_supersession_store import recovery_case
 from test_monitoring_controller_publication_integration import PublicationHarness
 from test_monitoring_event_readiness import native_delivery, receive
@@ -14,6 +18,7 @@ from test_monitoring_provisioning import (
     CONTEXT,
     OWNER,
     connector,
+    exclude,
     factory,
     setup_store,
     target,
@@ -24,15 +29,19 @@ from test_monitoring_provisioning_orchestration import (
     runner_for,
     seed_existing_publication,
 )
+from test_monitoring_sql_review9_bindings import connector_commit
+from test_monitoring_store import uid
 
 from triage.monitoring import models as m
 from triage.monitoring.contracts import (
     MonitoringCommitUncertain,
     MonitoringConflict,
+    MonitoringLeaseLost,
     MonitoringUnavailable,
 )
+from triage.monitoring.controller import reconcile_monitoring_work
 from triage.monitoring.events import ConnectorBinding
-from triage.monitoring.memory import InMemoryMonitoringStore, stable_id
+from triage.monitoring.memory import InMemoryMonitoringStore, key_digest, stable_id
 from triage.monitoring.provisioning import (
     PRESENCE_GAP,
     OwnedEventCapabilityProbe,
@@ -45,6 +54,7 @@ from triage.monitoring.provisioning import (
     publication_from_plan,
     publish_connector_intent,
 )
+from triage.monitoring.sql_store import AzureSqlMonitoringStore
 
 __all__ = ["factory"]
 
@@ -694,3 +704,574 @@ async def test_paused_scope_disable_needs_explicit_removal_evidence_from_control
     result = await factory(seed, clock, remote).run_once()
     assert result.results[0].code == "controller_source_retirement_required"
     assert remote.graph["sources"] == []
+
+
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+async def test_add_only_overtaken_observation_is_rejected_and_requeues_followup_on_both_adapters(
+    backend, tmp_path,
+):
+    fixture = PublicationHarness(backend, tmp_path)
+    await fixture.collect()
+    await fixture.execute(fixture.activate())
+    planned = fixture.connector()
+    proposal, = planned.source_proposals
+    assert planned.sources == () and planned.source_removals == ()
+    run = await fixture.apply_worker()
+    assert run.results[0].code == "controller_source_binding_required"
+    first_observed = fixture.connector()
+    intent_receipt_id = stable_id(CONTEXT, f"connector:{CONNECTOR}:{planned.revision}")
+    first_receipt_id = stable_id(CONTEXT, f"connector:{CONNECTOR}:{first_observed.revision - 1}")
+    fixture.h.clock.advance(1)
+    worker = fixture.use("worker")
+    second_observed = worker.record_connector(
+        fixture.version("worker"),
+        m.OwnedConnectorManifest.model_validate({
+            **first_observed.model_dump(),
+            "revision": first_observed.revision + 1,
+            "updated_at": fixture.h.clock(),
+        }),
+        expected_connector_revision=first_observed.revision,
+        commit=connector_commit(fixture.h, worker, CONNECTOR, db=fixture.db),
+    )
+    second_receipt_id = stable_id(CONTEXT, f"connector:{CONNECTOR}:{first_observed.revision}")
+    controller = fixture.use("controller")
+    claimed = controller.claim_work(m.WorkClaimRequest(
+        **CONTEXT.model_dump(), owner_id=uid(94_101), kinds=("reconcile_state",),
+        limit=20, per_workspace_limit=20, lease_seconds=120,
+    ))
+    intent_work = next(item for item in claimed if item.reconcile_request_id == intent_receipt_id)
+    first_work = next(item for item in claimed if item.reconcile_request_id == first_receipt_id)
+    second_work = next(item for item in claimed if item.reconcile_request_id == second_receipt_id)
+    before_receipts = deepcopy(fixture.db.receipts if fixture.db else fixture.h.state.receipts)
+
+    intent_outcome = reconcile_monitoring_work(controller, intent_work)
+    first_outcome = reconcile_monitoring_work(controller, first_work)
+
+    assert intent_outcome.state == ("pending_validation" if backend == "sql" else "rejected")
+    assert first_outcome.state == ("pending_validation" if backend == "sql" else "rejected")
+    reobserve_id = stable_id(CONTEXT, f"connector-reobserve:{first_receipt_id}")
+    followup = controller.get_work(CONTEXT, reobserve_id)
+    assert followup is not None and followup.kind == "connector_reconcile" and followup.state == "queued"
+    assert followup.connector_id == CONNECTOR
+    assert fixture.connector().sources == () and fixture.connector().source_proposals == (proposal,)
+    assert fixture.connector().revision == second_observed.revision
+    receipts = fixture.db.receipts if fixture.db else fixture.h.state.receipts
+    assert all(receipts[key] == value for key, value in before_receipts.items())
+
+    second_outcome = reconcile_monitoring_work(controller, second_work)
+    assert second_outcome.state == "published"
+    bound = fixture.connector()
+    assert bound.source_proposals == () and bound.source_removals == ()
+    assert len(bound.sources) == 1
+    assert bound.sources[0].source_id == fixture.remote.graph["sources"][0]["id"]
+    assert bound.sources[0].source_id not in {proposal.proposal_id, proposal.node_name}
+    assert bound.state == "provisioning" and bound.delivery_proof is None
+
+    if backend == "sql":
+        fixture.h.clock.advance(16)
+        reclaimed = {
+            item.work_id: item for item in controller.claim_work(m.WorkClaimRequest(
+                **CONTEXT.model_dump(), owner_id=uid(94_102), kinds=("reconcile_state",),
+                limit=20, per_workspace_limit=20, lease_seconds=120,
+            ))
+        }
+        for prior_work in (intent_work, first_work):
+            ack = reconcile_monitoring_work(controller, reclaimed[prior_work.work_id])
+            assert ack.state == "rejected" and ack.resolution_scope == "handoff_acknowledgement"
+    assert controller.get_work(CONTEXT, intent_work.work_id).state == "completed"
+    assert controller.get_work(CONTEXT, first_work.work_id).state == "completed"
+    assert controller.get_work(CONTEXT, second_work.work_id).state == "completed"
+    assert controller.get_work(CONTEXT, reobserve_id) == followup
+    assert len(fixture.remote.update_bodies) == 1
+
+
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+@pytest.mark.parametrize("phase", ["add", "remove"])
+@pytest.mark.parametrize("fault", ["missing_baseline", "future_baseline"])
+async def test_missing_or_future_baseline_fails_closed_without_false_overtaken_rejection(
+    backend, phase, fault, tmp_path,
+):
+    if phase == "add":
+        fixture = PublicationHarness(backend, tmp_path)
+        await fixture.collect()
+        await fixture.execute(fixture.activate())
+        await fixture.apply_worker()
+        controller = fixture.use("controller")
+        current_version = fixture.version("controller")
+        current_connector = fixture.connector()
+        binding_receipt_id = stable_id(CONTEXT, f"connector:{CONNECTOR}:{current_connector.revision - 1}")
+        claimed = controller.claim_work(m.WorkClaimRequest(
+            **CONTEXT.model_dump(), owner_id=uid(94_200), kinds=("reconcile_state",),
+            limit=20, per_workspace_limit=20, lease_seconds=120,
+        ))
+        work = next(item for item in claimed if item.reconcile_request_id == binding_receipt_id)
+        db = fixture.db
+        state = fixture.h.state
+    else:
+        h, controller, _, _, _, _, _, request = recovery_case(backend)
+        work = controller.get_work(h.version, request.work_id)
+        current_version = h.version
+        current_connector = next(
+            item for item in controller.list_connectors(m.PageQuery(**h.context())).items
+            if item.connector_id == request.connector_id
+        )
+        db = controller._sql.db if backend == "sql" else None
+        state = h.state
+
+    request_id = work.reconcile_request_id
+    if backend == "memory":
+        obs_key = (
+            current_version.tenant_id, current_version.epoch,
+            "connector_observation", key_digest(request_id),
+        )
+        if fault == "missing_baseline":
+            state.records.pop(obs_key)
+        else:
+            row = state.records[obs_key]
+            future_obs = m.OwnedConnectorManifest.model_validate_json(row.payload).model_copy(
+                update={"revision": current_connector.revision + 2},
+            )
+            state.records[obs_key] = replace(row, payload=future_obs.model_dump_json())
+    else:
+        req_key = ("worker_reconcile_request", request_id)
+        row = db.records[req_key]
+        document = json.loads(row.payload)
+        if fault == "missing_baseline":
+            document["request_payload"]["expected_connector_revision"] = None
+        else:
+            document["request_payload"]["expected_connector_revision"] = current_connector.revision + 1
+        db.records[req_key] = replace(row, payload=json.dumps(document, sort_keys=True))
+
+    def check_not_overtaken():
+        producer = controller._get(
+            "worker_reconcile_request", request_id, current_version, m.ReconciliationRequest,
+        )
+        return controller._connector_observation_overtaken(producer, current_connector, current_version)
+
+    if db is None:
+        assert check_not_overtaken() is False
+    else:
+        with controller._sql.transaction(write=False, operation="inspect", request_id=uid(94_201)):
+            assert check_not_overtaken() is False
+
+    before_records = deepcopy(db.records if db else state.records)
+    before_receipts = deepcopy(db.receipts if db else state.receipts)
+    with pytest.raises(MonitoringUnavailable):
+        controller.get_connector_observation(current_version, request_id)
+    with pytest.raises(MonitoringUnavailable):
+        reconcile_monitoring_work(controller, work)
+
+    assert (db.records if db else state.records) == before_records
+    assert (db.receipts if db else state.receipts) == before_receipts
+    assert controller.get_work(current_version, work.work_id).state == "leased"
+    reobserve_id = stable_id(current_version, f"connector-reobserve:{request_id}")
+    assert controller.get_work(current_version, reobserve_id) is None
+
+
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+def test_late_expiry_during_supersession_preparation_rejects_and_requeues_on_both_adapters(
+    backend, monkeypatch,
+):
+    h, controller, _, owned, pending, collection, _, request = recovery_case(backend)
+    original_observation = controller.get_connector_observation(h.version, request.observation_receipt_id)
+    removal_request_id = pending.pending_removals[0].request_id
+    original_removal_receipt = controller.get_connector_publication(h.version, removal_request_id)
+    remaining = (
+        original_observation.inspection.observed_at
+        + timedelta(seconds=m.SUPERSESSION_EVIDENCE_TTL_SECONDS)
+        - h.clock()
+    )
+    h.clock.advance(int(remaining.total_seconds()) - 1)
+    assert h.clock() - original_observation.inspection.observed_at < timedelta(
+        seconds=m.SUPERSESSION_EVIDENCE_TTL_SECONDS,
+    )
+    work = next(
+        item for item in controller.claim_work(m.WorkClaimRequest(
+            **h.context(), owner_id=uid(94_250), kinds=("reconcile_state",),
+            limit=200, per_workspace_limit=200, lease_seconds=120,
+        )) if item.work_id == request.work_id
+    )
+    original_snapshot = controller.snapshot
+    snapshot_calls = []
+
+    def expiring_snapshot(*args, **kwargs):
+        result = original_snapshot(*args, **kwargs)
+        h.clock.advance(3)
+        snapshot_calls.append(h.clock())
+        return result
+
+    monkeypatch.setattr(controller, "snapshot", expiring_snapshot)
+
+    outcome = reconcile_monitoring_work(controller, work)
+
+    assert snapshot_calls, "Preparation must execute after the early freshness guard"
+    assert outcome.state == "rejected"
+    assert outcome.producer_request_id == work.reconcile_request_id
+    finished = controller.get_work(h.version, work.work_id)
+    assert finished.state == "completed" and finished.lease is None
+    reobserve_id = stable_id(h.version, f"connector-reobserve:{work.reconcile_request_id}")
+    followup = controller.get_work(h.version, reobserve_id)
+    assert followup is not None and followup.kind == "connector_reconcile" and followup.state == "queued"
+    assert followup.work_id != collection.work_id
+    current = next(
+        item for item in controller.list_connectors(m.PageQuery(**h.context())).items
+        if item.connector_id == owned.connector_id
+    )
+    assert current.sources == owned.sources
+    assert current.source_removals == pending.pending_removals
+    assert current.revision == original_observation.observation.revision
+    assert controller.get_connector_publication(h.version, removal_request_id) == original_removal_receipt
+    assert controller.get_connector_observation(h.version, request.observation_receipt_id) == original_observation
+
+
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+@pytest.mark.parametrize("reason", ["overtaken", "late_expiry"])
+def test_rejection_rollback_and_followup_reobservation_deduplication(
+    backend, reason, monkeypatch,
+):
+    existing = scoped_connector(backend, database_type=SupersessionProtocolDatabase)
+    h, db, _, controller, worker, owned = existing
+    _, controller, worker, owned, pending, collection, observed, request = recovery_case(
+        backend, existing=existing, finish_inspection=reason != "overtaken",
+    )
+    work = controller.get_work(h.version, request.work_id)
+    reobserve_id = stable_id(h.version, f"connector-reobserve:{work.reconcile_request_id}")
+    if reason == "overtaken":
+        h.clock.advance(1)
+        if db:
+            db.principal = "worker"
+        newer = m.OwnedConnectorManifest.model_validate({
+            **observed.model_dump(), "revision": observed.revision + 1, "updated_at": h.clock(),
+        })
+        worker.record_connector(
+            h.version, newer, expected_connector_revision=observed.revision,
+            commit=m.CollectionCommit(
+                work_id=collection.work_id, lease=collection.lease,
+                expected_work_revision=collection.revision,
+            ),
+            inspection=m.ConnectorPresenceInspection(
+                read_only=True, observed_at=h.clock(),
+                definition_hash=m.connector_definition_hash(newer.observed_definition),
+                component_states={
+                    value: "Running" for value in newer.observed_definition["component_ids"].values()
+                },
+            ),
+        )
+        worker.complete_collection_work(
+            h.version, work_id=collection.work_id, lease=collection.lease,
+            expected_work_revision=collection.revision,
+        )
+        if db:
+            db.principal = "controller"
+            newer_id = stable_id(h.version, f"connector:{owned.connector_id}:{observed.revision}")
+            newer_obs = controller.get_connector_observation(h.version, newer_id)
+            newer_work, = [
+                item for item in controller.claim_work(m.WorkClaimRequest(
+                    **h.context(), owner_id=uid(94_301), kinds=("reconcile_state",),
+                    limit=200, per_workspace_limit=200, lease_seconds=120,
+                )) if item.work_id == newer_obs.reconcile_work_id
+            ]
+            assert reconcile_monitoring_work(controller, newer_work).state == "pending_validation"
+            work = controller.get_work(h.version, request.work_id)
+    else:
+        original_observation = controller.get_connector_observation(h.version, request.observation_receipt_id)
+        remaining = (
+            original_observation.inspection.observed_at
+            + timedelta(seconds=m.SUPERSESSION_EVIDENCE_TTL_SECONDS)
+            - h.clock()
+        )
+        h.clock.advance(int(remaining.total_seconds()) - 1)
+        work = next(
+            item for item in controller.claim_work(m.WorkClaimRequest(
+                **h.context(), owner_id=uid(94_302), kinds=("reconcile_state",),
+                limit=200, per_workspace_limit=200, lease_seconds=120,
+            )) if item.work_id == request.work_id
+        )
+        original_snapshot = controller.snapshot
+
+        def expiring_snapshot(*args, **kwargs):
+            result = original_snapshot(*args, **kwargs)
+            h.clock.advance(3)
+            return result
+
+        monkeypatch.setattr(controller, "snapshot", expiring_snapshot)
+
+    before_records = deepcopy(db.records if db else h.state.records)
+    before_receipts = deepcopy(db.receipts if db else h.state.receipts)
+    if db:
+        db.fail_commit = "before"
+        with pytest.raises(MonitoringCommitUncertain):
+            reconcile_monitoring_work(controller, work)
+    else:
+        original_finish = controller._finish_reconciliation
+
+        def fail_before_finish(*args, **kwargs):
+            assert controller._get("work", reobserve_id, h.version, m.MonitoringWork) is not None
+            raise MonitoringConflict("Injected rollback after follow-up enqueue")
+
+        monkeypatch.setattr(controller, "_finish_reconciliation", fail_before_finish)
+        with pytest.raises(MonitoringConflict, match="Injected rollback"):
+            reconcile_monitoring_work(controller, work)
+        monkeypatch.setattr(controller, "_finish_reconciliation", original_finish)
+
+    assert (db.records if db else h.state.records) == before_records
+    assert (db.receipts if db else h.state.receipts) == before_receipts
+    assert controller.get_work(h.version, reobserve_id) is None
+    assert controller.get_work(h.version, work.work_id).state == "leased"
+
+    if reason == "late_expiry":
+        # Restore the 1-second pre-expiry margin consumed by the rolled-back attempt.
+        h.clock.advance(-3)
+    first = reconcile_monitoring_work(controller, work)
+    assert first.state == "rejected"
+    followup = controller.get_work(h.version, reobserve_id)
+    assert followup is not None and followup.kind == "connector_reconcile" and followup.state == "queued"
+
+    assert reconcile_monitoring_work(controller, work) == first
+    deduped = controller.enqueue_work(m.MonitoringWorkDraft(
+        **h.context(), work_id=reobserve_id, kind="connector_reconcile",
+        connector_id=owned.connector_id, policy_revision=h.version.revision,
+        created_at=followup.created_at, due_at=followup.due_at,
+        reason="Expired source-presence evidence requires a fresh bounded observation.",
+    ))
+    assert deduped == followup
+    reobserve_rows = [
+        row for row in (db.records if db else h.state.records).values()
+        if row.kind == "work" and row.key == reobserve_id
+    ]
+    assert len(reobserve_rows) == 1
+
+
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+@pytest.mark.parametrize("phase", ["add", "remove", "expired_supersession"])
+@pytest.mark.parametrize("recovery_mode", ["reclaim_after_rollback", "lost_ack"])
+async def test_reclaim_and_lost_ack_recovery_preserve_ownership_authority_and_original_receipts(
+    backend, phase, recovery_mode, tmp_path, monkeypatch,
+):
+    if phase in {"add", "remove"}:
+        fixture = PublicationHarness(backend, tmp_path)
+        await fixture.collect()
+        await fixture.execute(fixture.activate())
+        await fixture.apply_worker()
+        if phase == "remove":
+            await fixture.drain()
+            exclude(fixture.use("web"), fixture.identity, nonce=94_401)
+            await fixture.drain()
+            await fixture.apply_worker()
+        controller = fixture.use("controller")
+        current_version = fixture.version("controller")
+        current_connector = fixture.connector()
+        binding_receipt_id = stable_id(CONTEXT, f"connector:{CONNECTOR}:{current_connector.revision - 1}")
+        claimed = controller.claim_work(m.WorkClaimRequest(
+            **CONTEXT.model_dump(), owner_id=uid(94_400), kinds=("reconcile_state",),
+            limit=20, per_workspace_limit=20, lease_seconds=120,
+        ))
+        for item in claimed:
+            if item.reconcile_request_id != binding_receipt_id:
+                reconcile_monitoring_work(controller, item)
+        work = next(item for item in claimed if item.reconcile_request_id == binding_receipt_id)
+        db = fixture.db
+        state = fixture.h.state
+        clock = fixture.h.clock
+    else:
+        h, controller, _, owned, pending, _, _, request = recovery_case(backend)
+        clock = h.clock
+        clock.advance(m.SUPERSESSION_EVIDENCE_TTL_SECONDS + 1)
+        current_version = h.version
+        db = controller._sql.db if backend == "sql" else None
+        state = h.state
+        if db:
+            db.principal = "controller"
+        work = next(
+            item for item in controller.claim_work(m.WorkClaimRequest(
+                **h.context(), owner_id=uid(94_402), kinds=("reconcile_state",),
+                limit=200, per_workspace_limit=200, lease_seconds=120,
+            )) if item.work_id == request.work_id
+        )
+
+    before_receipts = deepcopy(db.receipts if db else state.receipts)
+    if recovery_mode == "reclaim_after_rollback":
+        before_records = deepcopy(db.records if db else state.records)
+        if db:
+            db.fail_commit = "before"
+            with pytest.raises(MonitoringCommitUncertain):
+                reconcile_monitoring_work(controller, work)
+        else:
+            original_finish = controller._finish_reconciliation
+
+            def abort_before_commit(*args, **kwargs):
+                raise MonitoringConflict("Injected abort before reconciliation finishes")
+
+            monkeypatch.setattr(controller, "_finish_reconciliation", abort_before_commit)
+            with pytest.raises(MonitoringConflict, match="Injected abort"):
+                reconcile_monitoring_work(controller, work)
+            monkeypatch.setattr(controller, "_finish_reconciliation", original_finish)
+        assert (db.records if db else state.records) == before_records
+        clock.advance(121)
+        reclaimed = next(
+            item for item in controller.claim_work(m.WorkClaimRequest(
+                **current_version.model_dump(exclude={"revision"}),
+                owner_id=uid(94_403), kinds=("reconcile_state",),
+                limit=200, per_workspace_limit=200, lease_seconds=120,
+            )) if item.work_id == work.work_id
+        )
+        assert reclaimed.lease.fence == work.lease.fence + 1
+        with pytest.raises((MonitoringLeaseLost, MonitoringConflict)):
+            reconcile_monitoring_work(controller, work)
+        outcome = reconcile_monitoring_work(controller, reclaimed)
+        target_work = reclaimed
+    else:
+        if db:
+            db.fail_commit = "after"
+            with pytest.raises(MonitoringCommitUncertain):
+                reconcile_monitoring_work(controller, work)
+            restarted = AzureSqlMonitoringStore(db=db, component="controller")
+        else:
+            original_reconcile = controller.reconcile_work
+
+            def lose_ack_after_commit(claimed_work, **kwargs):
+                res = original_reconcile(claimed_work, **kwargs)
+                raise MonitoringCommitUncertain("reconciliation", res.request_id)
+
+            monkeypatch.setattr(controller, "reconcile_work", lose_ack_after_commit)
+            with pytest.raises(MonitoringCommitUncertain):
+                reconcile_monitoring_work(controller, work)
+            restarted = InMemoryMonitoringStore(state=state, clock=clock, component="controller")
+        snapshot_records = deepcopy(db.records if db else state.records)
+        snapshot_receipts = deepcopy(db.receipts if db else state.receipts)
+        outcome = reconcile_monitoring_work(restarted, work)
+        assert (db.records if db else state.records) == snapshot_records
+        assert (db.receipts if db else state.receipts) == snapshot_receipts
+        target_work = work
+
+    assert controller.get_work(current_version, target_work.work_id).state == "completed"
+    receipts = db.receipts if db else state.receipts
+    assert all(receipts[key] == value for key, value in before_receipts.items())
+    if phase == "add":
+        bound = fixture.connector()
+        assert len(bound.sources) == 1 and bound.source_proposals == () and bound.source_removals == ()
+        assert bound.state == "provisioning" and bound.delivery_proof is None
+    elif phase == "remove":
+        retired = fixture.connector()
+        assert retired.sources == () and retired.source_proposals == () and retired.source_removals == ()
+        tombstones = [row for row in fixture.rows() if row.kind == "connector_source_retirement"]
+        assert len(tombstones) == 1
+    else:
+        assert outcome.state == "rejected"
+        current = next(
+            item for item in controller.list_connectors(
+                m.PageQuery(**current_version.model_dump(exclude={"revision"})),
+            ).items if item.connector_id == owned.connector_id
+        )
+        assert current.sources == owned.sources and current.source_removals == pending.pending_removals
+        reobserve_id = stable_id(current_version, f"connector-reobserve:{target_work.reconcile_request_id}")
+        assert controller.get_work(current_version, reobserve_id) is not None
+
+
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+async def test_remove_retains_ownership_across_overtaken_and_present_observations_until_verified_absence(
+    backend, tmp_path,
+):
+    fixture = PublicationHarness(backend, tmp_path)
+    await fixture.collect()
+    await fixture.execute(fixture.activate())
+    planned = fixture.connector()
+    proposal, = planned.source_proposals
+    await fixture.apply_worker()
+    await fixture.drain()
+    active = fixture.connector()
+    owned_source, = active.sources
+    assert owned_source.source_id not in {proposal.proposal_id, proposal.node_name}
+
+    exclude(fixture.use("web"), fixture.identity, nonce=94_501)
+    await fixture.drain()
+    pending = fixture.connector()
+    removal, = pending.source_removals
+    assert pending.sources == (owned_source,)
+    assert fixture.use("controller").resolve_target(fixture.identity) is None
+    assert not any(row.kind == "connector_source_retirement" for row in fixture.rows())
+    removal_publication = fixture.use("controller").get_connector_publication(
+        CONTEXT, removal.request_id,
+    )
+
+    worker = fixture.use("worker")
+    first_present = worker.record_connector(
+        fixture.version("worker"),
+        m.OwnedConnectorManifest.model_validate({
+            **pending.model_dump(),
+            "revision": pending.revision + 1,
+            "observed_definition": active.desired_definition,
+            "state": "degraded",
+            "gaps": (m.CoverageGap(
+                code="source_still_present", detail="Remote source is still present before update.",
+            ),),
+            "updated_at": fixture.h.clock(),
+        }),
+        expected_connector_revision=pending.revision,
+        commit=connector_commit(fixture.h, worker, CONNECTOR, db=fixture.db),
+    )
+    first_receipt_id = stable_id(CONTEXT, f"connector:{CONNECTOR}:{pending.revision}")
+    fixture.h.clock.advance(1)
+    second_present = worker.record_connector(
+        fixture.version("worker"),
+        m.OwnedConnectorManifest.model_validate({
+            **first_present.model_dump(),
+            "revision": first_present.revision + 1,
+            "updated_at": fixture.h.clock(),
+        }),
+        expected_connector_revision=first_present.revision,
+        commit=connector_commit(fixture.h, worker, CONNECTOR, db=fixture.db),
+    )
+    second_receipt_id = stable_id(CONTEXT, f"connector:{CONNECTOR}:{first_present.revision}")
+
+    controller = fixture.use("controller")
+    claimed = controller.claim_work(m.WorkClaimRequest(
+        **CONTEXT.model_dump(), owner_id=uid(94_502), kinds=("reconcile_state",),
+        limit=20, per_workspace_limit=20, lease_seconds=120,
+    ))
+    first_work = next(item for item in claimed if item.reconcile_request_id == first_receipt_id)
+    second_work = next(item for item in claimed if item.reconcile_request_id == second_receipt_id)
+
+    overtaken_outcome = reconcile_monitoring_work(controller, first_work)
+    assert overtaken_outcome.state == ("pending_validation" if backend == "sql" else "rejected")
+    reobserve_id = stable_id(CONTEXT, f"connector-reobserve:{first_receipt_id}")
+    assert controller.get_work(CONTEXT, reobserve_id) is not None
+    assert fixture.connector().sources == (owned_source,)
+    assert fixture.connector().source_removals == (removal,)
+    assert not any(row.kind == "connector_source_retirement" for row in fixture.rows())
+
+    with pytest.raises(MonitoringConflict, match="observation|absence|present"):
+        reconcile_monitoring_work(controller, second_work)
+    assert fixture.connector().sources == (owned_source,)
+    assert fixture.connector().source_removals == (removal,)
+    assert fixture.connector().revision == second_present.revision
+    assert not any(row.kind == "connector_source_retirement" for row in fixture.rows())
+    assert controller.get_connector_publication(CONTEXT, removal.request_id) == removal_publication
+
+    fixture.h.clock.advance(121)
+    run = await fixture.apply_worker()
+    assert run.results[0].code == "controller_source_retirement_required"
+    assert fixture.remote.graph["sources"] == []
+    controller = fixture.use("controller")
+    due_work = controller.claim_work(m.WorkClaimRequest(
+        **CONTEXT.model_dump(), owner_id=uid(94_503), kinds=("reconcile_state",),
+        limit=20, per_workspace_limit=20, lease_seconds=120,
+    ))
+    for item in sorted(due_work, key=lambda candidate: candidate.work_id == first_work.work_id):
+        reconcile_monitoring_work(controller, item)
+    if backend == "sql":
+        fixture.h.clock.advance(16)
+        await fixture.drain()
+
+    retired = fixture.connector()
+    assert retired.sources == () and retired.source_proposals == () and retired.source_removals == ()
+    tombstones = [
+        m.ConnectorSourceRetirement.model_validate_json(row.payload)
+        for row in fixture.rows() if row.kind == "connector_source_retirement"
+    ]
+    assert len(tombstones) == 1
+    assert tombstones[0].original_binding == owned_source
+    assert tombstones[0].original_removal == removal
+    assert controller.get_connector_publication(CONTEXT, removal.request_id) == removal_publication
+
+

@@ -66,6 +66,7 @@ from triage.monitoring.records import (
     key_digest,
     stable_id,
 )
+from triage.observability import bind_work_correlation
 from triage.policy import APPROVAL_REQUIRED_ACTIONS, TriagePolicy
 from triage.redaction import redact_text
 from triage.store.retries import MAX_ATTEMPTS, backoff_seconds
@@ -506,12 +507,26 @@ class MonitoringEngine:
             return self._reconcile_claimed_work(work)
 
     def _reconcile_claimed_work(self, work: m.MonitoringWork) -> m.ReconciliationResult:
+        bind_work_correlation(
+            service=self.component,
+            work_id=work.work_id,
+            work_kind=work.kind,
+            handoff_id=work.reconcile_request_id,
+            revision=work.policy_revision,
+            fence=work.lease.fence if work.lease is not None else None,
+        )
         producer = self._reconcile_request(work)
         control = self._control(work)
         frontier = self._get("validation_frontier", producer.frontier_key, work, m.ValidationFrontier)
         if frontier is None:
             raise MonitoringUnavailable("Accepted producer evidence has no protected validation frontier")
         operation_id = stable_id(work, f"publication:{work.work_id}:{work.lease.fence if work.lease else 0}")
+        bind_work_correlation(
+            request_id=operation_id,
+            handoff_id=producer.request_id,
+            handoff_revision=producer.frontier_revision,
+            revision=control.revision,
+        )
         prior = self._receipt("reconciliation", operation_id, work, m.ReconciliationResult)
         if prior is not None:
             return prior
@@ -532,6 +547,16 @@ class MonitoringEngine:
             control = self._control(request)
             work = self._owned_work(request, request.work_id, request.lease, request.expected_work_revision)
             producer = self._reconcile_request(work)
+            bind_work_correlation(
+                service=self.component,
+                work_id=work.work_id,
+                work_kind=work.kind,
+                request_id=request.request_id,
+                handoff_id=producer.request_id,
+                handoff_revision=producer.frontier_revision,
+                revision=control.revision,
+                fence=work.lease.fence if work.lease is not None else None,
+            )
             frontier = self._get("validation_frontier", producer.frontier_key, request, m.ValidationFrontier)
             if frontier is None:
                 raise MonitoringUnavailable("Reconciliation has no protected accepted frontier")
@@ -573,6 +598,8 @@ class MonitoringEngine:
                 return self._reject_reconciliation_window(request, work, producer, frontier, control)
             current = True
             for binding in producer.evidence:
+                if producer.topic == "connector" and binding.kind == "connector":
+                    continue
                 stored = self._backend.get(binding.kind, binding.key, request)
                 if (
                     stored is None or stored.version != binding.revision
@@ -2390,9 +2417,15 @@ class MonitoringEngine:
             }
             if key_digest(_json(original_request)) != receipt.fingerprint:
                 raise MonitoringUnavailable("Presence inspection differs from its immutable original request fingerprint")
+        try:
+            recorded = m.OwnedConnectorManifest.model_validate_json(receipt.payload)
+        except ValidationError as exc:
+            raise MonitoringUnavailable("Connector observation receipt payload is unreadable") from exc
+        if recorded.connector_id != observation.connector_id or recorded.revision != observation.revision:
+            raise MonitoringUnavailable("Original connector observation cannot be reconstructed from a changed baseline")
         return m.ConnectorObservationResult(
             connector_id=observation.connector_id,
-            connector=m.OwnedConnectorManifest.model_validate_json(receipt.payload), observation=observation,
+            connector=recorded, observation=observation,
             observed_definition_hash=(
                 hashlib.sha256(_json(observation.observed_definition).encode("utf-16-le")).hexdigest().upper()
                 if observation.observed_definition is not None else None
@@ -2734,6 +2767,7 @@ class MonitoringEngine:
             prior is None or observed is None or request.sources != prior.sources
             or request.source_proposals != prior.source_proposals
             or request.desired_definition != prior.desired_definition
+            or observed.revision != prior.revision
             or observed.ownership_id != prior.ownership_id or observed.policy_revision != request.expected.revision
             or observed.state not in {"provisioning", "ready", "degraded"}
             or observed.sources != prior.sources or observed.source_proposals != prior.source_proposals
@@ -2978,8 +3012,6 @@ class MonitoringEngine:
         evidence, and queue one bounded re-observation. The removal fence is
         untouched and no supersession is authorized here.
         """
-        if not connector.source_removals:
-            return None
         if self._connector_observation_overtaken(producer, connector, control):
             # A later observation already advanced the connector, so this
             # handoff's baseline can never be reconstructed. On the SQL store
@@ -2987,6 +3019,8 @@ class MonitoringEngine:
             # observation is still readable and would otherwise be published.
             overtaken = True
         else:
+            if not connector.source_removals:
+                return None
             overtaken = False
             inspection = self._presence_inspection(producer, control)
             if inspection is None:
@@ -2994,7 +3028,6 @@ class MonitoringEngine:
             now = self._now()
             if now - timedelta(seconds=m.SUPERSESSION_EVIDENCE_TTL_SECONDS) <= inspection.observed_at <= now:
                 return None
-        now = self._now()
         return self._reject_connector_evidence(
             producer, connector, control, "overtaken" if overtaken else "inspection_expired",
         )
@@ -3398,6 +3431,7 @@ class MonitoringEngine:
             )
             if (
                 prior.target != draft.target or prior.execution != draft.execution
+                or prior.connector_id != draft.connector_id
                 or prior.scope_id != draft.scope_id
                 or prior.reconcile_request_id != draft.reconcile_request_id
                 or prior.reconcile_producer != draft.reconcile_producer
@@ -3707,7 +3741,7 @@ class MonitoringEngine:
                 self._backend.release_lease(work.lease)
                 self._release_controller(work)
                 return self._save_work(_update(
-                    work, state="waiting", lease=None, due_at=request.retry_at,
+                    work, state="waiting", lease=None, due_at=max(request.retry_at, self._now()),
                     disposition=request.detail, revision=work.revision + 1,
                 ))
             if work.kind in {"triage", "deferred_retry", "verify_action", "finalize"}:

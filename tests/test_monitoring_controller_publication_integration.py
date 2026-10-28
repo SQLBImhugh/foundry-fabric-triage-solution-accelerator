@@ -266,9 +266,13 @@ class ProvisioningSqlDatabase(ReceiverAbiDatabase):
                 "lease": {**work.lease.model_dump(), "expires_at": self.clock() + timedelta(seconds=args["lease_seconds"])},
             }
         elif args["transition"] == "retry":
-            if args["retry_at"] is None or args["retry_at"].replace(tzinfo=UTC) <= self.clock():
+            if args["retry_at"] is None:
                 raise RuntimeError("Worker retry requires its bounded future due time (51073)")
-            changes = {"lease": None, "state": "waiting", "due_at": args["retry_at"].replace(tzinfo=UTC)}
+            changes = {
+                "lease": None, "state": "waiting",
+                "due_at": max(args["retry_at"].replace(tzinfo=UTC), self.clock()),
+                "disposition": args["detail"] if args["detail"] is not None else work.disposition,
+            }
         else:
             if not args["detail"] or work.action_reservation_id is not None:
                 raise RuntimeError("Worker disposition needs a reason and cannot abandon an action (51073)")

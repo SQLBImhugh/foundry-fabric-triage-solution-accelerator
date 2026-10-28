@@ -364,7 +364,7 @@ class AzureSqlDatabase:
         # next statement fails. Probe while autocommit is still on, so the
         # existing one-shot read retry can replace it before BEGIN. Once the
         # transaction starts, reconnecting would replay an uncertain unit.
-        self.query("SELECT 1")
+        self.read("SELECT 1")
 
     def execute(self, sql: str, *params: Any) -> int:
         """Run a statement and return the number of rows it affected.
@@ -390,28 +390,41 @@ class AzureSqlDatabase:
         finally:
             self._close_cursor(cur)
 
-    def query(self, sql: str, *params: Any) -> list[tuple]:
-        """Run a read and return its rows, retrying once on a dead connection.
+    def read(self, sql: str, *params: Any) -> list[tuple]:
+        """Run an established read-only query, retrying once on a dead connection."""
+        previous = getattr(self._local, "read_only", False)
+        self._local.read_only = True
+        try:
+            return self.query(sql, *params)
+        finally:
+            self._local.read_only = previous
 
-        A pooled connection that has idled past the server's timeout does not
-        report itself as closed: it fails the *next* statement with
-        ``Communication link failure``. The deployed command center sat idle for
-        two days, and every first request afterwards -- each code path holding
-        its own connection -- answered 503 before the retry-on-next-use recovered
-        it. An operator opening the UI saw empty lists and no reason, which is
-        indistinguishable from a healthy empty tenant.
+    def query(self, sql: str, *params: Any, read_only: bool = False) -> list[tuple]:
+        """Run a result-returning statement and return its rows.
 
-        Retrying is safe here and only here. A read has no external effect, so
-        replaying it cannot duplicate one. ``execute`` deliberately does not
-        retry: an autocommit statement may have committed before the link
-        dropped, and that uncertainty needs receipt reconciliation, not a replay.
-        A transaction never retries either, for the reason ``_ensure`` gives.
+        Generic result-returning statements and RPCs default to ``read_only=False``
+        and never replay after a lost link: an autocommit ``EXEC`` or batch may
+        have mutated state before the connection dropped during ``execute`` or
+        ``fetchall``, and that uncertainty requires receipt reconciliation rather
+        than a second execution.
+
+        Established read-only operations opt in via :meth:`read` or
+        ``read_only=True`` to retry once when a pooled connection idled past the
+        server's timeout. A pooled connection does not report itself as closed
+        until the next statement fails with ``Communication link failure``; the
+        deployed command center sat idle for two days and answered 503 on every
+        first read before this retry replaced the dead handle. A transaction
+        never retries mid-unit, for the reason :meth:`_ensure` gives;
+        :meth:`_validate_before_transaction` probes idle connections before
+        ``BEGIN`` instead.
         """
+        can_retry = read_only or getattr(self._local, "read_only", False)
         try:
             return self._query_once(sql, *params)
         except BaseException as exc:
             if (
-                not _is_connection_error(exc)
+                not can_retry
+                or not _is_connection_error(exc)
                 or getattr(self._local, "transaction_active", False)
                 or getattr(self._local, "transaction_failed", False)
             ):
@@ -498,6 +511,14 @@ def _is_connection_error(exc: BaseException) -> bool:
     failure into several.
     """
     return type(exc).__name__ in _CONNECTION_ERROR_NAMES
+
+
+def read_rows(db: Any, sql: str, *params: Any) -> list[tuple]:
+    """Run an established read-only query, opting into dead-connection retry when supported."""
+    read = getattr(db, "read", None)
+    if callable(read):
+        return read(sql, *params)
+    return db.query(sql, *params)
 
 
 # ---------------------------------------------------------------------------

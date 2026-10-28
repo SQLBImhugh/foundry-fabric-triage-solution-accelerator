@@ -649,12 +649,18 @@ class AbiDatabase(KernelProtocolDatabase):
                 reconciliation_completion_sql(self.names), args,
             ):
                 raise RuntimeError("Reconciliation has no terminal guarded result (51072)")
+            if args["transition"] == "retry" and args["retry_at"] is None:
+                raise RuntimeError("Retry requires a future due time (51073)")
             work = m.MonitoringWork.model_validate({
                 **work.model_dump(), "revision": work.revision + 1,
                 "state": {"complete": "completed", "retry": "waiting", "disposition": "dispositioned"}[args["transition"]],
                 "lease": None, "completed_at": self.clock() if args["transition"] != "retry" else None,
-                "due_at": args["retry_at"].replace(tzinfo=UTC) if args["retry_at"] else work.due_at,
-                "disposition": args["detail"] if args["transition"] == "disposition" else work.disposition,
+                "due_at": (
+                    max(args["retry_at"].replace(tzinfo=UTC), self.clock())
+                    if args["transition"] == "retry"
+                    else args["retry_at"].replace(tzinfo=UTC) if args["retry_at"] else work.due_at
+                ),
+                "disposition": args["detail"] if args["transition"] in {"retry", "disposition"} and args["detail"] is not None else work.disposition,
             })
             self.save_work(work)
             result = {"work_id": work.work_id, "work": work.model_dump(mode="json")}

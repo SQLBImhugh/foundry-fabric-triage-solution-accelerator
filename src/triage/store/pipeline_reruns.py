@@ -18,7 +18,7 @@ from typing import Any, Protocol
 from triage.pipeline_models import PipelineRerunRecord, RerunState
 from triage.redaction import redact_text
 from triage.store.atomic import replace_atomically
-from triage.store.azure_sql import quote_identifier
+from triage.store.azure_sql import quote_identifier, read_rows
 
 logger = logging.getLogger("triage.store.pipeline_reruns")
 
@@ -131,8 +131,8 @@ class AzureSqlPipelineRerunStore:
         return self._db.is_available
 
     def get(self, key: str) -> PipelineRerunRecord | None:
-        rows = self._db.query(
-            f"SELECT payload FROM {self._table} WHERE run_key = ?", _key(key)
+        rows = read_rows(
+            self._db, f"SELECT payload FROM {self._table} WHERE run_key = ?", _key(key)
         )
         return PipelineRerunRecord.model_validate_json(rows[0][0]) if rows else None
 
@@ -164,7 +164,8 @@ class AzureSqlPipelineRerunStore:
     def pending(self, workspace_id: str, pipeline_id: str) -> list[PipelineRerunRecord]:
         return [
             PipelineRerunRecord.model_validate_json(row[0])
-            for row in self._db.query(
+            for row in read_rows(
+                self._db,
                 f"SELECT payload FROM {self._table} "
                 "WHERE workspace_id = ? AND pipeline_id = ? AND state = 'submitted'",
                 workspace_id, pipeline_id,

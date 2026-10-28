@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, m
 from triage.models import TriageResult
 from triage.redaction import redact_text
 from triage.store.atomic import replace_atomically
-from triage.store.azure_sql import SqlUnavailable, quote_identifier
+from triage.store.azure_sql import SqlUnavailable, quote_identifier, read_rows
 
 RunState = Literal["running", "completed", "failed"]
 CommandState = Literal["queued", "running", "completed", "failed", "interrupted"]
@@ -744,8 +744,8 @@ class AzureSqlCommandCenterStore:
                 fingerprint, clean.model_dump_json(),
             )
         except self._db.integrity_error():
-            rows = self._db.query(
-                f"SELECT start_hash FROM {self._runs} WHERE run_id = ?", clean.id,
+            rows = read_rows(
+                self._db, f"SELECT start_hash FROM {self._runs} WHERE run_id = ?", clean.id,
             )
             if not rows:
                 raise
@@ -767,8 +767,8 @@ class AzureSqlCommandCenterStore:
                 clean.kind, clean.model_dump_json(),
             )
         except self._db.integrity_error():
-            rows = self._db.query(
-                f"SELECT payload FROM {self._events} WHERE event_id = ?", clean.id,
+            rows = read_rows(
+                self._db, f"SELECT payload FROM {self._events} WHERE event_id = ?", clean.id,
             )
             if not rows:
                 raise
@@ -802,8 +802,8 @@ class AzureSqlCommandCenterStore:
 
     def get_run(self, run_id: str) -> RunRecord | None:
         self._ready()
-        rows = self._db.query(
-            f"SELECT payload FROM {self._runs} WHERE run_id = ?", _uuid(run_id),
+        rows = read_rows(
+            self._db, f"SELECT payload FROM {self._runs} WHERE run_id = ?", _uuid(run_id),
         )
         return RunRecord.model_validate_json(rows[0][0]) if rows else None
 
@@ -813,7 +813,8 @@ class AzureSqlCommandCenterStore:
         limit, offset = _page(limit, offset)
         self._ready()
         where, params = (" WHERE signature = ?", (signature,)) if signature else ("", ())
-        rows = self._db.query(
+        rows = read_rows(
+            self._db,
             f"SELECT payload FROM {self._runs}{where} ORDER BY started_at DESC, run_id DESC "
             f"OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY", *params,
         )
@@ -822,14 +823,15 @@ class AzureSqlCommandCenterStore:
     def count_runs(self, signature: str = "") -> int:
         self._ready()
         where, params = (" WHERE signature = ?", (signature,)) if signature else ("", ())
-        rows = self._db.query(f"SELECT COUNT_BIG(*) FROM {self._runs}{where}", *params)
+        rows = read_rows(self._db, f"SELECT COUNT_BIG(*) FROM {self._runs}{where}", *params)
         if len(rows) != 1:
             raise RuntimeError("SQL run count did not return one row")
         return int(rows[0][0])
 
     def events(self, run_id: str) -> list[RunEvent]:
         self._ready()
-        rows = self._db.query(
+        rows = read_rows(
+            self._db,
             f"SELECT payload FROM {self._events} WHERE run_id = ? "
             "ORDER BY sequence, occurred_at, event_id", _uuid(run_id),
         )
@@ -881,7 +883,8 @@ class AzureSqlCommandCenterStore:
     def commands(self, limit: int = 50) -> list[CommandRecord]:
         limit, _ = _page(limit)
         self._ready()
-        rows = self._db.query(
+        rows = read_rows(
+            self._db,
             f"SELECT {self._command_columns()} FROM {self._commands} "
             f"ORDER BY created_at DESC, command_id DESC OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY",
         )
@@ -890,7 +893,8 @@ class AzureSqlCommandCenterStore:
     def queued_commands(self, limit: int = 100) -> list[CommandRecord]:
         limit, _ = _page(limit)
         self._ready()
-        rows = self._db.query(
+        rows = read_rows(
+            self._db,
             f"SELECT {self._command_columns()} FROM {self._commands} WHERE state = 'queued' "
             f"ORDER BY created_at ASC, command_id ASC OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY",
         )
@@ -899,7 +903,8 @@ class AzureSqlCommandCenterStore:
     def eligible_commands(self, limit: int = 100) -> list[CommandRecord]:
         limit, _ = _page(limit)
         self._ready()
-        rows = self._db.query(
+        rows = read_rows(
+            self._db,
             f"SELECT {self._command_columns()} FROM {self._commands} AS candidate "
             "WHERE candidate.state = 'queued' AND NOT EXISTS ("
             f"SELECT 1 FROM {self._commands} AS blocker "
@@ -913,7 +918,8 @@ class AzureSqlCommandCenterStore:
     def active_commands(self, limit: int = 100) -> list[CommandRecord]:
         limit, _ = _page(limit)
         self._ready()
-        rows = self._db.query(
+        rows = read_rows(
+            self._db,
             f"SELECT {self._command_columns()} FROM {self._commands} "
             "WHERE state IN ('queued', 'running', 'interrupted') "
             f"ORDER BY created_at ASC, command_id ASC OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY",
@@ -923,7 +929,8 @@ class AzureSqlCommandCenterStore:
     def target_blocked(self, target_id: str) -> bool:
         target_id = _identifier(target_id, 200)
         self._ready()
-        rows = self._db.query(
+        rows = read_rows(
+            self._db,
             f"SELECT command_id FROM {self._commands} "
             "WHERE target_id = ? AND state IN ('running', 'interrupted') "
             "ORDER BY command_id OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
@@ -933,7 +940,8 @@ class AzureSqlCommandCenterStore:
 
     def get_command(self, id: str) -> CommandRecord | None:
         self._ready()
-        rows = self._db.query(
+        rows = read_rows(
+            self._db,
             f"SELECT {self._command_columns()} FROM {self._commands} WHERE command_id = ?",
             _identifier(id, 100),
         )
@@ -956,7 +964,8 @@ class AzureSqlCommandCenterStore:
         if affected == 0:
             return None
         self._one_row(affected)
-        rows = self._db.query(
+        rows = read_rows(
+            self._db,
             f"SELECT {self._command_columns()} FROM {self._commands} "
             "WHERE command_id = ? AND state = 'running' AND worker_id = ? "
             "AND lease_expires_at > SYSUTCDATETIME()",

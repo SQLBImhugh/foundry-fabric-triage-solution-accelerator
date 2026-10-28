@@ -28,7 +28,7 @@ import threading
 from pathlib import Path
 from typing import Any, Protocol
 
-from triage.store.azure_sql import SqlUnavailable, quote_identifier
+from triage.store.azure_sql import SqlUnavailable, quote_identifier, read_rows
 
 logger = logging.getLogger("triage.store.processed")
 
@@ -146,7 +146,7 @@ class AzureSqlProcessedLog(InMemoryProcessedLog):
     def _load(self, fingerprint: str | None = None) -> None:
         where = " WHERE fingerprint = ?" if fingerprint is not None else ""
         params = (fingerprint,) if fingerprint is not None else ()
-        rows = self._db.query(f"SELECT fingerprint, received_at FROM {self._table}{where}", *params)
+        rows = read_rows(self._db, f"SELECT fingerprint, received_at FROM {self._table}{where}", *params)
         loaded: dict[str, str] = {}
         try:
             for key, received in rows:

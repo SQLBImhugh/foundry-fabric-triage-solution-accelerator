@@ -224,6 +224,7 @@ JOIN {receipts} AS root ON root.tenant_id=original.tenant_id AND root.epoch=orig
       =TRY_CONVERT(bigint,JSON_VALUE(root.payload,'$.result.validated_revision'))
 JOIN {records} AS own_handoff ON own_handoff.tenant_id=original.tenant_id AND own_handoff.epoch=original.epoch
   AND own_handoff.record_kind='validation_handoff'
+  AND own_handoff.parent_hash={key_hash("JSON_VALUE(original.payload,'$.result.frontier_key')")}
   AND own_handoff.parent_key=JSON_VALUE(original.payload,'$.result.frontier_key')
   AND own_handoff.sequence_number=TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.handoff_revision'))
   AND JSON_VALUE(own_handoff.payload,'$.work_id')=JSON_VALUE(original.payload,'$.result.work_id')
@@ -232,6 +233,7 @@ JOIN {records} AS own_handoff ON own_handoff.tenant_id=original.tenant_id AND ow
   AND own_handoff.status=JSON_VALUE(original.payload,'$.result.handoff_decision')
 JOIN {records} AS root_handoff ON root_handoff.tenant_id=root.tenant_id AND root_handoff.epoch=root.epoch
   AND root_handoff.record_kind='validation_handoff'
+  AND root_handoff.parent_hash={key_hash("JSON_VALUE(root.payload,'$.result.frontier_key')")}
   AND root_handoff.parent_key=JSON_VALUE(root.payload,'$.result.frontier_key')
   AND root_handoff.sequence_number=TRY_CONVERT(bigint,JSON_VALUE(root.payload,'$.result.handoff_revision'))
   AND JSON_VALUE(root_handoff.payload,'$.work_id')=JSON_VALUE(root.payload,'$.result.work_id')
@@ -336,8 +338,11 @@ IF @transition NOT IN ('renew','retry','complete','disposition')
     THROW 51073, 'Unsupported ownership-controlled work transition', 1;
 IF @transition='renew' AND (@lease_seconds IS NULL OR @lease_seconds NOT BETWEEN 1 AND 86400)
     THROW 51073, 'Renewal requires a bounded lifetime', 1;
-IF @transition='retry' AND (@retry_at IS NULL OR @retry_at<=@now)
-    THROW 51073, 'Retry requires a future due time', 1;
+IF @transition='retry'
+BEGIN
+    IF @retry_at IS NULL THROW 51073, 'Retry requires a future due time', 1;
+    IF @retry_at<=@now SET @retry_at=@now;
+END;
 IF @transition='disposition' AND NULLIF(@detail,N'') IS NULL
     THROW 51073, 'Disposition requires bounded recorded detail', 1;
 IF @transition IN ('retry','disposition') AND JSON_VALUE(@stored_work,'$.action_reservation_id') IS NOT NULL

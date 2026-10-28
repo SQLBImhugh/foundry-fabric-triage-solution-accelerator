@@ -68,16 +68,16 @@ def _nonwindow_case(db, case):
         "evidence_digest": "B" * 64, "requires_window": False,
     }
     _insert_record(db, kernel, "validation_handoff", handoff_key, handoff)
-    db.execute(f"UPDATE {records} SET status='published',parent_key=?,sequence_number=1 "
-               "WHERE record_kind='validation_handoff' AND full_key=?", (frontier_key, handoff_key))
+    db.execute(f"UPDATE {records} SET status='published',parent_key=?,parent_hash=KEY_DIGEST(?),sequence_number=1 "
+               "WHERE record_kind='validation_handoff' AND full_key=?", (frontier_key, frontier_key, handoff_key))
     for sequence in (2, 3, 4):
         sibling = {**handoff, "frontier_revision": sequence,
                    "work_id": _id(205) if sequence == 4 else _id(210 + sequence),
                    "producer_request_id": _id(206) if sequence == 4 else _id(215 + sequence)}
         key = f"{frontier_key}:handoff:{sequence}"
         _insert_record(db, kernel, "validation_handoff", key, sibling)
-        db.execute(f"UPDATE {records} SET status='published',parent_key=?,sequence_number=? "
-                   "WHERE record_kind='validation_handoff' AND full_key=?", (frontier_key, sequence, key))
+        db.execute(f"UPDATE {records} SET status='published',parent_key=?,parent_hash=KEY_DIGEST(?),sequence_number=? "
+                   "WHERE record_kind='validation_handoff' AND full_key=?", (frontier_key, frontier_key, sequence, key))
     for row in db.execute(f"SELECT payload FROM {records} WHERE record_kind='validation_handoff'").fetchall():
         producer = json.loads(row[0])
         receipt_params = _mutation_params(connector, producer["producer_request_id"])
@@ -219,8 +219,8 @@ def _later_pending(db, kernel, params):
                "payload=json_set(payload,'$.accepted_revision',5) "
                "WHERE record_kind='validation_frontier' AND full_key=?", (params["frontier_key"],))
     _insert_record(db, kernel, "validation_handoff", "later-pending", {"state": "pending_validation"})
-    db.execute(f"UPDATE {records} SET parent_key=?,sequence_number=5 WHERE full_key='later-pending'",
-               (params["frontier_key"],))
+    db.execute(f"UPDATE {records} SET parent_key=?,parent_hash=KEY_DIGEST(?),sequence_number=5 WHERE full_key='later-pending'",
+               (params["frontier_key"], params["frontier_key"]))
     db.commit()
     params["accepted"] = 5
 
@@ -601,3 +601,37 @@ def test_current_policy_observation_can_finish_old_work_without_relabeling_old_r
     )
     assert finished.state == "completed" and finished.policy_revision == original_version.revision
     assert worker.get_operation_receipt(original_version, "worker.observe_connector", receipt.request_id) == receipt
+
+
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+def test_retry_transition_clamps_due_time_overtaken_by_control_lock_wait(backend):
+    h, db, _, _, worker, connector = scoped_connector(backend, database_type=ProvisioningSqlDatabase)
+    commit = connector_commit(h, worker, connector.connector_id, db=db)
+    retry_at = h.clock() + timedelta(seconds=1)
+    request = m.WorkDispositionRequest(
+        **h.context(), request_id=h.next_id(), work_id=commit.work_id, lease=commit.lease,
+        expected_work_revision=commit.expected_work_revision, disposition="retry",
+        retry_at=retry_at, detail="Retry due time passed while waiting on monitoring_control lock.",
+    )
+    if db is not None:
+        db.principal = "worker"
+        with pytest.raises(RuntimeError, match="51073"):
+            db.apply_rpc("worker.transition_work", {
+                **h.context(), "request_id": h.next_id(), "fingerprint": "0" * 64,
+                "expected_revision": h.version.revision, "work_id": commit.work_id,
+                "owner_id": commit.lease.owner_id, "fence": commit.lease.fence,
+                "work_revision": commit.expected_work_revision, "transition": "retry",
+                "lease_seconds": None, "retry_at": None, "detail": request.detail, "finalization_id": None,
+            })
+    h.clock.advance(5)
+    assert request.retry_at < h.clock()
+    waiting = worker.disposition_work(request)
+    assert waiting.state == "waiting" and waiting.lease is None
+    assert waiting.due_at == h.clock()
+    assert waiting.disposition == request.detail
+    assert worker.disposition_work(request) == waiting
+    reclaimed, = [entry for entry in worker.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(994), kinds=("connector_reconcile",), limit=200, per_workspace_limit=200,
+    )) if entry.work_id == commit.work_id]
+    assert reclaimed.lease.fence == commit.lease.fence + 1
+

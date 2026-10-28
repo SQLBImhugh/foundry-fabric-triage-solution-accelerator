@@ -208,6 +208,11 @@ def test_stored_work_family_and_owner_fence_guard_all_transitions(kernel) -> Non
     assert "Controller completion requires its original finalization receipt" in controller
     assert "JSON_VALUE(payload,'$.result.state')='completed'" in controller
     assert "Controller execution must use incident finalization" in controller
+    for body in (worker, controller):
+        assert "IF @retry_at IS NULL THROW 51073, 'Retry requires a future due time', 1;" in body
+        assert "IF @retry_at<=@now SET @retry_at=@now;" in body
+        assert "OR @retry_at<=@now" not in body
+        assert body.index("@binding_json") < body.index("IF @retry_at<=@now SET @retry_at=@now;")
 
 
 def test_partition_lease_and_journal_update_together(kernel) -> None:

@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from copy import deepcopy
@@ -73,6 +74,21 @@ from triage.monitoring.sql_kernel_contracts import (
     Component,
 )
 from triage.monitoring.sql_permissions import build_permission_kernel, decode_rpc_result
+from triage.observability import (
+    DECISION_MODES,
+    MAX_EXPORTED_FIELD,
+    WORK_KINDS,
+    bind_work_correlation,
+    build_version,
+    monitoring_sql_span,
+    validated_build,
+    validated_int,
+    validated_rpc,
+    validated_service,
+    validated_token,
+    validated_type_name,
+    validated_uuid,
+)
 from triage.policy import TriagePolicy
 from triage.redaction import redact_text
 from triage.store.azure_sql import AzureSqlDatabase, SqlCommitUncertain
@@ -141,11 +157,6 @@ def _guard_code(text: str) -> str | None:
     return next((code for message, code in _guard_messages() if message and message in text), None)
 
 
-#: Longest identifier this boundary will export. Long enough for our own
-#: operation and guard names, short enough that a quoted row cannot ride along.
-MAX_EXPORTED_FIELD = 128
-
-
 def _exported_token(value: str) -> str:
     """One whitespace-free, bounded token safe to place in an exported field.
 
@@ -156,8 +167,39 @@ def _exported_token(value: str) -> str:
     return token[:MAX_EXPORTED_FIELD] if token else "none"
 
 
-def _exported_failure_fields(operation: str, exc: BaseException) -> dict[str, str]:
-    """Fixed identifiers describing a failed SQL operation, and nothing else.
+_GUARD_ERROR_TYPES: dict[str, type[MonitoringStoreError]] = {
+    "51070": MonitoringComponentDenied,
+    "51071": MonitoringConflict,
+    "51072": MonitoringConflict,
+    "51073": MonitoringConflict,
+    "51074": MonitoringLeaseLost,
+    "51076": MonitoringNotBootstrapped,
+    "51077": MonitoringKernelUnsupported,
+}
+
+
+def _classified_error_type(guard: str | None) -> str:
+    error_cls = _GUARD_ERROR_TYPES.get(guard or "", MonitoringUnavailable)
+    return error_cls.__name__
+
+
+def _exported_failure_fields(
+    operation: str,
+    exc: BaseException,
+    *,
+    rpc: object = None,
+    service: object = None,
+    build: object = None,
+    work_id: object = None,
+    work_kind: object = None,
+    request_id: object = None,
+    handoff_id: object = None,
+    revision: object = None,
+    handoff_revision: object = None,
+    fence: object = None,
+    decision_mode: object = None,
+) -> dict[str, str]:
+    """Fixed identifiers and validated correlation describing a failed SQL operation.
 
     Only the ``triage.telemetry`` family reaches Azure Monitor, so whatever this
     returns leaves the tenant. Redaction removes credential shapes, not customer
@@ -166,16 +208,29 @@ def _exported_failure_fields(operation: str, exc: BaseException) -> dict[str, st
     the exported message. Truncating that message does not make it metadata.
 
     So the message is not exported at all. What an operator actually needs is
-    which operation failed, which exception class the driver raised, and -- when
-    it is one of ours -- the guard code that says the refusal was deterministic.
-    Each of those is a fixed literal from this repository or a class name. The
-    full redacted detail still goes to the local ``triage.monitoring.sql``
-    logger, which is deliberately not exported.
+    which operation and RPC failed, which exception class the driver raised, the
+    guard code and classified error when deterministic, and strictly validated
+    work/request/handoff/revision/fence/service/build correlation. The full
+    redacted detail still goes to the local ``triage.monitoring.sql`` logger,
+    which is deliberately not exported.
     """
+    guard = _guard_code(str(exc))
     return {
-        "operation": _exported_token(operation),
-        "error_type": _exported_token(type(exc).__name__),
-        "guard_code": _exported_token(_guard_code(str(exc)) or ""),
+        "operation": _exported_token(operation) if isinstance(operation, str) else "none",
+        "rpc": validated_rpc(rpc),
+        "service": validated_service(service),
+        "build": validated_build(build if build is not None else build_version()),
+        "error_type": validated_type_name(type(exc).__name__),
+        "classified_error_type": _classified_error_type(guard),
+        "guard_code": _exported_token(guard or ""),
+        "work_id": validated_uuid(work_id),
+        "work_kind": validated_token(work_kind, WORK_KINDS),
+        "request_id": validated_uuid(request_id, allow_read=True),
+        "handoff_id": validated_uuid(handoff_id),
+        "revision": validated_int(revision),
+        "handoff_revision": validated_int(handoff_revision),
+        "fence": validated_int(fence),
+        "decision_mode": validated_token(decision_mode, DECISION_MODES),
     }
 
 
@@ -297,93 +352,220 @@ class SqlBackend:
     def transaction_active(self) -> bool:
         return bool(getattr(self._local, "active", False))
 
+    def _reset_correlation(self, operation: str, request_id: str) -> None:
+        self._local.stage = operation
+        self._local.rpc = "schema_check"
+        self._local.work_id = None
+        self._local.work_kind = None
+        self._local.correlation_request_id = request_id
+        self._local.handoff_id = None
+        self._local.revision = None
+        self._local.handoff_revision = None
+        self._local.fence = None
+        self._local.decision_mode = None
+        bind_work_correlation(service=self.component, build=build_version(), request_id=request_id)
+
+    def _clear_correlation(self) -> None:
+        for attr in (
+            "stage", "rpc", "work_id", "work_kind", "correlation_request_id",
+            "handoff_id", "revision", "handoff_revision", "fence", "decision_mode",
+        ):
+            setattr(self._local, attr, None)
+
+    def bind_correlation(self, **fields: object) -> None:
+        if (val := validated_rpc(fields.get("rpc"))) != "none":
+            self._local.rpc = val
+        if (val := validated_uuid(fields.get("work_id"))) != "none":
+            self._local.work_id = val
+        if (val := validated_token(fields.get("work_kind"), WORK_KINDS)) != "none":
+            self._local.work_kind = val
+        if (val := validated_uuid(fields.get("request_id"), allow_read=True)) != "none":
+            self._local.correlation_request_id = val
+        if (val := validated_uuid(fields.get("handoff_id"))) != "none":
+            self._local.handoff_id = val
+        if validated_int(fields.get("revision")) != "none":
+            self._local.revision = fields.get("revision")
+        if validated_int(fields.get("handoff_revision")) != "none":
+            self._local.handoff_revision = fields.get("handoff_revision")
+        if validated_int(fields.get("fence")) != "none":
+            self._local.fence = fields.get("fence")
+        if (val := validated_token(fields.get("decision_mode"), DECISION_MODES)) != "none":
+            self._local.decision_mode = val
+        bind_work_correlation(service=self.component, **fields)
+
+    def _failure_fields(self, operation: str, exc: BaseException) -> dict[str, str]:
+        return _exported_failure_fields(
+            operation,
+            exc,
+            rpc=getattr(self._local, "rpc", None),
+            service=self.component,
+            build=build_version(),
+            work_id=getattr(self._local, "work_id", None),
+            work_kind=getattr(self._local, "work_kind", None),
+            request_id=(
+                getattr(self._local, "correlation_request_id", None)
+                or getattr(self._local, "request_id", None)
+            ),
+            handoff_id=getattr(self._local, "handoff_id", None),
+            revision=getattr(self._local, "revision", None),
+            handoff_revision=getattr(self._local, "handoff_revision", None),
+            fence=getattr(self._local, "fence", None),
+            decision_mode=getattr(self._local, "decision_mode", None),
+        )
+
+    def _apply_span_fields(
+        self, span: object, *, status: str, elapsed_ms: int, fields: Mapping[str, str],
+    ) -> None:
+        set_attr = getattr(span, "set", None)
+        if not callable(set_attr):
+            return
+        for key, value in {
+            "service.name": fields["service"],
+            "service.version": fields["build"],
+            "sql.operation": fields["operation"],
+            "sql.rpc": fields["rpc"],
+            "sql.status": status,
+            "sql.elapsed_ms": elapsed_ms,
+            "sql.guard_code": fields["guard_code"],
+            "sql.classified_error_type": fields["classified_error_type"],
+            "error.type": fields["error_type"],
+            "monitoring.work_id": fields["work_id"],
+            "monitoring.work_kind": fields["work_kind"],
+            "monitoring.request_id": fields["request_id"],
+            "monitoring.handoff_id": fields["handoff_id"],
+            "monitoring.revision": fields["revision"],
+            "monitoring.handoff_revision": fields["handoff_revision"],
+            "monitoring.fence": fields["fence"],
+            "monitoring.decision_mode": fields["decision_mode"],
+        }.items():
+            set_attr(key, value)
+
     @contextmanager
     def transaction(self, *, write: bool, operation: str, request_id: str) -> Iterator[None]:
         if getattr(self._local, "active", False):
             raise MonitoringConflict("Nested monitoring transactions are not supported")
         self.operation_identity(operation, request_id)
-        try:
-            with self.db.transaction():
-                self._local.active = True
+        self._reset_correlation(operation, request_id)
+        began = time.monotonic()
+        with monitoring_sql_span(
+            operation,
+            **{
+                "service.name": self.component,
+                "service.version": build_version(),
+                "monitoring.request_id": request_id,
+            },
+        ) as span:
+            try:
+                with self.db.transaction():
+                    self._local.active = True
+                    self._local.records = {}
+                    self._local.control_cached = False
+                    self._local.control_row = None
+                    self._local.collection = None
+                    self._local.source_frame = None
+                    self._local.rpc = "schema_check"
+                    required = ("monitoring_control", "monitoring_records", "monitoring_receipts")
+                    read_objects = [self.tables[name] for name in required]
+                    if self.component == "controller":
+                        read_objects.append(self.queue_table)
+                    elif self.component == "web":
+                        read_objects.append(self.kernel_names.object("web_work_status"))
+                    rows = self.db.query(
+                        "SELECT " + ", ".join("OBJECT_ID(?, 'V')" for _ in read_objects),
+                        *read_objects,
+                    )
+                    if len(rows) != 1 or len(rows[0]) != len(read_objects):
+                        raise MonitoringUnavailable("SQL schema inspection returned an invalid shape")
+                    present = {name: rows[0][index] is not None for index, name in enumerate(required)}
+                    self._local.control_exists = present["monitoring_control"]
+                    if present["monitoring_control"] and not all(present.values()):
+                        missing = ", ".join(name for name, exists in present.items() if not exists)
+                        raise MonitoringNotBootstrapped(f"Monitoring baseline is incomplete: {missing}")
+                    if present["monitoring_control"] and self.component == "controller" and rows[0][-1] is None:
+                        raise MonitoringNotBootstrapped("Monitoring baseline is missing controller_queue_read")
+                    if present["monitoring_control"] and self.component == "web" and rows[0][-1] is None:
+                        raise MonitoringNotBootstrapped("Monitoring baseline is missing web_work_status")
+                    if present["monitoring_control"] and not write:
+                        self._local.rpc = "control_lock"
+                        self.db.query(
+                            f"SELECT singleton FROM {self.tables['monitoring_control']} "
+                            "WITH (HOLDLOCK) WHERE singleton = 1",
+                        )
+                    yield
+                    elapsed_ms = max(0, int((time.monotonic() - began) * 1000))
+                    completed_fields = {
+                        **self._failure_fields(operation, RuntimeError()),
+                        "error_type": "",
+                        "classified_error_type": "none",
+                        "guard_code": "none",
+                    }
+                    self._apply_span_fields(
+                        span, status="completed", elapsed_ms=elapsed_ms, fields=completed_fields,
+                    )
+            except SqlCommitUncertain as exc:
+                elapsed_ms = max(0, int((time.monotonic() - began) * 1000))
+                uncertain_fields = {
+                    **self._failure_fields(operation, exc),
+                    "classified_error_type": "MonitoringCommitUncertain",
+                }
+                self._apply_span_fields(
+                    span, status="uncertain", elapsed_ms=elapsed_ms, fields=uncertain_fields,
+                )
+                operation = self._local.operation
+                request_id = self._local.request_id
+                logger.error("Monitoring commit unconfirmed operation=%s request_id=%s", operation, request_id)
+                raise MonitoringCommitUncertain(operation, request_id) from exc
+            except (MonitoringStoreError, ValidationError, ValueError) as exc:
+                elapsed_ms = max(0, int((time.monotonic() - began) * 1000))
+                classified = type(exc).__name__ if isinstance(exc, MonitoringStoreError) else "MonitoringUnavailable"
+                store_fields = {
+                    **self._failure_fields(operation, exc),
+                    "classified_error_type": classified,
+                }
+                self._apply_span_fields(
+                    span, status="failed", elapsed_ms=elapsed_ms, fields=store_fields,
+                )
+                raise
+            except Exception as exc:
+                elapsed_ms = max(0, int((time.monotonic() - began) * 1000))
+                # The class alone is not actionable. A guarded refusal carries a
+                # 5107x code and is decoded below, but everything else -- a
+                # ProgrammingError from a renamed column, a DataError from an
+                # oversized value -- looks identical in a log that prints only the
+                # type, and an operator has nothing to act on. The message is
+                # redacted and truncated for the same reason every other store
+                # boundary redacts: a SQL error can quote the row that failed.
+                detail = redact_text(str(exc))[:400]
+                logger.error(
+                    "Monitoring SQL operation failed operation=%s error_type=%s detail=%s",
+                    operation, type(exc).__name__, detail,
+                )
+                fields = self._failure_fields(operation, exc)
+                bind_work_correlation(rpc=fields["rpc"], guard_code=fields["guard_code"])
+                self._apply_span_fields(span, status="failed", elapsed_ms=elapsed_ms, fields=fields)
+                # Exported: fixed identifiers only. The redacted detail above stays
+                # on the local logger, which Azure Monitor never receives.
+                telemetry_logger.error(
+                    "monitoring_sql_failed %s",
+                    " ".join(
+                        f"{key}={value}"
+                        for key, value in fields.items()
+                    ),
+                )
+                number = _guard_code(str(exc))
+                if number is not None:
+                    error = _GUARD_ERROR_TYPES.get(number, MonitoringUnavailable)
+                    raise error(f"Guarded SQL operation {operation} was refused ({number})") from exc
+                raise MonitoringUnavailable(f"Monitoring SQL operation {operation} failed; shared state was not replaced") from exc
+            finally:
+                self._local.active = False
+                self._local.control_exists = False
                 self._local.records = {}
                 self._local.control_cached = False
                 self._local.control_row = None
                 self._local.collection = None
                 self._local.source_frame = None
-                required = ("monitoring_control", "monitoring_records", "monitoring_receipts")
-                read_objects = [self.tables[name] for name in required]
-                if self.component == "controller":
-                    read_objects.append(self.queue_table)
-                elif self.component == "web":
-                    read_objects.append(self.kernel_names.object("web_work_status"))
-                rows = self.db.query(
-                    "SELECT " + ", ".join("OBJECT_ID(?, 'V')" for _ in read_objects),
-                    *read_objects,
-                )
-                if len(rows) != 1 or len(rows[0]) != len(read_objects):
-                    raise MonitoringUnavailable("SQL schema inspection returned an invalid shape")
-                present = {name: rows[0][index] is not None for index, name in enumerate(required)}
-                self._local.control_exists = present["monitoring_control"]
-                if present["monitoring_control"] and not all(present.values()):
-                    missing = ", ".join(name for name, exists in present.items() if not exists)
-                    raise MonitoringNotBootstrapped(f"Monitoring baseline is incomplete: {missing}")
-                if present["monitoring_control"] and self.component == "controller" and rows[0][-1] is None:
-                    raise MonitoringNotBootstrapped("Monitoring baseline is missing controller_queue_read")
-                if present["monitoring_control"] and self.component == "web" and rows[0][-1] is None:
-                    raise MonitoringNotBootstrapped("Monitoring baseline is missing web_work_status")
-                if present["monitoring_control"] and not write:
-                    self.db.query(
-                        f"SELECT singleton FROM {self.tables['monitoring_control']} "
-                        "WITH (HOLDLOCK) WHERE singleton = 1",
-                    )
-                yield
-        except SqlCommitUncertain as exc:
-            operation = self._local.operation
-            request_id = self._local.request_id
-            logger.error("Monitoring commit unconfirmed operation=%s request_id=%s", operation, request_id)
-            raise MonitoringCommitUncertain(operation, request_id) from exc
-        except (MonitoringStoreError, ValidationError, ValueError):
-            raise
-        except Exception as exc:
-            # The class alone is not actionable. A guarded refusal carries a
-            # 5107x code and is decoded below, but everything else -- a
-            # ProgrammingError from a renamed column, a DataError from an
-            # oversized value -- looks identical in a log that prints only the
-            # type, and an operator has nothing to act on. The message is
-            # redacted and truncated for the same reason every other store
-            # boundary redacts: a SQL error can quote the row that failed.
-            detail = redact_text(str(exc))[:400]
-            logger.error(
-                "Monitoring SQL operation failed operation=%s error_type=%s detail=%s",
-                operation, type(exc).__name__, detail,
-            )
-            # Exported: fixed identifiers only. The redacted detail above stays
-            # on the local logger, which Azure Monitor never receives.
-            telemetry_logger.error(
-                "monitoring_sql_failed %s",
-                " ".join(
-                    f"{key}={value}"
-                    for key, value in _exported_failure_fields(operation, exc).items()
-                ),
-            )
-            number = _guard_code(str(exc))
-            if number is not None:
-                error = {
-                    "51070": MonitoringComponentDenied, "51072": MonitoringConflict,
-                    "51073": MonitoringConflict, "51074": MonitoringLeaseLost,
-                    "51076": MonitoringNotBootstrapped, "51077": MonitoringKernelUnsupported,
-                    "51071": MonitoringConflict,
-                }.get(number, MonitoringUnavailable)
-                raise error(f"Guarded SQL operation {operation} was refused ({number})") from exc
-            raise MonitoringUnavailable(f"Monitoring SQL operation {operation} failed; shared state was not replaced") from exc
-        finally:
-            self._local.active = False
-            self._local.control_exists = False
-            self._local.records = {}
-            self._local.control_cached = False
-            self._local.control_row = None
-            self._local.collection = None
-            self._local.source_frame = None
+                self._clear_correlation()
 
     def operation_identity(self, operation: str, request_id: str) -> None:
         self._local.operation = operation
@@ -407,6 +589,14 @@ class SqlBackend:
             raise MonitoringConflict("A guarded SQL operation must join the monitoring transaction")
         self._flush_inventory_inserts()
         self.operation_identity(operation, str(arguments.get("request_id") or arguments.get("work_id") or "read"))
+        self.bind_correlation(
+            rpc=operation,
+            work_id=arguments.get("work_id"),
+            request_id=arguments.get("request_id"),
+            fence=arguments.get("fence"),
+            revision=arguments.get("expected_revision"),
+            handoff_revision=arguments.get("expected_frontier_revision"),
+        )
         sql, values = contract.bind(arguments)
         rows = self.db.query(sql, *values)
         try:
@@ -450,6 +640,7 @@ class SqlBackend:
         raise MonitoringComponentDenied(f"{self.component} cannot directly mutate record family {kind}")
 
     def now(self) -> datetime:
+        self._local.rpc = "now"
         rows = self.db.query("SELECT SYSUTCDATETIME()")
         if len(rows) != 1 or len(rows[0]) != 1:
             raise MonitoringUnavailable("SQL did not return one authoritative clock value")
@@ -460,6 +651,7 @@ class SqlBackend:
             return None
         if self._local.control_cached:
             return deepcopy(self._local.control_row)
+        self._local.rpc = "control_read"
         rows = self.db.query(
             f"SELECT schema_version, tenant_id, epoch, revision, activation_cutoff, maintenance, updated_at, payload "
             f"FROM {self.tables['monitoring_control']} WHERE singleton = 1",
@@ -481,6 +673,7 @@ class SqlBackend:
         )
         if promoted != expected:
             raise MonitoringUnavailable("Deployment control columns disagree with their validated payload")
+        self.bind_correlation(revision=control.revision)
         self._local.control_row = control.model_dump(mode="json")
         self._local.control_cached = True
         return deepcopy(self._local.control_row)
@@ -971,7 +1164,51 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         super().__init__(engine)
         self._sql = backend
 
+    def _bind_operation_correlation(self, args: tuple[object, ...], kwargs: Mapping[str, object]) -> None:
+        for value in (*args, *kwargs.values()):
+            if isinstance(value, m.MonitoringWork):
+                self._sql.bind_correlation(
+                    work_id=value.work_id,
+                    work_kind=value.kind,
+                    revision=value.policy_revision,
+                    fence=value.lease.fence if value.lease is not None else None,
+                    handoff_id=value.reconcile_request_id,
+                )
+            elif isinstance(value, m.MonitoringWorkDraft):
+                self._sql.bind_correlation(
+                    work_id=value.work_id,
+                    work_kind=value.kind,
+                    revision=value.policy_revision,
+                    handoff_id=value.reconcile_request_id,
+                )
+            elif isinstance(value, m.ReconcileStateRequest):
+                self._sql.bind_correlation(
+                    work_id=value.work_id,
+                    work_kind="reconcile_state",
+                    request_id=value.request_id,
+                    revision=value.expected_policy_revision,
+                    handoff_revision=value.expected_frontier_revision,
+                    fence=value.lease.fence,
+                )
+            elif isinstance(value, BaseModel):
+                lease = getattr(value, "lease", None)
+                expected = getattr(value, "expected", None)
+                self._sql.bind_correlation(
+                    work_id=getattr(value, "work_id", None),
+                    request_id=(
+                        getattr(value, "request_id", None)
+                        or getattr(value, "idempotency_id", None)
+                        or getattr(value, "finalization_id", None)
+                    ),
+                    fence=getattr(lease, "fence", None) if lease is not None else getattr(value, "action_fence", None),
+                    revision=(
+                        getattr(expected, "revision", None)
+                        if expected is not None else getattr(value, "policy_revision", None)
+                    ),
+                )
+
     def run_operation(self, method: Callable[..., ResultT], write: bool, args: tuple[object, ...], kwargs: dict[str, object]) -> ResultT:
+        self._bind_operation_correlation(args, kwargs)
         if method.__name__ in {
             "list_partition_ownership", "change_partition_ownership", "claim_partition",
             "ensure_stream_start", "get_stream_start", "record_stream_receipts",
@@ -1914,14 +2151,28 @@ class SqlMonitoringAdapter(MonitoringAdapter):
                     raise MonitoringUnavailable("Retirement does not match its original binding, observation and current work")
 
     def reconcile_connector_observation(self, producer: m.ReconciliationRequest, connector: m.OwnedConnectorManifest, control: m.DeploymentControl) -> Rejection | None:
+        stale = self.engine._stale_presence_evidence(producer, connector, control)
+        if stale is not None:
+            return stale
+        document, _ = self._native_reconciliation(control, producer.request_id, "worker")
+        arguments = document["request_payload"] if document is not None else {}
+        revision = arguments.get("expected_connector_revision")
+        if (
+            document is None or document.get("topic") != "connector"
+            or type(revision) is not int or revision < 0
+            or connector.revision != revision + 1
+            or connector.connector_id != arguments.get("connector_id")
+            or connector.ownership_id != arguments.get("ownership_id")
+            or connector.policy_revision != document.get("policy_revision")
+            or connector.policy_revision != arguments.get("expected_revision")
+        ):
+            logger.error("Original connector observation baseline changed request_hash=%s", key_digest(producer.request_id))
+            raise MonitoringUnavailable("Original connector observation cannot be reconstructed from a changed baseline")
         if (
             (connector.source_proposals or connector.source_removals)
             and producer.request_payload.get("definition_observed")
             and connector.state in {"provisioning", "ready", "degraded"}
         ):
-            stale = self.engine._stale_presence_evidence(producer, connector, control)
-            if stale is not None:
-                return stale
             work = self.engine._get("work", producer.work_id, control, m.MonitoringWork)
             frontier = self.engine._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
             rejected, result = self.engine._bind_connector_evidence(
@@ -1960,7 +2211,7 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         if document is None or document.get("topic") != "connector":
             return False
         revision = document["request_payload"].get("expected_connector_revision")
-        return type(revision) is int and connector.revision != revision + 1
+        return type(revision) is int and revision >= 0 and revision + 1 < connector.revision
 
     def _action_work(self, context, work_id, lease, *, revision=None):
         work = self.engine._get("work", m.canonical_id(work_id), context, m.MonitoringWork)
@@ -2614,8 +2865,16 @@ class SqlMonitoringAdapter(MonitoringAdapter):
     def _sql_reconcile_claimed_work(self, work):
         if work.kind != "reconcile_state" or work.lease is None:
             raise MonitoringConflict("Deterministic reconciliation requires its own leased work")
+        self._sql.bind_correlation(
+            work_id=work.work_id,
+            work_kind=work.kind,
+            handoff_id=work.reconcile_request_id,
+            revision=work.policy_revision,
+            fence=work.lease.fence,
+        )
         self._sql.lock_context(work)
         operation_id = stable_id(work, f"publication:{work.work_id}:{work.lease.fence}")
+        self._sql.bind_correlation(request_id=operation_id)
         prior = self._sql.get_receipt("controller.resolve_frontier", operation_id, work)
         if prior is not None:
             proof = self._frontier_proof(work, operation_id)
@@ -2632,6 +2891,10 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         document, handoff = self._native_reconciliation(work, work.reconcile_request_id, work.reconcile_producer)
         if document is None or handoff.work_id != work.work_id:
             raise MonitoringUnavailable("Reconciliation has no exact immutable producer handoff")
+        self._sql.bind_correlation(
+            handoff_id=handoff.producer_request_id,
+            handoff_revision=handoff.frontier_revision,
+        )
         control = self.engine._control(work)
         frontier = self.engine._get("validation_frontier", handoff.frontier_key, work, m.ValidationFrontier)
         if frontier is None:
@@ -2644,6 +2907,14 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         return self._sql_reconcile_state(request)
 
     def _sql_reconcile_state(self, request):
+        self._sql.bind_correlation(
+            work_id=request.work_id,
+            work_kind="reconcile_state",
+            request_id=request.request_id,
+            revision=request.expected_policy_revision,
+            handoff_revision=request.expected_frontier_revision,
+            fence=request.lease.fence,
+        )
         self._sql.lock_context(request)
         fingerprint = key_digest(_json(request.model_dump(mode="json")))
         replay = self._rpc_replay("controller.resolve_frontier", request.request_id, request, fingerprint)
@@ -2656,6 +2927,15 @@ class SqlMonitoringAdapter(MonitoringAdapter):
         document, handoff = self._native_reconciliation(request, work.reconcile_request_id, work.reconcile_producer)
         if document is None or handoff.work_id != work.work_id:
             raise MonitoringUnavailable("Current work has no exact accepted handoff")
+        self._sql.bind_correlation(
+            work_id=work.work_id,
+            work_kind=work.kind,
+            request_id=request.request_id,
+            handoff_id=handoff.producer_request_id,
+            handoff_revision=handoff.frontier_revision,
+            revision=control.revision,
+            fence=work.lease.fence,
+        )
         current = handoff.policy_revision == control.revision and not control.maintenance
         for value in document["evidence"]:
             binding = m.EvidenceBinding.model_validate(value)
@@ -2729,6 +3009,14 @@ class SqlMonitoringAdapter(MonitoringAdapter):
                 if core is not None and core.operation == "inventory" and core.result.completeness != "complete":
                     decision = "rejected" if core.result.completed_at is not None else "published"
                 reject_window = complete and decision == "rejected"
+        decision_mode = (
+            "window" if reject_window
+            else "window_acknowledgement" if window_row is not None and window_row.status in {"rejected", "validated"}
+            else "handoff_acknowledgement" if acknowledge_handoff
+            else "pending_window_acknowledgement" if acknowledge_pending_window
+            else "handoff"
+        )
+        self._sql.bind_correlation(decision_mode=decision_mode)
         validation = m.FrontierValidation(
             validation_id=stable_id(request, f"frontier-proof:{request.request_id}"), work_id=work.work_id,
             lease_owner_id=work.lease.owner_id, lease_fence=work.lease.fence,

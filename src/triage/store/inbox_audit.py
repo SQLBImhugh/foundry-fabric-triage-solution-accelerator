@@ -40,7 +40,7 @@ from typing import Any, Protocol
 
 from triage.redaction import redact
 from triage.store.atomic import replace_atomically
-from triage.store.azure_sql import SqlUnavailable, quote_identifier
+from triage.store.azure_sql import SqlUnavailable, quote_identifier, read_rows
 
 logger = logging.getLogger("triage.store.inbox_audit")
 
@@ -211,9 +211,10 @@ class AzureSqlInboxAudit(InMemoryInboxAudit):
             self._loaded = False
             self._items.clear()
             try:
-                rows = self._db.query(
+                rows = read_rows(
+                    self._db,
                     f"SELECT fingerprint, sender, subject, reason, ignored_at "
-                    f"FROM {self._table}"
+                    f"FROM {self._table}",
                 )
             except Exception as exc:
                 logger.error(

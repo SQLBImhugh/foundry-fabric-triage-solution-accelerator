@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import socket
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -78,6 +79,12 @@ from triage.monitoring.runtime import (
     source_work_id,
     stable_id,
     target_signature,
+)
+from triage.observability import (
+    bind_work_correlation,
+    build_version,
+    monitoring_work_span,
+    record_heartbeat_phase,
 )
 from triage.pipeline_models import (
     PIPELINE_JOB_TYPES,
@@ -2057,7 +2064,9 @@ class TriageRunner:
     ) -> list[str]:
         if budget is not None and not budget.can_claim():
             return []
+        context_began = time.monotonic()
         context = await settled_thread(lambda: self.monitoring_context)
+        record_heartbeat_phase(context_ms=max(0, int((time.monotonic() - context_began) * 1000)))
         owner = str(uuid4())
         lines: list[str] = []
         leases = {
@@ -2101,13 +2110,39 @@ class TriageRunner:
                         return ()
                     return self.monitoring.claim_work(request)
 
-                claimed = await settled_thread(claim, request)
+                claim_began = time.monotonic()
+                try:
+                    claimed = await settled_thread(claim, request)
+                finally:
+                    record_heartbeat_phase(
+                        claim_ms=max(0, int((time.monotonic() - claim_began) * 1000)),
+                    )
                 if claimed:
                     work = claimed[0]
                     break
             if work is None:
                 break
-            lines.append(await self.execute_monitoring_work(work))
+            lease = getattr(work, "lease", None)
+            execution_ref = getattr(work, "execution", None)
+            bind_work_correlation(
+                service=getattr(self.monitoring, "component", "controller"),
+                build=build_version(),
+                work_id=getattr(work, "work_id", None),
+                work_kind=getattr(work, "kind", None),
+                request_id=getattr(work, "reconcile_request_id", None) or (
+                    getattr(execution_ref, "run_id", None) if execution_ref is not None else None
+                ),
+                handoff_id=getattr(work, "reconcile_request_id", None),
+                revision=getattr(work, "policy_revision", None),
+                fence=getattr(lease, "fence", None),
+            )
+            execute_began = time.monotonic()
+            try:
+                lines.append(await self.execute_monitoring_work(work))
+            finally:
+                record_heartbeat_phase(
+                    execute_ms=max(0, int((time.monotonic() - execute_began) * 1000)),
+                )
         return lines
 
     async def retire_monitoring_history(self, budget: HeartbeatBudget | None = None) -> list[str]:
@@ -2159,6 +2194,28 @@ class TriageRunner:
         return [line]
 
     async def execute_monitoring_work(
+        self, work: MonitoringWork, *, pipeline_client: FabricPipelineClient | None = None,
+        powerbi_client: Any = None,
+    ) -> str:
+        lease = getattr(work, "lease", None)
+        execution_ref = getattr(work, "execution", None)
+        with monitoring_work_span(
+            service=getattr(self.monitoring, "component", "controller"),
+            build=build_version(),
+            work_id=getattr(work, "work_id", None),
+            work_kind=getattr(work, "kind", None),
+            request_id=getattr(work, "reconcile_request_id", None) or (
+                getattr(execution_ref, "run_id", None) if execution_ref is not None else None
+            ),
+            handoff_id=getattr(work, "reconcile_request_id", None),
+            revision=getattr(work, "policy_revision", None),
+            fence=getattr(lease, "fence", None),
+        ):
+            return await self._execute_monitoring_work_inner(
+                work, pipeline_client=pipeline_client, powerbi_client=powerbi_client,
+            )
+
+    async def _execute_monitoring_work_inner(
         self, work: MonitoringWork, *, pipeline_client: FabricPipelineClient | None = None,
         powerbi_client: Any = None,
     ) -> str:

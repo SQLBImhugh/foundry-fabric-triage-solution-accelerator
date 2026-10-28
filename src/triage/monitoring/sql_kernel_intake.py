@@ -140,7 +140,7 @@ IF ISJSON(@positions_json)<>1 OR LEFT(LTRIM(@positions_json),1)<>N'[' OR DATALEN
     THROW 51073, 'A bounded position batch is required', 1;
 DECLARE @start bigint;
 SELECT @start=sequence_number FROM {records}
-WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='stream_start' AND full_key=@partition_key;
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='stream_start' AND full_key=@partition_key AND key_hash={key_hash('@partition_key')};
 IF @start IS NULL THROW 51072, 'Pin the actual broker start before accepting positions', 1;
 IF (SELECT COUNT(*) FROM OPENJSON(@positions_json)) NOT BETWEEN 1 AND 200
     THROW 51073, 'Position batch size is outside the fixed bound', 1;
@@ -287,7 +287,8 @@ CROSS APPLY (
 IF EXISTS (
     SELECT 1 FROM @positions AS p JOIN {records} AS prior
       ON prior.tenant_id=@tenant_id AND prior.epoch=@epoch AND prior.record_kind='stream_position'
-     AND prior.parent_key=@partition_key AND prior.sequence_number=p.sequence_number
+     AND prior.parent_hash={key_hash('@partition_key')} AND prior.parent_key=@partition_key
+     AND prior.sequence_number=p.sequence_number
     WHERE NOT {exact_text_equal("JSON_VALUE(prior.payload,'$.offset')", 'p.offset_value')}
        OR JSON_VALUE(prior.payload,'$.enqueued_at')<>p.enqueued_at
        OR NOT {exact_text_equal("JSON_VALUE(prior.payload,'$.receipt_key')", 'p.receipt_key')}
@@ -315,7 +316,8 @@ SELECT @tenant_id,@epoch,'stream_position',
         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)
 FROM @positions AS p WHERE NOT EXISTS (
     SELECT 1 FROM {records} AS r WHERE r.tenant_id=@tenant_id AND r.epoch=@epoch
-      AND r.record_kind='stream_position' AND r.parent_key=@partition_key AND r.sequence_number=p.sequence_number);
+      AND r.record_kind='stream_position' AND r.parent_hash={key_hash('@partition_key')}
+      AND r.parent_key=@partition_key AND r.sequence_number=p.sequence_number);
 SET @affected=@@ROWCOUNT;
 INSERT INTO {records}
     (tenant_id,epoch,record_kind,key_hash,full_key,revision,parent_hash,parent_key,payload)
@@ -335,7 +337,7 @@ IF NOT EXISTS (SELECT 1 FROM @positions WHERE disposition<>'accepted')
    AND (SELECT COUNT(DISTINCT CONVERT(nvarchar(1024),JSON_QUERY(payload,'$.observation.execution.target')))
         FROM @positions)=1
     SELECT TOP (1) @intake_target=JSON_QUERY(payload,'$.observation.execution.target') FROM @positions;
-{handoff_sql(names, producer='worker', operation='worker.commit_positions', topic="N'stream_intake'", reference='@connector_id', target='@intake_target')}
+{handoff_sql(names, producer='worker', operation='worker.commit_positions', topic="N'stream_intake'", reference='@connector_id', target='@intake_target', evidence_parent='@partition_key')}
 SET @result=(SELECT @request_id AS batch_id,@partition_key AS partition_key,
     JSON_QUERY(@partition_json) AS partition,
     (SELECT COUNT(*) FROM @positions) AS position_count,@reconcile_id AS reconcile_work_id,
@@ -344,7 +346,8 @@ SET @result=(SELECT @request_id AS batch_id,@partition_key AS partition_key,
         JSON_VALUE(j.payload,'$.batch_id') AS first_committed_batch_id,
         JSON_VALUE(j.payload,'$.payload_hash') AS original_payload_hash
         FROM @positions AS p JOIN {records} AS j ON j.tenant_id=@tenant_id AND j.epoch=@epoch
-          AND j.record_kind='stream_position' AND j.parent_key=@partition_key AND j.sequence_number=p.sequence_number
+          AND j.record_kind='stream_position' AND j.parent_hash={key_hash('@partition_key')}
+          AND j.parent_key=@partition_key AND j.sequence_number=p.sequence_number
         ORDER BY p.sequence_number FOR JSON PATH)) AS positions,
     JSON_QUERY(N'['+(SELECT STRING_AGG(CONVERT(nvarchar(max),{quote}(receipt_key)),N',')
         WITHIN GROUP (ORDER BY sequence_number) FROM @positions)+N']') AS receipt_keys,
@@ -360,10 +363,10 @@ def _checkpoint(names: SqlNames, contract: RpcContract) -> KernelObject:
 DECLARE @first bigint,@prior_revision bigint,@prior_sequence bigint,@count bigint,@last_offset nvarchar(256),
     @last_enqueued_at nvarchar(40);
 SELECT @first=sequence_number FROM {records}
-WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='stream_start' AND full_key=@partition_key;
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='stream_start' AND full_key=@partition_key AND key_hash={key_hash('@partition_key')};
 IF @first IS NULL THROW 51072, 'No pinned broker start exists', 1;
 SELECT @prior_revision=revision,@prior_sequence=sequence_number FROM {records}
-WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='stream_checkpoint' AND full_key=@partition_key;
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='stream_checkpoint' AND full_key=@partition_key AND key_hash={key_hash('@partition_key')};
 IF COALESCE(@prior_revision,0)<>@expected_checkpoint_revision
     THROW 51072, 'Checkpoint revision changed', 1;
 SET @first=COALESCE(@prior_sequence+1,@first);
@@ -371,7 +374,8 @@ IF @through_sequence_number<@first OR @through_sequence_number-@first>100000
     THROW 51073, 'Checkpoint range is regressive or exceeds the bounded scan', 1;
 SELECT @count=COUNT_BIG(*) FROM {records} AS p
 WHERE p.tenant_id=@tenant_id AND p.epoch=@epoch AND p.record_kind='stream_position'
-  AND p.parent_key=@partition_key AND p.sequence_number BETWEEN @first AND @through_sequence_number
+  AND p.parent_hash={key_hash('@partition_key')} AND p.parent_key=@partition_key
+  AND p.sequence_number BETWEEN @first AND @through_sequence_number
   AND p.status IN ('accepted','quarantined')
   AND EXISTS (SELECT 1 FROM {receipts} AS r
       WHERE r.tenant_id=@tenant_id AND r.epoch=@epoch AND r.operation='worker.commit_positions'
@@ -381,6 +385,8 @@ WHERE p.tenant_id=@tenant_id AND p.epoch=@epoch AND p.record_kind='stream_positi
             SELECT 1 FROM {records} AS fact JOIN {records} AS accepted
               ON accepted.tenant_id=fact.tenant_id AND accepted.epoch=fact.epoch
              AND accepted.record_kind='accepted_fact'
+             AND accepted.accepted_fact_key_hash=fact.key_hash
+             AND accepted.parent_hash={key_hash('@partition_key')} AND accepted.parent_key=@partition_key
              AND JSON_VALUE(accepted.payload,'$.fact_kind')=fact.record_kind
              AND JSON_VALUE(accepted.payload,'$.fact_key')=fact.full_key
              AND TRY_CONVERT(bigint,JSON_VALUE(accepted.payload,'$.fact_revision'))=fact.revision
@@ -398,7 +404,8 @@ IF @count<>@through_sequence_number-@first+1
     THROW 51072, 'Checkpoint would skip an uncommitted position or intake receipt', 1;
 SELECT @last_offset=JSON_VALUE(payload,'$.offset'),@last_enqueued_at=JSON_VALUE(payload,'$.enqueued_at') FROM {records}
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='stream_position'
-  AND parent_key=@partition_key AND sequence_number=@through_sequence_number;
+  AND parent_hash={key_hash('@partition_key')} AND parent_key=@partition_key
+  AND sequence_number=@through_sequence_number;
 IF NOT {exact_text_equal('@last_offset', '@through_offset')}
     THROW 51072, 'Checkpoint offset differs from original accepted evidence', 1;
 DECLARE @checkpoint nvarchar(max)=(

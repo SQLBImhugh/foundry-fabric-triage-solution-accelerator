@@ -30,7 +30,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
-from triage.store.azure_sql import SqlUnavailable, quote_identifier
+from triage.store.azure_sql import SqlUnavailable, quote_identifier, read_rows
 
 logger = logging.getLogger("triage.store.retries")
 
@@ -334,7 +334,7 @@ class AzureSqlRetryStore(InMemoryRetryStore):
     def _load(self, signature: str | None = None) -> None:
         where = " WHERE signature = ?" if signature is not None else ""
         params = (signature,) if signature is not None else ()
-        rows = self._db.query(f"SELECT signature, payload FROM {self._table}{where}", *params)
+        rows = read_rows(self._db, f"SELECT signature, payload FROM {self._table}{where}", *params)
         loaded: dict[str, dict[str, Any]] = {}
         revisions: dict[str, bytes] = {}
         try:

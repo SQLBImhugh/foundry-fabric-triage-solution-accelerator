@@ -32,7 +32,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from triage.store.azure_sql import SqlUnavailable, quote_identifier
+from triage.store.azure_sql import SqlUnavailable, quote_identifier, read_rows
 
 logger = logging.getLogger("triage.store.semantic_health")
 
@@ -297,7 +297,7 @@ class AzureSqlSemanticHealthStore(InMemorySemanticHealthStore):
     def _load(self, key: str | None = None) -> None:
         where = " WHERE probe_key = ?" if key is not None else ""
         params = (key,) if key is not None else ()
-        rows = self._db.query(f"SELECT probe_key, payload FROM {self._table}{where}", *params)
+        rows = read_rows(self._db, f"SELECT probe_key, payload FROM {self._table}{where}", *params)
         loaded: dict[str, dict[str, Any]] = {}
         revisions: dict[str, bytes] = {}
         try:

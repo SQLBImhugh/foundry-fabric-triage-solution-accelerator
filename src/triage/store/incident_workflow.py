@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from triage.models import Incident
 from triage.redaction import redact_text
-from triage.store.azure_sql import AzureSqlDatabase, SqlUnavailable, quote_identifier
+from triage.store.azure_sql import AzureSqlDatabase, SqlUnavailable, quote_identifier, read_rows
 from triage.store.command_center import _digest, _identifier, _sql_time, _timestamp
 from triage.store.incidents import InMemoryIncidentStore
 
@@ -511,7 +511,7 @@ class AzureSqlIncidentWorkflowStore(IncidentWorkflowStore):
 
     def _query(self, sql: str, *params: Any) -> list[tuple]:
         try:
-            return self._db.query(sql, *params)
+            return read_rows(self._db, sql, *params)
         except Exception as exc:
             logger.error("Incident collaboration read failed (%s); no cached state used", type(exc).__name__)
             raise SqlUnavailable("Incident collaboration could not be read.") from exc

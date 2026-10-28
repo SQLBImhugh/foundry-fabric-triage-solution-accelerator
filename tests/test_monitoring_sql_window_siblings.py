@@ -49,7 +49,8 @@ def sibling_case(db):
     leases = kernel.names.table("monitoring_leases")
     db.execute(f"""CREATE TABLE {records} (
         tenant_id TEXT,epoch TEXT,record_kind TEXT,full_key TEXT,key_hash BLOB,revision INTEGER,
-        sequence_number INTEGER,status TEXT,parent_key TEXT,target_key TEXT,work_kind TEXT,due_at TEXT,payload TEXT)""")
+        sequence_number INTEGER,status TEXT,parent_key TEXT,target_key TEXT,work_kind TEXT,due_at TEXT,payload TEXT,
+        parent_hash BLOB GENERATED ALWAYS AS (KEY_DIGEST(parent_key)) VIRTUAL)""")
     db.execute(f"""CREATE TABLE {receipts} (
         tenant_id TEXT,epoch TEXT,operation TEXT,request_id TEXT,fingerprint TEXT,payload TEXT,
         request_hash BLOB GENERATED ALWAYS AS (KEY_DIGEST(request_id)) VIRTUAL,

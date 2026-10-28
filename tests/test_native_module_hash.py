@@ -136,9 +136,9 @@ def test_utf8_sql_catalogue_and_complete_kernel_abi_remain_unchanged() -> None:
     # seeks; native header projection cannot change source bytes or the
     # remaining kernel ABI.
     assert kernel_contract_hash(tables) == (
-        "ca6dcb8639d5adc9a3842426913c9f46f6e8b368f7d08e1b19d20586367af9d5"
+        "0d21728e3364f5aa50450daa7184228fb92794603e266b9555082830b12149f5"
     )
     assert fingerprint(kernel_abi(tables)) == kernel_contract_hash(tables)
     assert fingerprint(list(kernel.catalogue())) == (
-        "198337efe871aa6660248e46358dcd96a5a816e7dbfe8244942098d4ebcb8f4a"
+        "0441f8248493d23a12763f2d12568777b05c010d5ddeeff91b1f58e7acfce768"
     )

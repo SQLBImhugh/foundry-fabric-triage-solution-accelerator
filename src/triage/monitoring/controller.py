@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 from triage.approvals import ApprovalDecision, ApprovalRequest
 from triage.monitoring.contracts import (
     ControllerMonitoringStore,
-    FixedDiagnosticError,
     MonitoringComponentDenied,
     MonitoringConflict,
     MonitoringLeaseLost,
@@ -54,7 +53,16 @@ from triage.monitoring.models import (
     SourceRunObservation,
 )
 from triage.monitoring.runtime import fixture_id, stable_id, target_signature
-from triage.observability import heartbeat_span, telemetry_status
+from triage.observability import (
+    HeartbeatCorrelation,
+    build_version,
+    current_heartbeat_correlation,
+    heartbeat_span,
+    monitoring_work_span,
+    root_cause_code,
+    telemetry_status,
+    validated_type_name,
+)
 
 if TYPE_CHECKING:
     from triage.tools.powerbi import PowerBIClient, RefreshOutcome
@@ -90,9 +98,10 @@ async def settled_thread(
                 break
         error = None if future.cancelled() else future.exception()
         heartbeat_logger.warning(
-            "heartbeat_sync_settled status=%s error_type=%s",
+            "heartbeat_sync_settled status=%s error_type=%s error_cause=%s",
             "uncertain" if future.cancelled() else "failed" if error is not None else "completed",
-            type(error).__name__ if error is not None else "",
+            validated_type_name(type(error).__name__, default="") if error is not None else "",
+            _root_cause(error) if error is not None else "",
         )
         if error is not None:
             raise cancelled from error
@@ -199,7 +208,24 @@ def reconcile_monitoring_work(store: ControllerMonitoringStore, work: Monitoring
         raise MonitoringComponentDenied("Deterministic runtime publication requires the controller component")
     if work.kind != "reconcile_state" or work.lease is None:
         raise MonitoringLeaseLost("Deterministic publication requires its own leased reconciliation work")
-    return store.reconcile_work(work, connector_publisher=publish_reconciliation_connector)
+    with monitoring_work_span(
+        service=store.component,
+        build=build_version(),
+        work_id=work.work_id,
+        work_kind=work.kind,
+        request_id=work.reconcile_request_id,
+        handoff_id=work.reconcile_request_id,
+        revision=work.policy_revision,
+        fence=work.lease.fence,
+    ) as span:
+        result = store.reconcile_work(work, connector_publisher=publish_reconciliation_connector)
+        span.set("monitoring.request_id", result.request_id)
+        span.set("monitoring.handoff_id", result.producer_request_id)
+        span.set("monitoring.revision", result.policy_revision)
+        span.set("monitoring.handoff_revision", result.frontier_revision)
+        if result.resolution_scope is not None:
+            span.set("monitoring.decision_mode", result.resolution_scope)
+        return result
 
 
 @dataclass(frozen=True)
@@ -304,7 +330,7 @@ async def controller_heartbeat(
             lines.extend(housekeeping)
         except BaseException as exc:
             status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
-            error_type = type(exc).__name__
+            error_type = validated_type_name(type(exc).__name__, default="")
             error_cause = _root_cause(exc)
             raise
         finally:
@@ -314,12 +340,28 @@ async def controller_heartbeat(
             await asyncio.gather(*workers, return_exceptions=True)
             elapsed_ms = max(0, int((clock() - began) * 1000))
             exhausted = not budget.can_claim()
+            correlation = (current_heartbeat_correlation() or HeartbeatCorrelation()).phase_snapshot()
             for key, value in {
+                "service.name": correlation["service"],
+                "service.version": correlation["build"],
                 "heartbeat.status": status, "heartbeat.elapsed_ms": elapsed_ms,
+                "heartbeat.context_ms": correlation["context_ms"],
+                "heartbeat.claim_ms": correlation["claim_ms"],
+                "heartbeat.execute_ms": correlation["execute_ms"],
                 "heartbeat.automatic_calls": started["automatic"], "heartbeat.human_calls": started["human"],
                 "heartbeat.automatic_results": completed["automatic"], "heartbeat.human_results": completed["human"],
                 "heartbeat.budget_exhausted": exhausted, "error.type": error_type,
                 "error.cause": error_cause,
+                "monitoring.work_id": correlation["work_id"],
+                "monitoring.work_kind": correlation["work_kind"],
+                "monitoring.request_id": correlation["request_id"],
+                "monitoring.handoff_id": correlation["handoff_id"],
+                "monitoring.revision": correlation["revision"],
+                "monitoring.handoff_revision": correlation["handoff_revision"],
+                "monitoring.fence": correlation["fence"],
+                "monitoring.decision_mode": correlation["decision_mode"],
+                "sql.rpc": correlation["rpc"],
+                "sql.guard_code": correlation["guard_code"],
             }.items():
                 span.set(key, value)
             health = telemetry_status()
@@ -327,10 +369,20 @@ async def controller_heartbeat(
                 logging.INFO if status == "completed" else logging.WARNING,
                 "heartbeat_finished status=%s elapsed_ms=%d automatic_calls=%d human_calls=%d "
                 "automatic_results=%d human_results=%d budget_exhausted=%s error_type=%s error_cause=%s "
-                "telemetry_configuration=%s export_failures=%d export_warnings=%d ingestion=unverified",
+                "telemetry_configuration=%s export_failures=%d export_warnings=%d ingestion=unverified "
+                "service=%s build=%s context_ms=%d claim_ms=%d execute_ms=%d work_id=%s work_kind=%s "
+                "request_id=%s handoff_id=%s revision=%s handoff_revision=%s fence=%s decision_mode=%s "
+                "rpc=%s guard_code=%s",
                 status, elapsed_ms, started["automatic"], started["human"],
                 completed["automatic"], completed["human"], exhausted, error_type, error_cause,
                 health["configuration"], health["export_failures"], health["export_warnings"],
+                correlation["service"], correlation["build"],
+                correlation["context_ms"], correlation["claim_ms"], correlation["execute_ms"],
+                correlation["work_id"], correlation["work_kind"],
+                correlation["request_id"], correlation["handoff_id"],
+                correlation["revision"], correlation["handoff_revision"],
+                correlation["fence"], correlation["decision_mode"],
+                correlation["rpc"], correlation["guard_code"],
             )
     if not lines and not budget.can_claim():
         return ["Heartbeat admission budget exhausted; no new work was claimed. Any queued work remains pending."]
@@ -361,15 +413,7 @@ def _root_cause(exc: BaseException) -> str:
     quoting a synthetic row. The pattern check is a second bound, not the
     primary one -- the type is what establishes provenance.
     """
-    cause, depth = exc.__cause__, 0
-    while cause is not None and depth < 5:
-        code = getattr(cause, "code", None) if isinstance(cause, FixedDiagnosticError) else None
-        if isinstance(code, str) and _FIXED_CODE.match(code):
-            return f"{type(cause).__name__}:{code}"[:MAX_EXPORTED_CAUSE]
-        if cause.__cause__ is None:
-            return type(cause).__name__[:MAX_EXPORTED_CAUSE]
-        cause, depth = cause.__cause__, depth + 1
-    return ""
+    return root_cause_code(exc)[:MAX_EXPORTED_CAUSE]
 
 
 def current_execution() -> MonitoringExecution | None:

@@ -123,12 +123,43 @@ def test_every_frontier_receipt_records_the_frontier_its_handoff_was_written_wit
 
 
 def test_a_batch_reads_its_own_bindings_through_the_parent_index():
-    ddl = next(obj.ddl for obj in KERNEL.objects if obj.logical_name == "worker.accept_facts")
-    batch_reads = [
+    for operation, parent in (
+        ("worker.accept_facts", "@work_id"),
+        ("worker.commit_positions", "@partition_key"),
+    ):
+        ddl = next(obj.ddl for obj in KERNEL.objects if obj.logical_name == operation)
+        batch_reads = [
+            statement for statement in re.split(r";\s*\n", ddl)
+            if "record_kind='accepted_fact'" in statement and "'$.batch_id')=@request_id" in statement
+        ]
+        assert len(batch_reads) == 2, operation
+        for statement in batch_reads:
+            assert f"parent_hash=HASHBYTES('SHA2_256', CONVERT(varchar(max), ({parent})" in statement
+            assert f"parent_key={parent}" in statement
+
+
+def test_resolve_frontier_seeks_reconcile_request_handoff_and_evidence_bindings():
+    ddl = next(obj.ddl for obj in KERNEL.objects if obj.logical_name == "controller.resolve_frontier")
+    request_pos = ddl.index("SELECT @producer_request=payload")
+    handoff_pos = ddl.index("SELECT @handoff=payload")
+    assert request_pos < handoff_pos
+    request_stmt = ddl[request_pos:ddl.index(";", request_pos)]
+    assert "full_key=@producer_request_id" in request_stmt
+    assert "key_hash=HASHBYTES('SHA2_256', CONVERT(varchar(max), (@producer_request_id)" in request_stmt
+    handoff_stmt = ddl[handoff_pos:ddl.index(";", handoff_pos)]
+    assert "parent_hash=HASHBYTES('SHA2_256', CONVERT(varchar(max), (JSON_VALUE(@producer_request,'$.frontier_key'))" in handoff_stmt
+    assert "parent_key=JSON_VALUE(@producer_request,'$.frontier_key')" in handoff_stmt
+    assert "sequence_number=TRY_CONVERT(bigint,JSON_VALUE(@producer_request,'$.frontier_revision'))" in handoff_stmt
+    evidence_stmt = next(
         statement for statement in re.split(r";\s*\n", ddl)
-        if "record_kind='accepted_fact'" in statement and "'$.batch_id')=@request_id" in statement
-    ]
-    assert len(batch_reads) == 2
-    for statement in batch_reads:
-        assert "parent_hash=HASHBYTES('SHA2_256', CONVERT(varchar(max), (@work_id)" in statement
-        assert "parent_key=@work_id" in statement
+        if "record_kind='accepted_fact'" in statement and "'$.batch_id')=@producer_request_id" in statement
+    )
+    assert "binding.parent_hash=HASHBYTES('SHA2_256', CONVERT(varchar(max), (@evidence_parent)" in evidence_stmt
+    assert "binding.parent_key=@evidence_parent" in evidence_stmt
+    for match in re.finditer(r"(?:(\w+)\.)?record_kind\s*=\s*'validation_handoff'", ddl):
+        alias = match.group(1)
+        prefix = rf"\b{alias}\." if alias else r"(?<![\w.@])"
+        window = ddl[match.start():match.start() + 320]
+        if re.search(prefix + r"parent_key\s*=", window):
+            assert re.search(prefix + r"parent_hash\s*=", window) or re.search(prefix + r"key_hash\s*=", window), _flat(window)
+

@@ -18,12 +18,15 @@ Three defects stopped live detection together:
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from test_monitoring_publication import drain, poll_page, ready
 from test_monitoring_sql_review9_bindings import Review9Database
 from test_monitoring_store import Harness, uid
 
 from triage.monitoring import models as m
+from triage.monitoring.contracts import MonitoringCommitUncertain
 from triage.monitoring.memory import InMemoryMonitoringStore
 from triage.monitoring.sql_permissions import build_permission_kernel
 from triage.monitoring.sql_store import AzureSqlMonitoringStore, SqlMonitoringAdapter
@@ -73,8 +76,11 @@ def test_a_window_that_skips_validated_coverage_is_rejected_without_admitting_it
 class Estate:
     """Controller and worker over one memory state or one SQL protocol double."""
 
-    def __init__(self, backend: str):
+    def __init__(self, backend: str, *, seed: bool = False):
         self.h = Harness()
+        if seed:
+            self.h.seed(count=2, workspaces=2)
+            self.h.activate()
         self.db = Review9Database(self.h) if backend == "sql" else None
         self.stores = {
             component: AzureSqlMonitoringStore(db=self.db, component=component) if self.db else
@@ -169,3 +175,254 @@ def test_a_window_left_open_by_the_earlier_release_closes_on_its_next_attempt(mo
     assert (result.state, result.resolution_scope) == ("rejected", "window")
     assert not controller.get_validation_frontier(estate.h.version, result.frontier_key).pending
     assert controller.get_work(estate.h.version, stuck.work_id).state == "completed"
+
+
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+def test_partial_inventory_pages_acknowledge_without_replay_churn_and_close_cleanly(backend):
+    estate = Estate(backend)
+    h = estate.h
+    controller = estate.use("controller")
+    draft = controller.enqueue_work(m.MonitoringWorkDraft(
+        **h.context(), work_id=h.next_id(), kind="inventory", policy_revision=0,
+        discovery_selector=m.ScopeSelector(tenant_id=uid(1), kind="tenant"),
+        created_at=h.clock(), due_at=h.clock(), reason="Multi-page inventory window.",
+    ))
+    worker = estate.use("worker")
+    collection, = worker.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(950), kinds=("inventory",), limit=1, per_workspace_limit=1,
+    ))
+    page1_req_id = h.next_id()
+    gen_p1 = worker.record_inventory(m.InventoryBatch(
+        request_id=page1_req_id, expected=h.version,
+        generation=m.InventoryGeneration(
+            **h.context(), generation_id=draft.work_id, selector=draft.discovery_selector,
+            adapter="fixture", authority="tenant_admin", completeness="partial",
+            started_at=h.clock(), continuation="page-2",
+            gaps=(m.CoverageGap(code="inventory_in_progress", detail="Page 1 of 3."),),
+        ),
+        items=(m.InventoryItem(
+            **h.context(), generation_id=draft.work_id, workspace_id=uid(100), item_id=uid(1001),
+            name="Pipeline page 1", item_type="DataPipeline", workload="fabric_pipeline",
+            observed_at=h.clock(),
+        ),),
+        commit=m.InventoryCommit(
+            work_id=collection.work_id, lease=collection.lease,
+            expected_work_revision=collection.revision, expected_generation_revision=0,
+        ),
+    ))
+
+    # Reconcile page 1 while the window is still collecting.
+    controller = estate.use("controller")
+    page1_first, = controller.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(951), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+    ))
+    page1_initial = controller.reconcile_work(page1_first)
+    assert (page1_initial.state, page1_initial.resolution_scope) == ("pending_validation", "handoff")
+    assert controller.get_work(h.version, page1_first.work_id).state == "waiting"
+
+    # Subsequent claims before the 15s wait timer expires do not re-claim page 1.
+    h.clock.advance(5)
+    assert controller.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(952), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+    )) == ()
+
+    # Page 2 arrives (still partial), advancing generation evidence.
+    worker = estate.use("worker")
+    page2_req_id = h.next_id()
+    gen_p2 = worker.record_inventory(m.InventoryBatch(
+        request_id=page2_req_id, expected=h.version,
+        generation=m.InventoryGeneration.model_validate({
+            **gen_p1.model_dump(), "completed_pages": 1, "continuation": "page-3",
+        }),
+        items=(m.InventoryItem(
+            **h.context(), generation_id=draft.work_id, workspace_id=uid(100), item_id=uid(1002),
+            name="Pipeline page 2", item_type="DataPipeline", workload="fabric_pipeline",
+            observed_at=h.clock(),
+        ),),
+        commit=m.InventoryCommit(
+            work_id=collection.work_id, lease=collection.lease,
+            expected_work_revision=collection.revision,
+            expected_generation_revision=gen_p1.revision,
+            expected_continuation=gen_p1.continuation,
+        ),
+    ))
+
+    # Advance past the 15s wait so page 1 is reclaimed alongside page 2.
+    h.clock.advance(11)
+    controller = estate.use("controller")
+    due_batch = controller.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(953), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+    ))
+    by_req = {work.reconcile_request_id: work for work in due_batch}
+    assert set(by_req) == {page1_req_id, page2_req_id}
+
+    if estate.db is not None:
+        estate.db.fail_commit = "after"
+        with pytest.raises(MonitoringCommitUncertain):
+            controller.reconcile_work(by_req[page1_req_id])
+
+    page1_ack = controller.reconcile_work(by_req[page1_req_id])
+    assert page1_ack.state == "pending_validation"
+    assert page1_ack.resolution_scope == "pending_window_acknowledgement"
+    assert page1_ack.handoff_resolution_request_id == page1_initial.request_id
+    assert page1_ack.handoff_resolution_work_fence == page1_first.lease.fence
+
+    page2_initial = controller.reconcile_work(by_req[page2_req_id])
+    assert (page2_initial.state, page2_initial.resolution_scope) == ("pending_validation", "handoff")
+    assert controller.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(954), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+    )) == ()
+
+    # Closing page 3 arrives and completes the inventory window.
+    worker = estate.use("worker")
+    page3_req_id = h.next_id()
+    worker.record_inventory(m.InventoryBatch(
+        request_id=page3_req_id, expected=h.version,
+        generation=m.InventoryGeneration.model_validate({
+            **gen_p2.model_dump(), "completed_pages": 2, "continuation": None,
+            "completeness": "complete", "completed_at": h.clock(), "discovered_count": 3, "gaps": (),
+        }),
+        items=(m.InventoryItem(
+            **h.context(), generation_id=draft.work_id, workspace_id=uid(100), item_id=uid(1003),
+            name="Pipeline page 3", item_type="DataPipeline", workload="fabric_pipeline",
+            observed_at=h.clock(),
+        ),),
+        commit=m.InventoryCommit(
+            work_id=collection.work_id, lease=collection.lease,
+            expected_work_revision=collection.revision,
+            expected_generation_revision=gen_p2.revision,
+            expected_continuation=gen_p2.continuation,
+        ),
+    ))
+
+    # Closing page 3 is immediately due while pages 1 and 2 remain in their 15s wait.
+    controller = estate.use("controller")
+    page3_first, = controller.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(955), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+    ))
+    assert page3_first.reconcile_request_id == page3_req_id
+    page3_published = controller.reconcile_work(page3_first)
+    assert (page3_published.state, page3_published.resolution_scope) == ("published", "handoff")
+    frontier = controller.get_validation_frontier(h.version, page3_published.frontier_key)
+    assert not frontier.pending and frontier.validated_revision == frontier.accepted_revision == 3
+    assert controller.get_work(h.version, page3_first.work_id).state == "completed"
+
+    # Once pages 1 and 2 wake up, they acknowledge the closed window and complete.
+    h.clock.advance(16)
+    siblings = controller.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(956), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+    ))
+    assert {work.reconcile_request_id for work in siblings} == {page1_req_id, page2_req_id}
+    for sibling in siblings:
+        ack = controller.reconcile_work(sibling)
+        assert (ack.state, ack.resolution_scope) == ("published", "window_acknowledgement")
+        assert ack.window_resolution_request_id == page3_published.request_id
+        assert ack.window_resolution_state == "published"
+        assert controller.get_work(h.version, sibling.work_id).state == "completed"
+
+    # Original decisions and receipts remain intact; no completed page work ever replays.
+    assert controller.reconcile_work(page1_first) == page1_initial
+    assert controller.reconcile_work(by_req[page1_req_id]) == page1_ack
+    assert controller.reconcile_work(by_req[page2_req_id]) == page2_initial
+    assert controller.reconcile_work(page3_first) == page3_published
+    for step in (16, 60, 120):
+        h.clock.advance(step)
+        assert controller.claim_work(m.WorkClaimRequest(
+            **h.context(), owner_id=uid(957), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+        )) == ()
+
+
+@pytest.mark.parametrize("backend", ["memory", "sql"])
+def test_partial_rest_poll_pages_preserve_decisions_across_reclaims_and_window_rejection(backend):
+    estate = Estate(backend, seed=True)
+    h = estate.h
+    target = h.targets[0]
+    worker = estate.use("worker")
+    poll = next(work for work in worker.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(960), kinds=("poll",), limit=5, per_workspace_limit=5,
+    )) if work.target == target)
+    window = m.ObservationWindow(start_at=h.clock() - timedelta(minutes=30), end_at=h.clock())
+
+    obs1 = h.observation(target=target, execution={"target": target, "run_id": uid(45_001), "run_id_kind": "fabric_job"})
+    req1 = m.RestPageRequest(
+        page_id=h.next_id(), target=target, policy_revision=h.version.revision,
+        poll_work_id=poll.work_id, lease=poll.lease, expected_checkpoint_revision=0,
+        expected_cursor=None, next_cursor="cursor-2", window=window,
+        received_count=1, observed_at=h.clock(), window_complete=False, observations=(obs1,),
+    )
+    worker.record_rest_page(req1)
+
+    controller = estate.use("controller")
+    page1_first, = controller.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(961), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+    ))
+    page1_initial = controller.reconcile_work(page1_first)
+    assert (page1_initial.state, page1_initial.resolution_scope) == ("pending_validation", "handoff")
+    assert controller.get_work(h.version, page1_first.work_id).state == "waiting"
+    assert controller.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(962), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+    )) == ()
+
+    worker = estate.use("worker")
+    obs2 = h.observation(target=target, execution={"target": target, "run_id": uid(45_002), "run_id_kind": "fabric_job"})
+    req2 = m.RestPageRequest(
+        page_id=h.next_id(), target=target, policy_revision=h.version.revision,
+        poll_work_id=poll.work_id, lease=poll.lease, expected_checkpoint_revision=1,
+        expected_cursor="cursor-2", next_cursor="cursor-3", window=window,
+        received_count=1, observed_at=h.clock(), window_complete=False, observations=(obs2,),
+    )
+    worker.record_rest_page(req2)
+
+    h.clock.advance(16)
+    controller = estate.use("controller")
+    due = {
+        work.reconcile_request_id: work
+        for work in controller.claim_work(m.WorkClaimRequest(
+            **h.context(), owner_id=uid(963), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+        ))
+    }
+    assert set(due) == {req1.page_id, req2.page_id}
+    page1_ack = controller.reconcile_work(due[req1.page_id])
+    assert (page1_ack.state, page1_ack.resolution_scope) == ("pending_validation", "pending_window_acknowledgement")
+    assert page1_ack.handoff_resolution_request_id == page1_initial.request_id
+    assert page1_ack.handoff_resolution_work_fence == page1_first.lease.fence
+
+    page2_initial = controller.reconcile_work(due[req2.page_id])
+    assert (page2_initial.state, page2_initial.resolution_scope) == ("pending_validation", "handoff")
+
+    # Reject the unfinished window on the next cycle and verify sibling completion.
+    h.clock.advance(16)
+    reclaimed = {
+        work.reconcile_request_id: work
+        for work in controller.claim_work(m.WorkClaimRequest(
+            **h.context(), owner_id=uid(964), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+        ))
+    }
+    page2_reject = controller.reconcile_state(m.ReconcileStateRequest(
+        **h.context(), request_id=h.next_id(), work_id=reclaimed[req2.page_id].work_id,
+        lease=reclaimed[req2.page_id].lease, expected_work_revision=reclaimed[req2.page_id].revision,
+        expected_policy_revision=h.version.revision, expected_frontier_revision=2,
+        reject_whole_window=True, detail="Abandon unfinished poll window without changing earlier page decisions.",
+    ))
+    assert (page2_reject.state, page2_reject.resolution_scope) == ("rejected", "window")
+    assert not controller.get_validation_frontier(h.version, page2_reject.frontier_key).pending
+    assert controller.get_work(h.version, reclaimed[req2.page_id].work_id).state == "completed"
+
+    page1_terminal = controller.reconcile_work(reclaimed[req1.page_id])
+    assert (page1_terminal.state, page1_terminal.resolution_scope) == ("rejected", "window_acknowledgement")
+    assert page1_terminal.window_rejection_request_id == page2_reject.request_id
+    assert page1_terminal.window_resolution_request_id == page2_reject.request_id
+    assert page1_terminal.window_resolution_state == "rejected"
+    assert controller.get_work(h.version, reclaimed[req1.page_id].work_id).state == "completed"
+
+    assert controller.reconcile_work(page1_first) == page1_initial
+    assert controller.reconcile_work(due[req1.page_id]) == page1_ack
+    assert controller.reconcile_work(due[req2.page_id]) == page2_initial
+    assert controller.reconcile_work(reclaimed[req1.page_id]) == page1_terminal
+    assert controller.get_source(obs1.execution) is None
+    assert controller.get_source(obs2.execution) is None
+    h.clock.advance(60)
+    assert controller.claim_work(m.WorkClaimRequest(
+        **h.context(), owner_id=uid(965), kinds=("reconcile_state",), limit=10, per_workspace_limit=10,
+    )) == ()
+

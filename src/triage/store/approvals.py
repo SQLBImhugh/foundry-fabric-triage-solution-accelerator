@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from triage.redaction import redact_text
-from triage.store.azure_sql import SqlUnavailable, quote_identifier
+from triage.store.azure_sql import SqlUnavailable, quote_identifier, read_rows
 
 logger = logging.getLogger("triage.store.approvals")
 
@@ -394,8 +394,8 @@ class AzureSqlApprovalChannel(InMemoryApprovalChannel):
 
     def _fetch(self, request_id: str) -> dict[str, Any] | None:
         try:
-            rows = self._db.query(
-                f"SELECT payload FROM {self._table} WHERE request_id = ?", request_id
+            rows = read_rows(
+                self._db, f"SELECT payload FROM {self._table} WHERE request_id = ?", request_id
             )
         except Exception as exc:
             logger.error(
@@ -436,8 +436,8 @@ class AzureSqlApprovalChannel(InMemoryApprovalChannel):
 
     def pending(self) -> list[dict[str, Any]]:
         try:
-            rows = self._db.query(
-                f"SELECT payload FROM {self._table} WHERE decision IS NULL OR decision = ''"
+            rows = read_rows(
+                self._db, f"SELECT payload FROM {self._table} WHERE decision IS NULL OR decision = ''"
             )
         except Exception as exc:
             logger.error("Could not list pending approvals (%s)", type(exc).__name__)
@@ -453,13 +453,14 @@ class AzureSqlApprovalChannel(InMemoryApprovalChannel):
     def list_requests(self, limit: int = 200) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 500))
         return [
-            self._decode(row[0]) for row in self._db.query(
+            self._decode(row[0]) for row in read_rows(
+                self._db,
                 f"SELECT TOP ({limit}) payload FROM {self._table} "
                 "ORDER BY CASE WHEN (decision IS NULL OR decision = '') "
                 "AND COALESCE(JSON_VALUE(payload, '$.consumed_at'), '') = '' "
                 "AND TRY_CAST(JSON_VALUE(payload, '$.expires_at') AS DATETIMEOFFSET) > SYSDATETIMEOFFSET() "
                 "THEN 0 ELSE 1 END, "
-                "TRY_CAST(JSON_VALUE(payload, '$.requested_at') AS DATETIMEOFFSET) DESC, request_id DESC"
+                "TRY_CAST(JSON_VALUE(payload, '$.requested_at') AS DATETIMEOFFSET) DESC, request_id DESC",
             )
         ]
 

@@ -600,7 +600,15 @@ class MemoryMonitoringAdapter(MonitoringAdapter):
             return None
         if producer.topic != "connector":
             raise MonitoringConflict("The requested producer handoff is not a connector observation")
-        return self.engine._connector_observation_result(context, request_id)
+        result = self.engine._connector_observation_result(context, request_id)
+        connector = self.engine._get("connector", result.connector_id, context, m.OwnedConnectorManifest)
+        if (
+            connector is None or result.observation.revision != connector.revision
+            or result.observation.ownership_id != connector.ownership_id
+            or result.observation.policy_revision != connector.policy_revision
+        ):
+            raise MonitoringUnavailable("Original connector observation cannot be reconstructed from a changed baseline")
+        return result
 
     def connector_publication(self, request: m.ConnectorPublicationRequest) -> m.ConnectorPublicationResult:
         def apply():
@@ -754,15 +762,23 @@ class MemoryMonitoringAdapter(MonitoringAdapter):
         )
 
     def reconcile_connector_observation(self, producer: m.ReconciliationRequest, connector: m.OwnedConnectorManifest, control: m.DeploymentControl) -> Rejection | None:
-        observed = self.engine._get("connector_observation", producer.request_id, control, m.OwnedConnectorManifest)
-        if (
-            observed is not None and observed.observed_definition is not None
-            and observed.state in {"provisioning", "ready", "degraded"}
-            and (connector.source_proposals or connector.source_removals) and self.engine.component != "fixture"
-        ):
+        if self.engine.component != "fixture":
             stale = self.engine._stale_presence_evidence(producer, connector, control)
             if stale is not None:
                 return stale
+        observed = self.engine._get("connector_observation", producer.request_id, control, m.OwnedConnectorManifest)
+        if (
+            observed is None or observed.connector_id != connector.connector_id
+            or observed.ownership_id != connector.ownership_id
+            or observed.policy_revision != control.revision
+            or observed.revision != connector.revision
+        ):
+            raise MonitoringUnavailable("Original connector observation cannot be reconstructed from a changed baseline")
+        if (
+            observed.observed_definition is not None
+            and observed.state in {"provisioning", "ready", "degraded"}
+            and (connector.source_proposals or connector.source_removals) and self.engine.component != "fixture"
+        ):
             work = self.engine._get("work", producer.work_id, control, m.MonitoringWork)
             frontier = self.engine._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
             rejected, result = self.engine._bind_connector_evidence(
@@ -779,7 +795,7 @@ class MemoryMonitoringAdapter(MonitoringAdapter):
                 raise MonitoringUnavailable("Connector binding did not return its original publication result")
             self.engine._publish_connector(result.connector, control)
             return None
-        if observed is not None and observed.state == "ready" and self.engine.component != "fixture":
+        if observed.state == "ready" and self.engine.component != "fixture":
             work = self.engine._get("work", producer.work_id, control, m.MonitoringWork)
             frontier = self.engine._get("validation_frontier", producer.frontier_key, control, m.ValidationFrontier)
             result = self.engine._connector_publication(m.ConnectorPublicationRequest(
@@ -811,7 +827,7 @@ class MemoryMonitoringAdapter(MonitoringAdapter):
         acknowledgement then failed guard 51072 for lacking that prefix.
         """
         observed = self.engine._get("connector_observation", producer.request_id, control, m.OwnedConnectorManifest)
-        return observed is not None and observed.revision != connector.revision
+        return observed is not None and 0 < observed.revision < connector.revision
 
     def commit_review_intent(self, control: m.DeploymentControl, pending: m.SafetyReview, expected_review_revision: int) -> tuple[m.DeploymentControl, m.SafetyReview]:
         updated = _update(control, revision=control.revision + 1, updated_at=self.engine._now())

@@ -204,8 +204,8 @@ def test_an_overtaken_handoff_is_rejected_and_requeued_on_both_backends(backend)
     """
     existing = scoped_connector(backend, database_type=SupersessionProtocolDatabase)
     h, db, _, controller, worker, owned = existing
-    _, controller, worker, owned, pending, collection, _, request = recovery_case(
-        backend, existing=existing,
+    _, controller, worker, owned, pending, collection, observed, request = recovery_case(
+        backend, existing=existing, finish_inspection=False,
     )
     if db:
         db.principal = "controller"
@@ -216,22 +216,68 @@ def test_an_overtaken_handoff_is_rejected_and_requeued_on_both_backends(backend)
         )
         connector = controller._get("connector", owned.connector_id, h.version, m.OwnedConnectorManifest)
         overtaken = connector.model_copy(update={"revision": connector.revision + 3})
+        future = connector.model_copy(update={"revision": max(1, connector.revision - 1)})
         return (
             controller._connector_observation_overtaken(producer, overtaken, h.version),
             controller._connector_observation_overtaken(producer, connector, h.version),
+            controller._connector_observation_overtaken(producer, future, h.version),
         )
 
     if db is None:
-        moved, unchanged = inspect()
+        moved, unchanged, regressed = inspect()
     else:
         # The SQL adapter reads through restricted views, which refuse any
         # statement outside an owned transaction.
         with controller._sql.transaction(write=False, operation="inspect", request_id=h.next_id()):
-            moved, unchanged = inspect()
+            moved, unchanged, regressed = inspect()
 
     assert moved is True
     # The unchanged connector is not overtaken, so a healthy handoff still publishes.
     assert unchanged is False
+    assert regressed is False
+
+    h.clock.advance(1)
+    if db:
+        db.principal = "worker"
+    newer = m.OwnedConnectorManifest.model_validate({
+        **observed.model_dump(), "revision": observed.revision + 1, "updated_at": h.clock(),
+    })
+    newer_inspection = m.ConnectorPresenceInspection(
+        read_only=True, observed_at=h.clock(),
+        definition_hash=m.connector_definition_hash(newer.observed_definition),
+        component_states={
+            physical_id: "Running"
+            for physical_id in newer.observed_definition["component_ids"].values()
+        },
+    )
+    worker.record_connector(
+        h.version, newer, expected_connector_revision=observed.revision,
+        commit=m.CollectionCommit(
+            work_id=collection.work_id, lease=collection.lease,
+            expected_work_revision=collection.revision,
+        ),
+        inspection=newer_inspection,
+    )
+    worker.complete_collection_work(
+        h.version, work_id=collection.work_id, lease=collection.lease,
+        expected_work_revision=collection.revision,
+    )
+    if db:
+        db.principal = "controller"
+    work = controller.get_work(h.version, request.work_id)
+    outcome = reconcile_monitoring_work(controller, work)
+    assert outcome.state in {"rejected", "pending_validation"}
+    reobserve_id = stable_id(h.version, f"connector-reobserve:{request.observation_receipt_id}")
+    followup = controller.get_work(h.version, reobserve_id)
+    assert followup is not None and followup.kind == "connector_reconcile" and followup.state == "queued"
+    assert followup.work_id != collection.work_id
+    current = next(
+        item for item in controller.list_connectors(m.PageQuery(**h.context())).items
+        if item.connector_id == owned.connector_id
+    )
+    assert current.source_removals == pending.pending_removals
+    assert current.sources == owned.sources
+    assert controller.get_connector_publication(h.version, pending.pending_removals[0].request_id) == pending
 
 
 def test_memory_supersession_preserves_original_removal_and_physical_identity():

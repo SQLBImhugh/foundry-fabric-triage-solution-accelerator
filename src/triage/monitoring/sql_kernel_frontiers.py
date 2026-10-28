@@ -268,7 +268,7 @@ JOIN {receipts} AS root ON root.tenant_id=f.tenant_id AND root.epoch=f.epoch
   AND TRY_CONVERT(bigint,JSON_VALUE(root.payload,'$.result.validated_revision'))=fc.sequence_number
   AND TRY_CONVERT(bigint,JSON_VALUE(root.payload,'$.result.work_fence'))>0
 JOIN {records} AS root_handoff ON root_handoff.tenant_id=f.tenant_id AND root_handoff.epoch=f.epoch
-  AND root_handoff.record_kind='validation_handoff' AND root_handoff.parent_key=f.full_key
+  AND root_handoff.record_kind='validation_handoff' AND root_handoff.parent_hash=f.key_hash AND root_handoff.parent_key=f.full_key
   AND root_handoff.sequence_number=TRY_CONVERT(bigint,JSON_VALUE(root.payload,'$.result.handoff_revision'))
   AND root_handoff.sequence_number BETWEEN 1 AND fc.sequence_number
   AND JSON_VALUE(root_handoff.payload,'$.requires_window')='false'
@@ -288,7 +288,7 @@ WHERE f.tenant_id=@tenant_id AND f.epoch=@epoch AND f.record_kind='validation_fr
       AND w.record_kind='validation_window' AND w.full_key=f.full_key AND w.key_hash=f.key_hash)
   AND (SELECT COUNT_BIG(*) FROM {records} AS prefix
       WHERE prefix.tenant_id=f.tenant_id AND prefix.epoch=f.epoch
-        AND prefix.record_kind='validation_handoff' AND prefix.parent_key=f.full_key
+        AND prefix.record_kind='validation_handoff' AND prefix.parent_hash=f.key_hash AND prefix.parent_key=f.full_key
         AND prefix.sequence_number BETWEEN 1 AND fc.sequence_number
         AND prefix.status IN ('published','rejected')
         AND JSON_VALUE(prefix.payload,'$.requires_window')='false'
@@ -411,6 +411,7 @@ IF @stored_work_revision<>@work_revision OR @stored_work_status<>'leased'
 DECLARE @producer_request_id nvarchar(256)=JSON_VALUE(@stored_work,'$.reconcile_request_id'),
     @producer varchar(16)=JSON_VALUE(@stored_work,'$.reconcile_producer'),@handoff nvarchar(max),
     @handoff_key nvarchar(1024),@handoff_state varchar(40),@producer_request nvarchar(max),
+    @producer_receipt nvarchar(max),@evidence_parent nvarchar(1024),
     @frontier_key nvarchar(1024),@handoff_revision bigint,@frontier nvarchar(max),
     @accepted bigint,@validated bigint,@window nvarchar(max),@proof nvarchar(max),
     @decision varchar(24),@window_decision varchar(24),@can_close bit=0,
@@ -421,24 +422,32 @@ DECLARE @producer_request_id nvarchar(256)=JSON_VALUE(@stored_work,'$.reconcile_
     @frontier_resolution_request_id nvarchar(256),@frontier_resolution_revision bigint,
     @window_rejection_request_id nvarchar(256),@window_resolution_request_id nvarchar(256),
     @window_resolution_state varchar(24);
+SELECT @producer_request=payload FROM {records}
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind=@producer+'_reconcile_request'
+  AND full_key=@producer_request_id AND key_hash={key_hash('@producer_request_id')};
 SELECT @handoff=payload,@handoff_key=full_key,@handoff_state=status,
     @frontier_key=parent_key,@handoff_revision=sequence_number FROM {records}
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_handoff'
+  AND parent_hash={key_hash("JSON_VALUE(@producer_request,'$.frontier_key')")}
+  AND parent_key=JSON_VALUE(@producer_request,'$.frontier_key')
+  AND sequence_number=TRY_CONVERT(bigint,JSON_VALUE(@producer_request,'$.frontier_revision'))
   AND JSON_VALUE(payload,'$.producer_request_id')=@producer_request_id
   AND JSON_VALUE(payload,'$.producer')=@producer AND JSON_VALUE(payload,'$.work_id')=@work_id;
-SELECT @producer_request=payload FROM {records}
-WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind=@producer+'_reconcile_request'
-  AND full_key=@producer_request_id;
-IF @handoff IS NULL OR @producer_request IS NULL
+SELECT @producer_receipt=payload FROM {receipts}
+WHERE tenant_id=@tenant_id AND epoch=@epoch
+  AND operation=JSON_VALUE(@handoff,'$.producer_operation')
+  AND request_id=@producer_request_id AND request_hash={key_hash("@producer_request_id")}
+  AND fingerprint=JSON_VALUE(@handoff,'$.producer_fingerprint')
+  AND JSON_VALUE(payload,'$.binding_hash')=JSON_VALUE(@handoff,'$.producer_binding_hash');
+IF @handoff IS NULL OR @producer_request IS NULL OR @producer_receipt IS NULL
    OR COALESCE(JSON_VALUE(@producer_request,'$.work_id'),'')<>@work_id
    OR COALESCE(JSON_VALUE(@producer_request,'$.frontier_key'),'')<>@frontier_key
    OR COALESCE(JSON_VALUE(@producer_request,'$.fingerprint'),'')
       <>COALESCE(JSON_VALUE(@handoff,'$.producer_fingerprint'),'')
-   OR NOT EXISTS (SELECT 1 FROM {receipts} WHERE tenant_id=@tenant_id AND epoch=@epoch
-       AND operation=JSON_VALUE(@handoff,'$.producer_operation') AND request_id=@producer_request_id AND request_hash={key_hash("@producer_request_id")}
-       AND fingerprint=JSON_VALUE(@handoff,'$.producer_fingerprint')
-       AND JSON_VALUE(payload,'$.binding_hash')=JSON_VALUE(@handoff,'$.producer_binding_hash'))
     THROW 51072, 'Reconciliation lost its immutable intent/evidence/receipt binding', 1;
+SET @evidence_parent=COALESCE(
+    JSON_VALUE(@producer_receipt,'$.result.partition_key'),
+    JSON_VALUE(@producer_request,'$.reference_id'));
 SELECT @frontier=payload,@accepted=sequence_number FROM {records} WITH (UPDLOCK,HOLDLOCK)
 WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_frontier' AND full_key=@frontier_key AND key_hash={key_hash('@frontier_key')};
 SET @validated=TRY_CONVERT(bigint,JSON_VALUE(@frontier,'$.validated_revision'));
@@ -532,7 +541,8 @@ BEGIN
     SET @whole_window_rejection=1;
     IF (SELECT COUNT_BIG(*) FROM {records} AS accepted_handoff
         WHERE accepted_handoff.tenant_id=@tenant_id AND accepted_handoff.epoch=@epoch
-          AND accepted_handoff.record_kind='validation_handoff' AND accepted_handoff.parent_key=@frontier_key
+          AND accepted_handoff.record_kind='validation_handoff'
+          AND accepted_handoff.parent_hash={key_hash('@frontier_key')} AND accepted_handoff.parent_key=@frontier_key
           AND accepted_handoff.sequence_number BETWEEN 1 AND @accepted
           AND EXISTS (SELECT 1 FROM {receipts} AS original_receipt
               WHERE original_receipt.tenant_id=@tenant_id AND original_receipt.epoch=@epoch
@@ -553,6 +563,7 @@ IF {page_publication_required_sql()} AND (
        AND fact.full_key=JSON_VALUE(binding.payload,'$.fact_key')
        AND fact.key_hash={key_hash("JSON_VALUE(binding.payload,'$.fact_key')")}
         WHERE binding.tenant_id=@tenant_id AND binding.epoch=@epoch AND binding.record_kind='accepted_fact'
+          AND binding.parent_hash={key_hash('@evidence_parent')} AND binding.parent_key=@evidence_parent
           AND JSON_VALUE(binding.payload,'$.batch_id')=@producer_request_id
           AND (fact.full_key IS NULL
                OR COALESCE(TRY_CONVERT(bigint,JSON_VALUE(binding.payload,'$.fact_revision')),-1)<>fact.revision
@@ -565,6 +576,7 @@ IF {page_publication_required_sql()} AND @producer='web' AND NOT EXISTS (
             WHEN 'scope' THEN 'scope' WHEN 'review' THEN 'review_request'
             WHEN 'discovery' THEN 'discovery_request' END
       AND full_key=JSON_VALUE(@producer_request,'$.reference_id')
+      AND key_hash={key_hash("JSON_VALUE(@producer_request,'$.reference_id')")}
       AND JSON_VALUE(payload,'$.request_id')=@producer_request_id)
     THROW 51072, 'Producer intent changed before publication; its original binding must be rejected', 1;
 IF {handoff_decision_change_sql()}
@@ -578,7 +590,8 @@ WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_handoff'
 END;
 IF (SELECT COUNT_BIG(*) FROM {records}
     WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_handoff'
-      AND parent_key=@frontier_key AND sequence_number BETWEEN 1 AND @accepted
+      AND parent_hash={key_hash('@frontier_key')} AND parent_key=@frontier_key
+      AND sequence_number BETWEEN 1 AND @accepted
       AND status IN ('published','rejected'))=@accepted
     SET @all_resolved=1;
 SET @window_decision=@decision;

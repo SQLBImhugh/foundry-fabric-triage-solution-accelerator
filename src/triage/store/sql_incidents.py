@@ -14,7 +14,7 @@ from typing import Any
 
 from triage.models import Incident, TriageResult
 from triage.pipeline_models import PipelineFailure
-from triage.store.azure_sql import AzureSqlDatabase, SqlUnavailable, quote_identifier
+from triage.store.azure_sql import AzureSqlDatabase, SqlUnavailable, quote_identifier, read_rows
 from triage.store.incidents import InMemoryIncidentStore, _utcnow
 
 logger = logging.getLogger("triage.store.sql.incidents")
@@ -53,7 +53,7 @@ class AzureSqlIncidentStore(InMemoryIncidentStore):
             self._loaded = True
 
     def _load(self, where: str = "", *params: Any) -> None:
-        rows = self._db.query(f"SELECT payload FROM {self._table}{where}", *params)
+        rows = read_rows(self._db, f"SELECT payload FROM {self._table}{where}", *params)
         loaded: dict[str, Incident] = {}
         revisions: dict[str, bytes] = {}
         try:
