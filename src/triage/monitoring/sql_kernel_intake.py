@@ -387,7 +387,7 @@ WHERE p.tenant_id=@tenant_id AND p.epoch=@epoch AND p.record_kind='stream_positi
              AND accepted.record_kind='accepted_fact'
              AND accepted.accepted_fact_key_hash=fact.key_hash
              AND accepted.parent_hash={key_hash('@partition_key')} AND accepted.parent_key=@partition_key
-             AND JSON_VALUE(accepted.payload,'$.fact_kind')=fact.record_kind
+             AND fact.record_kind=CONVERT(varchar(40),JSON_VALUE(accepted.payload,'$.fact_kind'))
              AND JSON_VALUE(accepted.payload,'$.fact_key')=fact.full_key
              AND TRY_CONVERT(bigint,JSON_VALUE(accepted.payload,'$.fact_revision'))=fact.revision
             WHERE fact.tenant_id=@tenant_id AND fact.epoch=@epoch

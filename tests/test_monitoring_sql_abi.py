@@ -19,6 +19,7 @@ from triage.monitoring.contracts import (
     MonitoringCommitUncertain,
     MonitoringConflict,
 )
+from triage.monitoring.events import ReceiverHeartbeat
 from triage.monitoring.memory import StoredRecord, key_digest, stable_id
 from triage.monitoring.rate_limit import RatePolicy
 from triage.monitoring.sql_kernel_contracts import (
@@ -41,6 +42,8 @@ from triage.monitoring.sql_kernel_frontiers import (
 from triage.monitoring.sql_kernel_inventory_retention import (
     inventory_passes_sql,
     inventory_retirement_eligible_sql,
+    superseded_binding_predicate_sql,
+    superseded_fact_keys_sql,
 )
 from triage.monitoring.sql_kernel_work import (
     connector_collection_completion_sql,
@@ -346,11 +349,12 @@ class AbiDatabase(KernelProtocolDatabase):
             records, receipts = self.names.table("monitoring_records"), self.names.table("monitoring_receipts")
             connection.execute(f"CREATE TABLE {records} "
                                "(tenant_id,epoch,record_kind,full_key,revision,status,parent_key,sequence_number,payload,key_hash,"
-                               "parent_hash)")
-            connection.executemany(f"INSERT INTO {records} VALUES (?,?,?,?,?,?,?,?,?,?,?)", [
+                               "parent_hash,accepted_fact_key_hash)")
+            connection.executemany(f"INSERT INTO {records} VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
                 (row.context.tenant_id, row.context.epoch, row.kind, row.key, row.version, row.status,
                  row.parent_key, row.sequence_number, row.payload, bytes.fromhex(key_digest(row.key)),
-                 bytes.fromhex(key_digest(row.parent_key)) if row.parent_key else None)
+                 bytes.fromhex(key_digest(row.parent_key)) if row.parent_key else None,
+                 bytes.fromhex(key_digest(json.loads(row.payload)["fact_key"])) if row.kind == "accepted_fact" else None)
                 for row in self.records.values()
             ])
             connection.execute(f"CREATE TABLE {receipts} "
@@ -553,7 +557,7 @@ class AbiDatabase(KernelProtocolDatabase):
         if operation == "controller.retire_inventory":
             return self._retire_inventory(args)
         if operation not in {
-            "worker.accept_facts", "web.commit_intent", "worker.transition_work",
+            "worker.accept_facts", "worker.record_heartbeat", "web.commit_intent", "worker.transition_work",
             "controller.resolve_frontier", "controller.transition_work",
             "controller.publish_source", "controller.disposition_source",
         }:
@@ -567,10 +571,37 @@ class AbiDatabase(KernelProtocolDatabase):
             return {"kernel_version": KERNEL_VERSION, "operation": operation, "status": "replayed", "affected_rows": 0,
                     "result": prior["payload"]["result"]}
         if args["expected_revision"] != self.control.revision and operation not in {
-            "controller.transition_work", "controller.publish_source", "controller.disposition_source",
+            "worker.record_heartbeat", "controller.transition_work",
+            "controller.publish_source", "controller.disposition_source",
         }:
             raise RuntimeError("Current policy changed (51072)")
-        if operation == "worker.accept_facts":
+        if operation == "worker.record_heartbeat":
+            if args["connector_id"] is not None and ("connector", args["connector_id"]) not in self.records:
+                raise RuntimeError("Heartbeat requires an owned connector (51072)")
+            state = "blocked" if self.control.maintenance and args["state"] == "running" else args["state"]
+            heartbeat = ReceiverHeartbeat(
+                tenant_id=args["tenant_id"], epoch=args["epoch"],
+                worker_id=args["worker_id"], connector_id=args["connector_id"],
+                observed_at=self.clock(), state=state,
+                transport_connected=args["transport_connected"],
+                accepted_positions=args["accepted_positions"],
+                error_code=args["error_code"],
+                last_delivery_at=(
+                    args["last_delivery_at"].replace(tzinfo=UTC) if args["last_delivery_at"] else None
+                ),
+                last_maintenance_at=(
+                    args["last_maintenance_at"].replace(tzinfo=UTC) if args["last_maintenance_at"] else None
+                ),
+            )
+            result = heartbeat.model_dump(mode="json")
+            key = f"{args['connector_id'] or 'collector'}:{args['worker_id']}"
+            row = self.native_put("receiver_heartbeat", key, result, status=state, parent_key=args["connector_id"])
+            self.native_put("accepted_fact", f"accepted:{args['request_id']}:heartbeat", {
+                "batch_id": args["request_id"], "batch_fingerprint": args["fingerprint"],
+                "fact_kind": "receiver_heartbeat", "fact_key": key,
+                "fact_revision": row.version, "row_hash": self.row_hash(row),
+            }, parent_key=args["connector_id"])
+        elif operation == "worker.accept_facts":
             work = m.MonitoringWork.model_validate_json(self.records[("work", args["work_id"])].payload)
             if work.state != "leased" or work.revision != args["work_revision"] or (
                 work.lease.owner_id != args["owner_id"] or work.lease.fence != args["fence"]
@@ -646,7 +677,7 @@ class AbiDatabase(KernelProtocolDatabase):
             }):
                 raise RuntimeError("Collection has no original accepted batch (51072)")
             if operation == "controller.transition_work" and args["transition"] == "complete" and not self.native_rows(
-                reconciliation_completion_sql(self.names), args,
+                reconciliation_completion_sql(self.names), {**args, "stored_work": work.model_dump_json()},
             ):
                 raise RuntimeError("Reconciliation has no terminal guarded result (51072)")
             if args["transition"] == "retry" and args["retry_at"] is None:
@@ -771,6 +802,21 @@ class AbiDatabase(KernelProtocolDatabase):
             if row.kind == "accepted_fact"
             and (json.loads(row.payload)["fact_kind"], json.loads(row.payload)["fact_key"]) in facts
         ] + [self.records.pop(fact) for fact in sorted(facts)]
+        binding_budget = max(0, m.INVENTORY_RETIREMENT_SIGHTINGS - sum(row.kind == "accepted_fact" for row in deleted))
+        if binding_budget:
+            records = self.names.table("monitoring_records")
+            superseded_keys = [
+                row["full_key"] for row in self.native_rows(
+                    f"WITH keys AS ({superseded_fact_keys_sql(self.names)}) "
+                    f"SELECT b.full_key FROM keys AS k JOIN {records} AS b "
+                    "ON b.tenant_id=@tenant_id AND b.epoch=@epoch AND b.record_kind='accepted_fact' "
+                    "AND b.accepted_fact_key_hash=k.key_hash "
+                    f"WHERE {superseded_binding_predicate_sql(self.names, key_alias='k', binding_alias='b')} "
+                    "ORDER BY k.record_kind, k.key_hash, b.key_hash LIMIT @binding_budget",
+                    {**self.context.model_dump(), "binding_budget": binding_budget},
+                )
+            ]
+            deleted.extend(self.records.pop(("accepted_fact", key)) for key in superseded_keys)
         for kind in sorted({row.kind for row in deleted}):
             rows = [row for row in deleted if row.kind == kind]
             prior_row = self.records.get(("record_retirement", kind))

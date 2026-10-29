@@ -87,9 +87,14 @@ def _key_digest(value):
 
 def key_digest_sql(statement: str) -> str:
     """SQLite form of the kernel's key_hash() seek predicates: the UTF-8 digest of their text."""
-    return re.sub(
+    statement = re.sub(
         r"HASHBYTES\('SHA2_256', CONVERT\(varchar\(max\), \((.+?)\) COLLATE Latin1_General_100_BIN2_UTF8\)\)",
         r"KEY_DIGEST(\1)", statement,
+    )
+    return re.sub(
+        r"CONVERT\(varchar\(40\),\s*((?:JSON_VALUE\([^)]*\)|@\w+)(?:\s*\+\s*N?'_reconcile_request')?)\)",
+        lambda m: m.group(1).replace("+N'", "||'").replace("+'", "||'"),
+        statement,
     )
 
 

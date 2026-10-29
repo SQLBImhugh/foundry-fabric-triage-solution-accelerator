@@ -25,6 +25,12 @@ SIGHTING_KINDS = ("workspace_seen", "inventory_seen", "domain_seen")
 #: Catalogue records that name the pass which last saw them. A deleted item
 #: names the complete pass that established its deletion.
 REFERENCE_KINDS = ("inventory", "workspace", "domain")
+#: Mutable facts whose earlier accepted_fact bindings are superseded once the
+#: fact's revision has advanced and the batch's frontier is no longer pending.
+SUPERSEDED_FACT_KINDS = (
+    "receiver_heartbeat", "poll_progress", "poll_schedule",
+    "capability", "inventory", "workspace", "domain",
+)
 OPEN_WINDOW_STATES = ("collecting", "awaiting_validation")
 
 
@@ -91,6 +97,40 @@ AND NOT EXISTS (
     WHERE v.tenant_id=@tenant_id AND v.epoch=@epoch AND v.record_kind='validation_window'
       AND v.parent_hash={key_hash} AND v.parent_key={generation}
       AND v.status IN ({varchar_literals(OPEN_WINDOW_STATES)}))"""
+
+
+def superseded_fact_keys_sql(names: SqlNames) -> str:
+    """Mutable facts at revision > 1 that still have more than one accepted_fact binding."""
+    records = names.table("monitoring_records")
+    return f"""SELECT r.record_kind,r.key_hash,r.full_key,r.revision
+FROM {records} AS r
+WHERE r.tenant_id=@tenant_id AND r.epoch=@epoch
+  AND r.record_kind IN ({varchar_literals(SUPERSEDED_FACT_KINDS)})
+  AND r.revision>1
+  AND (
+      SELECT COUNT(*) FROM {records} AS b
+      WHERE b.tenant_id=@tenant_id AND b.epoch=@epoch AND b.record_kind='accepted_fact'
+        AND b.accepted_fact_key_hash=r.key_hash
+  )>1"""
+
+
+def superseded_binding_predicate_sql(
+    names: SqlNames, *, key_alias: str = "k", binding_alias: str = "b",
+) -> str:
+    """True when a binding for ``key_alias`` is strictly older and its frontier is not pending."""
+    records = names.table("monitoring_records")
+    return f"""JSON_VALUE({binding_alias}.payload,'$.fact_kind')={key_alias}.record_kind
+  AND JSON_VALUE({binding_alias}.payload,'$.fact_key') COLLATE Latin1_General_100_BIN2={key_alias}.full_key
+  AND TRY_CONVERT(bigint,JSON_VALUE({binding_alias}.payload,'$.fact_revision'))<{key_alias}.revision
+  AND ({key_alias}.record_kind='receiver_heartbeat' OR NOT EXISTS (
+      SELECT 1 FROM {records} AS req JOIN {records} AS vf
+        ON vf.tenant_id=req.tenant_id AND vf.epoch=req.epoch AND vf.record_kind='validation_frontier'
+       AND vf.key_hash={key_hash("JSON_VALUE(req.payload,'$.frontier_key')")}
+       AND vf.full_key=JSON_VALUE(req.payload,'$.frontier_key')
+       AND vf.status='pending_validation'
+      WHERE req.tenant_id=@tenant_id AND req.epoch=@epoch AND req.record_kind='worker_reconcile_request'
+        AND req.key_hash={key_hash(f"JSON_VALUE({binding_alias}.payload,'$.batch_id')")}
+        AND req.full_key=JSON_VALUE({binding_alias}.payload,'$.batch_id')))"""
 
 
 def _id_array(relation: str, alias: str, where: str = "") -> str:
@@ -190,6 +230,28 @@ FROM {records} AS d JOIN @facts AS f
 IF (SELECT COUNT(*) FROM @deleted WHERE record_kind='generation')<>(SELECT COUNT(*) FROM @retired)
    OR (SELECT COUNT(*) FROM @deleted WHERE record_kind IN ({sightings}))<>@selected_sightings
     THROW 51072, 'A retired inventory pass changed during retirement', 1;
+-- Superseded accepted_fact bindings for mutable facts are retired up to the
+-- remaining sighting budget once their batch's frontier is no longer pending.
+DECLARE @binding_budget int={m.INVENTORY_RETIREMENT_SIGHTINGS}-(SELECT COUNT(*) FROM @deleted WHERE record_kind='accepted_fact');
+IF @binding_budget>0
+BEGIN
+    DECLARE @keys TABLE (record_kind varchar(40) COLLATE DATABASE_DEFAULT NOT NULL, key_hash binary(32) NOT NULL,
+        full_key nvarchar(1024) COLLATE DATABASE_DEFAULT NOT NULL, revision bigint NOT NULL,
+        PRIMARY KEY (record_kind,key_hash));
+    INSERT INTO @keys (record_kind,key_hash,full_key,revision)
+    {superseded_fact_keys_sql(names)};
+    DECLARE @cand TABLE (id int IDENTITY(1,1) PRIMARY KEY, key_hash binary(32) NOT NULL);
+    INSERT INTO @cand (key_hash)
+    SELECT TOP (@binding_budget) b.key_hash
+    FROM @keys AS k JOIN {records} AS b
+      ON b.tenant_id=@tenant_id AND b.epoch=@epoch AND b.record_kind='accepted_fact'
+     AND b.accepted_fact_key_hash=k.key_hash
+    WHERE {superseded_binding_predicate_sql(names, key_alias='k', binding_alias='b')};
+    DELETE b OUTPUT deleted.record_kind,deleted.revision INTO @deleted
+    FROM {records} AS b JOIN @cand AS s
+      ON b.tenant_id=@tenant_id AND b.epoch=@epoch AND b.record_kind='accepted_fact'
+     AND b.key_hash=s.key_hash;
+END;
 -- Each deleted row adds its revisions plus one to its kind's offset, so a
 -- change counter (live revisions plus offset) rises instead of repeating.
 DECLARE @retirement TABLE (record_kind varchar(40) COLLATE DATABASE_DEFAULT NOT NULL PRIMARY KEY, retired_rows bigint NOT NULL,

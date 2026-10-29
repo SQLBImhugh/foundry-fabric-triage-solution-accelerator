@@ -275,7 +275,7 @@ IF NOT EXISTS (SELECT 1 FROM {records} AS h JOIN {records} AS f
       AND h.parent_key=JSON_VALUE(@plan,'$.frontier_key')
       AND f.sequence_number=TRY_CONVERT(bigint,JSON_VALUE(@plan,'$.frontier_revision'))
       AND EXISTS (SELECT 1 FROM {receipts} AS r WHERE r.tenant_id=@tenant_id AND r.epoch=@epoch
-          AND r.operation=JSON_VALUE(h.payload,'$.producer_operation')
+          AND r.operation=CONVERT(varchar(40),JSON_VALUE(h.payload,'$.producer_operation'))
           AND r.request_id=JSON_VALUE(h.payload,'$.producer_request_id') AND r.request_hash={key_hash("JSON_VALUE(h.payload,'$.producer_request_id')")}
           AND r.fingerprint=JSON_VALUE(h.payload,'$.producer_fingerprint')
           AND JSON_VALUE(r.payload,'$.binding_hash')=JSON_VALUE(h.payload,'$.producer_binding_hash')))

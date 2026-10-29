@@ -975,12 +975,17 @@ class MemoryMonitoringAdapter(MonitoringAdapter):
                 generation_id for generation_id in candidates
                 if engine._inventory_pass_retirable(control, generation_id, generations, now)
             ]
+            sighting_kinds = ("workspace_seen", "inventory_seen", "domain_seen")
+            superseded_kinds = (
+                "receiver_heartbeat", "poll_progress", "poll_schedule",
+                "capability", "inventory", "workspace", "domain",
+            )
             budget = m.INVENTORY_RETIREMENT_SIGHTINGS
             deleted: dict[str, list[StoredRecord]] = {}
             retired: list[str] = []
             for generation_id in eligible:
                 sightings = sorted((
-                    row for kind in ("workspace_seen", "inventory_seen", "domain_seen")
+                    row for kind in sighting_kinds
                     for row in backend.scan(kind, control, limit=len(backend.state.records), filters={"parent_key": generation_id})
                 ), key=lambda row: (row.kind, key_digest(row.key)))
                 for row in sightings[:budget]:
@@ -991,6 +996,44 @@ class MemoryMonitoringAdapter(MonitoringAdapter):
                     deleted.setdefault("generation", []).append(backend.delete("generation", generation_id, control))
                     retired.append(generation_id)
                 budget -= min(budget, len(sightings))
+            retired_facts = {(row.kind, row.key) for rows in deleted.values() for row in rows}
+            if retired_facts:
+                for row in backend.scan("accepted_fact", control, limit=len(backend.state.records)):
+                    payload = json.loads(row.payload)
+                    if (payload.get("fact_kind"), payload.get("fact_key")) in retired_facts:
+                        deleted.setdefault("accepted_fact", []).append(backend.delete("accepted_fact", row.key, control))
+            binding_budget = max(0, m.INVENTORY_RETIREMENT_SIGHTINGS - len(deleted.get("accepted_fact", ())))
+            if binding_budget:
+                bindings = backend.scan("accepted_fact", control, limit=len(backend.state.records))
+                counts = Counter(key_digest(json.loads(row.payload)["fact_key"]) for row in bindings)
+                keys = [
+                    row for kind in superseded_kinds
+                    for row in backend.scan(kind, control, limit=len(backend.state.records))
+                    if row.version > 1 and counts[key_digest(row.key)] > 1
+                ]
+                for target_row in keys:
+                    if binding_budget <= 0:
+                        break
+                    target_hash = key_digest(target_row.key)
+                    for row in bindings:
+                        if binding_budget <= 0:
+                            break
+                        payload = json.loads(row.payload)
+                        if (
+                            key_digest(payload["fact_key"]) != target_hash
+                            or payload["fact_kind"] != target_row.kind
+                            or payload["fact_key"] != target_row.key
+                            or int(payload["fact_revision"]) >= target_row.version
+                        ):
+                            continue
+                        if target_row.kind != "receiver_heartbeat":
+                            req = backend.get("worker_reconcile_request", payload["batch_id"], control)
+                            frontier_key = json.loads(req.payload)["frontier_key"] if req is not None else None
+                            vf = backend.get("validation_frontier", frontier_key, control) if frontier_key else None
+                            if vf is not None and vf.status in {"pending", "pending_validation"}:
+                                continue
+                        deleted.setdefault("accepted_fact", []).append(backend.delete("accepted_fact", row.key, control))
+                        binding_budget -= 1
             for kind, rows in sorted(deleted.items()):
                 prior = engine._get("record_retirement", kind, control, m.RecordRetirement)
                 offset = (prior.counter_offset if prior else 0) + sum(row.version + 1 for row in rows)
@@ -1003,7 +1046,8 @@ class MemoryMonitoringAdapter(MonitoringAdapter):
                 retain_after=now - m.INVENTORY_RETENTION, retired_generation_ids=tuple(sorted(retired)),
                 refused_generation_ids=tuple(sorted(set(candidates) - set(eligible))),
                 deferred_generation_ids=tuple(sorted(set(eligible) - set(retired))),
-                retired_sightings=sum(len(rows) for kind, rows in deleted.items() if kind != "generation"),
+                retired_sightings=sum(len(rows) for kind, rows in deleted.items() if kind in sighting_kinds),
+                retired_bindings=len(deleted.get("accepted_fact", ())),
             )
         return self.idempotent(
             "inventory_retirement", request.request_id, control, request, m.InventoryRetirementResult, apply,

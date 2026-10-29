@@ -121,14 +121,14 @@ BEGIN
          AND input_handoff.parent_hash={key_hash("JSON_VALUE(accepted_receipt.payload,'$.result.frontier_key')")}
          AND input_handoff.sequence_number=TRY_CONVERT(bigint,JSON_VALUE(accepted_receipt.payload,'$.result.frontier_revision'))
          AND JSON_VALUE(input_handoff.payload,'$.producer_request_id')=JSON_VALUE(binding.payload,'$.batch_id')
-         AND accepted_receipt.operation=JSON_VALUE(input_handoff.payload,'$.producer_operation')
+         AND accepted_receipt.operation=CONVERT(varchar(40),JSON_VALUE(input_handoff.payload,'$.producer_operation'))
           JOIN {records} AS own_handoff ON own_handoff.tenant_id=input_handoff.tenant_id
          AND own_handoff.epoch=input_handoff.epoch AND own_handoff.record_kind='validation_handoff'
          AND own_handoff.parent_key=input_handoff.parent_key AND own_handoff.parent_hash=input_handoff.parent_hash
          AND JSON_VALUE(own_handoff.payload,'$.work_id')=@work_id
           WHERE binding.tenant_id=raw.tenant_id AND binding.epoch=raw.epoch AND binding.record_kind='accepted_fact'
             AND binding.accepted_fact_key_hash=raw.key_hash
-            AND JSON_VALUE(binding.payload,'$.fact_kind')=raw.record_kind
+            AND raw.record_kind=CONVERT(varchar(40),JSON_VALUE(binding.payload,'$.fact_kind'))
             AND JSON_VALUE(binding.payload,'$.fact_key')=raw.full_key
             AND TRY_CONVERT(bigint,JSON_VALUE(binding.payload,'$.fact_revision'))=raw.revision
             AND JSON_VALUE(binding.payload,'$.row_hash')={record_hash('raw')}

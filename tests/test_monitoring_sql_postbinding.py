@@ -258,7 +258,9 @@ def test_published_window_sibling_ack_is_published_not_rejection(db, sibling_cas
     db.commit()
     authority = db.execute(_typed_query(closed_window_authority_sql(kernel.names)), params).fetchone()
     assert authority == ("A-window-rejection", "published")
-    preserved = db.execute(f"SELECT * FROM {records} WHERE record_kind<>'work' ORDER BY record_kind,full_key").fetchall()
+    preserved = db.execute(
+        f"SELECT * FROM {records} WHERE record_kind NOT IN ('work','reconcile_acceptance') ORDER BY record_kind,full_key",
+    ).fetchall()
     result = {
         "work_id": params["work_id"], "work_fence": params["fence"], "frontier_key": params["frontier_key"],
         "validated_revision": params["accepted"], "state": "published", "resolution_scope": "window_acknowledgement",
@@ -268,7 +270,9 @@ def test_published_window_sibling_ack_is_published_not_rejection(db, sibling_cas
     receipt("controller.resolve_frontier", "B-published-ack", result)
     db.commit()
     assert _transition(db, kernel, params, "complete", "B-completed")["state"] == "completed"
-    assert db.execute(f"SELECT * FROM {records} WHERE record_kind<>'work' ORDER BY record_kind,full_key").fetchall() == preserved
+    assert db.execute(
+        f"SELECT * FROM {records} WHERE record_kind NOT IN ('work','reconcile_acceptance') ORDER BY record_kind,full_key",
+    ).fetchall() == preserved
     assert db.execute(f"SELECT payload FROM {receipts} WHERE request_id='B-pending'").fetchone()[0].find("pending_validation")>=0
 
 

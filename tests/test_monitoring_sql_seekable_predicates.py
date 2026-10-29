@@ -163,3 +163,48 @@ def test_resolve_frontier_seeks_reconcile_request_handoff_and_evidence_bindings(
         if re.search(prefix + r"parent_key\s*=", window):
             assert re.search(prefix + r"parent_hash\s*=", window) or re.search(prefix + r"key_hash\s*=", window), _flat(window)
 
+
+def test_every_receipt_lookup_by_operation_uses_varchar_and_request_hash():
+    from triage.monitoring.sql_kernel_frontiers import (
+        nonwindow_handoff_authority_sql,
+        pending_window_handoff_authority_sql,
+    )
+    from triage.monitoring.sql_kernel_work import reconciliation_completion_sql
+
+    uncast_json = re.compile(
+        r"\b(?:WHERE|AND|OR|ON|WHEN)\s+(?:\w+\.)?(?:"
+        + "|".join(VARCHAR_COLUMNS)
+        + r")\s*(?:=|<>|(?:NOT\s+)?IN\s*\()\s*(?:JSON_VALUE\(|@\w+\s*\+)",
+        re.I,
+    )
+    offenders = [
+        (name, match.group(0)) for name, statement in _statements() for match in uncast_json.finditer(statement)
+    ]
+    assert offenders == []
+
+    for name, statement in _statements():
+        if RECEIPTS not in statement:
+            continue
+        for match in re.finditer(
+            r"(?:(\w+)\.)?operation\s*=\s*(?:'controller\.resolve_frontier'|CONVERT\(varchar\(40\),)",
+            statement,
+        ):
+            alias = match.group(1)
+            prefix = rf"\b{alias}\." if alias else r"(?<![\w.@])"
+            if alias:
+                assert re.search(prefix + r"request_id\s*=", statement), (name, alias, _flat(statement))
+            assert re.search(prefix + r"request_hash\s*=", statement), (name, alias, _flat(statement))
+
+    for helper in (pending_window_handoff_authority_sql, nonwindow_handoff_authority_sql):
+        sql = helper(KERNEL.names)
+        assert "acc.record_kind='reconcile_acceptance'" in sql
+        assert "acc.parent_hash=f.key_hash AND acc.parent_key=f.full_key" in sql
+        assert "original.request_id=acc.full_key AND original.request_hash=acc.key_hash" in sql
+
+    completion = reconciliation_completion_sql(KERNEL.names)
+    assert "req.record_kind=CONVERT(varchar(40),JSON_VALUE(@stored_work,'$.reconcile_producer')+'_reconcile_request')" in completion
+    assert "req.key_hash=" in completion
+    assert "acc.record_kind='reconcile_acceptance'" in completion
+    assert "resolution.request_id=acc.full_key AND resolution.request_hash=acc.key_hash" in completion
+
+

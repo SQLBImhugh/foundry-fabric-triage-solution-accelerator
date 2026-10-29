@@ -628,10 +628,8 @@ class InventoryRetirementResult(MonitoringContext):
         _unique(proposed, "Retired, refused and deferred passes")
         if len(proposed) > self.limit:
             raise ValueError("A retirement result cannot exceed its request limit")
-        if not (self.retired_generation_ids or self.deferred_generation_ids) and (
-            self.retired_sightings or self.retired_bindings
-        ):
-            raise ValueError("Sightings and bindings are retired only for an eligible pass")
+        if not (self.retired_generation_ids or self.deferred_generation_ids) and self.retired_sightings:
+            raise ValueError("Sightings are retired only for an eligible pass")
         if self.status == "maintenance" and (proposed or self.retired_sightings or self.retired_bindings or self.replayed):
             raise ValueError("Maintenance refuses retirement without deleting or recording anything")
         return self

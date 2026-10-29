@@ -101,6 +101,9 @@ def _nonwindow_case(db, case):
         "reconcile_producer": "worker", "reconcile_request_id": producer_id,
         "lease": {"owner_id": owner_id, "fence": 2},
     }
+    _insert_record(db, kernel, "worker_reconcile_request", producer_id, {
+        "request_id": producer_id, "work_id": work_id, "frontier_key": frontier_key, "frontier_revision": 1,
+    })
     _insert_record(db, kernel, "work", work_id, work, revision=7)
     db.execute(f"UPDATE {records} SET work_kind='reconcile_state' WHERE record_kind='work' AND full_key=?", (work_id,))
     leases = kernel.names.table("monitoring_leases")
@@ -131,6 +134,12 @@ def _nonwindow_case(db, case):
         "state": "published", "handoff_decision": "published", "resolution_scope": "handoff",
     }
     for request_id, result in ((_id(203), old_result), (_id(204), root_result)):
+        _insert_record(db, kernel, "reconcile_acceptance", request_id, result)
+        db.execute(
+            f"UPDATE {records} SET status=?,parent_key=?,parent_hash=KEY_DIGEST(?),sequence_number=4 "
+            "WHERE record_kind='reconcile_acceptance' AND full_key=?",
+            (result["state"], frontier_key, frontier_key, request_id),
+        )
         _save_receipt(db, kernel, "controller.resolve_frontier", _mutation_params(connector, request_id), result)
     db.execute("UPDATE dbo.control SET revision=2")
     db.commit()
@@ -234,7 +243,8 @@ def test_nonwindow_acknowledgement_finishes_current_work_without_mutating_origin
     if later_pending:
         _later_pending(db, kernel, params)
     records, receipts = kernel.names.table("monitoring_records"), kernel.names.table("monitoring_receipts")
-    protected = db.execute(f"SELECT * FROM {records} WHERE record_kind<>'work' ORDER BY record_kind,full_key").fetchall()
+    protected = db.execute(f"SELECT * FROM {records} WHERE record_kind NOT IN ('work','reconcile_acceptance') "
+                           "ORDER BY record_kind,full_key").fetchall()
     originals = db.execute(f"SELECT * FROM {receipts} ORDER BY operation,request_id").fetchall()
     control = db.execute("SELECT * FROM dbo.control").fetchall()
     result = _acknowledge_handoff(db, kernel, params, _id(240))

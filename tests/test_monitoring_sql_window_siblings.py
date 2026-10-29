@@ -76,6 +76,9 @@ def sibling_case(db):
            status="published", sequence=1, parent="window")
     record("validation_handoff", "B", {"policy_revision": 1, "work_id": "work-B", "producer_request_id": "input-B"},
            status="pending_validation", sequence=2, parent="window")
+    record("worker_reconcile_request", "input-B", {
+        "request_id": "input-B", "work_id": "work-B", "frontier_key": "window", "frontier_revision": 2,
+    }, status="pending", sequence=2, parent="window")
     record("validation_frontier", "unrelated", {"accepted_revision": 1, "validated_revision": 0},
            status="pending_validation", sequence=1)
     work_key = "work:v1:epoch:tenant:work-B"
@@ -94,6 +97,12 @@ def sibling_case(db):
     ))
 
     def receipt(operation, request_id, result, fingerprint="original"):
+        if operation == "controller.resolve_frontier":
+            record(
+                "reconcile_acceptance", request_id, result,
+                status=result.get("state"), sequence=result.get("frontier_revision"),
+                parent=result.get("frontier_key"),
+            )
         db.execute(f"INSERT INTO {receipts} VALUES (?,?,?,?,?,?)", (
             "tenant", "epoch", operation, request_id, fingerprint, _json({"result": result}),
         ))
@@ -118,8 +127,9 @@ def sibling_case(db):
     db.commit()
     params = {
         "tenant_id": "tenant", "epoch": "epoch", "work_id": "work-B", "work_key": work_key,
-        "owner_id": "owner-B", "fence": 9, "work_revision": 1, "frontier_key": "window",
-        "accepted": 2, "handoff_key": "B", "handoff_revision": 2, "producer_request_id": "input-B",
+        "owner_id": "owner-B", "fence": 9, "work_revision": 1, "stored_work": _json(work),
+        "frontier_key": "window", "accepted": 2, "handoff_key": "B", "handoff_revision": 2,
+        "producer_request_id": "input-B",
         "now": "2026-09-16T12:01:00Z", "new_expiry": "2026-09-16T12:01:00Z",
         "completed_at": "2026-09-16T12:01:00Z", "retry_at": None, "detail": "Window was durably rejected.",
     }
@@ -156,6 +166,10 @@ def _acknowledge(db, kernel, params, request_id):
             "handoff_decision": "pending_validation", "resolution_scope": "window_acknowledgement",
             "window_rejection_request_id": authority[0][0],
         }
+        db.execute(f"INSERT INTO {records} VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            params["tenant_id"], params["epoch"], "reconcile_acceptance", request_id, _digest(request_id), 1,
+            params["accepted"], "rejected", params["frontier_key"], None, None, None, _json(result),
+        ))
         db.execute(f"INSERT INTO {receipts} VALUES (?,?,?,?,?,?)", (
             params["tenant_id"], params["epoch"], "controller.resolve_frontier", request_id, "original",
             _json({"result": result}),
@@ -216,7 +230,9 @@ def _transition(db, kernel, original_params, transition, request_id):
 def test_two_handoffs_policy_advance_and_sibling_completion_use_actual_transition_path(db, sibling_case, transition, terminal):
     kernel, params, _ = sibling_case
     records = kernel.names.table("monitoring_records")
-    preserved = db.execute(f"SELECT * FROM {records} WHERE record_kind<>'work' ORDER BY record_kind,full_key").fetchall()
+    preserved = db.execute(
+        f"SELECT * FROM {records} WHERE record_kind NOT IN ('work','reconcile_acceptance') ORDER BY record_kind,full_key",
+    ).fetchall()
     control, actions = db.execute("SELECT * FROM dbo.control").fetchall(), db.execute("SELECT * FROM dbo.actions").fetchall()
     with pytest.raises(ValueError, match="terminal receipt"):
         _transition(db, kernel, params, transition, "before-ack")
@@ -229,7 +245,9 @@ def test_two_handoffs_policy_advance_and_sibling_completion_use_actual_transitio
     assert completed["revision"] == 2
     assert _transition(db, kernel, params, transition, "B-completion") == completed
     assert _acknowledge(db, kernel, params, "B-pending")["state"] == "pending_validation"
-    assert db.execute(f"SELECT * FROM {records} WHERE record_kind<>'work' ORDER BY record_kind,full_key").fetchall() == preserved
+    assert db.execute(
+        f"SELECT * FROM {records} WHERE record_kind NOT IN ('work','reconcile_acceptance') ORDER BY record_kind,full_key",
+    ).fetchall() == preserved
     assert db.execute("SELECT * FROM dbo.control").fetchall() == control
     assert db.execute("SELECT * FROM dbo.actions").fetchall() == actions
     assert db.execute(f"SELECT expires_at FROM {kernel.names.table('monitoring_leases')} "

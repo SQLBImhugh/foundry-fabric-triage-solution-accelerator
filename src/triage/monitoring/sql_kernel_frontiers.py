@@ -242,27 +242,34 @@ JOIN {records} AS own_handoff ON own_handoff.tenant_id=f.tenant_id AND own_hando
   AND JSON_VALUE(own_handoff.payload,'$.work_id')=@work_id
   AND JSON_VALUE(own_handoff.payload,'$.producer_request_id')=@producer_request_id
   AND TRY_CONVERT(bigint,JSON_VALUE(own_handoff.payload,'$.frontier_revision'))=@handoff_revision
+JOIN {records} AS acc ON acc.tenant_id=f.tenant_id AND acc.epoch=f.epoch
+  AND acc.record_kind='reconcile_acceptance' AND acc.parent_hash=f.key_hash AND acc.parent_key=f.full_key
+  AND acc.parent_hash IS NOT NULL
+  AND JSON_VALUE(acc.payload,'$.work_id')=@work_id
+  AND JSON_VALUE(acc.payload,'$.producer_request_id')=@producer_request_id
+  AND JSON_VALUE(acc.payload,'$.resolution_scope')='handoff'
 JOIN {receipts} AS original ON original.tenant_id=f.tenant_id AND original.epoch=f.epoch
   AND original.operation='controller.resolve_frontier'
+  AND original.request_id=acc.full_key AND original.request_hash=acc.key_hash
   AND JSON_VALUE(original.payload,'$.result.work_id')=@work_id
   AND JSON_VALUE(original.payload,'$.result.producer_request_id')=@producer_request_id
   AND JSON_VALUE(original.payload,'$.result.frontier_key')=f.full_key
   AND JSON_VALUE(original.payload,'$.result.resolution_scope')='handoff'
-  AND JSON_VALUE(original.payload,'$.result.handoff_decision')=own_handoff.status
-  AND JSON_VALUE(original.payload,'$.result.state') IN ('pending_validation',own_handoff.status)
+  AND own_handoff.status=CONVERT(varchar(40),JSON_VALUE(original.payload,'$.result.handoff_decision'))
+  AND CONVERT(varchar(40),JSON_VALUE(original.payload,'$.result.state')) IN ('pending_validation',own_handoff.status)
   AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.handoff_revision'))=@handoff_revision
   AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.work_fence')) BETWEEN 1 AND @fence
 JOIN {records} AS fc ON fc.tenant_id=f.tenant_id AND fc.epoch=f.epoch
   AND fc.record_kind='frontier_commit' AND fc.full_key=f.full_key AND fc.key_hash=f.key_hash
   AND fc.status IN ('published','rejected') AND fc.sequence_number=@validated
   AND JSON_VALUE(fc.payload,'$.frontier_key')=f.full_key
-  AND JSON_VALUE(fc.payload,'$.decision')=fc.status
+  AND fc.status=CONVERT(varchar(40),JSON_VALUE(fc.payload,'$.decision'))
   AND TRY_CONVERT(bigint,JSON_VALUE(fc.payload,'$.frontier_revision'))=fc.sequence_number
 JOIN {receipts} AS root ON root.tenant_id=f.tenant_id AND root.epoch=f.epoch
   AND root.operation='controller.resolve_frontier'
   AND root.request_id=JSON_VALUE(fc.payload,'$.request_id') AND root.request_hash={key_hash("JSON_VALUE(fc.payload,'$.request_id')")}
   AND JSON_VALUE(root.payload,'$.result.resolution_scope')='handoff'
-  AND JSON_VALUE(root.payload,'$.result.state')=fc.status
+  AND fc.status=CONVERT(varchar(40),JSON_VALUE(root.payload,'$.result.state'))
   AND JSON_VALUE(root.payload,'$.result.frontier_key')=f.full_key
   AND TRY_CONVERT(bigint,JSON_VALUE(root.payload,'$.result.frontier_revision'))=fc.sequence_number
   AND TRY_CONVERT(bigint,JSON_VALUE(root.payload,'$.result.validated_revision'))=fc.sequence_number
@@ -274,7 +281,7 @@ JOIN {records} AS root_handoff ON root_handoff.tenant_id=f.tenant_id AND root_ha
   AND JSON_VALUE(root_handoff.payload,'$.requires_window')='false'
   AND JSON_VALUE(root_handoff.payload,'$.work_id')=JSON_VALUE(root.payload,'$.result.work_id')
   AND JSON_VALUE(root_handoff.payload,'$.producer_request_id')=JSON_VALUE(root.payload,'$.result.producer_request_id')
-  AND root_handoff.status=JSON_VALUE(root.payload,'$.result.handoff_decision')
+  AND root_handoff.status=CONVERT(varchar(40),JSON_VALUE(root.payload,'$.result.handoff_decision'))
 WHERE f.tenant_id=@tenant_id AND f.epoch=@epoch AND f.record_kind='validation_frontier'
   AND f.full_key=@frontier_key AND f.key_hash={key_hash('@frontier_key')} AND f.parent_key IS NULL AND f.sequence_number=@accepted
   AND TRY_CONVERT(bigint,JSON_VALUE(f.payload,'$.accepted_revision'))=@accepted
@@ -295,7 +302,7 @@ WHERE f.tenant_id=@tenant_id AND f.epoch=@epoch AND f.record_kind='validation_fr
         AND TRY_CONVERT(bigint,JSON_VALUE(prefix.payload,'$.frontier_revision'))=prefix.sequence_number
         AND EXISTS (SELECT 1 FROM {receipts} AS producer_receipt
             WHERE producer_receipt.tenant_id=f.tenant_id AND producer_receipt.epoch=f.epoch
-              AND producer_receipt.operation=JSON_VALUE(prefix.payload,'$.producer_operation')
+              AND producer_receipt.operation=CONVERT(varchar(40),JSON_VALUE(prefix.payload,'$.producer_operation'))
               AND producer_receipt.request_id=JSON_VALUE(prefix.payload,'$.producer_request_id') AND producer_receipt.request_hash={key_hash("JSON_VALUE(prefix.payload,'$.producer_request_id')")}
               AND producer_receipt.fingerprint=JSON_VALUE(prefix.payload,'$.producer_fingerprint')
               AND JSON_VALUE(producer_receipt.payload,'$.binding_hash')=JSON_VALUE(prefix.payload,'$.producer_binding_hash')
@@ -325,21 +332,28 @@ JOIN {records} AS own_handoff ON own_handoff.tenant_id=f.tenant_id AND own_hando
   AND TRY_CONVERT(bigint,JSON_VALUE(own_handoff.payload,'$.frontier_revision'))=@handoff_revision
   AND TRY_CONVERT(bigint,JSON_VALUE(own_handoff.payload,'$.policy_revision'))=@current_revision
 JOIN {receipts} AS intake ON intake.tenant_id=f.tenant_id AND intake.epoch=f.epoch
-  AND intake.operation=JSON_VALUE(own_handoff.payload,'$.producer_operation')
+  AND intake.operation=CONVERT(varchar(40),JSON_VALUE(own_handoff.payload,'$.producer_operation'))
   AND intake.request_id=@producer_request_id AND intake.request_hash={key_hash("@producer_request_id")}
   AND intake.fingerprint=JSON_VALUE(own_handoff.payload,'$.producer_fingerprint')
   AND JSON_VALUE(intake.payload,'$.binding_hash')=JSON_VALUE(own_handoff.payload,'$.producer_binding_hash')
   AND JSON_VALUE(intake.payload,'$.result.reconcile_work_id')=@work_id
   AND JSON_VALUE(intake.payload,'$.result.frontier_key')=f.full_key
   AND TRY_CONVERT(bigint,JSON_VALUE(intake.payload,'$.result.frontier_revision'))=@handoff_revision
+JOIN {records} AS acc ON acc.tenant_id=f.tenant_id AND acc.epoch=f.epoch
+  AND acc.record_kind='reconcile_acceptance' AND acc.parent_hash=f.key_hash AND acc.parent_key=f.full_key
+  AND acc.parent_hash IS NOT NULL
+  AND JSON_VALUE(acc.payload,'$.work_id')=@work_id
+  AND JSON_VALUE(acc.payload,'$.producer_request_id')=@producer_request_id
+  AND JSON_VALUE(acc.payload,'$.resolution_scope')='handoff'
 JOIN {receipts} AS original ON original.tenant_id=f.tenant_id AND original.epoch=f.epoch
   AND original.operation='controller.resolve_frontier'
+  AND original.request_id=acc.full_key AND original.request_hash=acc.key_hash
   AND JSON_VALUE(original.payload,'$.result.work_id')=@work_id
   AND JSON_VALUE(original.payload,'$.result.producer_request_id')=@producer_request_id
   AND JSON_VALUE(original.payload,'$.result.frontier_key')=f.full_key
   AND JSON_VALUE(original.payload,'$.result.resolution_scope')='handoff'
   AND JSON_VALUE(original.payload,'$.result.state')='pending_validation'
-  AND JSON_VALUE(original.payload,'$.result.handoff_decision')=own_handoff.status
+  AND own_handoff.status=CONVERT(varchar(40),JSON_VALUE(original.payload,'$.result.handoff_decision'))
   AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.handoff_revision'))=@handoff_revision
   AND TRY_CONVERT(bigint,JSON_VALUE(original.payload,'$.result.work_fence')) BETWEEN 1 AND @fence
 WHERE f.tenant_id=@tenant_id AND f.epoch=@epoch AND f.record_kind='validation_frontier'
@@ -423,7 +437,7 @@ DECLARE @producer_request_id nvarchar(256)=JSON_VALUE(@stored_work,'$.reconcile_
     @window_rejection_request_id nvarchar(256),@window_resolution_request_id nvarchar(256),
     @window_resolution_state varchar(24);
 SELECT @producer_request=payload FROM {records}
-WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind=@producer+'_reconcile_request'
+WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind=CONVERT(varchar(40),@producer+'_reconcile_request')
   AND full_key=@producer_request_id AND key_hash={key_hash('@producer_request_id')};
 SELECT @handoff=payload,@handoff_key=full_key,@handoff_state=status,
     @frontier_key=parent_key,@handoff_revision=sequence_number FROM {records}
@@ -435,7 +449,7 @@ WHERE tenant_id=@tenant_id AND epoch=@epoch AND record_kind='validation_handoff'
   AND JSON_VALUE(payload,'$.producer')=@producer AND JSON_VALUE(payload,'$.work_id')=@work_id;
 SELECT @producer_receipt=payload FROM {receipts}
 WHERE tenant_id=@tenant_id AND epoch=@epoch
-  AND operation=JSON_VALUE(@handoff,'$.producer_operation')
+  AND operation=CONVERT(varchar(40),JSON_VALUE(@handoff,'$.producer_operation'))
   AND request_id=@producer_request_id AND request_hash={key_hash("@producer_request_id")}
   AND fingerprint=JSON_VALUE(@handoff,'$.producer_fingerprint')
   AND JSON_VALUE(payload,'$.binding_hash')=JSON_VALUE(@handoff,'$.producer_binding_hash');
@@ -546,7 +560,7 @@ BEGIN
           AND accepted_handoff.sequence_number BETWEEN 1 AND @accepted
           AND EXISTS (SELECT 1 FROM {receipts} AS original_receipt
               WHERE original_receipt.tenant_id=@tenant_id AND original_receipt.epoch=@epoch
-                AND original_receipt.operation=JSON_VALUE(accepted_handoff.payload,'$.producer_operation')
+                AND original_receipt.operation=CONVERT(varchar(40),JSON_VALUE(accepted_handoff.payload,'$.producer_operation'))
                 AND original_receipt.request_id=JSON_VALUE(accepted_handoff.payload,'$.producer_request_id') AND original_receipt.request_hash={key_hash("JSON_VALUE(accepted_handoff.payload,'$.producer_request_id')")}
                 AND original_receipt.fingerprint=JSON_VALUE(accepted_handoff.payload,'$.producer_fingerprint')
                 AND JSON_VALUE(original_receipt.payload,'$.binding_hash')
@@ -559,7 +573,7 @@ IF {page_publication_required_sql()} AND (
     {stale_page_policy_sql()}
     OR EXISTS (SELECT 1 FROM {records} AS binding LEFT JOIN {records} AS fact
         ON fact.tenant_id=binding.tenant_id AND fact.epoch=binding.epoch
-       AND fact.record_kind=JSON_VALUE(binding.payload,'$.fact_kind')
+       AND fact.record_kind=CONVERT(varchar(40),JSON_VALUE(binding.payload,'$.fact_kind'))
        AND fact.full_key=JSON_VALUE(binding.payload,'$.fact_key')
        AND fact.key_hash={key_hash("JSON_VALUE(binding.payload,'$.fact_key')")}
         WHERE binding.tenant_id=@tenant_id AND binding.epoch=@epoch AND binding.record_kind='accepted_fact'

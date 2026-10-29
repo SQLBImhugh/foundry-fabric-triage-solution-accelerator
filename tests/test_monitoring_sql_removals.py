@@ -126,6 +126,11 @@ def _adapt(kernel, sql, *, concatenate=False):
         r"HASHBYTES\('SHA2_256', CONVERT\(varchar\(max\), \((.+?)\) COLLATE Latin1_General_100_BIN2_UTF8\)\)",
         r"KEY_DIGEST(\1)", sql,
     )
+    sql = re.sub(
+        r"CONVERT\(varchar\(40\),\s*((?:JSON_VALUE\([^)]*\)|@\w+)(?:\s*\+\s*N?'_reconcile_request')?)\)",
+        lambda m: m.group(1).replace("+N'", "||'").replace("+'", "||'"),
+        sql,
+    )
     for expression in (
         "@remove_binding", "@binding_receipt_payload",
         "JSON_QUERY(@binding_observation,'$.observed_definition')",

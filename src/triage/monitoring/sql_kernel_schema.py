@@ -144,7 +144,7 @@ AND EXISTS (
       AND accepted.accepted_fact_key_hash=r.key_hash
       AND (r.record_kind NOT IN ({varchar_literals(CATALOGUE_KINDS)})
            OR accepted.key_hash={key_hash("N'accepted:'+receipt.request_id+N':'+r.record_kind+N':'+LOWER(CONVERT(char(64),r.key_hash,2))")})
-      AND JSON_VALUE(accepted.payload,'$.fact_kind')=r.record_kind
+      AND r.record_kind=CONVERT(varchar(40),JSON_VALUE(accepted.payload,'$.fact_kind'))
       AND JSON_VALUE(accepted.payload,'$.fact_key')=r.full_key
       AND TRY_CONVERT(bigint,JSON_VALUE(accepted.payload,'$.fact_revision'))=r.revision
       AND JSON_VALUE(accepted.payload,'$.payload_hash')={payload_hash('r.payload')}

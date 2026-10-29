@@ -40,7 +40,13 @@ from triage.monitoring import models as m
 from triage.monitoring.contracts import MonitoringComponentDenied, MonitoringConflict
 from triage.monitoring.controller import HeartbeatBudget
 from triage.monitoring.engine import MonitoringEngine
-from triage.monitoring.sql_kernel_inventory_retention import inventory_retirement_eligible_sql
+from triage.monitoring.events import ReceiverHeartbeat
+from triage.monitoring.memory import StoredRecord, key_digest
+from triage.monitoring.sql_kernel_inventory_retention import (
+    inventory_retirement_eligible_sql,
+    superseded_binding_predicate_sql,
+    superseded_fact_keys_sql,
+)
 from triage.monitoring.sql_permissions import build_permission_kernel
 from triage.runner import TriageRunner
 from triage.settings import Settings
@@ -571,6 +577,157 @@ async def test_maintenance_refuses_retirement_without_recording_it(history):
     assert set(result.retired_generation_ids) == {passes["A"], passes["A2"], passes["B"]}
 
 
+def _fact_bindings(fixture: PublicationHarness, kind: str, key: str | None = None) -> list[int]:
+    return sorted(
+        int(payload["fact_revision"])
+        for row in fixture.rows()
+        if row.kind == "accepted_fact"
+        and (payload := json.loads(row.payload))["fact_kind"] == kind
+        and (key is None or payload["fact_key"] == key)
+    )
+
+
+def _seed_memory_binding(
+    fixture: PublicationHarness, *, batch_id: str, kind: str, key: str, revision: int,
+) -> None:
+    if fixture.db is not None:
+        return
+    binding_key = f"{batch_id}:{kind}:{key_digest(key)}"
+    fixture.h.state.records[(CONTEXT.tenant_id, CONTEXT.epoch, "accepted_fact", key_digest(binding_key))] = (
+        StoredRecord(
+            kind="accepted_fact", key=binding_key, context=CONTEXT, version=1,
+            payload=json.dumps({
+                "batch_id": batch_id, "batch_fingerprint": "f" * 64,
+                "fact_kind": kind, "fact_key": key, "fact_revision": revision, "row_hash": "0" * 64,
+            }),
+        )
+    )
+
+
+def _accepted_fact_counter(fixture: PublicationHarness) -> int:
+    backend = fixture.use("controller")._backend
+    with backend.transaction(write=False, operation="read", request_id="read"):
+        return backend.change_counter("accepted_fact", CONTEXT)
+
+
+@pytest.mark.parametrize("adapter", ["memory", "sql"])
+async def test_superseded_mutable_fact_bindings_are_retired_only_after_their_frontier_closes(adapter, tmp_path):
+    fixture = PublicationHarness(adapter, tmp_path, register_transport=False)
+    workspace_key = fixture.identity.workspace_id
+    item_key = f"{workspace_key}:{fixture.identity.item_id}"
+    target_key = fixture.identity.key
+    worker_id = uid(77_100)
+    heartbeat_key = f"collector:{worker_id}"
+
+    pass1 = await scan(fixture)
+    _seed_memory_binding(fixture, batch_id=uid(77_201), kind="workspace", key=workspace_key, revision=1)
+    _seed_memory_binding(fixture, batch_id=uid(77_201), kind="inventory", key=item_key, revision=1)
+    record_probe(fixture, pass1, hours=24)
+    await fixture.drain()
+    await activate(fixture)
+
+    fixture.h.clock.advance(60)
+    await scan(fixture)
+    _seed_memory_binding(fixture, batch_id=uid(77_202), kind="workspace", key=workspace_key, revision=2)
+    _seed_memory_binding(fixture, batch_id=uid(77_202), kind="inventory", key=item_key, revision=2)
+
+    worker = fixture.use("worker")
+    for index, state in enumerate(("running", "stopping"), start=1):
+        worker.record_receiver_heartbeat(ReceiverHeartbeat(
+            **CONTEXT.model_dump(), worker_id=worker_id, connector_id=None,
+            observed_at=fixture.h.clock(), state=state,
+        ))
+        _seed_memory_binding(fixture, batch_id=uid(77_210 + index), kind="receiver_heartbeat", key=heartbeat_key, revision=index)
+        fixture.h.clock.advance(1)
+
+    poll1, = fixture.claim("worker", "poll")
+    window1 = m.ObservationWindow(start_at=fixture.h.clock() - timedelta(minutes=15), end_at=fixture.h.clock())
+    page1_id = fixture.h.next_id()
+    page2_id = fixture.h.next_id()
+    worker.record_rest_page(m.RestPageRequest(
+        page_id=page1_id, target=fixture.identity, policy_revision=fixture.version("worker").revision,
+        poll_work_id=poll1.work_id, lease=poll1.lease, expected_checkpoint_revision=0,
+        expected_cursor=None, next_cursor="page-2", window=window1, received_count=0,
+        window_complete=False, observed_at=fixture.h.clock(),
+    ))
+    _seed_memory_binding(fixture, batch_id=page1_id, kind="poll_progress", key=target_key, revision=1)
+    worker.record_rest_page(m.RestPageRequest(
+        page_id=page2_id, target=fixture.identity, policy_revision=fixture.version("worker").revision,
+        poll_work_id=poll1.work_id, lease=poll1.lease, expected_checkpoint_revision=1,
+        expected_cursor="page-2", next_cursor=None, window=window1, received_count=0,
+        window_complete=True, observed_at=fixture.h.clock(),
+    ))
+    _seed_memory_binding(fixture, batch_id=page2_id, kind="poll_progress", key=target_key, revision=2)
+    _seed_memory_binding(fixture, batch_id=page2_id, kind="poll_schedule", key=target_key, revision=1)
+
+    counter0 = _accepted_fact_counter(fixture)
+    assert _fact_bindings(fixture, "workspace", workspace_key) == [1, 2]
+    assert _fact_bindings(fixture, "inventory", item_key) == [1, 2]
+    assert _fact_bindings(fixture, "receiver_heartbeat", heartbeat_key) == [1, 2]
+    assert _fact_bindings(fixture, "poll_progress", target_key) == [1, 2]
+
+    # No pass is 7 days old yet, and poll1's frontier is still pending_validation:
+    # workspace, inventory and receiver_heartbeat lose revision 1 while poll_progress keeps [1, 2].
+    _, first = retire(fixture)
+    counter1 = _accepted_fact_counter(fixture)
+
+    assert first.retired_generation_ids == first.refused_generation_ids == first.deferred_generation_ids == ()
+    assert first.retired_sightings == 0
+    assert first.retired_bindings == 3
+    assert counter1 > counter0
+    assert _fact_bindings(fixture, "workspace", workspace_key) == [2]
+    assert _fact_bindings(fixture, "inventory", item_key) == [2]
+    assert _fact_bindings(fixture, "receiver_heartbeat", heartbeat_key) == [2]
+    assert _fact_bindings(fixture, "poll_progress", target_key) == [1, 2]
+
+    await fixture.drain()
+    fixture.h.clock.advance(3_600)
+    poll2, = fixture.claim("worker", "poll")
+    window2 = m.ObservationWindow(start_at=window1.end_at, end_at=fixture.h.clock())
+    page3_id = fixture.h.next_id()
+    fixture.use("worker").record_rest_page(m.RestPageRequest(
+        page_id=page3_id, target=fixture.identity, policy_revision=fixture.version("worker").revision,
+        poll_work_id=poll2.work_id, lease=poll2.lease, expected_checkpoint_revision=2,
+        expected_cursor=None, next_cursor=None, window=window2, received_count=0,
+        window_complete=True, observed_at=fixture.h.clock(),
+    ))
+    _seed_memory_binding(fixture, batch_id=page3_id, kind="poll_progress", key=target_key, revision=3)
+    _seed_memory_binding(fixture, batch_id=page3_id, kind="poll_schedule", key=target_key, revision=2)
+    await fixture.drain()
+
+    capability_row = next(row for row in fixture.rows() if row.kind == "capability")
+    if fixture.db is not None:
+        fixture.db.native_put("capability", capability_row.key, json.loads(capability_row.payload), target_key=target_key)
+        fixture.db.native_put("accepted_fact", f"{uid(77_220)}:capability:{key_digest(capability_row.key)}", {
+            "batch_id": uid(77_220), "batch_fingerprint": "f" * 64,
+            "fact_kind": "capability", "fact_key": capability_row.key, "fact_revision": 2, "row_hash": "0" * 64,
+        })
+    else:
+        fixture.h.state.records[(CONTEXT.tenant_id, CONTEXT.epoch, "capability", key_digest(capability_row.key))] = (
+            StoredRecord(
+                kind="capability", key=capability_row.key, context=CONTEXT, version=2,
+                payload=capability_row.payload, target_key=target_key,
+            )
+        )
+        _seed_memory_binding(fixture, batch_id=uid(77_219), kind="capability", key=capability_row.key, revision=1)
+        _seed_memory_binding(fixture, batch_id=uid(77_220), kind="capability", key=capability_row.key, revision=2)
+
+    counter_before_second = _accepted_fact_counter(fixture)
+    _, second = retire(fixture)
+    counter2 = _accepted_fact_counter(fixture)
+
+    assert second.retired_generation_ids == () and second.retired_sightings == 0
+    assert second.retired_bindings == 4
+    assert counter2 > counter_before_second
+    assert _fact_bindings(fixture, "poll_progress", target_key) == [3]
+    assert _fact_bindings(fixture, "poll_schedule", target_key) == [2]
+    assert _fact_bindings(fixture, "capability", capability_row.key) == [2]
+
+    _, third = retire(fixture)
+    assert third.retired_bindings == 0
+    assert _accepted_fact_counter(fixture) == counter2
+
+
 def test_the_sql_kernel_lets_only_the_controller_retire_inventory_history():
     kernel = build_permission_kernel()
     contract = kernel.rpcs["controller.retire_inventory"]
@@ -587,6 +744,9 @@ def test_the_sql_kernel_lets_only_the_controller_retire_inventory_history():
     assert inventory_retirement_eligible_sql(
         kernel.names, passes="@passes", generation="c.generation_id", key_hash="c.key_hash",
     ) in ddl
+    assert superseded_fact_keys_sql(kernel.names) in ddl
+    assert superseded_binding_predicate_sql(kernel.names, key_alias="k", binding_alias="b") in ddl
+    assert "DECLARE @cand TABLE (id int IDENTITY(1,1) PRIMARY KEY, key_hash binary(32) NOT NULL)" in ddl
     # VARCHAR columns compared with N'...' literals lose their index seeks.
     assert not re.search(r"record_kind\s*(=|IN \()\s*N'", ddl)
     assert not re.search(r"status IN \(N'", ddl)
