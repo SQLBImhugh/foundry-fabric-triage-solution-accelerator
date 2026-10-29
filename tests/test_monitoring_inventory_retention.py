@@ -746,7 +746,8 @@ def test_the_sql_kernel_lets_only_the_controller_retire_inventory_history():
     ) in ddl
     assert superseded_fact_keys_sql(kernel.names) in ddl
     assert superseded_binding_predicate_sql(kernel.names, key_alias="k", binding_alias="b") in ddl
-    assert "DECLARE @cand TABLE (id int IDENTITY(1,1) PRIMARY KEY, key_hash binary(32) NOT NULL)" in ddl
+    assert "DECLARE @cand TABLE (id int IDENTITY(1,1) PRIMARY KEY, key_hash binary(32) NOT NULL," in ddl
+    assert "DECLARE @sup TABLE (id int IDENTITY(1,1) PRIMARY KEY, key_hash binary(32) NOT NULL UNIQUE)" in ddl
     # VARCHAR columns compared with N'...' literals lose their index seeks.
     assert not re.search(r"record_kind\s*(=|IN \()\s*N'", ddl)
     assert not re.search(r"status IN \(N'", ddl)

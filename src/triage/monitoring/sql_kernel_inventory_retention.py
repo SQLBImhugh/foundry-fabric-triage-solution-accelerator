@@ -99,19 +99,24 @@ AND NOT EXISTS (
       AND v.status IN ({varchar_literals(OPEN_WINDOW_STATES)}))"""
 
 
-def superseded_fact_keys_sql(names: SqlNames) -> str:
+def superseded_fact_keys_sql(names: SqlNames, *, index_only: bool = True) -> str:
     """Mutable facts at revision > 1 that still have more than one accepted_fact binding."""
     records = names.table("monitoring_records")
+    count = (
+        f"SELECT COUNT(*) FROM (SELECT TOP (2) 1 AS x FROM {records} AS b "
+        "WHERE b.tenant_id=@tenant_id AND b.epoch=@epoch AND b.record_kind='accepted_fact' "
+        "AND b.accepted_fact_key_hash=r.key_hash AND b.accepted_fact_key_hash IS NOT NULL) AS t"
+        if index_only else
+        f"SELECT COUNT(*) FROM {records} AS b "
+        "WHERE b.tenant_id=@tenant_id AND b.epoch=@epoch AND b.record_kind='accepted_fact' "
+        "AND b.accepted_fact_key_hash=r.key_hash AND b.accepted_fact_key_hash IS NOT NULL"
+    )
     return f"""SELECT r.record_kind,r.key_hash,r.full_key,r.revision
 FROM {records} AS r
 WHERE r.tenant_id=@tenant_id AND r.epoch=@epoch
   AND r.record_kind IN ({varchar_literals(SUPERSEDED_FACT_KINDS)})
   AND r.revision>1
-  AND (
-      SELECT COUNT(*) FROM {records} AS b
-      WHERE b.tenant_id=@tenant_id AND b.epoch=@epoch AND b.record_kind='accepted_fact'
-        AND b.accepted_fact_key_hash=r.key_hash
-  )>1"""
+  AND ({count})>1"""
 
 
 def superseded_binding_predicate_sql(
@@ -240,15 +245,27 @@ BEGIN
         PRIMARY KEY (record_kind,key_hash));
     INSERT INTO @keys (record_kind,key_hash,full_key,revision)
     {superseded_fact_keys_sql(names)};
-    DECLARE @cand TABLE (id int IDENTITY(1,1) PRIMARY KEY, key_hash binary(32) NOT NULL);
-    INSERT INTO @cand (key_hash)
-    SELECT TOP (@binding_budget) b.key_hash
+    DECLARE @cand TABLE (id int IDENTITY(1,1) PRIMARY KEY, key_hash binary(32) NOT NULL,
+        record_kind varchar(40) COLLATE DATABASE_DEFAULT NOT NULL,
+        full_key nvarchar(1024) COLLATE DATABASE_DEFAULT NOT NULL, revision bigint NOT NULL);
+    INSERT INTO @cand (key_hash,record_kind,full_key,revision)
+    SELECT TOP (2000) b.key_hash,k.record_kind,k.full_key,k.revision
     FROM @keys AS k JOIN {records} AS b
       ON b.tenant_id=@tenant_id AND b.epoch=@epoch AND b.record_kind='accepted_fact'
      AND b.accepted_fact_key_hash=k.key_hash
-    WHERE {superseded_binding_predicate_sql(names, key_alias='k', binding_alias='b')};
+    WHERE b.accepted_fact_key_hash IS NOT NULL;
+    DECLARE @sup TABLE (id int IDENTITY(1,1) PRIMARY KEY, key_hash binary(32) NOT NULL UNIQUE);
+    INSERT INTO @sup (key_hash)
+    SELECT TOP (@binding_budget) s.key_hash
+    FROM (
+        SELECT DISTINCT k.key_hash
+        FROM @cand AS k JOIN {records} AS b
+          ON b.tenant_id=@tenant_id AND b.epoch=@epoch AND b.record_kind='accepted_fact'
+         AND b.key_hash=k.key_hash
+        WHERE {superseded_binding_predicate_sql(names, key_alias='k', binding_alias='b')}
+    ) AS s;
     DELETE b OUTPUT deleted.record_kind,deleted.revision INTO @deleted
-    FROM {records} AS b JOIN @cand AS s
+    FROM {records} AS b JOIN @sup AS s
       ON b.tenant_id=@tenant_id AND b.epoch=@epoch AND b.record_kind='accepted_fact'
      AND b.key_hash=s.key_hash;
 END;

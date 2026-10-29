@@ -807,7 +807,7 @@ class AbiDatabase(KernelProtocolDatabase):
             records = self.names.table("monitoring_records")
             superseded_keys = [
                 row["full_key"] for row in self.native_rows(
-                    f"WITH keys AS ({superseded_fact_keys_sql(self.names)}) "
+                    f"WITH keys AS ({superseded_fact_keys_sql(self.names, index_only=False)}) "
                     f"SELECT b.full_key FROM keys AS k JOIN {records} AS b "
                     "ON b.tenant_id=@tenant_id AND b.epoch=@epoch AND b.record_kind='accepted_fact' "
                     "AND b.accepted_fact_key_hash=k.key_hash "
