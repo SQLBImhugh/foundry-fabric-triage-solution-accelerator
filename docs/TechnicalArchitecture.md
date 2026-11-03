@@ -121,7 +121,7 @@ A finished pass carries `next_scan_at`, and the controller queues the next pass
 of its selector when it publishes the pass, unless other active inventory work
 already scans that selector. Each pass used to queue its own successor, so every
 extra pass of a selector (a discovery request or a scope activation) started
-another periodic chain: from 2026-09-25 two chains scanned the MorkNet monitored
+another periodic chain: from 2026-09-25 two chains scanned the monitored
 workspace about 20 minutes apart. Existing duplicate chains end at their next
 publication.
 
@@ -156,7 +156,7 @@ provisioning does not establish event delivery or durable end-to-end operation.
 
 Every scan writes a pass record (`generation`), plus a sighting per workspace,
 domain and item it saw. Admission checks read every pass record against the
-5,000-record `SCAN_BUDGET`; in the MorkNet lab 363 accumulated in eleven days,
+5,000-record `SCAN_BUDGET`; in the reference lab 363 accumulated in eleven days,
 and 3 still had a reader. The controller heartbeat therefore runs one
 retirement operation per 15-minute `INVENTORY_RETIREMENT_INTERVAL`: at most 50
 passes, oldest first, and at most 1,000 sightings
@@ -210,7 +210,7 @@ after the workers finished; the first live heartbeats used their whole
 The procedure compares `VARCHAR` columns such as `record_kind` and `status`
 with `VARCHAR` literals. With `N'...'` literals, the
 `SQL_Latin1_General_CP1_CI_AS` collation rules out an index seek: on the
-MorkNet database the reference check took 8,184 ms for 25 passes instead of
+reference database the reference check took 8,184 ms for 25 passes instead of
 14 ms, while the procedure held the control lock.
 
 Change counters (`change_counter`) add a per-kind offset from
@@ -278,7 +278,7 @@ newest receipt is read through the receipts recency index
 (`tenant_id, epoch, operation, recorded_at`, created by `schema.py`) and its work
 row by `key_hash`. Joining every transition receipt to every work row by JSON,
 and reading `completed_at` from every work payload, took about 5 seconds per
-claim on the MorkNet database, inside the claim's control-row lock. Reading
+claim on the reference database, inside the claim's control-row lock. Reading
 only transition receipts would leave the cursor on an older workspace after a
 finalized or disposed completion, and with single-slot claims one workspace
 with steady due work would then be served first every time.
@@ -288,7 +288,7 @@ with steady due work would then be served first every time.
 
 Every mutating kernel procedure locks the control row (`UPDLOCK, HOLDLOCK`) and
 keeps the lock until its transaction commits, so a statement that scans also
-makes every other caller wait. On the MorkNet database (S1, 20 DTU) Query Store
+makes every other caller wait. On the reference database (S1, 20 DTU) Query Store
 recorded 13.8 million ms of control-row lock waits in two hours, and heartbeats
 took 100 to 140 seconds for three to seven reconciliations. The causes, and the
 rules the kernel now follows:

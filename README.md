@@ -249,7 +249,7 @@ All durable state lives in one shared Azure SQL Database (`bitriage-state`) so c
 
 ## Triage Command Center walkthrough
 
-The **Triage Command Center** (`command-center/`) is a React 18 + FastAPI operational portal deployed on Azure App Service. Every screenshot below is captured live from the MorkNet reference deployment (`rg-bitriage-accel`) monitoring 1,458 Fabric and Power BI artifacts across 4 active workspaces.
+The **Triage Command Center** (`command-center/`) is a React 18 + FastAPI operational portal deployed on Azure App Service. Every screenshot below is captured live from the reference deployment (`rg-bitriage-accel`) monitoring 1,458 Fabric and Power BI artifacts across 4 active workspaces.
 
 ### Command Center overview and incident queue
 
@@ -519,7 +519,7 @@ See [Monitoring setup](./docs/CommandCenter.md#monitoring-setup) and [Scheduled 
 
 ## Live verification status
 
-What has been verified live against the MorkNet reference deployment (`rg-bitriage-accel`) vs what remains scoped out:
+What has been verified live against the reference deployment (`rg-bitriage-accel`) vs what remains scoped out:
 
 - **Shared Azure SQL state store (`bitriage-state`) and permission kernel:**
   - Deployed with Microsoft Entra-only authentication, 27 RPC stored procedures, 3 component read views (`worker_read`, `web_read`, `controller_read`), 106 explicit permission grants, and zero schema drift (`sys.sql_modules` verified against `build_permission_kernel()`).
