@@ -1,8 +1,8 @@
-# The BI Triage Solution Accelerator
+# The Fabric Triage Solution Accelerator
 
-<img src="./command-center/public/triage-logo.png" alt="BI Triage logo" width="44" height="52" />
+<img src="./command-center/public/triage-logo.png" alt="Fabric Triage logo" width="44" height="52" />
 
-The **BI Triage Solution Accelerator** is a developer sample built on Azure AI
+The **Fabric Triage Solution Accelerator** is a developer sample built on Azure AI
 Foundry, Azure SQL Database, Power BI and Microsoft Fabric. It shows how to
 build a multi-agent operations loop that triages business intelligence failures
 without giving a language model the authority to break things. This document
