@@ -13,20 +13,23 @@
 
   <rect width="1240" height="750" fill="#ffffff"/>
 
-  <text x="40" y="46" font-size="25" font-weight="600" fill="#1b1f23">BI Request Triage &amp; Resolution</text>
+  <text x="40" y="46" font-size="25" font-weight="600" fill="#1b1f23">Power BI &amp; Fabric Triage — Control Loop &amp; Policy Boundary</text>
   <text x="40" y="72" font-size="15" fill="#5b6470">Reasoning proposes. The controller decides. Deterministic evidence settles disagreements.</text>
 
   <rect x="40" y="104" width="228" height="200" rx="10" fill="#f4f6f8" stroke="#d4d9e0"/>
-  <text x="56" y="130" font-size="13" font-weight="700" fill="#5b6470" letter-spacing="0.8">SIGNALS IN</text>
+  <text x="56" y="128" font-size="13" font-weight="700" fill="#5b6470" letter-spacing="0.8">SIGNALS IN</text>
 
-  <rect x="56" y="146" width="196" height="60" rx="7" fill="#ffffff" stroke="#c3cad3"/>
-  <text x="70" y="169" font-size="14.5" font-weight="600" fill="#1b1f23">Monitored mailbox</text>
-  <text x="70" y="189" font-size="12.5" fill="#5b6470">Graph · sender allowlist</text>
+  <rect x="56" y="138" width="196" height="48" rx="7" fill="#ffffff" stroke="#c3cad3"/>
+  <text x="70" y="159" font-size="13.5" font-weight="600" fill="#1b1f23">Fabric Eventstream &amp; REST</text>
+  <text x="70" y="176" font-size="11.5" fill="#5b6470">ItemJob events + worker polls</text>
 
-  <rect x="56" y="216" width="196" height="70" rx="7" fill="#ffffff" stroke="#c3cad3"/>
-  <text x="70" y="239" font-size="14.5" font-weight="600" fill="#1b1f23">Scheduled sweep</text>
-  <text x="70" y="259" font-size="12.5" fill="#5b6470">silent-failure scan,</text>
-  <text x="70" y="276" font-size="12.5" fill="#5b6470">due retries</text>
+  <rect x="56" y="192" width="196" height="48" rx="7" fill="#ffffff" stroke="#c3cad3"/>
+  <text x="70" y="213" font-size="13.5" font-weight="600" fill="#1b1f23">Monitored mailbox</text>
+  <text x="70" y="230" font-size="11.5" fill="#5b6470">Graph · sender allowlist</text>
+
+  <rect x="56" y="246" width="196" height="48" rx="7" fill="#ffffff" stroke="#c3cad3"/>
+  <text x="70" y="267" font-size="13.5" font-weight="600" fill="#1b1f23">Scheduled &amp; silent sweeps</text>
+  <text x="70" y="284" font-size="11.5" fill="#5b6470">staleness, row drops, due retries</text>
 
   <rect x="316" y="104" width="252" height="200" rx="10" fill="#eef4fb" stroke="#b8cfe8"/>
   <text x="332" y="130" font-size="12.5" font-weight="700" fill="#2b5f96" letter-spacing="0.6">REASONING · NO PERMISSIONS</text>
@@ -68,19 +71,19 @@
 
   <rect x="948" y="146" width="236" height="58" rx="7" fill="#ffffff" stroke="#a5cfb4"/>
   <text x="962" y="169" font-size="14.5" font-weight="600" fill="#1b1f23">Power BI refresh</text>
-  <text x="962" y="189" font-size="12" fill="#5b6470">REST · or postponed with backoff</text>
+  <text x="962" y="189" font-size="12" fill="#5b6470">REST · or deferred with backoff</text>
 
   <rect x="948" y="214" width="236" height="58" rx="7" fill="#ffffff" stroke="#a5cfb4"/>
-  <text x="962" y="237" font-size="14.5" font-weight="600" fill="#1b1f23">Teams card</text>
-  <text x="962" y="257" font-size="12" fill="#5b6470">announced once per incident</text>
+  <text x="962" y="237" font-size="14.5" font-weight="600" fill="#1b1f23">Fabric pipeline rerun</text>
+  <text x="962" y="257" font-size="12" fill="#5b6470">Tier 2 · replay-safe + approval + fence</text>
 
   <rect x="948" y="282" width="236" height="58" rx="7" fill="#ffffff" stroke="#a5cfb4"/>
   <text x="962" y="305" font-size="14.5" font-weight="600" fill="#1b1f23">Schedule re-enable</text>
-  <text x="962" y="325" font-size="12" fill="#5b6470">Tier 2 · approval required</text>
+  <text x="962" y="325" font-size="12" fill="#5b6470">Tier 2 · fingerprint approval required</text>
 
   <rect x="948" y="350" width="236" height="58" rx="7" fill="#ffffff" stroke="#a5cfb4"/>
-  <text x="962" y="373" font-size="14.5" font-weight="600" fill="#1b1f23">Data quality flag</text>
-  <text x="962" y="393" font-size="12" fill="#5b6470">reported, never auto-fixed</text>
+  <text x="962" y="373" font-size="14.5" font-weight="600" fill="#1b1f23">Teams card &amp; DQ flag</text>
+  <text x="962" y="393" font-size="12" fill="#5b6470">announced once · DQ never auto-fixed</text>
 
   <text x="948" y="434" font-size="12" fill="#0f7038">Anything not on an allowlist is refused before dispatch.</text>
 
@@ -88,8 +91,8 @@
   <text x="56" y="362" font-size="12.5" font-weight="700" fill="#5c3d8f" letter-spacing="0.6">DETERMINISTIC EVIDENCE</text>
 
   <rect x="56" y="378" width="160" height="60" rx="7" fill="#ffffff" stroke="#c0b2da"/>
-  <text x="70" y="401" font-size="13.5" font-weight="600" fill="#1b1f23">Dataset scan</text>
-  <text x="70" y="421" font-size="12" fill="#5b6470">duplicates, row counts</text>
+  <text x="70" y="401" font-size="13.5" font-weight="600" fill="#1b1f23">Dataset &amp; job scans</text>
+  <text x="70" y="421" font-size="12" fill="#5b6470">DAX rows, activity runs</text>
 
   <rect x="228" y="378" width="160" height="60" rx="7" fill="#ffffff" stroke="#c0b2da"/>
   <text x="242" y="401" font-size="13.5" font-weight="600" fill="#1b1f23">Silent-failure</text>
@@ -97,26 +100,26 @@
 
   <rect x="400" y="378" width="152" height="60" rx="7" fill="#ffffff" stroke="#c0b2da"/>
   <text x="414" y="401" font-size="13.5" font-weight="600" fill="#1b1f23">Playbooks</text>
-  <text x="414" y="421" font-size="12" fill="#5b6470">top 3, public sources</text>
+  <text x="414" y="421" font-size="12" fill="#5b6470">top 3, public Learn docs</text>
 
   <rect x="40" y="490" width="1160" height="112" rx="10" fill="#f4f6f8" stroke="#d4d9e0"/>
-  <text x="56" y="516" font-size="12.5" font-weight="700" fill="#5b6470" letter-spacing="0.6">STATE · REDACTED AT THE STORE BOUNDARY</text>
+  <text x="56" y="516" font-size="12.5" font-weight="700" fill="#5b6470" letter-spacing="0.6">SHARED DURABLE STATE · AZURE SQL DATABASE (REDACTED AT THE STORE BOUNDARY)</text>
 
   <rect x="56" y="532" width="270" height="54" rx="7" fill="#ffffff" stroke="#c3cad3"/>
-  <text x="70" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Incidents</text>
-  <text x="70" y="573" font-size="12" fill="#5b6470">signature dedup, occurrence counts</text>
+  <text x="70" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Incidents &amp; activity</text>
+  <text x="70" y="573" font-size="12" fill="#5b6470">signature dedup, notes, observer Q&amp;A</text>
 
   <rect x="342" y="532" width="270" height="54" rx="7" fill="#ffffff" stroke="#c3cad3"/>
-  <text x="356" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Deferred retries</text>
-  <text x="356" y="573" font-size="12" fill="#5b6470">exponential backoff, capped at 3</text>
+  <text x="356" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Monitoring registry &amp; leases</text>
+  <text x="356" y="573" font-size="12" fill="#5b6470">scopes, work queue, action fences</text>
 
   <rect x="628" y="532" width="270" height="54" rx="7" fill="#ffffff" stroke="#c3cad3"/>
-  <text x="642" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Health baselines</text>
-  <text x="642" y="573" font-size="12" fill="#5b6470">advanced only from healthy readings</text>
+  <text x="642" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Approvals, retries &amp; baselines</text>
+  <text x="642" y="573" font-size="12" fill="#5b6470">fingerprint gates, backoff, row medians</text>
 
   <rect x="914" y="532" width="270" height="54" rx="7" fill="#ffffff" stroke="#c3cad3"/>
-  <text x="928" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Telemetry</text>
-  <text x="928" y="573" font-size="12" fill="#5b6470">OTel spans, metadata only</text>
+  <text x="928" y="554" font-size="13.5" font-weight="600" fill="#1b1f23">Receipts &amp; telemetry</text>
+  <text x="928" y="573" font-size="12" fill="#5b6470">atomic SQL receipts · metadata-only OTel</text>
 
   <path d="M 268 190 L 310 190" stroke="#5b6470" stroke-width="1.8" fill="none" marker-end="url(#arrow)"/>
   <path d="M 268 250 L 292 250 L 292 190" stroke="#5b6470" stroke-width="1.8" fill="none"/>
@@ -132,7 +135,7 @@
   <text x="396" y="322" font-size="12" fill="#5c3d8f">measured evidence outranks model output</text>
 
   <text x="40" y="640" font-size="13" fill="#5b6470">A blocked action is returned to the agent as a refusal, not a crash, so it can escalate rather than leave the operator with silence.</text>
-  <text x="40" y="664" font-size="13" fill="#5b6470">A human approves or declines from the Teams card. Timeout, error, malformed reply and no gate configured all read as a decline.</text>
-  <text x="40" y="688" font-size="13" fill="#5b6470">Every terminal outcome is persisted, including crashes, timeouts and policy blocks.</text>
-  <text x="40" y="712" font-size="12.5" fill="#8a929c">Runs fully offline with mock providers and mock tools. The same code path runs live.</text>
+  <text x="40" y="664" font-size="13" fill="#5b6470">Approvers decide Tier 2 actions in the Command Center or Teams. Timeout, error, malformed reply and no gate configured all read as a decline.</text>
+  <text x="40" y="688" font-size="13" fill="#5b6470">Every terminal outcome is persisted in Azure SQL (live) or local JSON/CSV (offline), including crashes, timeouts and policy blocks.</text>
+  <text x="40" y="712" font-size="12.5" fill="#8a929c">Runs fully offline across 15 executable YAML scenarios with mock providers and mock tools. The same controller path runs live.</text>
 </svg>

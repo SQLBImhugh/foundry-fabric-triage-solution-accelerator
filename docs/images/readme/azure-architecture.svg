@@ -1,0 +1,262 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1360" height="890" viewBox="0 0 1360 890" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif">
+  <defs>
+    <style>
+      .title     { font-size: 19px; font-weight: 700; fill: #0f172a; }
+      .subtitle  { font-size: 12px; fill: #475569; }
+      .zone-lbl  { font-size: 11px; font-weight: 700; letter-spacing: 0.9px; text-transform: uppercase; }
+      .box-title { font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .box-sub   { font-size: 11px; fill: #334155; }
+      .box-code  { font-size: 10px; font-family: Consolas, 'SFMono-Regular', monospace; fill: #0f172a; }
+      .pill      { font-size: 9.5px; font-weight: 700; font-family: Consolas, 'SFMono-Regular', monospace; }
+      .edge-lbl  { font-size: 10px; fill: #334155; font-weight: 600; }
+      .foot      { font-size: 11px; fill: #334155; }
+      .foot-bold { font-size: 11px; font-weight: 700; fill: #0f172a; }
+    </style>
+
+    <marker id="arr-slate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#0284c7"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#15803d"/>
+    </marker>
+    <marker id="arr-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#b45309"/>
+    </marker>
+    <marker id="arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#6d28d9"/>
+    </marker>
+  </defs>
+
+  <!-- Canvas background -->
+  <rect width="1360" height="890" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+
+  <!-- Header -->
+  <text x="28" y="34" class="title">Azure &amp; Microsoft Fabric Deployment Architecture</text>
+  <text x="28" y="54" class="subtitle">Resource topology, managed-identity trust boundaries, and SQL role separation (worker / web / controller) across Azure AI Foundry, App Service, Container Apps, Azure SQL, and Fabric</text>
+
+  <!-- ===================================================================== -->
+  <!-- TOP ROW: OPERATOR PLANE (LEFT) + IDENTITY & OBSERVABILITY (RIGHT)      -->
+  <!-- ===================================================================== -->
+
+  <!-- Zone 1: Operator Experience & Collaboration -->
+  <rect x="24" y="72" width="768" height="176" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+  <text x="40" y="92" class="zone-lbl" fill="#1d4ed8">Operator Experience &amp; Collaboration Plane</text>
+
+  <!-- App Service: Command Center -->
+  <rect x="40" y="104" width="475" height="130" rx="8" fill="#ffffff" stroke="#3b82f6" stroke-width="1.8"/>
+  <rect x="40" y="104" width="475" height="26" rx="8" fill="#dbeafe"/>
+  <text x="54" y="121" class="box-title" fill="#1e3a8a">Azure App Service — Triage Command Center</text>
+  <rect x="392" y="108" width="112" height="18" rx="9" fill="#1d4ed8"/>
+  <text x="448" y="120" text-anchor="middle" class="pill" fill="#ffffff">SQL role: web</text>
+  <text x="54" y="146" class="box-code">bitriage-command-center (React 18 SPA + FastAPI)</text>
+  <text x="54" y="164" class="box-sub">• Operator queue, incident records, run timelines, monitoring scopes, scenario validation</text>
+  <text x="54" y="181" class="box-sub">• Validates Entra ID JWT app-role claims (Reader, Operator, Approver, Admin)</text>
+  <text x="54" y="198" class="box-sub">• Writes queued human intents &amp; approvals via checked SQL procedures</text>
+  <text x="54" y="215" class="box-sub" fill="#1e40af" font-weight="600">• Never dispatches Fabric or Power BI remediation directly from a browser request</text>
+
+  <!-- Teams & Exchange -->
+  <rect x="530" y="104" width="246" height="60" rx="8" fill="#ffffff" stroke="#64748b" stroke-width="1.2"/>
+  <text x="544" y="124" class="box-title">Microsoft Teams</text>
+  <text x="544" y="141" class="box-sub">Adaptive Card incident summaries</text>
+  <text x="544" y="155" class="box-code">Teams.PostMessage (once per incident)</text>
+
+  <rect x="530" y="174" width="246" height="60" rx="8" fill="#ffffff" stroke="#64748b" stroke-width="1.2"/>
+  <text x="544" y="194" class="box-title">Exchange Online / Graph</text>
+  <text x="544" y="211" class="box-sub">Sender-allowlisted alert mailbox</text>
+  <text x="544" y="225" class="box-code">Graph.ReadAlertFolder (read-only)</text>
+
+  <!-- Zone 2: Identity, Governance & Observability -->
+  <rect x="810" y="72" width="526" height="176" rx="10" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="826" y="92" class="zone-lbl" fill="#334155">Identity, Container Registry &amp; Observability</text>
+
+  <!-- Microsoft Entra ID -->
+  <rect x="826" y="104" width="262" height="130" rx="8" fill="#ffffff" stroke="#475569" stroke-width="1.4"/>
+  <text x="840" y="124" class="box-title">Microsoft Entra ID</text>
+  <text x="840" y="143" class="box-sub">• 3 User-Assigned Managed Identities:</text>
+  <text x="850" y="159" class="box-code">id-controller / id-worker / id-web</text>
+  <text x="840" y="177" class="box-sub">• App Roles on Command Center SPA:</text>
+  <text x="850" y="193" class="box-code">Reader, Operator, Approver, Admin</text>
+  <text x="840" y="211" class="box-sub">• Zero client secrets, keys, or SQL logins</text>
+
+  <!-- Azure Monitor & ACR -->
+  <rect x="1102" y="104" width="218" height="60" rx="8" fill="#ffffff" stroke="#475569" stroke-width="1.2"/>
+  <text x="1116" y="124" class="box-title">Application Insights &amp; Logs</text>
+  <text x="1116" y="141" class="box-sub">OpenTelemetry metadata-only spans</text>
+  <text x="1116" y="155" class="box-code">No prompt or completion bodies</text>
+
+  <rect x="1102" y="174" width="218" height="60" rx="8" fill="#ffffff" stroke="#475569" stroke-width="1.2"/>
+  <text x="1116" y="194" class="box-title">Azure Container Registry</text>
+  <text x="1116" y="211" class="box-sub">Controller &amp; worker images</text>
+  <text x="1116" y="225" class="box-code">AcrPull via Managed Identity</text>
+
+  <!-- ===================================================================== -->
+  <!-- MIDDLE ROW: WORKLOADS & INTAKE (LEFT) + SHARED AZURE SQL (CENTER)      -->
+  <!--             + AZURE AI FOUNDRY CONTROL PLANE (RIGHT)                   -->
+  <!-- ===================================================================== -->
+
+  <!-- Zone 3: Microsoft Fabric & Power BI + Monitoring Worker (Left Column) -->
+  <rect x="24" y="302" width="406" height="500" rx="10" fill="#fefce8" stroke="#facc15" stroke-width="1.5"/>
+  <text x="40" y="322" class="zone-lbl" fill="#854d0e">Monitored Fabric &amp; Power BI Workloads + Worker</text>
+
+  <!-- Power BI Semantic Models -->
+  <rect x="40" y="334" width="374" height="106" rx="8" fill="#ffffff" stroke="#eab308" stroke-width="1.4"/>
+  <text x="54" y="354" class="box-title" fill="#713f12">Power BI Semantic Models (Fabric Workspaces)</text>
+  <text x="54" y="373" class="box-sub">• Refresh history &amp; error signatures: <tspan class="box-code">PowerBI.GetRefreshHistory</tspan></text>
+  <text x="54" y="391" class="box-sub">• Deterministic DAX table scans: <tspan class="box-code">DataQuality.Check</tspan> + baselines</text>
+  <text x="54" y="409" class="box-sub">• Gated model refresh remediation: <tspan class="box-code">PowerBI.TriggerRefresh</tspan></text>
+  <text x="54" y="427" class="box-sub">• Silent-failure detection when refresh succeeds with 0/stale rows</text>
+
+  <!-- Fabric Data Pipelines -->
+  <rect x="40" y="452" width="374" height="106" rx="8" fill="#ffffff" stroke="#eab308" stroke-width="1.4"/>
+  <text x="54" y="472" class="box-title" fill="#713f12">Microsoft Fabric Data Pipelines</text>
+  <text x="54" y="491" class="box-sub">• Scheduled job &amp; activity runs: <tspan class="box-code">Pipeline.GetRun / QueryActivityRuns</tspan></text>
+  <text x="54" y="509" class="box-sub">• Notebook activity failures captured as correlated pipeline evidence</text>
+  <text x="54" y="527" class="box-sub">• Full-pipeline rerun (<tspan class="box-code">Pipeline.RunNow</tspan>) requires replay-safety review,</text>
+  <text x="64" y="542" class="box-sub">explicit human approval, and durable action reservation before POST</text>
+
+  <!-- Fabric Eventstream -->
+  <rect x="40" y="570" width="374" height="68" rx="8" fill="#ffffff" stroke="#eab308" stroke-width="1.4"/>
+  <text x="54" y="590" class="box-title" fill="#713f12">Fabric Workspace Eventstream (Fabric.ItemJob)</text>
+  <text x="54" y="608" class="box-sub">• App-owned Eventstream routes workspace job events to Event Hub</text>
+  <text x="54" y="625" class="box-sub">• Events are source hints; REST evidence + controller admission required</text>
+
+  <!-- Container Apps: Monitoring Worker -->
+  <rect x="40" y="652" width="374" height="134" rx="8" fill="#ffffff" stroke="#0284c7" stroke-width="1.8"/>
+  <rect x="40" y="652" width="374" height="26" rx="8" fill="#e0f2fe"/>
+  <text x="54" y="669" class="box-title" fill="#075985">Container Apps — Monitoring Worker</text>
+  <rect x="294" y="656" width="110" height="18" rx="9" fill="#0369a1"/>
+  <text x="349" y="668" text-anchor="middle" class="pill" fill="#ffffff">SQL role: worker</text>
+  <text x="54" y="694" class="box-code">bitriage-monitoring-worker (pinned UAMI)</text>
+  <text x="54" y="712" class="box-sub">• Discovers domains, workspaces, semantic models &amp; pipelines</text>
+  <text x="54" y="729" class="box-sub">• Polls Fabric/Power BI REST history &amp; consumes Eventstream</text>
+  <text x="54" y="746" class="box-sub">• Submits observations via SQL <tspan class="box-code">worker.*</tspan> procedures</text>
+  <text x="54" y="763" class="box-sub" fill="#0369a1" font-weight="600">• Holds read/event access only — cannot trigger refreshes or reruns</text>
+
+  <!-- Zone 4: Shared Durable State Store — Azure SQL Database (Center Column) -->
+  <rect x="450" y="302" width="424" height="500" rx="10" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+  <rect x="450" y="302" width="424" height="32" rx="10" fill="#dcfce7"/>
+  <text x="466" y="323" class="zone-lbl" fill="#166534">Shared Durable State — Azure SQL Database</text>
+
+  <rect x="466" y="346" width="392" height="72" rx="8" fill="#ffffff" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="480" y="366" class="box-title" fill="#14532d">bitriage-state (<tspan class="box-code">&lt;server&gt;.database.windows.net</tspan>)</text>
+  <text x="480" y="384" class="box-sub">• Entra-only authentication (<tspan class="box-code">ActiveDirectoryDefault</tspan>), TLS, SQL firewall</text>
+  <text x="480" y="401" class="box-sub">• Fail-closed adapters; synchronous atomic <tspan class="box-code">db.transaction()</tspan></text>
+
+  <!-- Kernel Boundary Box -->
+  <rect x="466" y="430" width="392" height="176" rx="8" fill="#ffffff" stroke="#15803d" stroke-width="1.4"/>
+  <text x="480" y="450" class="box-title" fill="#14532d">Permission Kernel (Views &amp; Stored Procedures)</text>
+  <text x="480" y="469" class="box-sub">Zero direct <tspan class="box-code">INSERT/UPDATE/DELETE</tspan> grants on monitoring tables:</text>
+  <text x="480" y="489" class="box-code" fill="#0369a1">worker_read + worker.*</text>
+  <text x="646" y="489" class="box-sub">Observations, checkpoints, heartbeats</text>
+  <text x="480" y="509" class="box-code" fill="#1d4ed8">web_read + web.*</text>
+  <text x="646" y="509" class="box-sub">Scope intents, safety reviews, approvals</text>
+  <text x="480" y="529" class="box-code" fill="#6d28d9">controller_read + controller.*</text>
+  <text x="668" y="529" class="box-sub">Admission, leases, fences, finalize</text>
+  <line x1="480" y1="541" x2="842" y2="541" stroke="#dcfce7" stroke-width="1.5"/>
+  <text x="480" y="558" class="box-sub">• Monotonic epoch &amp; revision checks + <tspan class="box-code">record_retirement</tspan> offsets</text>
+  <text x="480" y="575" class="box-sub">• Idempotent operation receipts (<tspan class="box-code">triage_monitoring_receipts</tspan>)</text>
+  <text x="480" y="592" class="box-sub">• Automatic retirement of superseded inventory &amp; worker fact bindings</text>
+
+  <!-- Operational Tables Box -->
+  <rect x="466" y="618" width="392" height="168" rx="8" fill="#ffffff" stroke="#15803d" stroke-width="1.4"/>
+  <text x="480" y="638" class="box-title" fill="#14532d">Core Operational &amp; Audit Tables</text>
+  <text x="480" y="658" class="box-code">triage_monitoring_records</text>
+  <text x="666" y="658" class="box-sub">Targets, scopes, work queue, fences</text>
+  <text x="480" y="676" class="box-code">triage_incidents</text>
+  <text x="666" y="676" class="box-sub">PII-redacted outcomes &amp; run history</text>
+  <text x="480" y="694" class="box-code">triage_incident_activity</text>
+  <text x="666" y="694" class="box-sub">Append-only notes, closures, Q&amp;A</text>
+  <text x="480" y="712" class="box-code">triage_approvals</text>
+  <text x="666" y="712" class="box-sub">Fingerprint-bound single-use gates</text>
+  <text x="480" y="730" class="box-code">triage_claims &amp; retries</text>
+  <text x="666" y="730" class="box-sub">Atomic incident locks &amp; backoff</text>
+  <text x="480" y="748" class="box-code">triage_baselines</text>
+  <text x="666" y="748" class="box-sub">Row-count &amp; freshness history</text>
+  <text x="480" y="766" class="box-code">triage_pipeline_reservations</text>
+  <text x="666" y="766" class="box-sub">Pre-POST rerun fences &amp; receipts</text>
+
+  <!-- Zone 5: Azure AI Foundry Control & Reasoning Plane (Right Column) -->
+  <rect x="894" y="302" width="442" height="500" rx="10" fill="#f5f3ff" stroke="#a78bfa" stroke-width="1.8"/>
+  <text x="910" y="322" class="zone-lbl" fill="#5b21b6">Control &amp; Reasoning Plane — Azure AI Foundry</text>
+
+  <!-- Hosted Controller Agent -->
+  <rect x="910" y="334" width="410" height="236" rx="8" fill="#ffffff" stroke="#7c3aed" stroke-width="2"/>
+  <rect x="910" y="334" width="410" height="28" rx="8" fill="#ede9fe"/>
+  <text x="924" y="353" class="box-title" fill="#4c1d95">Foundry Hosted Controller</text>
+  <rect x="1192" y="338" width="118" height="18" rx="9" fill="#6d28d9"/>
+  <text x="1251" y="350" text-anchor="middle" class="pill" fill="#ffffff">SQL role: controller</text>
+
+  <text x="924" y="380" class="box-sub" font-weight="600"><tspan class="box-code">bi-triage-controller</tspan> — TriageRunner + PolicyLedger + ToolDispatcher:</text>
+  <text x="924" y="399" class="box-sub">1. Reconciles worker observations, web intents &amp; uncertain receipts</text>
+  <text x="924" y="417" class="box-sub">2. Claims leased monitoring work with workspace-fair rotation</text>
+  <text x="924" y="435" class="box-sub">3. Enforces <tspan class="box-code">PolicyLedger</tspan> budgets (max 8 calls, 1 remediation, 1 post)</text>
+  <text x="924" y="453" class="box-sub">4. Refuses non-allowlisted tools; denials never spend remediation budget</text>
+  <text x="924" y="471" class="box-sub">5. Verifies unexpired, fingerprint-matched approval &amp; atomic SQL fence</text>
+  <text x="924" y="489" class="box-sub">6. Dispatches permitted Power BI / Fabric / Graph / Teams API calls</text>
+  <text x="924" y="507" class="box-sub">7. Cross-checks model final outcome against recorded evidence; overrides</text>
+  <text x="936" y="523" class="box-sub">false <tspan class="box-code">resolved</tspan> claims when deterministic scans fail</text>
+  <text x="924" y="543" class="box-sub" fill="#5b21b6" font-weight="600">Only identity authorized to mutate authority or trigger Fabric actions</text>
+
+  <!-- Foundry Prompt Agents (Zero Permissions) -->
+  <rect x="910" y="584" width="410" height="132" rx="8" fill="#ffffff" stroke="#8b5cf6" stroke-width="1.4" stroke-dasharray="5,3"/>
+  <text x="924" y="604" class="box-title" fill="#4c1d95">Foundry Prompt Agents (<tspan class="box-code">gpt-4.1-mini</tspan>)</text>
+  <rect x="1178" y="588" width="132" height="18" rx="9" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="1244" y="600" text-anchor="middle" class="pill" fill="#b91c1c">0 Service Permissions</text>
+  <text x="924" y="626" class="box-sub">• <tspan font-weight="600">Triage-Orchestrator</tspan>: proposes allowlisted tool calls &amp; structured</text>
+  <text x="936" y="642" class="box-sub"><tspan class="box-code">TriageOutcome</tspan> from failure signatures + public Learn playbooks</text>
+  <text x="924" y="661" class="box-sub">• <tspan font-weight="600">DataQuality-Specialist</tspan>: tool-free interpretation of deterministic</text>
+  <text x="936" y="677" class="box-sub">table scan facts (<tspan class="box-code">DataQualityReport</tspan>)</text>
+  <text x="924" y="696" class="box-sub">• <tspan font-weight="600">Triage-Observer</tspan>: tool-free incident Q&amp;A grounded on stored evidence</text>
+
+  <!-- Logic Apps Scheduler -->
+  <rect x="910" y="728" width="410" height="58" rx="8" fill="#ffffff" stroke="#64748b" stroke-width="1.4"/>
+  <text x="924" y="748" class="box-title">Azure Logic Apps (<tspan class="box-code">bi-triage-command-sweep</tspan>)</text>
+  <text x="924" y="766" class="box-sub">• Invokes controller <tspan class="box-code">heartbeat</tspan> (every 2m), <tspan class="box-code">sweep</tspan> &amp; <tspan class="box-code">silent-sweep</tspan></text>
+
+  <!-- ===================================================================== -->
+  <!-- CONNECTING ARROWS BETWEEN PLANES                                      -->
+  <!-- ===================================================================== -->
+
+  <!-- Command Center <-> Azure SQL (web role) -->
+  <path d="M 480 234 L 480 302" fill="none" stroke="#0284c7" stroke-width="2" marker-end="url(#arr-blue)" marker-start="url(#arr-blue)"/>
+  <text x="352" y="274" class="edge-lbl" fill="#0369a1">web_read / web.* intents</text>
+
+  <!-- Monitoring Worker <-> Azure SQL (worker role) -->
+  <path d="M 414 716 L 450 716" fill="none" stroke="#0284c7" stroke-width="2" marker-end="url(#arr-blue)" marker-start="url(#arr-blue)"/>
+
+  <!-- Controller <-> Azure SQL (controller role) -->
+  <path d="M 910 468 L 874 468" fill="none" stroke="#15803d" stroke-width="2.2" marker-end="url(#arr-green)" marker-start="url(#arr-green)"/>
+
+  <!-- Controller <-> Prompt Agents -->
+  <path d="M 1110 570 L 1110 584" fill="none" stroke="#6d28d9" stroke-width="2" marker-end="url(#arr-purple)" marker-start="url(#arr-purple)"/>
+
+  <!-- Logic App -> Controller -->
+  <path d="M 1290 728 L 1290 570" fill="none" stroke="#475569" stroke-width="1.6" marker-end="url(#arr-slate)"/>
+
+  <!-- Controller -> Teams / Graph (upper routing channel y=262) -->
+  <path d="M 990 334 L 990 262 L 653 262 L 653 234" fill="none" stroke="#475569" stroke-width="1.6" marker-end="url(#arr-slate)"/>
+  <text x="735" y="257" class="edge-lbl">Graph poll &amp; Teams Adaptive Card</text>
+
+  <!-- Controller -> Fabric / Power BI (lower routing channel y=284) -->
+  <path d="M 950 334 L 950 284 L 227 284 L 227 334" fill="none" stroke="#b45309" stroke-width="2" marker-end="url(#arr-amber)"/>
+  <text x="515" y="279" class="edge-lbl" fill="#b45309">Gated TriggerRefresh, Pipeline.RunNow &amp; DAX scans</text>
+
+  <!-- Worker <- Fabric / Eventstream -->
+  <path d="M 227 638 L 227 652" fill="none" stroke="#0284c7" stroke-width="1.8" marker-end="url(#arr-blue)"/>
+
+  <!-- ===================================================================== -->
+  <!-- FOOTER: SECURITY & ARCHITECTURAL GUARANTEES                           -->
+  <!-- ===================================================================== -->
+  <rect x="24" y="818" width="1312" height="52" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2"/>
+  <text x="40" y="839" class="foot">
+    <tspan class="foot-bold">Least-privilege separation:</tspan>
+    Reasoning models hold zero Azure/Fabric credentials. The web portal and monitoring worker cannot execute remediations or write authority tables.
+  </text>
+  <text x="40" y="857" class="foot">
+    <tspan class="foot-bold">Default networking &amp; identity:</tspan>
+    Public endpoints hardened by Entra-only authentication, TLS, SQL firewall admission, and JWT app-role claims (no client secrets, SQL logins, or VNet prerequisites).
+  </text>
+</svg>
