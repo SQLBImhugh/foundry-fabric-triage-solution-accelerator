@@ -2,7 +2,7 @@
 
 <img src="./command-center/public/triage-logo.png" alt="Fabric Triage logo" width="44" height="52" />
 
-The **Fabric Triage Solution Accelerator** is an MIT-licensed reference architecture built on Azure AI Foundry, Azure SQL Database, Power BI, and Microsoft Fabric. It runs a multi-agent operations loop for semantic model refresh failures and scheduled Fabric pipeline failures while keeping every write action, budget limit, and approval gate inside deterministic Python and SQL controller code.
+The **Fabric Triage Solution Accelerator** is an MIT-licensed reference architecture built on Azure AI Foundry, Azure SQL Database, Power BI, and Microsoft Fabric. It automates the investigation and triage of Power BI semantic model refresh failures and scheduled Fabric pipeline failures—doing all the diagnostic legwork an engineer normally does by hand, auto-resolving safe transient blips, and queuing higher-blast-radius fixes in the **Triage Command Center** for one-click human approval before any tool executes.
 
 The entire system also runs **fully offline** on a workstation using mock providers and fixture state:
 - No Azure subscription, Entra credentials, or network access are required to run the CLI or the test suite.
@@ -10,8 +10,46 @@ The entire system also runs **fully offline** on a workstation using mock provid
 
 > **Note:** This is an independently maintained developer sample. It is not a Microsoft product and carries no support agreement. See [Disclaimers](#disclaimers).
 
+## High-level triage flow: from failure to human-approved fix
+
+When a Power BI refresh or Fabric pipeline fails, an engineer normally has to open the workspace, pull the refresh or activity history, check whether the error is transient or repeating, inspect upstream tables for bad data, look up the error code on Microsoft Learn, and decide whether to retry or apply a configuration fix.
+
+In this accelerator, the agents perform that entire due-diligence checklist automatically, while the deterministic controller and human approval gate control what actually runs against your tenant.
+
+Here is how a real failure covered by the built-in [**Gateway unreachable** and **Scheduled refresh deactivated** playbooks](./src/triage/knowledge/playbooks.py) ([`scenario5-approval-granted`](./scenarios/scenario5-approval-granted.yaml)) flows through the system end to end:
+
+1. **Failure arrives and is deduplicated by the controller:**
+   - The scheduled refresh for the `Orders Daily Rollup` semantic model fails with `GatewayUnavailable` (`The on-premises data gateway 'gw-onprem-01' did not respond`).
+   - The monitoring worker (or mailbox watcher) records the failure in Azure SQL, and `TriageRunner` computes a stable failure signature (`dataset_id + GatewayUnavailable`), acquires an atomic SQL claim (`triage_claims`), and confirms no open incident is already tracking this failure.
+2. **Agents run the diagnostic due diligence (with zero write permissions):**
+   - **Refresh history check (`get_refresh_history`):** The triage agent inspects recent runs and finds this is the **3rd consecutive scheduled failure** on `gw-onprem-01`.
+   - **Playbook lookup (`Playbook: Gateway unreachable` & `Scheduled refresh deactivated`):** Retrieved Microsoft Learn guidance warns that a single gateway failure can be retried once, but 3 consecutive scheduled failures mean `gw-onprem-01` itself is down and a 4th failure will cause Power BI to **automatically disable the model's refresh schedule**.
+   - **Upstream data scan (`check_data_quality` -> `DataQualityAgent`):** The controller deterministically scans the upstream `daily_sales` table for duplicate keys, null business keys, and row-count drops (`0` issues found), confirming the source data is clean before any fix is proposed.
+3. **Agent proposes an automated fix in the Triage Command Center (human-in-the-loop):**
+   - Because another refresh on `gw-onprem-01` will fail and deactivate the schedule, the agent proposes rebinding the dataset to the healthy standby gateway (`rebind_report` -> `gw-onprem-02`) followed by a fresh refresh (`refresh_dataset`).
+   - Rebinding affects gateway routing, so `src/triage/policy.py` classifies it as a **Tier-2 gated action**.
+   - `ToolDispatcher` halts execution, persists the full diagnostic timeline, evidence, and blast-radius summary to Azure SQL, and surfaces the proposal in the **Triage Command Center** (`awaiting_approval`).
+4. **Human approves in Command Center and the tool executes the fix:**
+   - An operator with the `CommandCenter.Approver` role reviews the collected evidence in the Command Center **Proposal & Approval** tab and clicks **Approve & queue execution**.
+   - Command Center writes a single-use, unexpired approval record bound to the exact SHA-256 fingerprint of the call (`sha256(incident_id, action, canonical_args)`).
+   - If the human clicks **Deny proposal** instead (`scenario6-approval-denied`), the tool never runs, the denial **does not consume the remediation budget**, and the incident closes cleanly as `approval_denied`.
+5. **Controller dispatches the tool, verifies completion, and closes the incident:**
+   - On the next heartbeat, `ToolDispatcher` verifies the allowlist, `PolicyLedger` budget (`max_remediation_actions=1`), and matching approval fingerprint, then executes `rebind_report` and `refresh_dataset` using the controller's managed identity.
+   - The controller verifies over REST that the new refresh status is `Completed`, posts a single resolution summary to Teams (`notified_count = 1`), and persists the terminal outcome as `resolved`.
+
+> **The same human-in-the-loop pattern applies to scheduled Fabric Data Pipelines** ([`scenario10-pipeline-rerun-approved`](./scenarios/scenario10-pipeline-rerun-approved.yaml)): when a pipeline fails on an `ADLSGen2OperationFailed` (`InternalServerError`) copy activity, the agent inspects the failed activity run, verifies that an Admin has attested the pipeline's `full_pipeline_rerun` replay safety (`idempotent_overwrite`), queues a `Pipeline.RunNow` proposal for human approval in Command Center, reserves an atomic SQL fence (`triage_pipeline_reservations`), triggers the rerun, and verifies that the new job and activities reach `Completed` before marking the incident `resolved`.
+
+Depending on what the agent's investigation finds, every incident routes down one of three branches:
+
+| Triage branch | When the agent chooses it | What happens next |
+|---|---|---|
+| **Tier 1 — Auto-remediate (no human needed)** | Isolated transient refresh timeout (`scenario1-transient`), capacity contention needing a deferred backoff (`scenario8-capacity-backoff`), or a disabled schedule whose latest manual refresh already succeeded (`scenario7-schedule-reenable`). | `ToolDispatcher` checks the allowlist and `PolicyLedger` budget (`max 1 remediation`), runs the fix automatically, verifies completion, and records `resolved` or `deferred_retry`. |
+| **Tier 2 — Human-in-the-loop approval** | High-blast-radius fix such as rebinding a semantic model to a backup gateway (`scenario5-approval-granted`) or rerunning an idempotent Fabric data pipeline after an ADLS/SQL transient error (`scenario10-pipeline-rerun-approved`). | Agent completes all diagnostics, writes the proposal and blast radius to Command Center (`awaiting_approval`), waits for a fingerprint-matched `Approver` decision, executes the tool, and verifies completion. |
+| **Escalate — Needs human / Data quality flag** | Duplicate keys in source data (`scenario2-data-quality`), expired credentials (`scenario9-pipeline-authentication`), schema drift (`scenario12-pipeline-schema-mismatch`), or partial pipeline writes where a rerun could duplicate rows (`scenario14-pipeline-write-timeout`). | Controller refuses any blind retry, flags the offending table or activity with exact diagnostic evidence, notifies the owner once, and records `flagged_data_quality` or `needs_human`. |
+
 ## Table of contents
 
+- [High-level triage flow: from failure to human-approved fix](#high-level-triage-flow-from-failure-to-human-approved-fix)
 - [Problem and authorization boundary](#problem-and-authorization-boundary)
   - [Failure modes in a Power BI and Fabric estate](#failure-modes-in-a-power-bi-and-fabric-estate)
   - [Why prompt wording is not an authorization boundary](#why-prompt-wording-is-not-an-authorization-boundary)
