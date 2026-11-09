@@ -185,8 +185,9 @@ raise SystemExit(1 if issues else 0)
         if (-not ($names -cmatch '^scenarios/[^/]+\.ya?ml$') -or -not ($names -cmatch '^mock/.+')) {
             throw 'The canonical scenarios or mock inputs are absent from the archive.'
         }
-        if (-not ($names -match '(?i)^command-center/dist/.*DejaVu[^/]*\.(woff2?|ttf|otf)$')) {
-            throw 'The built frontend must include its self-hosted DejaVu fonts.'
+        if (-not ($names -match '(?i)^command-center/dist/fonts/SourceSans3[^/]*\.(woff2?|ttf|otf)$') -or
+            -not ($names -match '(?i)^command-center/dist/fonts/IBMPlexMono[^/]*\.(woff2?|ttf|otf)$')) {
+            throw 'The built frontend must include its self-hosted Source Sans 3 and IBM Plex Mono fonts.'
         }
         $requirementsReader = [IO.StreamReader]::new($check.GetEntry('requirements.txt').Open())
         try {

@@ -249,7 +249,7 @@ All durable state lives in one shared Azure SQL Database (`bitriage-state`) so c
 
 ## Triage Command Center walkthrough
 
-The **Triage Command Center** (`command-center/`) is a React 18 + FastAPI operational portal deployed on Azure App Service. Every screenshot below is captured live from the reference deployment (`rg-bitriage-accel`) monitoring 1,458 Fabric and Power BI artifacts across 4 active workspaces.
+The **Triage Command Center** (`command-center/`) is a React 18 + FastAPI operational portal deployed on Azure App Service. Every screenshot below is captured live from the reference deployment (`rg-bitriage-accel`).
 
 ### Command Center overview and incident queue
 
@@ -276,7 +276,7 @@ Clicking **How it works** in the top bar opens the **System overview** reference
 
 The **Monitoring setup** page manages tenant discovery, workspace scope activation, Eventstream health, and per-pipeline replay safety reviews:
 - **Runtime & Eventstream status:** Shows live worker freshness (`Fresh`), Eventstream mode (`event_enabled`, `Active`), and controller reconciliation status.
-- **Workspace scope selector:** Lists discovered workspaces (332 discovered in the tenant; 4 workspaces with 1,458 targets enabled in scope).
+- **Monitoring coverage and scope selector:** Shows verified discovery and capability status (`Inventory total: 3. Inventory complete; capability checks complete.`) and manages positive/negative workspace and domain scope rules.
 - **Target safety reviews:** Allows Admins to attest replay posture (`full_pipeline_rerun`, `diagnostic_only`, or `blocked`) pinned to each pipeline's definition hash before any rerun can be proposed.
 
 ![Monitoring Setup and Workspace Scope](./docs/images/command-center/portal-monitoring-setup.png)
@@ -525,7 +525,7 @@ What has been verified live against the reference deployment (`rg-bitriage-accel
   - Deployed with Microsoft Entra-only authentication, 27 RPC stored procedures, 3 component read views (`worker_read`, `web_read`, `controller_read`), 106 explicit permission grants, and zero schema drift (`sys.sql_modules` verified against `build_permission_kernel()`).
   - Live retention (`controller.retire_inventory`) retires superseded inventory generations and superseded `accepted_fact` bindings (`fact_revision < r.revision`) in batches of 1,000, keeping S1 (20 DTU) Data IO at ~12–18% and draining `reconcile_state` queues to zero with 17–32s controller heartbeats.
 - **Hybrid monitoring worker (`bitriage-monitoring-worker`) and Eventstream intake:**
-  - Deployed as a no-ingress Container App discovering 332 Fabric workspaces and monitoring 1,458 targets across 4 active workspaces (`Sales & Revenue Analytics`, `Finance & Operations BI`, `Enterprise Claims Hub`, and `Bitriage Event Canary`).
+  - Deployed as a no-ingress Container App polling and verifying the active monitored workspace (`3` discovered, access-verified, and admitted targets across Power BI semantic models and Fabric pipelines).
   - Native Fabric Job Eventstream (`workspace.jobevents`) is active in `event_enabled` mode alongside REST polling.
 - **Command Center (`bitriage-command-center`) and Foundry controller (`bi-triage-controller`):**
   - Live on Azure App Service and Azure AI Foundry with Entra JWT role validation, 1-minute Consumption Logic App heartbeats (`bitriage-heartbeat`), metadata-only Application Insights spans, Tier-2 pipeline rerun approval gates, and 15/15 passing scenario validations.
