@@ -66,9 +66,12 @@ INVENTORY_RETIREMENT_INTERVAL = timedelta(minutes=15)
 #: pass record goes with the last of them. Each sighting also has one or more
 #: accepted-evidence bindings.
 INVENTORY_RETIREMENT_SIGHTINGS = 1_000
-#: Record kinds inventory retirement deletes: a pass record, its sightings and
-#: the accepted-evidence bindings for those rows.
-RETIRED_RECORD_KINDS = ("generation", "workspace_seen", "inventory_seen", "domain_seen", "accepted_fact")
+#: Record kinds inventory retirement deletes: a pass record, its sightings,
+#: orphaned/unsupported catalogue rows and their accepted-evidence bindings.
+RETIRED_RECORD_KINDS = (
+    "generation", "workspace_seen", "inventory_seen", "domain_seen",
+    "inventory", "workspace", "domain", "accepted_fact",
+)
 #: Work states in which an inventory pass may still record pages.
 ACTIVE_WORK_STATES = ("queued", "leased", "waiting", "finalizing")
 
@@ -638,7 +641,10 @@ class InventoryRetirementResult(MonitoringContext):
 class RecordRetirement(MonitoringContext):
     """Cumulative deletions of one record kind; its offset keeps change counters rising."""
 
-    record_kind: Literal["generation", "workspace_seen", "inventory_seen", "domain_seen", "accepted_fact"]
+    record_kind: Literal[
+        "generation", "workspace_seen", "inventory_seen", "domain_seen",
+        "inventory", "workspace", "domain", "accepted_fact",
+    ]
     retired_rows: Count
     counter_offset: Count
     updated_at: UtcDateTime

@@ -166,13 +166,18 @@ of these applies:
 
 | Kept pass | Reader |
 |---|---|
-| Latest, latest finished or latest complete pass of its scan (selector and enumeration) | Coverage, scope preview, catalogue completeness |
+| Latest finished or latest complete pass of its scan (selector and enumeration) | Coverage, scope preview, catalogue completeness |
 | Finished pass that a scan still collecting defers to, within `INVENTORY_COLLECTION_GRACE` | Admission during a re-inventory |
-| Pass named by a workspace, domain or item record | Catalogue lookups; a deleted item names the pass that proved the deletion |
+| Finished pass named by a workspace, domain or supported item record (or an unfinished pass in a workspace with a non-removed target) | Catalogue lookups; a deleted item names the pass that proved the deletion |
 | Pass whose inventory work is queued, leased, waiting or finalizing | The worker resumes it |
 | Pass whose collection window is still open | Controller publication |
 
-A deleted item's evidence is always kept: every later complete scan that
+An unfinished pass whose work was dispositioned and whose collection window was
+closed or rejected is excluded from coverage when no enabled scope selects its
+selector, and is retired with its sightings and unreferenced catalogue rows
+once the seven-day retention window expires. Unsupported item rows (`workload`
+is `NULL`) from older unfiltered scans do not keep a pass alive and are retired
+with it. A deleted item's evidence is always kept: every later complete scan that
 covers the item proves the deletion again and becomes the pass it names.
 Operation receipts and per-page acceptance records (`intake_disposition`),
 which copy each page's pass details, are not retired.

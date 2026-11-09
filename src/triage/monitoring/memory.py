@@ -976,6 +976,7 @@ class MemoryMonitoringAdapter(MonitoringAdapter):
                 if engine._inventory_pass_retirable(control, generation_id, generations, now)
             ]
             sighting_kinds = ("workspace_seen", "inventory_seen", "domain_seen")
+            reference_kinds = ("inventory", "workspace", "domain")
             superseded_kinds = (
                 "receiver_heartbeat", "poll_progress", "poll_schedule",
                 "capability", "inventory", "workspace", "domain",
@@ -988,14 +989,19 @@ class MemoryMonitoringAdapter(MonitoringAdapter):
                     row for kind in sighting_kinds
                     for row in backend.scan(kind, control, limit=len(backend.state.records), filters={"parent_key": generation_id})
                 ), key=lambda row: (row.kind, key_digest(row.key)))
-                for row in sightings[:budget]:
+                references = sorted((
+                    row for kind in reference_kinds
+                    for row in backend.scan(kind, control, limit=len(backend.state.records), filters={"generation_id": generation_id})
+                ), key=lambda row: (row.kind, key_digest(row.key)))
+                pass_rows = sightings + references
+                for row in pass_rows[:budget]:
                     deleted.setdefault(row.kind, []).append(backend.delete(row.kind, row.key, control))
-                # The pass record goes with its last sighting and stays
-                # eligible until then.
-                if len(sightings) <= budget:
+                # The pass record goes with its last sighting or orphaned
+                # catalogue row and stays eligible until then.
+                if len(pass_rows) <= budget:
                     deleted.setdefault("generation", []).append(backend.delete("generation", generation_id, control))
                     retired.append(generation_id)
-                budget -= min(budget, len(sightings))
+                budget -= min(budget, len(pass_rows))
             retired_facts = {(row.kind, row.key) for rows in deleted.values() for row in rows}
             if retired_facts:
                 for row in backend.scan("accepted_fact", control, limit=len(backend.state.records)):
@@ -1046,7 +1052,10 @@ class MemoryMonitoringAdapter(MonitoringAdapter):
                 retain_after=now - m.INVENTORY_RETENTION, retired_generation_ids=tuple(sorted(retired)),
                 refused_generation_ids=tuple(sorted(set(candidates) - set(eligible))),
                 deferred_generation_ids=tuple(sorted(set(eligible) - set(retired))),
-                retired_sightings=sum(len(rows) for kind, rows in deleted.items() if kind in sighting_kinds),
+                retired_sightings=sum(
+                    len(rows) for kind, rows in deleted.items()
+                    if kind in (*sighting_kinds, *reference_kinds)
+                ),
                 retired_bindings=len(deleted.get("accepted_fact", ())),
             )
         return self.idempotent(

@@ -513,11 +513,11 @@ async def test_a_proposed_pass_that_is_still_needed_is_refused_not_deleted(histo
 
 @pytest.mark.parametrize("adapter", ["memory", "sql"])
 async def test_each_scan_keeps_its_latest_latest_finished_and_latest_complete_pass(adapter, tmp_path, monkeypatch):
-    """Each pass here is kept by exactly one of the three rules, even when proposed.
+    """Kept passes are the latest active, latest finished and latest complete of each scan.
 
-    L: the only workspace scan; unfinished, and its window was rejected when a
-       scope activation changed policy.                -> latest of its scan
-    O1: finished incomplete; O2, newer, still collecting. -> latest finished
+    L: an unfinished workspace scan whose work was dispositioned and whose
+       window was rejected when a scope activation changed policy -> retired
+    O1: finished incomplete; O2, newer, still collecting. -> latest finished & latest active
     K1: complete; K2, newer, finished incomplete.        -> latest complete
     M: a later tenant scan that sees every item and the workspace again.
     """
@@ -540,15 +540,108 @@ async def test_each_scan_keeps_its_latest_latest_finished_and_latest_complete_pa
         fixture.h.clock.advance(60)
         passes[name] = await scan(fixture, **options)
     fixture.h.clock.advance(8 * DAY)
-    kept = [passes[name] for name in ("L", "O1", "K1")]
+    proposed = [passes[name] for name in ("L", "O2", "O1", "K1")]
     monkeypatch.setattr(
-        MonitoringEngine, "_inventory_retirement_candidates", lambda self, control, *, now, limit: kept,
+        MonitoringEngine, "_inventory_retirement_candidates", lambda self, control, *, now, limit: proposed,
     )
 
     _, result = retire(fixture)
 
-    assert result.retired_generation_ids == ()
-    assert set(result.refused_generation_ids) == set(kept)
+    assert result.retired_generation_ids == (passes["L"],)
+    assert set(result.refused_generation_ids) == {passes["O2"], passes["O1"], passes["K1"]}
+
+
+@pytest.mark.parametrize("adapter", ["memory", "sql"])
+async def test_abandoned_unfinished_pass_and_unsupported_items_are_retired_and_excluded_from_coverage(
+    adapter, tmp_path,
+):
+    """A dispositioned unfinished scan outside active scopes cannot poison coverage or pin stale catalogue rows."""
+    fixture = PublicationHarness(adapter, tmp_path, register_transport=False)
+    item = fixture.identity.item_id
+    stale_item = uid(77_090)
+    unsupported_item = uid(77_091)
+
+    # Start a complete workspace scan andprobe first so the workspace scope can be activated
+    # while an unfinished tenant scan's window is open, matching the Sept 18 live sequence.
+    ws_pass = await scan(fixture, items=(item,))
+    record_probe(fixture, ws_pass, hours=24 * 60)
+    await fixture.drain()
+
+    fixture.h.clock.advance(60)
+    abandoned_work = await start_pass(fixture, tenant_scan())
+    now = fixture.h.clock()
+    abandoned_gen = m.InventoryGeneration(
+        **CONTEXT.model_dump(), generation_id=abandoned_work.work_id, selector=tenant_scan(),
+        adapter="explicit_offline_inventory", authority="tenant_admin",
+        completeness="partial", started_at=now, completed_at=None, continuation="page-2",
+        discovered_count=1, completed_pages=1,
+        gaps=(
+            m.CoverageGap(code="inventory_in_progress", detail="Inventory has a durable continuation"),
+            m.CoverageGap(code="http_401", detail="REST evidence read returned HTTP 401", workspace_id=OTHER_WORKSPACE),
+        ),
+    )
+    fixture.use("worker").record_inventory(m.InventoryBatch(
+        request_id=fixture.h.next_id(), expected=fixture.version("worker"), generation=abandoned_gen,
+        workspaces=(
+            m.InventoryWorkspace(
+                **CONTEXT.model_dump(), generation_id=abandoned_work.work_id,
+                workspace_id=OTHER_WORKSPACE, name="Stale Workspace", observed_at=now,
+            ),
+        ),
+        items=(
+            m.InventoryItem(
+                **CONTEXT.model_dump(), generation_id=abandoned_work.work_id,
+                workspace_id=OTHER_WORKSPACE, item_id=stale_item, name="Stale Pipeline",
+                item_type="DataPipeline", workload="fabric_pipeline", observed_at=now,
+            ),
+            m.InventoryItem(
+                **CONTEXT.model_dump(), generation_id=abandoned_work.work_id,
+                workspace_id=OTHER_WORKSPACE, item_id=unsupported_item, name="Stale Eventstream",
+                item_type="Eventstream", workload=None, unsupported_reason="No detector contract",
+                observed_at=now,
+            ),
+        ),
+        commit=m.InventoryCommit(
+            work_id=abandoned_work.work_id, lease=abandoned_work.lease,
+            expected_work_revision=abandoned_work.revision,
+            expected_generation_revision=0, expected_continuation=None,
+        ),
+    ))
+    close(fixture, abandoned_work)
+    await fixture.drain()
+    # A complete workspace scan and scope activation while the unfinished tenant
+    # scan's window is open rejects that window, matching the Sept 18 live sequence.
+    fixture.h.clock.advance(60)
+    latest_ws_pass = await scan(fixture, items=(item,))
+    record_probe(fixture, latest_ws_pass, hours=24 * 60)
+    await fixture.drain()
+    await activate(fixture)
+    fixture.h.clock.advance(16)
+    await fixture.drain()
+
+    # Immediately (before 7-day retention), coverage ignores the abandoned tenant pass and its stale items.
+    for component in ("controller", "web"):
+        view = fixture.use(component).coverage(CONTEXT)
+        assert view.inventory_completeness == "complete"
+        assert view.capability_completeness == "complete"
+        assert view.scope_item_count == 1
+        assert view.discovered_count == 1
+        assert all(gap.code not in {"inventory_in_progress", "http_401", "inventory_incomplete", "access_unverified"} for gap in view.gaps)
+
+    # After 7 days, retirement deletes the abandoned tenant pass, its sightings, and its orphaned catalogue rows.
+    fixture.h.clock.advance(8 * DAY)
+    rev_before = inventory_revision(fixture)
+    _, result = retire(fixture)
+
+    assert abandoned_work.work_id in result.retired_generation_ids
+    assert ws_pass in result.retired_generation_ids
+    assert pass_rows(fixture, abandoned_work.work_id) == set()
+    assert fixture.use("controller").get_inventory_generation(CONTEXT, abandoned_work.work_id) is None
+    workspaces = fixture.use("web").list_workspaces(m.PageQuery(**CONTEXT.model_dump())).items
+    assert {w.workspace_id for w in workspaces} == {fixture.identity.workspace_id}
+    items = fixture.use("web").list_inventory(m.TargetQuery(**CONTEXT.model_dump())).items
+    assert {(i.workspace_id, i.item_id) for i in items} == {(fixture.identity.workspace_id, item)}
+    assert inventory_revision(fixture) > rev_before
 
 
 @pytest.mark.parametrize("history", ["memory", "sql"], indirect=True)

@@ -74,7 +74,6 @@ def inventory_retirement_eligible_sql(names: SqlNames, *, passes: str, generatio
     return f"""EXISTS (
     SELECT 1 FROM {passes} AS g
     WHERE g.generation_id={generation} AND g.started_at<@retain_after
-      AND EXISTS ({newer_in_scan})
       AND (g.finished=0 OR EXISTS ({newer_in_scan} AND n.finished=1))
       AND (g.complete=0 OR EXISTS ({newer_in_scan} AND n.complete=1))
       AND (g.finished=0 OR NOT EXISTS (
@@ -82,11 +81,16 @@ def inventory_retirement_eligible_sql(names: SqlNames, *, passes: str, generatio
           WHERE {_same_scan('x', 'g')} AND {_newer('x', 'g')} AND x.finished=0 AND x.started_at>=@grace_start
             AND NOT EXISTS (
                 SELECT 1 FROM {passes} AS f
-                WHERE {_same_scan('f', 'g')} AND f.finished=1 AND {_newer('f', 'g')} AND {_newer('x', 'f')}))))
-AND NOT EXISTS (
-    SELECT 1 FROM {records} AS r
-    WHERE r.tenant_id=@tenant_id AND r.epoch=@epoch AND r.record_kind IN ({varchar_literals(REFERENCE_KINDS)})
-      AND r.generation_id={generation})
+                WHERE {_same_scan('f', 'g')} AND f.finished=1 AND {_newer('f', 'g')} AND {_newer('x', 'f')})))
+      AND NOT EXISTS (
+          SELECT 1 FROM {records} AS r
+          WHERE r.tenant_id=@tenant_id AND r.epoch=@epoch AND r.record_kind IN ({varchar_literals(REFERENCE_KINDS)})
+            AND r.generation_id={generation}
+            AND (r.record_kind<>'inventory' OR r.workload IN ({varchar_literals(m.SUPPORTED_WORKLOADS)}))
+            AND (g.finished=1 OR EXISTS (
+                SELECT 1 FROM {records} AS t
+                WHERE t.tenant_id=@tenant_id AND t.epoch=@epoch AND t.record_kind='target'
+                  AND t.status<>'removed' AND t.workspace_id=r.workspace_id))))
 AND NOT EXISTS (
     SELECT 1 FROM {records} AS w
     WHERE w.tenant_id=@tenant_id AND w.epoch=@epoch AND w.record_kind='work'
@@ -165,6 +169,8 @@ def inventory_retention_procedures(names: SqlNames, contracts: dict[str, RpcCont
     records = names.table("monitoring_records")
     retirement_key = key_hash("t.record_kind")
     sightings = varchar_literals(SIGHTING_KINDS)
+    references = varchar_literals(REFERENCE_KINDS)
+    pass_fact_kinds = varchar_literals((*SIGHTING_KINDS, *REFERENCE_KINDS))
     body = f"""IF @limit NOT BETWEEN 1 AND {m.MAX_INVENTORY_RETIREMENT_BATCH}
     THROW 51073, 'Inventory retirement batch size is outside its fixed bound', 1;
 IF ISJSON(@generation_ids_json)<>1 OR LEFT(LTRIM(@generation_ids_json),1)<>N'['
@@ -206,8 +212,17 @@ FROM @eligible AS e JOIN {records} AS s
   ON s.tenant_id=@tenant_id AND s.epoch=@epoch AND s.record_kind IN ({sightings})
  AND s.parent_hash=e.key_hash AND s.parent_key=e.generation_id
 ORDER BY e.ordinal,s.record_kind,s.key_hash;
--- A pass record goes with its last sighting. Until then it stays, and stays
--- eligible, so a later operation continues where this one stopped.
+DECLARE @catalogue_budget int={m.INVENTORY_RETIREMENT_SIGHTINGS}-(SELECT COUNT(*) FROM @facts);
+IF @catalogue_budget>0
+INSERT INTO @facts (record_kind,key_hash,full_key)
+SELECT TOP (@catalogue_budget) r.record_kind,r.key_hash,r.full_key
+FROM @eligible AS e JOIN {records} AS r
+  ON r.tenant_id=@tenant_id AND r.epoch=@epoch AND r.record_kind IN ({references})
+ AND r.generation_id=e.generation_id
+ORDER BY e.ordinal,r.record_kind,r.key_hash;
+-- A pass record goes with its last sighting or orphaned catalogue row. Until
+-- then it stays, and stays eligible, so a later operation continues where this
+-- one stopped.
 DECLARE @retired TABLE (generation_id nvarchar(64) COLLATE DATABASE_DEFAULT NOT NULL PRIMARY KEY,
     key_hash binary(32) NOT NULL);
 INSERT INTO @retired (generation_id,key_hash)
@@ -216,7 +231,12 @@ WHERE NOT EXISTS (
     SELECT 1 FROM {records} AS s
     WHERE s.tenant_id=@tenant_id AND s.epoch=@epoch AND s.record_kind IN ({sightings})
       AND s.parent_hash=e.key_hash AND s.parent_key=e.generation_id
-      AND NOT EXISTS (SELECT 1 FROM @facts AS f WHERE f.record_kind=s.record_kind AND f.key_hash=s.key_hash));
+      AND NOT EXISTS (SELECT 1 FROM @facts AS f WHERE f.record_kind=s.record_kind AND f.key_hash=s.key_hash))
+  AND NOT EXISTS (
+    SELECT 1 FROM {records} AS r
+    WHERE r.tenant_id=@tenant_id AND r.epoch=@epoch AND r.record_kind IN ({references})
+      AND r.generation_id=e.generation_id
+      AND NOT EXISTS (SELECT 1 FROM @facts AS f WHERE f.record_kind=r.record_kind AND f.key_hash=r.key_hash));
 DECLARE @selected_sightings int=(SELECT COUNT(*) FROM @facts);
 INSERT INTO @facts (record_kind,key_hash,full_key)
 SELECT 'generation',r.key_hash,r.generation_id FROM @retired AS r;
@@ -233,7 +253,7 @@ FROM {records} AS d JOIN @facts AS f
   ON d.tenant_id=@tenant_id AND d.epoch=@epoch AND d.record_kind=f.record_kind
  AND d.key_hash=f.key_hash AND d.full_key=f.full_key;
 IF (SELECT COUNT(*) FROM @deleted WHERE record_kind='generation')<>(SELECT COUNT(*) FROM @retired)
-   OR (SELECT COUNT(*) FROM @deleted WHERE record_kind IN ({sightings}))<>@selected_sightings
+   OR (SELECT COUNT(*) FROM @deleted WHERE record_kind IN ({pass_fact_kinds}))<>@selected_sightings
     THROW 51072, 'A retired inventory pass changed during retirement', 1;
 -- Superseded accepted_fact bindings for mutable facts are retired up to the
 -- remaining sighting budget once their batch's frontier is no longer pending.
@@ -297,7 +317,7 @@ SET @result=(SELECT @tenant_id AS tenant_id,@epoch AS epoch,@request_id AS reque
     {_id_array('@retired', 'r')} AS retired_generation_ids,
     {_id_array('@candidates', 'c', ' WHERE NOT EXISTS (SELECT 1 FROM @eligible AS e WHERE e.generation_id=c.generation_id)')} AS refused_generation_ids,
     {_id_array('@eligible', 'e', ' WHERE NOT EXISTS (SELECT 1 FROM @retired AS r WHERE r.generation_id=e.generation_id)')} AS deferred_generation_ids,
-    (SELECT COUNT(*) FROM @deleted WHERE record_kind IN ({sightings})) AS retired_sightings,
+    (SELECT COUNT(*) FROM @deleted WHERE record_kind IN ({pass_fact_kinds})) AS retired_sightings,
     (SELECT COUNT(*) FROM @deleted WHERE record_kind='accepted_fact') AS retired_bindings
     FOR JSON PATH,WITHOUT_ARRAY_WRAPPER);
 {save_receipt(names, contract.operation)}"""

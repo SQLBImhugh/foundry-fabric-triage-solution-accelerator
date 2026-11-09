@@ -1412,18 +1412,19 @@ class MonitoringEngine:
         generation = next((value for value in generations if value.generation_id == generation_id), None)
         return (
             generation is not None and self._inventory_pass_superseded(generation, generations, now)
-            and not self._inventory_passes_in_use(control, [generation_id])
+            and not self._inventory_passes_in_use(control, [generation_id], generations)
         )
 
     def _inventory_pass_superseded(
         self, generation: m.InventoryGeneration, generations: list[m.InventoryGeneration], now: datetime,
     ) -> bool:
-        """Old enough, and newer passes of its scan have taken over every role it had.
+        """Old enough, and either superseded in scan order or left unfinished.
 
-        Coverage, scope previews and admission use the latest pass of each scan
-        and its latest finished and latest complete passes. A scan still
-        collecting within INVENTORY_COLLECTION_GRACE defers to the finished pass
-        before it (see _settled_pass).
+        Coverage, scope previews and admission use the latest finished and
+        latest complete passes of each scan. A scan still collecting within
+        INVENTORY_COLLECTION_GRACE defers to the finished pass before it (see
+        _settled_pass). An unfinished pass older than retention is kept only
+        while its work or collection window remains open in _inventory_passes_in_use.
         """
         if generation.started_at >= now - m.INVENTORY_RETENTION:
             return False
@@ -1434,8 +1435,7 @@ class MonitoringEngine:
         newer = [value for value in scan if _pass_order(value) > _pass_order(generation)]
         finished = generation.completed_at is not None
         return not (
-            not newer
-            or finished and not any(value.completed_at is not None for value in newer)
+            finished and not any(value.completed_at is not None for value in newer)
             or generation.completeness == "complete" and not any(value.completeness == "complete" for value in newer)
             or finished and any(
                 value.completed_at is None and now - value.started_at <= m.INVENTORY_COLLECTION_GRACE
@@ -1448,17 +1448,28 @@ class MonitoringEngine:
             )
         )
 
-    def _inventory_passes_in_use(self, control: m.DeploymentControl, generation_ids: list[str]) -> set[str]:
+    def _inventory_passes_in_use(
+        self, control: m.DeploymentControl, generation_ids: list[str],
+        generations: list[m.InventoryGeneration] | None = None,
+    ) -> set[str]:
         """The passes among these that a reader outside scan order still needs.
 
-        A workspace, domain or item record resolves the pass that last saw it,
-        and a deleted item's pass is its deletion evidence. A worker resumes a
-        pass through its active work, and the controller publishes a pass
-        through its open collection window.
+        A workspace, domain or supported item record from a finished pass
+        resolves the pass that last saw it, and a deleted item's pass is its
+        deletion evidence. An unfinished pass's partial catalogue entries keep
+        it only when a non-removed target exists in that workspace. A worker
+        resumes a pass through its active work, and the controller publishes a
+        pass through its open collection window.
         """
         wanted = set(generation_ids)
         if not wanted:
             return set()
+        if generations is None:
+            generations = self._all("generation", control, m.InventoryGeneration)
+        finished_ids = {
+            generation.generation_id for generation in generations
+            if generation.completed_at is not None
+        }
         in_use = {
             work.work_id for work in self._all(
                 "work", control, m.MonitoringWork,
@@ -1466,13 +1477,30 @@ class MonitoringEngine:
             )
         } | self._adapter.open_inventory_collections(control)
         remaining = sorted(wanted - in_use)
+        if not remaining:
+            return in_use & wanted
+        target_workspaces: set[str] | None = None
         for kind, model in (
             ("inventory", m.InventoryItem), ("workspace", m.InventoryWorkspace), ("domain", m.InventoryDomain),
         ):
             for offset in range(0, len(remaining), 200):
-                in_use.update(record.generation_id for record in self._all(
-                    kind, control, model, filters={"generation_id_in": tuple(remaining[offset:offset + 200])},
-                ))
+                filters: dict[str, object] = {"generation_id_in": tuple(remaining[offset:offset + 200])}
+                if kind == "inventory":
+                    filters["workload_in"] = m.SUPPORTED_WORKLOADS
+                for record in self._all(kind, control, model, filters=filters):
+                    if record.generation_id in finished_ids:
+                        in_use.add(record.generation_id)
+                        continue
+                    workspace_id = getattr(record, "workspace_id", None)
+                    if workspace_id is not None:
+                        if target_workspaces is None:
+                            target_workspaces = {
+                                target.identity.workspace_id
+                                for target in self._all("target", control, m.MonitoringTarget)
+                                if target.state != "removed"
+                            }
+                        if workspace_id in target_workspaces:
+                            in_use.add(record.generation_id)
         return in_use & wanted
 
     def _scope_disable_targets(
@@ -3266,6 +3294,45 @@ class MonitoringEngine:
             code="additional_gaps", detail=f"{len(gaps) - 199} additional gaps are available in paginated target/inventory records.",
         ))
 
+    def _abandoned_inventory_passes(
+        self, control: m.DeploymentControl, generations: list[m.InventoryGeneration],
+        scopes: list[m.ScopePolicy],
+    ) -> set[str]:
+        """Unfinished passes whose work was dispositioned outside any enabled scope."""
+        enabled_selectors = [
+            rule.selector for scope in scopes if scope.enabled
+            for rule in scope.rules if rule.effect == "include"
+        ]
+        if not enabled_selectors:
+            return set()
+        candidates = [
+            generation.generation_id for generation in generations
+            if generation.completed_at is None and generation.selector not in enabled_selectors
+        ]
+        if not candidates:
+            return set()
+        open_windows = self._adapter.open_inventory_collections(control)
+        abandoned = set()
+        for generation_id in candidates:
+            if generation_id in open_windows:
+                continue
+            frontier_key = f"validation:v1:{control.epoch}:{control.tenant_id}:inventory:{generation_id}"
+            frontier = self._backend.get("validation_frontier", frontier_key, control)
+            if (
+                frontier is not None and frontier.status == "rejected"
+                or self._backend.count(
+                    "validation_window", control,
+                    filters={"parent_key": generation_id, "status": "rejected"},
+                ) > 0
+            ):
+                abandoned.add(generation_id)
+                continue
+            if self.component != "web":
+                work = self._get("work", generation_id, control, m.MonitoringWork)
+                if work is not None and work.state not in m.ACTIVE_WORK_STATES:
+                    abandoned.add(generation_id)
+        return abandoned
+
     def _coverage(self, context: m.MonitoringContext) -> m.CoverageView:
         control = self._control(context)
         now = self._now()
@@ -3275,8 +3342,25 @@ class MonitoringEngine:
         items = [self._decode(row, m.InventoryItem) for row in inventory_rows]
         target_rows = self._backend.scan("target", context, limit=SCAN_BUDGET, filters={"status_in": ("current", "paused", "review_required")})
         targets = [self._effective_target(self._decode(row, m.MonitoringTarget)) for row in target_rows]
-        generations = self._all("generation", context, m.InventoryGeneration)
+        all_generations = self._all("generation", context, m.InventoryGeneration)
         scopes = self._all("scope", context, m.ScopePolicy, budget=1_000)
+        abandoned = self._abandoned_inventory_passes(control, all_generations, scopes)
+        generations = [
+            generation for generation in all_generations
+            if generation.generation_id not in abandoned
+        ]
+        if abandoned:
+            target_workspaces = {target.identity.workspace_id for target in targets}
+            abandoned_items = [
+                item for item in items
+                if item.generation_id in abandoned and item.workspace_id not in target_workspaces
+            ]
+            if abandoned_items:
+                items = [
+                    item for item in items
+                    if not (item.generation_id in abandoned and item.workspace_id not in target_workspaces)
+                ]
+                discovered = max(0, discovered - len(abandoned_items))
         latest_generations = {}
         for generation in generations:
             selector_key = generation.enumeration + ":" + _json(generation.selector.model_dump(mode="json"))

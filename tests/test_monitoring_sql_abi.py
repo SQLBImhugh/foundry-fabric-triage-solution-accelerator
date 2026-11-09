@@ -728,17 +728,21 @@ class AbiDatabase(KernelProtocolDatabase):
             )
             connection.create_function("CONCAT", -1, lambda *values: "".join("" if v is None else str(v) for v in values))
             connection.create_collation("Latin1_General_100_BIN2", lambda a, b: (a > b) - (a < b))
-            columns = "tenant_id,epoch,record_kind,full_key,key_hash,status,parent_key,parent_hash,generation_id,payload"
+            columns = (
+                "tenant_id,epoch,record_kind,full_key,key_hash,status,workload,workspace_id,"
+                "parent_key,parent_hash,generation_id,payload"
+            )
             connection.execute(f"CREATE TABLE {records} ({columns})")
             connection.execute(f"CREATE TABLE accepted_generations ({columns})")
             rows = [(
                 row.context.tenant_id, row.context.epoch, row.kind, row.key, bytes.fromhex(key_digest(row.key)),
-                row.status, row.parent_key, bytes.fromhex(key_digest(row.parent_key)) if row.parent_key else None,
+                row.status, row.workload, row.workspace_id,
+                row.parent_key, bytes.fromhex(key_digest(row.parent_key)) if row.parent_key else None,
                 row.generation_id, row.payload,
             ) for row in self.records.values()]
-            connection.executemany(f"INSERT INTO {records} VALUES ({','.join('?' * 10)})", rows)
+            connection.executemany(f"INSERT INTO {records} VALUES ({','.join('?' * 12)})", rows)
             # The kernel compares only passes the controller can read: accepted evidence.
-            connection.executemany(f"INSERT INTO accepted_generations VALUES ({','.join('?' * 10)})", [
+            connection.executemany(f"INSERT INTO accepted_generations VALUES ({','.join('?' * 12)})", [
                 values for values, row in zip(rows, self.records.values(), strict=True)
                 if row.kind == "generation" and self.accepted(row)
             ])
@@ -784,19 +788,26 @@ class AbiDatabase(KernelProtocolDatabase):
             requested, cutoff=cutoff, grace_start=now - m.INVENTORY_COLLECTION_GRACE,
         ) if requested else set()
         # The kernel spends its sighting budget in proposal order and deletes a
-        # pass record only with its last sighting.
+        # pass record only with its last sighting or orphaned catalogue row.
         sighting_kinds = {"workspace_seen", "inventory_seen", "domain_seen"}
+        reference_kinds = {"inventory", "workspace", "domain"}
+        pass_fact_kinds = sighting_kinds | reference_kinds
         budget, facts, retired = m.INVENTORY_RETIREMENT_SIGHTINGS, set(), []
         for generation_id in (value for value in requested if value in eligible):
             sightings = sorted((
                 (row.kind, row.key) for row in self.records.values()
                 if row.kind in sighting_kinds and row.parent_key == generation_id
             ), key=lambda fact: (fact[0], key_digest(fact[1])))
-            facts.update(sightings[:budget])
-            if len(sightings) <= budget:
+            references = sorted((
+                (row.kind, row.key) for row in self.records.values()
+                if row.kind in reference_kinds and row.generation_id == generation_id
+            ), key=lambda fact: (fact[0], key_digest(fact[1])))
+            pass_rows = sightings + references
+            facts.update(pass_rows[:budget])
+            if len(pass_rows) <= budget:
                 facts.add(("generation", generation_id))
                 retired.append(generation_id)
-            budget -= min(budget, len(sightings))
+            budget -= min(budget, len(pass_rows))
         deleted = [
             self.records.pop(key) for key, row in list(self.records.items())
             if row.kind == "accepted_fact"
@@ -831,7 +842,7 @@ class AbiDatabase(KernelProtocolDatabase):
             "retain_after": cutoff.isoformat(), "retired_generation_ids": sorted(retired),
             "refused_generation_ids": sorted(set(requested) - eligible),
             "deferred_generation_ids": sorted(eligible - set(retired)),
-            "retired_sightings": sum(row.kind in sighting_kinds for row in deleted),
+            "retired_sightings": sum(row.kind in pass_fact_kinds for row in deleted),
             "retired_bindings": sum(row.kind == "accepted_fact" for row in deleted),
         }
         self.receipts[identity] = {"fingerprint": args["fingerprint"], "recorded_at": now,
